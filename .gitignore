@@ -1,0 +1,8 @@
+# Local builds and IDE-generated files
+/build/
+/DerivedData/
+/Builds/
+/.DS_Store
+
+# Private conversation export; contains historical account data
+/Build Orion Style DAW.html

@@ -1,0 +1,3 @@
+[submodule "Dependencies/tracktion_engine"]
+	path = Dependencies/tracktion_engine
+	url = https://github.com/Tracktion/tracktion_engine.git
