@@ -39,23 +39,6 @@ In Xcode, select the **Orbit** scheme and press **Run**. The build can also be r
 
 The project records Tracktion Engine as a submodule at v3.2.0; that engine revision pins its JUCE submodule. Do not track a moving development branch for product builds.
 
-## Build on macOS
-
-Requirements: Xcode, CMake 3.22 or newer, and a macOS SDK supported by the checked-out JUCE/Tracktion Engine revisions. Orbit's application source is C++; CMake is the build configuration that generates Xcode projects, and JUCE/Tracktion Engine are C++ libraries.
-
-Generate an Xcode project:
-
-```sh
-cmake -S . -B build/xcode -G Xcode
-open build/xcode/OrbitDAW.xcodeproj
-```
-
-In Xcode, select the **Orbit** scheme and press **Run**. The build can also be run from Terminal with:
-
-```sh
-cmake --build build/xcode --config Debug --target Orbit
-```
-
 ## Licensing
 
 Orbit application code is released under GNU AGPLv3 (see `LICENSE`). JUCE is used under AGPLv3 and Tracktion Engine under GPLv3, subject to their respective license files and notices. Third-party dependencies inside either repository may have additional licenses; preserve those notices when distributing builds. This repository publishes source code; it does not include a compiled application bundle.
