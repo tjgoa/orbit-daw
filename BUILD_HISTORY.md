@@ -1,11 +1,11 @@
 # Orbit Build History
 
-Builds 1–24 used a new product build number for each app build. Starting after
-Build 24, rapid local development rebuilds overwrite the same Orbit app and keep
-the visible product build/version unchanged. `Tools/build-orbit-dev.sh` records
-each successful local rebuild in `DEV_BUILD_COUNTER.json`. When a feature set is
-ready as a user-facing checkpoint, increment the product build/version and add a
-row here. Failed builds do not increment the successful local iteration counter.
+Every app build reserves the next product build number and advances the product
+version before compilation. Failed builds consume their reserved number.
+`Tools/build-orbit-dev.sh` also records successful development iterations in
+`DEV_BUILD_COUNTER.json`; this counter is separate from product build numbering.
+The build script updates CMake metadata, the app's displayed build label, version,
+README, and this history row together.
 Open `Builds/README.txt` for the short Finder guide. The current app is copied
 to `Builds/Current/Orbit.app`; full and incremental source-only ZIPs live in
 `Builds/Source Archives/`. Build 24 is the complete source baseline. Later
@@ -37,3 +37,45 @@ iteration ZIPs are incremental and name their baseline inside the archive.
 | 22 | 0.3.1 | 2026-10-25 | Correct the mixer control component list and complete the transport toolbar / Playlist / Mixer / Master wiring. | Built successfully with CMake. Opened Build 22, created a project, and confirmed the Mixer window opens with generator selection, level, pan, and master output controls. The new toolbar controls are exposed in the main window accessibility tree. |
 | 23 | 0.3.2 | 2026-10-25 | Replace the selected-generator utility mixer with blue channel strips for each generator and a master strip; connect each strip's gain and pan directly to Tracktion's volume/pan plugin. Keep Playlist and Mixer as separate windows opened from the transport toolbar. | Built successfully; manual UI inspection found a black backdrop behind the strip panels and an irrelevant pan knob on Master, corrected in Build 24. |
 | 24 | 0.3.3 | 2026-10-25 | Fix Mixer backdrop transparency and remove the inactive Master pan control while preserving generator gain/pan and master gain. | Built successfully with CMake. Opened an isolated Build 24 copy, created a project and instrument, verified the Playlist and Mixer buttons open their separate windows, and inspected the Mixer: blue strips appear without a black backing, Master has gain only, and generator gain/pan are exposed. Changed the generator controls to -6.0 dB and +0.35 in the disposable test project and observed those slider values update. |
+| 25 | 0.3.4 | 2026-10-26 | Generator drag and embedded piano roll resize corrections; Orion menu scaffold and persistent Show Hints preference. | Built successfully with CMake. Direct runtime movement confirmation remains outstanding. |
+| 26 | 0.3.5 | 2026-10-26 | Correct product build reservation and history completion in the Orbit iteration build script. | Built successfully. |
+| 27 | 0.3.6 | 2026-10-26 | Add Folder and Remove list dialogs for Sample Paths and VST Paths; update Orion video notes and menu status; retain VST hosting as next-pass scope. | Built successfully. |
+| 28 | 0.3.7 | 2026-10-26 | Fix generator resize hit-test bounds and document verified move/resize behavior. | Build failed; reserved number consumed. |
+| 29 | 0.3.8 | 2026-10-26 | Fix generator resize hit-test bounds and document verified move/resize behavior. | Built successfully. |
+| 30 | 0.3.9 | 2026-10-26 | Add compact movable generator collapse and restore while preserving pattern controls and editor state. | Built successfully. |
+| 31 | 0.3.10 | 2026-10-26 | Keep Playlist Draw/Move and timeline zoom controls accessible above the scrolling grid. | Built successfully. |
+| 32 | 0.3.11 | 2026-10-26 | Integrate generator collapse and restore with the Window menu and Minimize All. | Built successfully. |
+| 33 | 0.3.12 | 2026-10-26 | Enable Edit Select All Notes with visible piano-roll selection feedback. | Built successfully. |
+| 34 | 0.3.13 | 2026-10-26 | Add first VST3 instrument insert path; review Orion window behavior and preserve multi-folder Sample/VST path settings | Built successfully. |
+| 35 | 0.3.14 | 2026-10-26 | Keep Orion-inspired linked movable generator and embedded piano roll; retain multi-folder search-path dialogs; keep VST hosting out of scope | Built successfully. |
+| 36 | 0.3.15 | 2026-10-26 | Give the generator a dedicated visible resize handle; preserve its draggable header and linked piano roll | Build failed; reserved number consumed. |
+| 37 | 0.3.16 | 2026-10-26 | Diagnostic rebuild for the dedicated generator resize handle | Build failed; reserved number consumed. |
+| 38 | 0.3.17 | 2026-10-26 | Fix the dedicated generator resize grip compiler error and keep the linked generator workspace resizable | Built successfully. |
+| 39 | 0.3.18 | 2026-10-26 | Add VST3 folder scanning, instrument discovery, and generator insertion | Build failed; reserved number consumed. |
+| 40 | 0.3.19 | 2026-10-26 | Add VST3 folder scanning, instrument discovery, and generator insertion | Build failed; reserved number consumed. |
+| 41 | 0.3.20 | 2026-10-26 | Add VST3 folder scanning, instrument discovery, and generator insertion | Built successfully. |
+| 42 | 0.3.21 | 2026-10-26 | Preserve mixer and meter plugins on VST3 generator tracks | Built successfully. Visual runtime verification of plugin scanning/insertion is pending because macOS Launch Services refused to open the isolated preview bundle. |
+| 43 | 0.3.22 | 2026-10-26 | Add automatic standard VST3 discovery, optional startup scan, and Orion-style VST3 Insert menu | Build failed; reserved number consumed. |
+| 44 | 0.3.23 | 2026-10-26 | Fix VST3 menu group paths and build the automatic standard VST3 discovery workflow | Built successfully. |
+| 45 | 0.3.24 | 2026-10-26 | Move VST3 startup scanning to VST Paths and add scan progress, desktop scan logs, and fatal crash reports | Built successfully. |
+| 46 | 0.3.25 | 2026-10-26 | Include previously crash-blacklisted VST3 bundles in scan diagnostics | Built successfully. |
+| 47 | 0.3.26 | 2026-10-26 | Make installed VST3 bundles selectable directly and explain when a project is required | Built successfully. |
+| 48 | 0.3.27 | 2026-10-26 | Match Orion Insert menu hierarchy; separate built-in Synths from VST Instruments and remove red plugin labels | Built successfully. |
+| 49 | 0.3.28 | 2026-10-26 | Start directly in a fresh project; open each inserted VST3 editor and expose the active generator selector | Built successfully. |
+| 50 | 0.3.29 | 2026-10-26 | Dock the mixer inside Orbit and remove its header and surrounding padding to match Orion | Build failed; reserved number consumed. |
+| 51 | 0.3.30 | 2026-10-26 | Complete the docked mixer view without pop-up chrome, heading, or surrounding padding | Built successfully. |
+| 52 | 0.3.31 | 2026-10-26 | Embed the VST3 editor within its generator and allow discarding unsaved projects when starting a new project | Built successfully. |
+| 53 | 0.3.32 | 2026-10-26 | Make the in-app mixer compact, movable, resizable, and bounded, with saved layout and scrollable channel strips | Build failed; reserved number consumed. |
+| 54 | 0.3.33 | 2026-10-26 | Make the in-app mixer compact, movable, resizable, bounded, and persistent | Built successfully. |
+| 55 | 0.3.34 | 2026-10-26 | Make Playlist pattern drawing and selection direct, add eight assignable mixer buses, and add compact, expanded, and minimized in-app Mixer modes | Built successfully. |
+| 56 | 0.3.35 | 2026-10-26 | Piano Roll/instrument view switching, generator minimize dock, mixer focus and output bus routing | Build failed; reserved number consumed. |
+| 57 | 0.3.36 | 2026-10-26 | Fix compile issues; piano roll view switch, generator minimize dock, mixer focus and output bus routing | Built successfully. |
+| 58 | 0.3.37 | 2026-10-26 | Show 48 piano-roll time columns and shorten black keys; align mixer buses, generator focus and collapse, and piano-roll switching | Built successfully. |
+| 59 | 0.3.38 | 2026-10-26 | Clear stale project dock and mixer state; make generator minimize cleanly and focus the piano roll over plugin GUIs | Built successfully. |
+| 60 | 0.3.39 | 2026-10-26 | Add fitted draggable mixer header and persistent piano-roll note lengths/settings | Build failed at compile: unsupported JUCE AlertWindow toggle API; reserved number consumed. |
+| 61 | 0.3.40 | 2026-10-26 | Fix piano-roll settings menu; add fitted mixer header and persistent note-length painting | Compilation reached link; disk ran out of space; reserved number consumed. |
+| 62 | 0.3.41 | 2026-10-26 | Complete mixer workspace controls and piano-roll length painting with controller options | Compile/link succeeded; app staging ran out of disk space; reserved number consumed. |
+| 63 | 0.3.42 | 2026-10-26 | Finalize mixer auto-sizing/header and piano-roll persistent note-length controls | Built successfully. |
+| 64 | 0.3.43 | 2026-10-26 | Remove mixer scrollbar gutter while preserving fitted strips and overflow scrolling | Built successfully. |
+| 65 | 0.3.44 | 2026-10-26 | Keep mixer hidden on insert; restore clicked-surface focus, piano-roll settings, and Playlist clip actions | Build failed; reserved number consumed. |
+| 66 | 0.3.45 | 2026-10-26 | Keep mixer hidden on insert; restore clicked-surface focus, piano-roll settings, and Playlist clip actions | Built successfully. |

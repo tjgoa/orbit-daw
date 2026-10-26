@@ -26,6 +26,8 @@ def eligible_files() -> list[pathlib.Path]:
         ".gitmodules",
         "BUILD_HISTORY.md",
         "ORBIT_DAW_FOUNDATION_PLAN_001.md",
+        "ORION_LEARN_TODO.md",
+        "ORION_VISUAL_TARGETS.md",
         "DEV_BUILD_COUNTER.json",
     ):
         path = ROOT / name

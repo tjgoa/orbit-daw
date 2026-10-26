@@ -176,7 +176,7 @@ void ensureTrackShape(juce::ValueTree track, juce::ValueTree mixer)
         channel.setProperty("pan", 0.0, nullptr);
         channel.setProperty("muted", false, nullptr);
         channel.setProperty("solo", false, nullptr);
-        for (int bus = 0; bus < 4; ++bus)
+        for (int bus = 0; bus < 8; ++bus)
             channel.setProperty("fx" + juce::String(bus + 1) + "SendDb", -60.0, nullptr);
         channel.setProperty("outputId", mixer.getProperty("masterChannelId"), nullptr);
         mixer.addChild(channel, -1, nullptr);
@@ -251,7 +251,7 @@ bool ensureSchemaShape(juce::ValueTree& state, juce::String& error)
         if (channel.getProperty("kind").toString() == "track")
         {
             if (!channel.hasProperty("solo")) channel.setProperty("solo", false, nullptr);
-            for (int bus = 0; bus < 4; ++bus)
+            for (int bus = 0; bus < 8; ++bus)
             {
                 const auto property = juce::Identifier("fx" + juce::String(bus + 1) + "SendDb");
                 if (!channel.hasProperty(property)) channel.setProperty(property, -60.0, nullptr);
@@ -287,6 +287,21 @@ juce::String trackKindToString(ProjectDocument::TrackKind kind)
 ProjectDocument::ProjectDocument()
     : ProjectDocument(createNew().state)
 {
+}
+
+ProjectDocument::ProjectDocument(const ProjectDocument& other)
+    : state(other.state.createCopy()), projectFile(other.projectFile)
+{
+}
+
+ProjectDocument& ProjectDocument::operator=(const ProjectDocument& other)
+{
+    if (this != &other)
+    {
+        state = other.state.createCopy();
+        projectFile = other.projectFile;
+    }
+    return *this;
 }
 
 ProjectDocument::ProjectDocument(juce::ValueTree projectState, juce::File file)
@@ -424,7 +439,7 @@ juce::String ProjectDocument::addTrack(TrackKind kind, const juce::String& reque
     channel.setProperty("pan", 0.0, nullptr);
     channel.setProperty("muted", false, nullptr);
     channel.setProperty("solo", false, nullptr);
-    for (int bus = 0; bus < 4; ++bus)
+    for (int bus = 0; bus < 8; ++bus)
         channel.setProperty("fx" + juce::String(bus + 1) + "SendDb", -60.0, nullptr);
     channel.setProperty("outputId", mixer.getProperty("masterChannelId"), nullptr);
     mixer.addChild(channel, -1, nullptr);
@@ -464,6 +479,26 @@ juce::String ProjectDocument::getName() const
 juce::String ProjectDocument::getProjectId() const
 {
     return state.getProperty("projectId").toString();
+}
+
+juce::String ProjectDocument::getDescription() const
+{
+    return state.getProperty("description").toString();
+}
+
+void ProjectDocument::setDescription(const juce::String& description)
+{
+    state.setProperty("description", description.trim(), nullptr);
+}
+
+juce::String ProjectDocument::getCreatorUrl() const
+{
+    return state.getProperty("creatorUrl").toString();
+}
+
+void ProjectDocument::setCreatorUrl(const juce::String& url)
+{
+    state.setProperty("creatorUrl", url.trim(), nullptr);
 }
 
 int ProjectDocument::getTrackCount() const
@@ -526,7 +561,7 @@ void ProjectDocument::setTrackSendGain(int index, int bus, double gainDb)
 {
     const auto tracks = state.getChildWithName(tracksType);
     if (!juce::isPositiveAndBelow(index, tracks.getNumChildren())
-        || !juce::isPositiveAndBelow(bus, 4)) return;
+        || !juce::isPositiveAndBelow(bus, 8)) return;
     const auto track = tracks.getChild(index);
     const auto mixer = state.getChildWithName(mixerType);
     auto channel = findMixerChannel(mixer, track.getProperty("mixerChannelId").toString());
@@ -539,7 +574,7 @@ bool ProjectDocument::setFxReturnMixerState(int bus, const juce::String& channel
                                              const juce::String& name, double gainDb, double pan,
                                              bool muted, bool solo)
 {
-    if (!juce::isPositiveAndBelow(bus, 4) || channelId.isEmpty()) return false;
+    if (!juce::isPositiveAndBelow(bus, 8) || channelId.isEmpty()) return false;
 
     auto mixer = state.getChildWithName(mixerType);
     juce::ValueTree channel;
@@ -640,6 +675,39 @@ bool ProjectDocument::getPatternNote(const juce::String& trackId, int slotIndex,
     return false;
 }
 
+int ProjectDocument::getPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step) const
+{
+    const auto notes = findPatternSlot(state, trackId, slotIndex).getChildWithName(patternNotesType);
+    for (int i = 0; i < notes.getNumChildren(); ++i)
+    {
+        const auto note = notes.getChild(i);
+        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
+            && static_cast<int>(note.getProperty("step", -1)) == step)
+            return juce::jlimit(1, 127, static_cast<int>(note.getProperty("velocity", 100)));
+    }
+    return 100;
+}
+
+int ProjectDocument::getPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step) const
+{
+    const auto slot = findPatternSlot(state, trackId, slotIndex);
+    const auto notes = slot.getChildWithName(patternNotesType);
+    for (int i = 0; i < notes.getNumChildren(); ++i)
+    {
+        const auto note = notes.getChild(i);
+        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
+            && static_cast<int>(note.getProperty("step", -1)) == step)
+            return juce::jmax(1, static_cast<int>(note.getProperty("lengthSteps", 1)));
+    }
+    return 1;
+}
+
+int ProjectDocument::getPatternLengthSteps(const juce::String& trackId, int slotIndex) const
+{
+    const auto slot = findPatternSlot(state, trackId, slotIndex);
+    return juce::jlimit(1, 64, static_cast<int>(slot.getProperty("lengthSteps", 16)));
+}
+
 void ProjectDocument::setPatternCreated(const juce::String& trackId, int slotIndex, bool created)
 {
     auto slot = findPatternSlot(state, trackId, slotIndex);
@@ -675,9 +743,58 @@ void ProjectDocument::setPatternNote(const juce::String& trackId, int slotIndex,
         note.setProperty("pitch", pitch, nullptr);
         note.setProperty("step", step, nullptr);
         note.setProperty("velocity", 100, nullptr);
+        note.setProperty("lengthSteps", 1, nullptr);
         notes.addChild(note, -1, nullptr);
         slot.setProperty("created", true, nullptr);
     }
+}
+
+void ProjectDocument::setPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step, int velocity)
+{
+    const auto notes = findPatternSlot(state, trackId, slotIndex).getChildWithName(patternNotesType);
+    for (int i = 0; i < notes.getNumChildren(); ++i)
+    {
+        auto note = notes.getChild(i);
+        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
+            && static_cast<int>(note.getProperty("step", -1)) == step)
+        {
+            note.setProperty("velocity", juce::jlimit(1, 127, velocity), nullptr);
+            return;
+        }
+    }
+}
+
+void ProjectDocument::setPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step, int lengthSteps)
+{
+    auto slot = findPatternSlot(state, trackId, slotIndex);
+    auto notes = slot.getChildWithName(patternNotesType);
+    for (int i = 0; i < notes.getNumChildren(); ++i)
+    {
+        auto note = notes.getChild(i);
+        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
+            && static_cast<int>(note.getProperty("step", -1)) == step)
+        {
+            note.setProperty("lengthSteps", juce::jlimit(1, 64 - step, lengthSteps), nullptr);
+            return;
+        }
+    }
+}
+
+void ProjectDocument::setPatternLengthSteps(const juce::String& trackId, int slotIndex, int lengthSteps)
+{
+    auto slot = findPatternSlot(state, trackId, slotIndex);
+    if (slot.isValid())
+        slot.setProperty("lengthSteps", juce::jlimit(1, 64, lengthSteps), nullptr);
+}
+
+void ProjectDocument::moveTrack(int sourceIndex, int destinationIndex)
+{
+    auto tracks = state.getChildWithName(tracksType);
+    if (!juce::isPositiveAndBelow(sourceIndex, tracks.getNumChildren())
+        || !juce::isPositiveAndBelow(destinationIndex, tracks.getNumChildren())
+        || sourceIndex == destinationIndex)
+        return;
+    tracks.moveChild(sourceIndex, destinationIndex, nullptr);
 }
 
 juce::String ProjectDocument::getPlaylistPatternId(const juce::String& trackId, int bar) const
@@ -762,4 +879,24 @@ ProjectDocument::TimeSignature ProjectDocument::getInitialTimeSignature() const
     const auto point = map.getChild(0);
     return { static_cast<int>(point.getProperty("numerator", 4)),
              static_cast<int>(point.getProperty("denominator", 4)) };
+}
+
+void ProjectDocument::setInitialTimeSignature(int numerator, int denominator)
+{
+    numerator = juce::jlimit(1, 32, numerator);
+    if (denominator != 1 && denominator != 2 && denominator != 4 && denominator != 8
+        && denominator != 16 && denominator != 32)
+        denominator = 4;
+
+    auto map = state.getChildWithName(meterMapType);
+    if (map.getNumChildren() == 0)
+        map.addChild(makeMeterPoint(numerator, denominator), -1, nullptr);
+    else
+    {
+        auto firstPoint = map.getChild(0);
+        firstPoint.setProperty("numerator", numerator, nullptr);
+        firstPoint.setProperty("denominator", denominator, nullptr);
+    }
+    state.setProperty("timeSignatureNumerator", numerator, nullptr);
+    state.setProperty("timeSignatureDenominator", denominator, nullptr);
 }

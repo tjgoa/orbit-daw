@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OrbitDAW VERSION 0.3.3 LANGUAGES C CXX)
+project(OrbitDAW VERSION 0.3.45 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,7 +18,7 @@ add_subdirectory("${ENGINE_ROOT}/modules" "${CMAKE_BINARY_DIR}/tracktion_modules
 juce_add_gui_app(Orbit
     PRODUCT_NAME "Orbit"
     VERSION "${PROJECT_VERSION}"
-    BUILD_VERSION "24"
+    BUILD_VERSION "66"
     COMPANY_NAME "Touch The Universe"
     BUNDLE_ID "com.touchtheuniverse.orbit"
     PLUGINHOST_AU TRUE)
@@ -53,6 +53,6 @@ target_link_libraries(Orbit PRIVATE
 set_target_properties(Orbit PROPERTIES
     MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
-    MACOSX_BUNDLE_BUNDLE_VERSION "24"
+    MACOSX_BUNDLE_BUNDLE_VERSION "66"
     CXX_VISIBILITY_PRESET hidden
     C_VISIBILITY_PRESET hidden)

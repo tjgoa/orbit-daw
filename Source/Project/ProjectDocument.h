@@ -28,6 +28,10 @@ public:
     };
 
     ProjectDocument();
+    ProjectDocument(const ProjectDocument& other);
+    ProjectDocument& operator=(const ProjectDocument& other);
+    ProjectDocument(ProjectDocument&&) noexcept = default;
+    ProjectDocument& operator=(ProjectDocument&&) noexcept = default;
 
     static ProjectDocument createNew();
     static std::optional<ProjectDocument> loadFromFile(const juce::File& file,
@@ -42,6 +46,10 @@ public:
 
     juce::String getName() const;
     juce::String getProjectId() const;
+    juce::String getDescription() const;
+    void setDescription(const juce::String& description);
+    juce::String getCreatorUrl() const;
+    void setCreatorUrl(const juce::String& url);
     juce::File getFile() const { return projectFile; }
     bool hasFile() const { return projectFile.existsAsFile(); }
     int getTrackCount() const;
@@ -59,8 +67,15 @@ public:
     juce::String getPatternName(const juce::String& trackId, int slotIndex) const;
     bool isPatternCreated(const juce::String& trackId, int slotIndex) const;
     bool getPatternNote(const juce::String& trackId, int slotIndex, int pitch, int step) const;
+    int getPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step) const;
+    int getPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step) const;
+    int getPatternLengthSteps(const juce::String& trackId, int slotIndex) const;
     void setPatternCreated(const juce::String& trackId, int slotIndex, bool created);
     void setPatternNote(const juce::String& trackId, int slotIndex, int pitch, int step, bool enabled);
+    void setPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step, int velocity);
+    void setPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step, int lengthSteps);
+    void setPatternLengthSteps(const juce::String& trackId, int slotIndex, int lengthSteps);
+    void moveTrack(int sourceIndex, int destinationIndex);
     juce::String getPlaylistPatternId(const juce::String& trackId, int bar) const;
     void setPlaylistClip(const juce::String& trackId, const juce::String& patternId,
                          int startBar, int lengthBars, bool enabled);
@@ -68,6 +83,7 @@ public:
     double getInitialTempoBpm() const;
     void setInitialTempoBpm(double bpm);
     TimeSignature getInitialTimeSignature() const;
+    void setInitialTimeSignature(int numerator, int denominator);
 
 private:
     explicit ProjectDocument(juce::ValueTree state, juce::File file = {});

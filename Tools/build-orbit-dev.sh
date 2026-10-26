@@ -4,8 +4,100 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$PROJECT_ROOT/build/make"
 COUNTER_FILE="$PROJECT_ROOT/DEV_BUILD_COUNTER.json"
+HISTORY_FILE="$PROJECT_ROOT/BUILD_HISTORY.md"
 CURRENT_APP="$PROJECT_ROOT/Builds/Current/Orbit.app"
 STAGING_APP="$PROJECT_ROOT/Builds/Current/Orbit.next.app"
+BUILD_SUMMARY="${1:-Development rebuild; see ORION_LEARN_TODO.md and the source archive.}"
+
+# Reserve a unique product build and advance all visible version metadata
+# before compiling. A failed attempt consumes the reserved number.
+RESERVED_BUILD="$(python3 - "$PROJECT_ROOT" "$BUILD_SUMMARY" <<'PY'
+import datetime
+import json
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+summary = sys.argv[2].replace("|", "/").replace("\n", " ").strip()
+counter_path = root / "DEV_BUILD_COUNTER.json"
+counter = json.loads(counter_path.read_text())
+build = int(counter.get("product_checkpoint_build", 0)) + 1
+parts = [int(piece) for piece in str(counter["product_checkpoint_version"]).split(".")]
+if len(parts) != 3:
+    raise SystemExit("Expected a three-part product version in DEV_BUILD_COUNTER.json")
+parts[2] += 1
+version = ".".join(map(str, parts))
+
+cmake_path = root / "CMakeLists.txt"
+cmake = cmake_path.read_text()
+cmake, n1 = re.subn(r"project\(OrbitDAW VERSION [0-9.]+ LANGUAGES C CXX\)",
+                    f"project(OrbitDAW VERSION {version} LANGUAGES C CXX)", cmake, count=1)
+cmake, n2 = re.subn(r'BUILD_VERSION "[0-9]+"', f'BUILD_VERSION "{build}"', cmake, count=1)
+cmake, n3 = re.subn(r'MACOSX_BUNDLE_BUNDLE_VERSION "[0-9]+"',
+                    f'MACOSX_BUNDLE_BUNDLE_VERSION "{build}"', cmake, count=1)
+if (n1, n2, n3) != (1, 1, 1):
+    raise SystemExit("Could not align CMake product version/build metadata")
+cmake_path.write_text(cmake)
+
+main_path = root / "Source" / "Main.cpp"
+main = main_path.read_text()
+main, n1 = re.subn(r'buildLabel\.setText\("Build [0-9]+  -  v[0-9.]+"',
+                   f'buildLabel.setText("Build {build}  -  v{version}"', main, count=1)
+main, n2 = re.subn(r'getApplicationVersion\(\) override \{ return "[0-9.]+"; \}',
+                   f'getApplicationVersion() override {{ return "{version}"; }}', main, count=1)
+if (n1, n2) != (1, 1):
+    raise SystemExit("Could not align app build label/version")
+main_path.write_text(main)
+
+counter["product_checkpoint_build"] = build
+counter["product_checkpoint_version"] = version
+counter["last_reserved_product_build"] = build
+counter_path.write_text(json.dumps(counter, indent=2) + "\n")
+
+readme_path = root / "README.md"
+readme = readme_path.read_text()
+readme = re.sub(r"current public source corresponds to product \*\*Build [0-9]+ / version [0-9.]+\*\*",
+                f"current public source corresponds to product **Build {build} / version {version}**", readme, count=1)
+readme_path.write_text(readme)
+
+history_path = root / "BUILD_HISTORY.md"
+history = history_path.read_text()
+today = datetime.date.today().isoformat()
+row = f"| {build} | {version} | {today} | {summary} | Build reserved; compilation in progress. |\n"
+history += row
+history_path.write_text(history)
+print(build)
+PY
+)"
+
+BUILD_RESERVED=1
+finish_build() {
+    local result=$?
+    if [[ "$BUILD_RESERVED" == "1" ]]; then
+        python3 - "$HISTORY_FILE" "$RESERVED_BUILD" "$result" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+build = int(sys.argv[2])
+result = int(sys.argv[3])
+history = path.read_text()
+old = f"| {build} |"
+lines = history.splitlines()
+for index, line in enumerate(lines):
+    if line.startswith(old) and "Build reserved; compilation in progress." in line:
+        lines[index] = line.replace(
+            "Build reserved; compilation in progress.",
+            "Build failed; reserved number consumed." if result else "Built successfully."
+        )
+        break
+path.write_text("\n".join(lines) + "\n")
+PY
+    fi
+    return "$result"
+}
+trap finish_build EXIT
 
 if [[ ! -f "$BUILD_DIR/Makefile" ]]; then
     echo "Build directory is missing. Configure it first with: cmake -S . -B build/make -G 'Unix Makefiles'" >&2
@@ -63,10 +155,41 @@ counter_path = pathlib.Path(sys.argv[1])
 data = json.loads(counter_path.read_text())
 data["successful_dev_iterations"] = int(data.get("successful_dev_iterations", 0)) + 1
 data["last_successful_build_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+data["artifact_path"] = "Builds/Current/Orbit.app"
 temporary_path = counter_path.with_suffix(counter_path.suffix + ".tmp")
 temporary_path.write_text(json.dumps(data, indent=2) + "\n")
 temporary_path.replace(counter_path)
-print(f"Successful local iteration {data['successful_dev_iterations']} recorded; product remains Build {data['product_checkpoint_build']} / v{data['product_checkpoint_version']}.")
+print(f"Successful development iteration {data['successful_dev_iterations']} recorded as product Build {data['product_checkpoint_build']} / v{data['product_checkpoint_version']}.")
+PY
+
+python3 - "$HISTORY_FILE" "$RESERVED_BUILD" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+build = int(sys.argv[2])
+history = path.read_text()
+lines = history.splitlines()
+for index, line in enumerate(lines):
+    if line.startswith(f"| {build} |") and "Build reserved; compilation in progress." in line:
+        lines[index] = line.replace("Build reserved; compilation in progress.", "Built successfully.")
+        break
+path.write_text("\n".join(lines) + "\n")
+PY
+
+BUILD_RESERVED=0
+trap - EXIT
+python3 - "$PROJECT_ROOT/README.md" "$COUNTER_FILE" <<'PY'
+import json
+import pathlib
+import re
+import sys
+readme_path = pathlib.Path(sys.argv[1])
+counter = json.loads(pathlib.Path(sys.argv[2]).read_text())
+readme = readme_path.read_text()
+readme = re.sub(r"local development iteration \*\*[0-9]+\*\*",
+                f"local development iteration **{counter['successful_dev_iterations']}**", readme, count=1)
+readme_path.write_text(readme)
 PY
 
 python3 "$PROJECT_ROOT/Tools/package-source-archive.py" --dev-iteration
