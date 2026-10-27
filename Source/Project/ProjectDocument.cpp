@@ -1,902 +1,814 @@
-#include "ProjectDocument.h"
-
-#include <cmath>
-
-namespace
-{
-const juce::Identifier projectType { "OrbitProject" };
-const juce::Identifier tempoMapType { "TempoMap" };
-const juce::Identifier tempoPointType { "TempoPoint" };
-const juce::Identifier meterMapType { "TimeSignatureMap" };
-const juce::Identifier meterPointType { "TimeSignaturePoint" };
-const juce::Identifier tracksType { "Tracks" };
-const juce::Identifier trackType { "Track" };
-const juce::Identifier patternsType { "Patterns" };
-const juce::Identifier patternSlotType { "PatternSlot" };
-const juce::Identifier patternNotesType { "Notes" };
-const juce::Identifier patternNoteType { "Note" };
-const juce::Identifier clipsType { "Clips" };
-const juce::Identifier playlistClipType { "PlaylistClip" };
-const juce::Identifier pluginsType { "Plugins" };
-const juce::Identifier automationType { "AutomationLanes" };
-const juce::Identifier mixerType { "MixerChannels" };
-const juce::Identifier mixerChannelType { "MixerChannel" };
-const juce::Identifier mediaType { "MediaReferences" };
-const juce::Identifier tracktionStateType { "TracktionEditState" };
-
-juce::String newId()
-{
-    return juce::Uuid().toString();
-}
-
-juce::ValueTree makeTempoPoint(double bpm)
-{
-    juce::ValueTree point(tempoPointType);
-    point.setProperty("id", newId(), nullptr);
-    point.setProperty("tick", juce::int64(0), nullptr);
-    point.setProperty("bpm", bpm, nullptr);
-    return point;
-}
-
-juce::ValueTree makeMeterPoint(int numerator, int denominator)
-{
-    juce::ValueTree point(meterPointType);
-    point.setProperty("id", newId(), nullptr);
-    point.setProperty("tick", juce::int64(0), nullptr);
-    point.setProperty("numerator", numerator, nullptr);
-    point.setProperty("denominator", denominator, nullptr);
-    return point;
-}
-
-void ensureChild(juce::ValueTree& parent, const juce::Identifier& type)
-{
-    if (!parent.getChildWithName(type).isValid())
-        parent.addChild(juce::ValueTree(type), -1, nullptr);
-}
-
-void ensurePatternBank(juce::ValueTree track)
-{
-    if (track.getProperty("kind").toString() != "instrument")
-        return;
-
-    auto patterns = track.getChildWithName(patternsType);
-    for (int index = 0; index < ProjectDocument::patternSlotCount; ++index)
-    {
-        juce::ValueTree slot;
-        for (int child = 0; child < patterns.getNumChildren(); ++child)
-        {
-            auto candidate = patterns.getChild(child);
-            if (candidate.getType() == patternSlotType
-                && static_cast<int>(candidate.getProperty("index", -1)) == index)
-            {
-                slot = candidate;
-                break;
-            }
-        }
-
-        if (!slot.isValid())
-        {
-            slot = juce::ValueTree(patternSlotType);
-            slot.setProperty("id", newId(), nullptr);
-            slot.setProperty("index", index, nullptr);
-            slot.setProperty("bank", index / ProjectDocument::patternsPerBank, nullptr);
-            slot.setProperty("slot", index % ProjectDocument::patternsPerBank, nullptr);
-            slot.setProperty("name", juce::String::charToString(static_cast<juce::juce_wchar>('A' + index / 8))
-                                           + juce::String(index % 8 + 1), nullptr);
-            slot.setProperty("lengthSteps", 16, nullptr);
-            slot.setProperty("created", false, nullptr);
-            patterns.addChild(slot, -1, nullptr);
-        }
-        ensureChild(slot, patternNotesType);
-    }
-}
-
-juce::ValueTree findPatternSlot(juce::ValueTree state, const juce::String& trackId, int slotIndex)
-{
-    if (trackId.isEmpty() || !juce::isPositiveAndBelow(slotIndex, ProjectDocument::patternSlotCount))
-        return {};
-
-    const auto tracks = state.getChildWithName(tracksType);
-    for (int i = 0; i < tracks.getNumChildren(); ++i)
-    {
-        auto track = tracks.getChild(i);
-        if (track.getProperty("id").toString() == trackId)
-        {
-            auto patterns = track.getChildWithName(patternsType);
-            for (int j = 0; j < patterns.getNumChildren(); ++j)
-            {
-                auto slot = patterns.getChild(j);
-                if (slot.getType() == patternSlotType
-                    && static_cast<int>(slot.getProperty("index", -1)) == slotIndex)
-                    return slot;
-            }
-        }
-    }
-    return {};
-}
-
-juce::ValueTree findProjectTrack(juce::ValueTree state, const juce::String& trackId)
-{
-    const auto tracks = state.getChildWithName(tracksType);
-    for (int i = 0; i < tracks.getNumChildren(); ++i)
-    {
-        auto track = tracks.getChild(i);
-        if (track.getProperty("id").toString() == trackId)
-            return track;
-    }
-    return {};
-}
-
-juce::ValueTree findMixerChannel(juce::ValueTree mixer, const juce::String& channelId)
-{
-    if (channelId.isEmpty()) return {};
-    for (int i = 0; i < mixer.getNumChildren(); ++i)
-    {
-        auto channel = mixer.getChild(i);
-        if (channel.getProperty("id").toString() == channelId)
-            return channel;
-    }
-    return {};
-}
-
-void ensureTrackShape(juce::ValueTree track, juce::ValueTree mixer)
-{
-    if (track.getProperty("id").toString().isEmpty())
-        track.setProperty("id", newId(), nullptr);
-    if (track.getProperty("name").toString().isEmpty())
-        track.setProperty("name", "Instrument", nullptr);
-    if (track.getProperty("kind").toString().isEmpty())
-        track.setProperty("kind", "instrument", nullptr);
-
-    ensureChild(track, patternsType);
-    ensureChild(track, clipsType);
-    ensureChild(track, pluginsType);
-    ensureChild(track, automationType);
-    ensurePatternBank(track);
-
-    auto channelId = track.getProperty("mixerChannelId").toString();
-    if (channelId.isEmpty())
-    {
-        channelId = newId();
-        track.setProperty("mixerChannelId", channelId, nullptr);
-    }
-
-    bool foundChannel = false;
-    for (int i = 0; i < mixer.getNumChildren(); ++i)
-        foundChannel |= mixer.getChild(i).getProperty("id").toString() == channelId;
-
-    if (!foundChannel)
-    {
-        juce::ValueTree channel(mixerChannelType);
-        channel.setProperty("id", channelId, nullptr);
-        channel.setProperty("kind", "track", nullptr);
-        channel.setProperty("trackId", track.getProperty("id"), nullptr);
-        channel.setProperty("name", track.getProperty("name"), nullptr);
-        channel.setProperty("gainDb", 0.0, nullptr);
-        channel.setProperty("pan", 0.0, nullptr);
-        channel.setProperty("muted", false, nullptr);
-        channel.setProperty("solo", false, nullptr);
-        for (int bus = 0; bus < 8; ++bus)
-            channel.setProperty("fx" + juce::String(bus + 1) + "SendDb", -60.0, nullptr);
-        channel.setProperty("outputId", mixer.getProperty("masterChannelId"), nullptr);
-        mixer.addChild(channel, -1, nullptr);
-    }
-}
-
-bool ensureSchemaShape(juce::ValueTree& state, juce::String& error)
-{
-    if (state.getProperty("projectId").toString().isEmpty())
-        state.setProperty("projectId", newId(), nullptr);
-    if (state.getProperty("name").toString().isEmpty())
-        state.setProperty("name", "Untitled Project", nullptr);
-    const auto storedPpq = static_cast<int>(state.getProperty("ticksPerQuarterNote", 0));
-    if (storedPpq == 0)
-        state.setProperty("ticksPerQuarterNote", ProjectDocument::ticksPerQuarterNote, nullptr);
-    else if (storedPpq != ProjectDocument::ticksPerQuarterNote)
-    {
-        error = "This project uses a musical time resolution Orbit cannot read.";
-        return false;
-    }
-
-    ensureChild(state, tempoMapType);
-    ensureChild(state, meterMapType);
-    ensureChild(state, tracksType);
-    ensureChild(state, mixerType);
-    ensureChild(state, mediaType);
-
-    auto tempoMap = state.getChildWithName(tempoMapType);
-    if (tempoMap.getNumChildren() == 0)
-        tempoMap.addChild(makeTempoPoint(static_cast<double>(state.getProperty("tempoBpm", 120.0))),
-                          -1, nullptr);
-
-    auto meterMap = state.getChildWithName(meterMapType);
-    if (meterMap.getNumChildren() == 0)
-        meterMap.addChild(makeMeterPoint(static_cast<int>(state.getProperty("timeSignatureNumerator", 4)),
-                                         static_cast<int>(state.getProperty("timeSignatureDenominator", 4))),
-                          -1, nullptr);
-
-    auto mixer = state.getChildWithName(mixerType);
-    auto masterId = mixer.getProperty("masterChannelId").toString();
-    if (masterId.isEmpty())
-    {
-        masterId = newId();
-        mixer.setProperty("masterChannelId", masterId, nullptr);
-    }
-
-    bool hasMaster = false;
-    for (int i = 0; i < mixer.getNumChildren(); ++i)
-        hasMaster |= mixer.getChild(i).getProperty("id").toString() == masterId;
-
-    if (!hasMaster)
-    {
-        juce::ValueTree master(mixerChannelType);
-        master.setProperty("id", masterId, nullptr);
-        master.setProperty("kind", "master", nullptr);
-        master.setProperty("name", "Master", nullptr);
-        master.setProperty("gainDb", 0.0, nullptr);
-        master.setProperty("pan", 0.0, nullptr);
-        master.setProperty("muted", false, nullptr);
-        master.setProperty("outputId", juce::String{}, nullptr);
-        mixer.addChild(master, -1, nullptr);
-    }
-
-    auto tracks = state.getChildWithName(tracksType);
-    for (int i = 0; i < tracks.getNumChildren(); ++i)
-        ensureTrackShape(tracks.getChild(i), mixer);
-
-    for (int i = 0; i < mixer.getNumChildren(); ++i)
-    {
-        auto channel = mixer.getChild(i);
-        if (!channel.hasProperty("muted")) channel.setProperty("muted", false, nullptr);
-        if (channel.getProperty("kind").toString() == "track")
-        {
-            if (!channel.hasProperty("solo")) channel.setProperty("solo", false, nullptr);
-            for (int bus = 0; bus < 8; ++bus)
-            {
-                const auto property = juce::Identifier("fx" + juce::String(bus + 1) + "SendDb");
-                if (!channel.hasProperty(property)) channel.setProperty(property, -60.0, nullptr);
-            }
-        }
-        else if (channel.getProperty("kind").toString() == "fx_return")
-        {
-            if (!channel.hasProperty("solo")) channel.setProperty("solo", false, nullptr);
-            if (!channel.hasProperty("gainDb")) channel.setProperty("gainDb", 0.0, nullptr);
-            if (!channel.hasProperty("pan")) channel.setProperty("pan", 0.0, nullptr);
-            if (!channel.hasProperty("outputId"))
-                channel.setProperty("outputId", mixer.getProperty("masterChannelId"), nullptr);
-        }
-    }
-
-    state.setProperty("schemaVersion", ProjectDocument::currentSchemaVersion, nullptr);
-    error.clear();
-    return true;
-}
-
-juce::String trackKindToString(ProjectDocument::TrackKind kind)
-{
-    switch (kind)
-    {
-        case ProjectDocument::TrackKind::instrument: return "instrument";
-        case ProjectDocument::TrackKind::midi:        return "midi";
-        case ProjectDocument::TrackKind::audio:       return "audio";
-    }
-    return "instrument";
-}
-}
-
-ProjectDocument::ProjectDocument()
-    : ProjectDocument(createNew().state)
-{
-}
-
-ProjectDocument::ProjectDocument(const ProjectDocument& other)
-    : state(other.state.createCopy()), projectFile(other.projectFile)
-{
-}
-
-ProjectDocument& ProjectDocument::operator=(const ProjectDocument& other)
-{
-    if (this != &other)
-    {
-        state = other.state.createCopy();
-        projectFile = other.projectFile;
-    }
-    return *this;
-}
-
-ProjectDocument::ProjectDocument(juce::ValueTree projectState, juce::File file)
-    : state(std::move(projectState)), projectFile(std::move(file))
-{
-}
-
-ProjectDocument ProjectDocument::createNew()
-{
-    juce::ValueTree root(projectType);
-    root.setProperty("schemaVersion", currentSchemaVersion, nullptr);
-    root.setProperty("projectId", newId(), nullptr);
-    root.setProperty("name", "Untitled Project", nullptr);
-    root.setProperty("ticksPerQuarterNote", ticksPerQuarterNote, nullptr);
-    root.addChild(juce::ValueTree(tempoMapType), -1, nullptr);
-    root.addChild(juce::ValueTree(meterMapType), -1, nullptr);
-    root.addChild(juce::ValueTree(tracksType), -1, nullptr);
-    root.addChild(juce::ValueTree(mixerType), -1, nullptr);
-    root.addChild(juce::ValueTree(mediaType), -1, nullptr);
-
-    juce::String ignoredError;
-    ensureSchemaShape(root, ignoredError);
-    return ProjectDocument(std::move(root));
-}
-
-std::optional<ProjectDocument> ProjectDocument::loadFromFile(const juce::File& file,
-                                                               juce::String& error)
-{
-    auto xml = juce::XmlDocument::parse(file);
-    if (xml == nullptr)
-    {
-        error = "Orbit could not read this project file.";
-        return std::nullopt;
-    }
-
-    auto loadedState = juce::ValueTree::fromXml(*xml);
-    if (!loadedState.hasType(projectType))
-    {
-        error = "This file is not an Orbit project.";
-        return std::nullopt;
-    }
-
-    const auto schemaVersion = static_cast<int>(loadedState.getProperty("schemaVersion", 0));
-    if (schemaVersion < 0 || schemaVersion > currentSchemaVersion)
-    {
-        error = "This Orbit project uses an unsupported version.";
-        return std::nullopt;
-    }
-
-    if (!ensureSchemaShape(loadedState, error))
-        return std::nullopt;
-
-    return ProjectDocument(std::move(loadedState), file);
-}
-
-bool ProjectDocument::saveToFile(const juce::File& file, juce::String& error)
-{
-    if (file == juce::File{})
-    {
-        error = "Choose a location for the project file.";
-        return false;
-    }
-
-    auto xml = state.createXml();
-    if (xml == nullptr)
-    {
-        error = "Orbit could not serialize this project.";
-        return false;
-    }
-
-    if (!file.getParentDirectory().createDirectory())
-    {
-        error = "Orbit could not create the project folder.";
-        return false;
-    }
-
-    auto temporaryFile = file.getSiblingFile(file.getFileName() + ".tmp");
-    if (!temporaryFile.replaceWithText(xml->toString()))
-    {
-        error = "Orbit could not write the project file.";
-        return false;
-    }
-
-    const auto replaced = file.existsAsFile() ? temporaryFile.replaceFileIn(file)
-                                              : temporaryFile.moveFileTo(file);
-    if (!replaced)
-    {
-        temporaryFile.deleteFile();
-        error = "Orbit could not finish saving the project file.";
-        return false;
-    }
-
-    projectFile = file;
-    error.clear();
-    return true;
-}
-
-void ProjectDocument::setName(const juce::String& name)
-{
-    const auto trimmedName = name.trim();
-    if (trimmedName.isNotEmpty())
-        state.setProperty("name", trimmedName, nullptr);
-}
-
-juce::String ProjectDocument::addTrack(TrackKind kind, const juce::String& requestedName)
-{
-    auto tracks = state.getChildWithName(tracksType);
-    auto mixer = state.getChildWithName(mixerType);
-    const auto number = tracks.getNumChildren() + 1;
-    const auto trackId = newId();
-
-    juce::ValueTree track(trackType);
-    track.setProperty("id", trackId, nullptr);
-    track.setProperty("kind", trackKindToString(kind), nullptr);
-    track.setProperty("name", requestedName.isNotEmpty()
-                                   ? requestedName
-                                   : trackKindToString(kind).substring(0, 1).toUpperCase()
-                                         + trackKindToString(kind).substring(1) + " "
-                                         + juce::String(number), nullptr);
-    track.setProperty("order", number - 1, nullptr);
-    ensureChild(track, patternsType);
-    ensureChild(track, clipsType);
-    ensureChild(track, pluginsType);
-    ensureChild(track, automationType);
-    ensurePatternBank(track);
-
-    const auto channelId = newId();
-    track.setProperty("mixerChannelId", channelId, nullptr);
-    juce::ValueTree channel(mixerChannelType);
-    channel.setProperty("id", channelId, nullptr);
-    channel.setProperty("kind", "track", nullptr);
-    channel.setProperty("trackId", trackId, nullptr);
-    channel.setProperty("name", track.getProperty("name"), nullptr);
-    channel.setProperty("gainDb", 0.0, nullptr);
-    channel.setProperty("pan", 0.0, nullptr);
-    channel.setProperty("muted", false, nullptr);
-    channel.setProperty("solo", false, nullptr);
-    for (int bus = 0; bus < 8; ++bus)
-        channel.setProperty("fx" + juce::String(bus + 1) + "SendDb", -60.0, nullptr);
-    channel.setProperty("outputId", mixer.getProperty("masterChannelId"), nullptr);
-    mixer.addChild(channel, -1, nullptr);
-    tracks.addChild(track, -1, nullptr);
-    return trackId;
-}
-
-void ProjectDocument::addInstrumentTrack()
-{
-    addTrack(TrackKind::instrument);
-}
-
-void ProjectDocument::setTracktionEditState(const juce::ValueTree& editState)
-{
-    auto existing = state.getChildWithName(tracktionStateType);
-    if (existing.isValid())
-        state.removeChild(existing, nullptr);
-    if (editState.isValid())
-    {
-        juce::ValueTree wrapper(tracktionStateType);
-        wrapper.addChild(editState.createCopy(), -1, nullptr);
-        state.addChild(wrapper, -1, nullptr);
-    }
-}
-
-juce::ValueTree ProjectDocument::getTracktionEditState() const
-{
-    const auto wrapper = state.getChildWithName(tracktionStateType);
-    return wrapper.getNumChildren() > 0 ? wrapper.getChild(0) : juce::ValueTree{};
-}
-
-juce::String ProjectDocument::getName() const
-{
-    return state.getProperty("name", "Untitled Project").toString();
-}
-
-juce::String ProjectDocument::getProjectId() const
-{
-    return state.getProperty("projectId").toString();
-}
-
-juce::String ProjectDocument::getDescription() const
-{
-    return state.getProperty("description").toString();
-}
-
-void ProjectDocument::setDescription(const juce::String& description)
-{
-    state.setProperty("description", description.trim(), nullptr);
-}
-
-juce::String ProjectDocument::getCreatorUrl() const
-{
-    return state.getProperty("creatorUrl").toString();
-}
-
-void ProjectDocument::setCreatorUrl(const juce::String& url)
-{
-    state.setProperty("creatorUrl", url.trim(), nullptr);
-}
-
-int ProjectDocument::getTrackCount() const
-{
-    return state.getChildWithName(tracksType).getNumChildren();
-}
-
-juce::String ProjectDocument::getTrackId(int index) const
-{
-    const auto tracks = state.getChildWithName(tracksType);
-    if (!juce::isPositiveAndBelow(index, tracks.getNumChildren()))
-        return {};
-
-    return tracks.getChild(index).getProperty("id").toString();
-}
-
-juce::String ProjectDocument::getTrackName(int index) const
-{
-    const auto tracks = state.getChildWithName(tracksType);
-    if (!juce::isPositiveAndBelow(index, tracks.getNumChildren()))
-        return {};
-
-    return tracks.getChild(index).getProperty("name").toString();
-}
-
-void ProjectDocument::setTrackName(int index, const juce::String& requestedName)
-{
-    const auto name = requestedName.trim();
-    auto tracks = state.getChildWithName(tracksType);
-    if (name.isEmpty() || !juce::isPositiveAndBelow(index, tracks.getNumChildren()))
-        return;
-
-    auto track = tracks.getChild(index);
-    track.setProperty("name", name, nullptr);
-
-    const auto mixer = state.getChildWithName(mixerType);
-    const auto channelId = track.getProperty("mixerChannelId").toString();
-    auto channel = findMixerChannel(mixer, channelId);
-    if (channel.isValid())
-        channel.setProperty("name", name, nullptr);
-}
-
-void ProjectDocument::setTrackMixerState(int index, double gainDb, double pan, bool muted, bool solo)
-{
-    const auto tracks = state.getChildWithName(tracksType);
-    if (!juce::isPositiveAndBelow(index, tracks.getNumChildren())) return;
-    const auto track = tracks.getChild(index);
-    const auto mixer = state.getChildWithName(mixerType);
-    auto channel = findMixerChannel(mixer, track.getProperty("mixerChannelId").toString());
-    if (channel.isValid())
-    {
-        channel.setProperty("gainDb", juce::jlimit(-60.0, 6.0, gainDb), nullptr);
-        channel.setProperty("pan", juce::jlimit(-1.0, 1.0, pan), nullptr);
-        channel.setProperty("muted", muted, nullptr);
-        channel.setProperty("solo", solo, nullptr);
-    }
-}
-
-void ProjectDocument::setTrackSendGain(int index, int bus, double gainDb)
-{
-    const auto tracks = state.getChildWithName(tracksType);
-    if (!juce::isPositiveAndBelow(index, tracks.getNumChildren())
-        || !juce::isPositiveAndBelow(bus, 8)) return;
-    const auto track = tracks.getChild(index);
-    const auto mixer = state.getChildWithName(mixerType);
-    auto channel = findMixerChannel(mixer, track.getProperty("mixerChannelId").toString());
-    if (channel.isValid())
-        channel.setProperty("fx" + juce::String(bus + 1) + "SendDb",
-                             juce::jlimit(-60.0, 6.0, gainDb), nullptr);
-}
-
-bool ProjectDocument::setFxReturnMixerState(int bus, const juce::String& channelId,
-                                             const juce::String& name, double gainDb, double pan,
-                                             bool muted, bool solo)
-{
-    if (!juce::isPositiveAndBelow(bus, 8) || channelId.isEmpty()) return false;
-
-    auto mixer = state.getChildWithName(mixerType);
-    juce::ValueTree channel;
-    for (int i = 0; i < mixer.getNumChildren(); ++i)
-    {
-        auto candidate = mixer.getChild(i);
-        if (candidate.getProperty("kind").toString() == "fx_return"
-            && static_cast<int>(candidate.getProperty("bus", -1)) == bus)
-        {
-            channel = candidate;
-            break;
-        }
-    }
-
-    const auto boundedGain = juce::jlimit(-60.0, 6.0, gainDb);
-    const auto boundedPan = juce::jlimit(-1.0, 1.0, pan);
-    const bool changed = !channel.isValid()
-        || channel.getProperty("id").toString() != channelId
-        || channel.getProperty("name").toString() != name
-        || static_cast<int>(channel.getProperty("bus", -1)) != bus
-        || std::abs(static_cast<double>(channel.getProperty("gainDb", 0.0)) - boundedGain) > 0.0001
-        || std::abs(static_cast<double>(channel.getProperty("pan", 0.0)) - boundedPan) > 0.0001
-        || static_cast<bool>(channel.getProperty("muted", false)) != muted
-        || static_cast<bool>(channel.getProperty("solo", false)) != solo
-        || channel.getProperty("outputId").toString() != mixer.getProperty("masterChannelId").toString();
-
-    if (!channel.isValid())
-    {
-        channel = juce::ValueTree(mixerChannelType);
-        mixer.addChild(channel, -1, nullptr);
-    }
-
-    channel.setProperty("id", channelId, nullptr);
-    channel.setProperty("kind", "fx_return", nullptr);
-    channel.setProperty("bus", bus, nullptr);
-    channel.setProperty("name", name, nullptr);
-    channel.setProperty("gainDb", boundedGain, nullptr);
-    channel.setProperty("pan", boundedPan, nullptr);
-    channel.setProperty("muted", muted, nullptr);
-    channel.setProperty("solo", solo, nullptr);
-    channel.setProperty("outputId", mixer.getProperty("masterChannelId"), nullptr);
-    return changed;
-}
-
-void ProjectDocument::setMasterMixerState(double gainDb, double pan, bool muted)
-{
-    auto mixer = state.getChildWithName(mixerType);
-    const auto masterId = mixer.getProperty("masterChannelId").toString();
-    auto channel = findMixerChannel(mixer, masterId);
-    if (channel.isValid())
-    {
-        channel.setProperty("gainDb", juce::jlimit(-60.0, 6.0, gainDb), nullptr);
-        channel.setProperty("pan", juce::jlimit(-1.0, 1.0, pan), nullptr);
-        channel.setProperty("muted", muted, nullptr);
-    }
-}
-
-juce::String ProjectDocument::getPatternId(const juce::String& trackId, int slotIndex) const
-{
-    return findPatternSlot(state, trackId, slotIndex).getProperty("id").toString();
-}
-
-int ProjectDocument::getPatternIndexForId(const juce::String& trackId, const juce::String& patternId) const
-{
-    if (patternId.isEmpty()) return -1;
-    const auto track = findProjectTrack(state, trackId);
-    const auto patterns = track.getChildWithName(patternsType);
-    for (int i = 0; i < patterns.getNumChildren(); ++i)
-    {
-        const auto slot = patterns.getChild(i);
-        if (slot.getProperty("id").toString() == patternId)
-            return static_cast<int>(slot.getProperty("index", -1));
-    }
-    return -1;
-}
-
-juce::String ProjectDocument::getPatternName(const juce::String& trackId, int slotIndex) const
-{
-    return findPatternSlot(state, trackId, slotIndex).getProperty("name").toString();
-}
-
-bool ProjectDocument::isPatternCreated(const juce::String& trackId, int slotIndex) const
-{
-    return static_cast<bool>(findPatternSlot(state, trackId, slotIndex).getProperty("created", false));
-}
-
-bool ProjectDocument::getPatternNote(const juce::String& trackId, int slotIndex, int pitch, int step) const
-{
-    const auto slot = findPatternSlot(state, trackId, slotIndex);
-    const auto notes = slot.getChildWithName(patternNotesType);
-    for (int i = 0; i < notes.getNumChildren(); ++i)
-    {
-        const auto note = notes.getChild(i);
-        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
-            return true;
-    }
-    return false;
-}
-
-int ProjectDocument::getPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step) const
-{
-    const auto notes = findPatternSlot(state, trackId, slotIndex).getChildWithName(patternNotesType);
-    for (int i = 0; i < notes.getNumChildren(); ++i)
-    {
-        const auto note = notes.getChild(i);
-        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
-            return juce::jlimit(1, 127, static_cast<int>(note.getProperty("velocity", 100)));
-    }
-    return 100;
-}
-
-int ProjectDocument::getPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step) const
-{
-    const auto slot = findPatternSlot(state, trackId, slotIndex);
-    const auto notes = slot.getChildWithName(patternNotesType);
-    for (int i = 0; i < notes.getNumChildren(); ++i)
-    {
-        const auto note = notes.getChild(i);
-        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
-            return juce::jmax(1, static_cast<int>(note.getProperty("lengthSteps", 1)));
-    }
-    return 1;
-}
-
-int ProjectDocument::getPatternLengthSteps(const juce::String& trackId, int slotIndex) const
-{
-    const auto slot = findPatternSlot(state, trackId, slotIndex);
-    return juce::jlimit(1, 64, static_cast<int>(slot.getProperty("lengthSteps", 16)));
-}
-
-void ProjectDocument::setPatternCreated(const juce::String& trackId, int slotIndex, bool created)
-{
-    auto slot = findPatternSlot(state, trackId, slotIndex);
-    if (slot.isValid())
-        slot.setProperty("created", created, nullptr);
-}
-
-void ProjectDocument::setPatternNote(const juce::String& trackId, int slotIndex, int pitch, int step, bool enabled)
-{
-    auto slot = findPatternSlot(state, trackId, slotIndex);
-    if (!slot.isValid())
-        return;
-
-    auto notes = slot.getChildWithName(patternNotesType);
-    for (int i = notes.getNumChildren(); --i >= 0;)
-    {
-        auto note = notes.getChild(i);
-        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
-        {
-            if (enabled)
-            {
-                slot.setProperty("created", true, nullptr);
-                return;
-            }
-            notes.removeChild(i, nullptr);
-        }
-    }
-
-    if (enabled)
-    {
-        juce::ValueTree note(patternNoteType);
-        note.setProperty("pitch", pitch, nullptr);
-        note.setProperty("step", step, nullptr);
-        note.setProperty("velocity", 100, nullptr);
-        note.setProperty("lengthSteps", 1, nullptr);
-        notes.addChild(note, -1, nullptr);
-        slot.setProperty("created", true, nullptr);
-    }
-}
-
-void ProjectDocument::setPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step, int velocity)
-{
-    const auto notes = findPatternSlot(state, trackId, slotIndex).getChildWithName(patternNotesType);
-    for (int i = 0; i < notes.getNumChildren(); ++i)
-    {
-        auto note = notes.getChild(i);
-        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
-        {
-            note.setProperty("velocity", juce::jlimit(1, 127, velocity), nullptr);
-            return;
-        }
-    }
-}
-
-void ProjectDocument::setPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step, int lengthSteps)
-{
-    auto slot = findPatternSlot(state, trackId, slotIndex);
-    auto notes = slot.getChildWithName(patternNotesType);
-    for (int i = 0; i < notes.getNumChildren(); ++i)
-    {
-        auto note = notes.getChild(i);
-        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
-        {
-            note.setProperty("lengthSteps", juce::jlimit(1, 64 - step, lengthSteps), nullptr);
-            return;
-        }
-    }
-}
-
-void ProjectDocument::setPatternLengthSteps(const juce::String& trackId, int slotIndex, int lengthSteps)
-{
-    auto slot = findPatternSlot(state, trackId, slotIndex);
-    if (slot.isValid())
-        slot.setProperty("lengthSteps", juce::jlimit(1, 64, lengthSteps), nullptr);
-}
-
-void ProjectDocument::moveTrack(int sourceIndex, int destinationIndex)
-{
-    auto tracks = state.getChildWithName(tracksType);
-    if (!juce::isPositiveAndBelow(sourceIndex, tracks.getNumChildren())
-        || !juce::isPositiveAndBelow(destinationIndex, tracks.getNumChildren())
-        || sourceIndex == destinationIndex)
-        return;
-    tracks.moveChild(sourceIndex, destinationIndex, nullptr);
-}
-
-juce::String ProjectDocument::getPlaylistPatternId(const juce::String& trackId, int bar) const
-{
-    if (!juce::isPositiveAndBelow(bar, 4096)) return {};
-    const auto track = findProjectTrack(state, trackId);
-    const auto clips = track.getChildWithName(clipsType);
-    for (int i = 0; i < clips.getNumChildren(); ++i)
-    {
-        const auto clip = clips.getChild(i);
-        const auto start = static_cast<int>(clip.getProperty("startBar", -1));
-        const auto length = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
-        if (bar >= start && bar < start + length)
-            return clip.getProperty("patternId").toString();
-    }
-    return {};
-}
-
-void ProjectDocument::setPlaylistClip(const juce::String& trackId, const juce::String& patternId,
-                                     int startBar, int lengthBars, bool enabled)
-{
-    if (!juce::isPositiveAndBelow(startBar, 4096)) return;
-    auto track = findProjectTrack(state, trackId);
-    if (!track.isValid()) return;
-    auto clips = track.getChildWithName(clipsType);
-    if (!clips.isValid())
-    {
-        clips = juce::ValueTree(clipsType);
-        track.addChild(clips, -1, nullptr);
-    }
-
-    // The first Playlist pass is a bar grid: one pattern clip occupies one bar.
-    // Replacing the cell removes an older clip at that position before adding the new reference.
-    for (int i = clips.getNumChildren(); --i >= 0;)
-    {
-        const auto clip = clips.getChild(i);
-        const auto start = static_cast<int>(clip.getProperty("startBar", -1));
-        if (clip.getType() == playlistClipType && start == startBar)
-            clips.removeChild(i, nullptr);
-    }
-
-    if (enabled && patternId.isNotEmpty())
-    {
-        juce::ValueTree clip(playlistClipType);
-        clip.setProperty("id", newId(), nullptr);
-        clip.setProperty("patternId", patternId, nullptr);
-        clip.setProperty("startBar", startBar, nullptr);
-        clip.setProperty("lengthBars", juce::jmax(1, lengthBars), nullptr);
-        clips.addChild(clip, -1, nullptr);
-    }
-}
-
-int ProjectDocument::getTicksPerQuarterNote() const
-{
-    return static_cast<int>(state.getProperty("ticksPerQuarterNote", ticksPerQuarterNote));
-}
-
-double ProjectDocument::getInitialTempoBpm() const
-{
-    const auto map = state.getChildWithName(tempoMapType);
-    return map.getNumChildren() > 0
-               ? static_cast<double>(map.getChild(0).getProperty("bpm", 120.0))
-               : 120.0;
-}
-
-void ProjectDocument::setInitialTempoBpm(double bpm)
-{
-    auto map = state.getChildWithName(tempoMapType);
-    if (map.getNumChildren() == 0)
-        map.addChild(makeTempoPoint(bpm), -1, nullptr);
-    else
-        map.getChild(0).setProperty("bpm", juce::jlimit(20.0, 300.0, bpm), nullptr);
-    state.setProperty("tempoBpm", juce::jlimit(20.0, 300.0, bpm), nullptr);
-}
-
-ProjectDocument::TimeSignature ProjectDocument::getInitialTimeSignature() const
-{
-    const auto map = state.getChildWithName(meterMapType);
-    if (map.getNumChildren() == 0)
-        return {};
-
-    const auto point = map.getChild(0);
-    return { static_cast<int>(point.getProperty("numerator", 4)),
-             static_cast<int>(point.getProperty("denominator", 4)) };
-}
-
-void ProjectDocument::setInitialTimeSignature(int numerator, int denominator)
-{
-    numerator = juce::jlimit(1, 32, numerator);
-    if (denominator != 1 && denominator != 2 && denominator != 4 && denominator != 8
-        && denominator != 16 && denominator != 32)
-        denominator = 4;
-
-    auto map = state.getChildWithName(meterMapType);
-    if (map.getNumChildren() == 0)
-        map.addChild(makeMeterPoint(numerator, denominator), -1, nullptr);
-    else
-    {
-        auto firstPoint = map.getChild(0);
-        firstPoint.setProperty("numerator", numerator, nullptr);
-        firstPoint.setProperty("denominator", denominator, nullptr);
-    }
-    state.setProperty("timeSignatureNumerator", numerator, nullptr);
-    state.setProperty("timeSignatureDenominator", denominator, nullptr);
-}
+YªçŠx³¬uç%j·Â+ar‰ì¶ë•ë_¢ºŞjË"‚v›•ëÚ®&›•ëÚ[˜ÛYH”›Ú™XİØİ[Y[š‚‚ˆÚ[˜ÛYHÛX]‚‚›˜[Y\ÜXÙBÂ˜ÛÛœİXÙN’Y[YšY\ˆ›Ú™Xİ\HÈ“Ü˜š]›Ú™XİˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ[\ÓX\\HÈ•[\ÓX\ˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ[\ÔÚ[\HÈ•[\ÔÚ[ˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆY]\“X\\HÈ•[YTÚYÛ˜]\™SX\ˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆY]\”Ú[\HÈ•[YTÚYÛ˜]\™TÚ[ˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ˜XÚÜÕ\HÈ•˜XÚÜÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ˜XÚÕ\HÈ•˜XÚÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ]\›œÕ\HÈ”]\›œÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ]\›”Ûİ\HÈ”]\›”ÛİˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ]\›“›İ\Õ\HÈ“›İ\ÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ]\›“›İU\HÈ“›İHˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ]\›]]ÛX][Û“[™\Õ\HÈ”]\›]]ÛX][Û“[™\ÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ]]ÛX][Û“[™U\HÈ]]ÛX][Û“[™HˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ]]ÛX][Û”Ú[\HÈ]]ÛX][Û”Ú[ˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆÛ\Õ\HÈÛ\ÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ^[\İÛ\\HÈ”^[\İÛ\ˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆYÚ[œÕ\HÈ”YÚ[œÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ]]ÛX][Û•\HÈ]]ÛX][Û“[™\ÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆZ^\•\HÈ“Z^\Ú[›™[ÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆZ^\Ú[›™[\HÈ“Z^\Ú[›™[ˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆYYXU\HÈ“YYXT™Y™\™[˜Ù\ÈˆNÂ˜ÛÛœİXÙN’Y[YšY\ˆ˜XÚİ[Û”İ]U\HÈ•˜XÚİ[Û‘Y]İ]HˆNÂ‚šXÙN”İš[™È™]ÒY
+
+BÂˆ™]\›ˆXÙN•]ZY
+
+KÔİš[™Ê
+NÂŸB‚šXÙN•˜[YU™YHXZÙU[\ÔÚ[
+İX›HœJBÂˆXÙN•˜[YU™YHÚ[
+[\ÔÚ[\JNÂˆÚ[œÙ]›Ü\JšY‹™]ÒY
+
+K[ŠNÂˆÚ[œÙ]›Ü\JXÚÈ‹XÙNš[
+
+K[ŠNÂˆÚ[œÙ]›Ü\J˜œH‹œK[ŠNÂˆ™]\›ˆÚ[ÂŸB‚šXÙN•˜[YU™YHXZÙSY]\”Ú[
+[[Y\˜]Ü‹[[›ÛZ[˜]ÜŠBÂˆXÙN•˜[YU™YHÚ[
+Y]\”Ú[\JNÂˆÚ[œÙ]›Ü\JšY‹™]ÒY
+
+K[ŠNÂˆÚ[œÙ]›Ü\JXÚÈ‹XÙNš[
+
+K[ŠNÂˆÚ[œÙ]›Ü\J›[Y\˜]Üˆ‹[Y\˜]Ü‹[ŠNÂˆÚ[œÙ]›Ü\J™[›ÛZ[˜]Üˆ‹[›ÛZ[˜]Ü‹[ŠNÂˆ™]\›ˆÚ[ÂŸB‚›ÚY[œİ\™PÚ[
+XÙN•˜[YU™YIˆ\™[ÛÛœİXÙN’Y[YšY\‰ˆ\JBÂˆYˆ
+\\™[™Ù]Ú[Ú]˜[YJ\JKš\Õ˜[Y
+
+JBˆ\™[˜YÚ[
+XÙN•˜[YU™YJ\JKLK[ŠNÂŸB‚›ÚY[œİ\™T]\›˜[šÊXÙN•˜[YU™YH˜XÚÊBÂˆYˆ
+˜XÚË™Ù]›Ü\JšÚ[™ŠKÔİš[™Ê
+HOHš[œİ[Y[ŠBˆ™]\›Â‚ˆ]]È]\›œÈH˜XÚË™Ù]Ú[Ú]˜[YJ]\›œÕ\JNÂˆ›Üˆ
+[[™^HÈ[™^›Ú™XİØİ[Y[œ]\›”ÛİÛİ[È
+ÊÚ[™^
+BˆÂˆXÙN•˜[YU™YHÛİÂˆ›Üˆ
+[Ú[HÈÚ[]\›œË™Ù][PÚ[™[Š
+NÈ
+ÊØÚ[
+BˆÂˆ]]ÈØ[™Y]HH]\›œË™Ù]Ú[
+Ú[
+NÂˆYˆ
+Ø[™Y]K™Ù]\J
+HOH]\›”Ûİ\Bˆ	‰ˆİ]X×ØØ\İ[ŠØ[™Y]K™Ù]›Ü\Jš[™^‹LJJHOH[™^
+BˆÂˆÛİHØ[™Y]NÂˆœ™XZÎÂˆBˆB‚ˆYˆ
+\Ûİš\Õ˜[Y
+
+JBˆÂˆÛİHXÙN•˜[YU™YJ]\›”Ûİ\JNÂˆÛİœÙ]›Ü\JšY‹™]ÒY
+
+K[ŠNÂˆÛİœÙ]›Ü\Jš[™^‹[™^[ŠNÂˆÛİœÙ]›Ü\J˜˜[šÈ‹[™^È›Ú™XİØİ[Y[œ]\›œÔ\˜[šË[ŠNÂˆÛİœÙ]›Ü\JœÛİ‹[™^	H›Ú™XİØİ[Y[œ]\›œÔ\˜[šË[ŠNÂˆÛİœÙ]›Ü\J›˜[YH‹XÙN”İš[™Î˜Ú\•Ôİš[™Êİ]X×ØØ\İXÙNšXÙWİØÚ\Š	ĞIÈ
+È[™^È
+JBˆ
+ÈXÙN”İš[™Ê[™^	H
+ÈJK[ŠNÂˆÛİœÙ]›Ü\J›[™İİ\È‹M‹[ŠNÂˆÛİœÙ]›Ü\J˜Ü™X]Y‹˜[ÙK[ŠNÂˆ]\›œË˜YÚ[
+ÛİLK[ŠNÂˆBˆ[œİ\™PÚ[
+Ûİ]\›“›İ\Õ\JNÂˆ[œİ\™PÚ[
+Ûİ]\›]]ÛX][Û“[™\Õ\JNÂˆBŸB‚šXÙN•˜[YU™YHš[™]\›”Ûİ
+XÙN•˜[YU™YHİ]KÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
+BÂˆYˆ
+˜XÚÒYš\Ñ[\J
+HZXÙNš\ÔÜÚ]]™P[™™[İÊÛİ[™^›Ú™XİØİ[Y[œ]\›”ÛİÛİ[
+JBˆ™]\›ˆßNÂ‚ˆÛÛœİ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆ›Üˆ
+[HHÈH˜XÚÜË™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆ]]È˜XÚÈH˜XÚÜË™Ù]Ú[
+JNÂˆYˆ
+˜XÚË™Ù]›Ü\JšYŠKÔİš[™Ê
+HOH˜XÚÒY
+BˆÂˆ]]È]\›œÈH˜XÚË™Ù]Ú[Ú]˜[YJ]\›œÕ\JNÂˆ›Üˆ
+[ˆHÈˆ]\›œË™Ù][PÚ[™[Š
+NÈ
+ÊÚŠBˆÂˆ]]ÈÛİH]\›œË™Ù]Ú[
+ŠNÂˆYˆ
+Ûİ™Ù]\J
+HOH]\›”Ûİ\Bˆ	‰ˆİ]X×ØØ\İ[ŠÛİ™Ù]›Ü\Jš[™^‹LJJHOHÛİ[™^
+Bˆ™]\›ˆÛİÂˆBˆBˆBˆ™]\›ˆßNÂŸB‚šXÙN•˜[YU™YHš[™›Ú™Xİ˜XÚÊXÙN•˜[YU™YHİ]KÛÛœİXÙN”İš[™Éˆ˜XÚÒY
+BÂˆÛÛœİ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆ›Üˆ
+[HHÈH˜XÚÜË™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆ]]È˜XÚÈH˜XÚÜË™Ù]Ú[
+JNÂˆYˆ
+˜XÚË™Ù]›Ü\JšYŠKÔİš[™Ê
+HOH˜XÚÒY
+Bˆ™]\›ˆ˜XÚÎÂˆBˆ™]\›ˆßNÂŸB‚šXÙN•˜[YU™YHš[™Z^\Ú[›™[
+XÙN•˜[YU™YHZ^\‹ÛÛœİXÙN”İš[™ÉˆÚ[›™[Y
+BÂˆYˆ
+Ú[›™[Yš\Ñ[\J
+JH™]\›ˆßNÂˆ›Üˆ
+[HHÈHZ^\‹™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆ]]ÈÚ[›™[HZ^\‹™Ù]Ú[
+JNÂˆYˆ
+Ú[›™[™Ù]›Ü\JšYŠKÔİš[™Ê
+HOHÚ[›™[Y
+Bˆ™]\›ˆÚ[›™[ÂˆBˆ™]\›ˆßNÂŸB‚›ÚY[œİ\™U˜XÚÔÚ\JXÙN•˜[YU™YH˜XÚËXÙN•˜[YU™YHZ^\ŠBÂˆYˆ
+˜XÚË™Ù]›Ü\JšYŠKÔİš[™Ê
+Kš\Ñ[\J
+JBˆ˜XÚËœÙ]›Ü\JšY‹™]ÒY
+
+K[ŠNÂˆYˆ
+˜XÚË™Ù]›Ü\J›˜[YHŠKÔİš[™Ê
+Kš\Ñ[\J
+JBˆ˜XÚËœÙ]›Ü\J›˜[YH‹’[œİ[Y[‹[ŠNÂˆYˆ
+˜XÚË™Ù]›Ü\JšÚ[™ŠKÔİš[™Ê
+Kš\Ñ[\J
+JBˆ˜XÚËœÙ]›Ü\JšÚ[™‹š[œİ[Y[‹[ŠNÂˆYˆ
+]˜XÚËš\Ô›Ü\JœÙ[XİY]\›’[™^ŠJBˆ˜XÚËœÙ]›Ü\JœÙ[XİY]\›’[™^‹[ŠNÂ‚ˆ[œİ\™PÚ[
+˜XÚË]\›œÕ\JNÂˆ[œİ\™PÚ[
+˜XÚËÛ\Õ\JNÂˆ[œİ\™PÚ[
+˜XÚËYÚ[œÕ\JNÂˆ[œİ\™PÚ[
+˜XÚË]]ÛX][Û•\JNÂˆ[œİ\™T]\›˜[šÊ˜XÚÊNÂ‚ˆ]]ÈÚ[›™[YH˜XÚË™Ù]›Ü\J›Z^\Ú[›™[YŠKÔİš[™Ê
+NÂˆYˆ
+Ú[›™[Yš\Ñ[\J
+JBˆÂˆÚ[›™[YH™]ÒY
+
+NÂˆ˜XÚËœÙ]›Ü\J›Z^\Ú[›™[Y‹Ú[›™[Y[ŠNÂˆB‚ˆ›ÛÛ›İ[™Ú[›™[H˜[ÙNÂˆ›Üˆ
+[HHÈHZ^\‹™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆ›İ[™Ú[›™[HZ^\‹™Ù]Ú[
+JK™Ù]›Ü\JšYŠKÔİš[™Ê
+HOHÚ[›™[YÂ‚ˆYˆ
+Y›İ[™Ú[›™[
+BˆÂˆXÙN•˜[YU™YHÚ[›™[
+Z^\Ú[›™[\JNÂˆÚ[›™[œÙ]›Ü\JšY‹Ú[›™[Y[ŠNÂˆÚ[›™[œÙ]›Ü\JšÚ[™‹˜XÚÈ‹[ŠNÂˆÚ[›™[œÙ]›Ü\J˜XÚÒY‹˜XÚË™Ù]›Ü\JšYŠK[ŠNÂˆÚ[›™[œÙ]›Ü\J›˜[YH‹˜XÚË™Ù]›Ü\J›˜[YHŠK[ŠNÂˆÚ[›™[œÙ]›Ü\J™ØZ[‘ˆ‹Œ[ŠNÂˆÚ[›™[œÙ]›Ü\Jœ[ˆ‹Œ[ŠNÂˆÚ[›™[œÙ]›Ü\J›]]Y‹˜[ÙK[ŠNÂˆÚ[›™[œÙ]›Ü\JœÛÛÈ‹˜[ÙK[ŠNÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÚ[›™[œÙ]›Ü\J™ˆ
+ÈXÙN”İš[™Ê\È
+ÈJH
+È”Ù[™ˆ‹MŒŒ[ŠNÂˆÚ[›™[œÙ]›Ü\J›İ]]Y‹Z^\‹™Ù]›Ü\J›X\İ\Ú[›™[YŠK[ŠNÂˆZ^\‹˜YÚ[
+Ú[›™[LK[ŠNÂˆBŸB‚˜›ÛÛ[œİ\™TØÚ[XTÚ\JXÙN•˜[YU™YIˆİ]KXÙN”İš[™Éˆ\œ›ÜŠBÂˆYˆ
+İ]K™Ù]›Ü\Jœ›Ú™XİYŠKÔİš[™Ê
+Kš\Ñ[\J
+JBˆİ]KœÙ]›Ü\Jœ›Ú™XİY‹™]ÒY
+
+K[ŠNÂˆYˆ
+İ]K™Ù]›Ü\J›˜[YHŠKÔİš[™Ê
+Kš\Ñ[\J
+JBˆİ]KœÙ]›Ü\J›˜[YH‹•[]Y›Ú™Xİ‹[ŠNÂˆÛÛœİ]]ÈİÜ™YHHİ]X×ØØ\İ[Šİ]K™Ù]›Ü\JXÚÜÔ\”]X\\“›İH‹
+JNÂˆYˆ
+İÜ™YHOH
+Bˆİ]KœÙ]›Ü\JXÚÜÔ\”]X\\“›İH‹›Ú™XİØİ[Y[XÚÜÔ\”]X\\“›İK[ŠNÂˆ[ÙHYˆ
+İÜ™YHOH›Ú™XİØİ[Y[XÚÜÔ\”]X\\“›İJBˆÂˆ\œ›ÜˆH•\È›Ú™Xİ\Ù\ÈH]\ÚXØ[[YH™\ÛÛ][ÛˆÜ˜š]Ø[››İ™XYˆÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆ[œİ\™PÚ[
+İ]K[\ÓX\\JNÂˆ[œİ\™PÚ[
+İ]KY]\“X\\JNÂˆ[œİ\™PÚ[
+İ]K˜XÚÜÕ\JNÂˆ[œİ\™PÚ[
+İ]KZ^\•\JNÂˆ[œİ\™PÚ[
+İ]KYYXU\JNÂ‚ˆ]]È[\ÓX\Hİ]K™Ù]Ú[Ú]˜[YJ[\ÓX\\JNÂˆYˆ
+[\ÓX\™Ù][PÚ[™[Š
+HOH
+Bˆ[\ÓX\˜YÚ[
+XZÙU[\ÔÚ[
+İ]X×ØØ\İİX›OŠİ]K™Ù]›Ü\J[\ĞœH‹LŒŒ
+JJKˆLK[ŠNÂ‚ˆ]]ÈY]\“X\Hİ]K™Ù]Ú[Ú]˜[YJY]\“X\\JNÂˆYˆ
+Y]\“X\™Ù][PÚ[™[Š
+HOH
+BˆY]\“X\˜YÚ[
+XZÙSY]\”Ú[
+İ]X×ØØ\İ[Šİ]K™Ù]›Ü\J[YTÚYÛ˜]\™S[Y\˜]Üˆ‹
+JKˆİ]X×ØØ\İ[Šİ]K™Ù]›Ü\J[YTÚYÛ˜]\™Q[›ÛZ[˜]Üˆ‹
+JJKˆLK[ŠNÂ‚ˆ]]ÈZ^\ˆHİ]K™Ù]Ú[Ú]˜[YJZ^\•\JNÂˆ]]ÈX\İ\’YHZ^\‹™Ù]›Ü\J›X\İ\Ú[›™[YŠKÔİš[™Ê
+NÂˆYˆ
+X\İ\’Yš\Ñ[\J
+JBˆÂˆX\İ\’YH™]ÒY
+
+NÂˆZ^\‹œÙ]›Ü\J›X\İ\Ú[›™[Y‹X\İ\’Y[ŠNÂˆB‚ˆ›ÛÛ\ÓX\İ\ˆH˜[ÙNÂˆ›Üˆ
+[HHÈHZ^\‹™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆ\ÓX\İ\ˆHZ^\‹™Ù]Ú[
+JK™Ù]›Ü\JšYŠKÔİš[™Ê
+HOHX\İ\’YÂ‚ˆYˆ
+Z\ÓX\İ\ŠBˆÂˆXÙN•˜[YU™YHX\İ\ŠZ^\Ú[›™[\JNÂˆX\İ\‹œÙ]›Ü\JšY‹X\İ\’Y[ŠNÂˆX\İ\‹œÙ]›Ü\JšÚ[™‹›X\İ\ˆ‹[ŠNÂˆX\İ\‹œÙ]›Ü\J›˜[YH‹“X\İ\ˆ‹[ŠNÂˆX\İ\‹œÙ]›Ü\J™ØZ[‘ˆ‹Œ[ŠNÂˆX\İ\‹œÙ]›Ü\Jœ[ˆ‹Œ[ŠNÂˆX\İ\‹œÙ]›Ü\J›]]Y‹˜[ÙK[ŠNÂˆX\İ\‹œÙ]›Ü\J›İ]]Y‹XÙN”İš[™ŞßK[ŠNÂˆZ^\‹˜YÚ[
+X\İ\‹LK[ŠNÂˆB‚ˆ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆ›Üˆ
+[HHÈH˜XÚÜË™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆ[œİ\™U˜XÚÔÚ\J˜XÚÜË™Ù]Ú[
+JKZ^\ŠNÂ‚ˆ›Üˆ
+[HHÈHZ^\‹™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆ]]ÈÚ[›™[HZ^\‹™Ù]Ú[
+JNÂˆYˆ
+XÚ[›™[š\Ô›Ü\J›]]YŠJHÚ[›™[œÙ]›Ü\J›]]Y‹˜[ÙK[ŠNÂˆYˆ
+Ú[›™[™Ù]›Ü\JšÚ[™ŠKÔİš[™Ê
+HOH˜XÚÈŠBˆÂˆYˆ
+XÚ[›™[š\Ô›Ü\JœÛÛÈŠJHÚ[›™[œÙ]›Ü\JœÛÛÈ‹˜[ÙK[ŠNÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÂˆÛÛœİ]]È›Ü\HHXÙN’Y[YšY\Š™ˆ
+ÈXÙN”İš[™Ê\È
+ÈJH
+È”Ù[™ˆŠNÂˆYˆ
+XÚ[›™[š\Ô›Ü\J›Ü\JJHÚ[›™[œÙ]›Ü\J›Ü\KMŒŒ[ŠNÂˆBˆBˆ[ÙHYˆ
+Ú[›™[™Ù]›Ü\JšÚ[™ŠKÔİš[™Ê
+HOH™Ü™]\›ˆŠBˆÂˆYˆ
+XÚ[›™[š\Ô›Ü\JœÛÛÈŠJHÚ[›™[œÙ]›Ü\JœÛÛÈ‹˜[ÙK[ŠNÂˆYˆ
+XÚ[›™[š\Ô›Ü\J™ØZ[‘ˆŠJHÚ[›™[œÙ]›Ü\J™ØZ[‘ˆ‹Œ[ŠNÂˆYˆ
+XÚ[›™[š\Ô›Ü\Jœ[ˆŠJHÚ[›™[œÙ]›Ü\Jœ[ˆ‹Œ[ŠNÂˆYˆ
+XÚ[›™[š\Ô›Ü\J›İ]]YŠJBˆÚ[›™[œÙ]›Ü\J›İ]]Y‹Z^\‹™Ù]›Ü\J›X\İ\Ú[›™[YŠK[ŠNÂˆBˆB‚ˆİ]KœÙ]›Ü\JœØÚ[XU™\œÚ[Ûˆ‹›Ú™XİØİ[Y[˜İ\œ™[ØÚ[XU™\œÚ[Û‹[ŠNÂˆ\œ›Ü‹˜ÛX\Š
+NÂˆ™]\›ˆYNÂŸB‚šXÙN”İš[™È˜XÚÒÚ[™Ôİš[™Ê›Ú™XİØİ[Y[•˜XÚÒÚ[™Ú[™
+BÂˆİÚ]Ú
+Ú[™
+BˆÂˆØ\ÙH›Ú™XİØİ[Y[•˜XÚÒÚ[™š[œİ[Y[ˆ™]\›ˆš[œİ[Y[ÂˆØ\ÙH›Ú™XİØİ[Y[•˜XÚÒÚ[™›ZYNˆ™]\›ˆ›ZYHÂˆØ\ÙH›Ú™XİØİ[Y[•˜XÚÒÚ[™˜]Y[Îˆ™]\›ˆ˜]Y[ÈÂˆBˆ™]\›ˆš[œİ[Y[ÂŸBŸB‚”›Ú™XİØİ[Y[”›Ú™XİØİ[Y[
+
+Bˆˆ›Ú™XİØİ[Y[
+Ü™X]S™]Ê
+Kœİ]JBÂŸB‚”›Ú™XİØİ[Y[”›Ú™XİØİ[Y[
+ÛÛœİ›Ú™XİØİ[Y[	ˆİ\ŠBˆˆİ]Jİ\‹œİ]K˜Ü™X]PÛÜJ
+JK›Ú™Xİš[Jİ\‹œ›Ú™Xİš[JBÂŸB‚”›Ú™XİØİ[Y[	ˆ›Ú™XİØİ[Y[›Ü\˜]ÜJÛÛœİ›Ú™XİØİ[Y[	ˆİ\ŠBÂˆYˆ
+\ÈOH	›İ\ŠBˆÂˆİ]HHİ\‹œİ]K˜Ü™X]PÛÜJ
+NÂˆ›Ú™Xİš[HHİ\‹œ›Ú™Xİš[NÂˆBˆ™]\›ˆ
+\ÎÂŸB‚”›Ú™XİØİ[Y[”›Ú™XİØİ[Y[
+XÙN•˜[YU™YH›Ú™Xİİ]KXÙN‘š[Hš[JBˆˆİ]Jİ›[İ™J›Ú™Xİİ]JJK›Ú™Xİš[Jİ›[İ™Jš[JJBÂŸB‚”›Ú™XİØİ[Y[›Ú™XİØİ[Y[˜Ü™X]S™]Ê
+BÂˆXÙN•˜[YU™YH›Ûİ
+›Ú™Xİ\JNÂˆ›ÛİœÙ]›Ü\JœØÚ[XU™\œÚ[Ûˆ‹İ\œ™[ØÚ[XU™\œÚ[Û‹[ŠNÂˆ›ÛİœÙ]›Ü\Jœ›Ú™XİY‹™]ÒY
+
+K[ŠNÂˆ›ÛİœÙ]›Ü\J›˜[YH‹•[]Y›Ú™Xİ‹[ŠNÂˆ›ÛİœÙ]›Ü\JXÚÜÔ\”]X\\“›İH‹XÚÜÔ\”]X\\“›İK[ŠNÂˆ›Ûİ˜YÚ[
+XÙN•˜[YU™YJ[\ÓX\\JKLK[ŠNÂˆ›Ûİ˜YÚ[
+XÙN•˜[YU™YJY]\“X\\JKLK[ŠNÂˆ›Ûİ˜YÚ[
+XÙN•˜[YU™YJ˜XÚÜÕ\JKLK[ŠNÂˆ›Ûİ˜YÚ[
+XÙN•˜[YU™YJZ^\•\JKLK[ŠNÂˆ›Ûİ˜YÚ[
+XÙN•˜[YU™YJYYXU\JKLK[ŠNÂ‚ˆXÙN”İš[™ÈYÛ›Ü™Y\œ›ÜÂˆ[œİ\™TØÚ[XTÚ\J›ÛİYÛ›Ü™Y\œ›ÜŠNÂˆ™]\›ˆ›Ú™XİØİ[Y[
+İ›[İ™J›Ûİ
+JNÂŸB‚œİ›Ü[Û˜[›Ú™XİØİ[Y[ˆ›Ú™XİØİ[Y[›ØYœ›ÛQš[JÛÛœİXÙN‘š[Iˆš[KˆXÙN”İš[™Éˆ\œ›ÜŠBÂˆ]]È[HXÙN–[Øİ[Y[œ\œÙJš[JNÂˆYˆ
+[OH[ŠBˆÂˆ\œ›ÜˆH“Ü˜š]Ûİ[›İ™XY\È›Ú™Xİš[KˆÂˆ™]\›ˆİ›[ÜÂˆB‚ˆ]]ÈØYYİ]HHXÙN•˜[YU™YN™œ›ÛV[
+
+[
+NÂˆYˆ
+[ØYYİ]Kš\Õ\J›Ú™Xİ\JJBˆÂˆ\œ›ÜˆH•\Èš[H\È›İ[ˆÜ˜š]›Ú™XİˆÂˆ™]\›ˆİ›[ÜÂˆB‚ˆÛÛœİ]]ÈØÚ[XU™\œÚ[ÛˆHİ]X×ØØ\İ[ŠØYYİ]K™Ù]›Ü\JœØÚ[XU™\œÚ[Ûˆ‹
+JNÂˆYˆ
+ØÚ[XU™\œÚ[ÛˆØÚ[XU™\œÚ[Ûˆˆİ\œ™[ØÚ[XU™\œÚ[ÛŠBˆÂˆ\œ›ÜˆH•\ÈÜ˜š]›Ú™Xİ\Ù\È[ˆ[œİ\ÜY™\œÚ[Û‹ˆÂˆ™]\›ˆİ›[ÜÂˆB‚ˆYˆ
+Y[œİ\™TØÚ[XTÚ\JØYYİ]K\œ›ÜŠJBˆ™]\›ˆİ›[ÜÂ‚ˆ™]\›ˆ›Ú™XİØİ[Y[
+İ›[İ™JØYYİ]JKš[JNÂŸB‚˜›ÛÛ›Ú™XİØİ[Y[œØ]™UÑš[JÛÛœİXÙN‘š[Iˆš[KXÙN”İš[™Éˆ\œ›ÜŠBÂˆYˆ
+š[HOHXÙN‘š[^ßJBˆÂˆ\œ›ÜˆHÚÛÜÙHHØØ][Ûˆ›ÜˆH›Ú™Xİš[KˆÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆ]]È[Hİ]K˜Ü™X]V[
+
+NÂˆYˆ
+[OH[ŠBˆÂˆ\œ›ÜˆH“Ü˜š]Ûİ[›İÙ\šX[^™H\È›Ú™XİˆÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆYˆ
+Yš[K™Ù]\™[\™XİÜJ
+K˜Ü™X]Q\™XİÜJ
+JBˆÂˆ\œ›ÜˆH“Ü˜š]Ûİ[›İÜ™X]HH›Ú™Xİ›Û\‹ˆÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆ]]È[\Ü˜\Qš[HHš[K™Ù]ÚX›[™Ñš[Jš[K™Ù]š[S˜[YJ
+H
+È‹\ŠNÂˆYˆ
+][\Ü˜\Qš[Kœ™\XÙUÚ]^
+[OÔİš[™Ê
+JJBˆÂˆ\œ›ÜˆH“Ü˜š]Ûİ[›İÜš]HH›Ú™Xİš[KˆÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆÛÛœİ]]È™\XÙYHš[K™^\İĞ\Ñš[J
+HÈ[\Ü˜\Qš[Kœ™\XÙQš[R[Šš[JBˆˆ[\Ü˜\Qš[K›[İ™Qš[UÊš[JNÂˆYˆ
+\™\XÙY
+BˆÂˆ[\Ü˜\Qš[K™[]Qš[J
+NÂˆ\œ›ÜˆH“Ü˜š]Ûİ[›İš[š\ÚØ]š[™ÈH›Ú™Xİš[KˆÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆ›Ú™Xİš[HHš[NÂˆ\œ›Ü‹˜ÛX\Š
+NÂˆ™]\›ˆYNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]˜[YJÛÛœİXÙN”İš[™Éˆ˜[YJBÂˆÛÛœİ]]Èš[[YY˜[YHH˜[YKš[J
+NÂˆYˆ
+š[[YY˜[YKš\Ó›İ[\J
+JBˆİ]KœÙ]›Ü\J›˜[YH‹š[[YY˜[YK[ŠNÂŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[˜Y˜XÚÊ˜XÚÒÚ[™Ú[™ÛÛœİXÙN”İš[™Éˆ™\]Y\İY˜[YJBÂˆ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆ]]ÈZ^\ˆHİ]K™Ù]Ú[Ú]˜[YJZ^\•\JNÂˆÛÛœİ]]È[X™\ˆH˜XÚÜË™Ù][PÚ[™[Š
+H
+ÈNÂˆÛÛœİ]]È˜XÚÒYH™]ÒY
+
+NÂ‚ˆXÙN•˜[YU™YH˜XÚÊ˜XÚÕ\JNÂˆ˜XÚËœÙ]›Ü\JšY‹˜XÚÒY[ŠNÂˆ˜XÚËœÙ]›Ü\JšÚ[™‹˜XÚÒÚ[™Ôİš[™ÊÚ[™
+K[ŠNÂˆ˜XÚËœÙ]›Ü\J›˜[YH‹™\]Y\İY˜[YKš\Ó›İ[\J
+BˆÈ™\]Y\İY˜[YBˆˆ˜XÚÒÚ[™Ôİš[™ÊÚ[™
+KœİXœİš[™ÊJKÕ\\Ø\ÙJ
+Bˆ
+È˜XÚÒÚ[™Ôİš[™ÊÚ[™
+KœİXœİš[™ÊJH
+Èˆ‚ˆ
+ÈXÙN”İš[™Ê[X™\ŠK[ŠNÂˆ˜XÚËœÙ]›Ü\J›Ü™\ˆ‹[X™\ˆHK[ŠNÂˆ˜XÚËœÙ]›Ü\JœÙ[XİY]\›’[™^‹[ŠNÂˆ[œİ\™PÚ[
+˜XÚË]\›œÕ\JNÂˆ[œİ\™PÚ[
+˜XÚËÛ\Õ\JNÂˆ[œİ\™PÚ[
+˜XÚËYÚ[œÕ\JNÂˆ[œİ\™PÚ[
+˜XÚË]]ÛX][Û•\JNÂˆ[œİ\™T]\›˜[šÊ˜XÚÊNÂ‚ˆÛÛœİ]]ÈÚ[›™[YH™]ÒY
+
+NÂˆ˜XÚËœÙ]›Ü\J›Z^\Ú[›™[Y‹Ú[›™[Y[ŠNÂˆXÙN•˜[YU™YHÚ[›™[
+Z^\Ú[›™[\JNÂˆÚ[›™[œÙ]›Ü\JšY‹Ú[›™[Y[ŠNÂˆÚ[›™[œÙ]›Ü\JšÚ[™‹˜XÚÈ‹[ŠNÂˆÚ[›™[œÙ]›Ü\J˜XÚÒY‹˜XÚÒY[ŠNÂˆÚ[›™[œÙ]›Ü\J›˜[YH‹˜XÚË™Ù]›Ü\J›˜[YHŠK[ŠNÂˆÚ[›™[œÙ]›Ü\J™ØZ[‘ˆ‹Œ[ŠNÂˆÚ[›™[œÙ]›Ü\Jœ[ˆ‹Œ[ŠNÂˆÚ[›™[œÙ]›Ü\J›]]Y‹˜[ÙK[ŠNÂˆÚ[›™[œÙ]›Ü\JœÛÛÈ‹˜[ÙK[ŠNÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÚ[›™[œÙ]›Ü\J™ˆ
+ÈXÙN”İš[™Ê\È
+ÈJH
+È”Ù[™ˆ‹MŒŒ[ŠNÂˆÚ[›™[œÙ]›Ü\J›İ]]Y‹Z^\‹™Ù]›Ü\J›X\İ\Ú[›™[YŠK[ŠNÂˆZ^\‹˜YÚ[
+Ú[›™[LK[ŠNÂˆ˜XÚÜË˜YÚ[
+˜XÚËLK[ŠNÂˆ™]\›ˆ˜XÚÒYÂŸB‚›ÚY›Ú™XİØİ[Y[˜Y[œİ[Y[˜XÚÊ
+BÂˆY˜XÚÊ˜XÚÒÚ[™š[œİ[Y[
+NÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]˜XÚİ[Û‘Y]İ]JÛÛœİXÙN•˜[YU™YIˆY]İ]JBÂˆ]]È^\İ[™ÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚİ[Û”İ]U\JNÂˆYˆ
+^\İ[™Ëš\Õ˜[Y
+
+JBˆİ]Kœ™[[İ™PÚ[
+^\İ[™Ë[ŠNÂˆYˆ
+Y]İ]Kš\Õ˜[Y
+
+JBˆÂˆXÙN•˜[YU™YHÜ˜\\Š˜XÚİ[Û”İ]U\JNÂˆÜ˜\\‹˜YÚ[
+Y]İ]K˜Ü™X]PÛÜJ
+KLK[ŠNÂˆİ]K˜YÚ[
+Ü˜\\‹LK[ŠNÂˆBŸB‚šXÙN•˜[YU™YH›Ú™XİØİ[Y[™Ù]˜XÚİ[Û‘Y]İ]J
+HÛÛœİÂˆÛÛœİ]]ÈÜ˜\\ˆHİ]K™Ù]Ú[Ú]˜[YJ˜XÚİ[Û”İ]U\JNÂˆ™]\›ˆÜ˜\\‹™Ù][PÚ[™[Š
+HˆÈÜ˜\\‹™Ù]Ú[
+
+HˆXÙN•˜[YU™Y^ßNÂŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[™Ù]˜[YJ
+HÛÛœİÂˆ™]\›ˆİ]K™Ù]›Ü\J›˜[YH‹•[]Y›Ú™XİŠKÔİš[™Ê
+NÂŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[™Ù]›Ú™XİY
+
+HÛÛœİÂˆ™]\›ˆİ]K™Ù]›Ü\Jœ›Ú™XİYŠKÔİš[™Ê
+NÂŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[™Ù]\ØÜš\[ÛŠ
+HÛÛœİÂˆ™]\›ˆİ]K™Ù]›Ü\J™\ØÜš\[ÛˆŠKÔİš[™Ê
+NÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]\ØÜš\[ÛŠÛÛœİXÙN”İš[™Éˆ\ØÜš\[ÛŠBÂˆİ]KœÙ]›Ü\J™\ØÜš\[Ûˆ‹\ØÜš\[Û‹š[J
+K[ŠNÂŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[™Ù]Ü™X]Ü•\›
+
+HÛÛœİÂˆ™]\›ˆİ]K™Ù]›Ü\J˜Ü™X]Ü•\›ŠKÔİš[™Ê
+NÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]Ü™X]Ü•\›
+ÛÛœİXÙN”İš[™Éˆ\›
+BÂˆİ]KœÙ]›Ü\J˜Ü™X]Ü•\›‹\›š[J
+K[ŠNÂŸB‚š[›Ú™XİØİ[Y[™Ù]˜XÚĞÛİ[
+
+HÛÛœİÂˆ™]\›ˆİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JK™Ù][PÚ[™[Š
+NÂŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[™Ù]˜XÚÒY
+[[™^
+HÛÛœİÂˆÛÛœİ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊ[™^˜XÚÜË™Ù][PÚ[™[Š
+JJBˆ™]\›ˆßNÂ‚ˆ™]\›ˆ˜XÚÜË™Ù]Ú[
+[™^
+K™Ù]›Ü\JšYŠKÔİš[™Ê
+NÂŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[™Ù]˜XÚÓ˜[YJ[[™^
+HÛÛœİÂˆÛÛœİ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊ[™^˜XÚÜË™Ù][PÚ[™[Š
+JJBˆ™]\›ˆßNÂ‚ˆ™]\›ˆ˜XÚÜË™Ù]Ú[
+[™^
+K™Ù]›Ü\J›˜[YHŠKÔİš[™Ê
+NÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]˜XÚÓ˜[YJ[[™^ÛÛœİXÙN”İš[™Éˆ™\]Y\İY˜[YJBÂˆÛÛœİ]]È˜[YHH™\]Y\İY˜[YKš[J
+NÂˆ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆYˆ
+˜[YKš\Ñ[\J
+HZXÙNš\ÔÜÚ]]™P[™™[İÊ[™^˜XÚÜË™Ù][PÚ[™[Š
+JJBˆ™]\›Â‚ˆ]]È˜XÚÈH˜XÚÜË™Ù]Ú[
+[™^
+NÂˆ˜XÚËœÙ]›Ü\J›˜[YH‹˜[YK[ŠNÂ‚ˆÛÛœİ]]ÈZ^\ˆHİ]K™Ù]Ú[Ú]˜[YJZ^\•\JNÂˆÛÛœİ]]ÈÚ[›™[YH˜XÚË™Ù]›Ü\J›Z^\Ú[›™[YŠKÔİš[™Ê
+NÂˆ]]ÈÚ[›™[Hš[™Z^\Ú[›™[
+Z^\‹Ú[›™[Y
+NÂˆYˆ
+Ú[›™[š\Õ˜[Y
+
+JBˆÚ[›™[œÙ]›Ü\J›˜[YH‹˜[YK[ŠNÂŸB‚˜›ÛÛ›Ú™XİØİ[Y[œ™[[İ™U˜XÚÊ[[™^
+BÂˆ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊ[™^˜XÚÜË™Ù][PÚ[™[Š
+JJH™]\›ˆ˜[ÙNÂˆÛÛœİ]]È˜XÚÈH˜XÚÜË™Ù]Ú[
+[™^
+NÂˆÛÛœİ]]ÈÚ[›™[YH˜XÚË™Ù]›Ü\J›Z^\Ú[›™[YŠKÔİš[™Ê
+NÂˆ]]ÈZ^\ˆHİ]K™Ù]Ú[Ú]˜[YJZ^\•\JNÂˆ›Üˆ
+[HHZ^\‹™Ù][PÚ[™[Š
+NÈKZHHÊBˆYˆ
+Z^\‹™Ù]Ú[
+JK™Ù]›Ü\JšYŠKÔİš[™Ê
+HOHÚ[›™[Y
+BˆZ^\‹œ™[[İ™PÚ[
+K[ŠNÂˆ˜XÚÜËœ™[[İ™PÚ[
+[™^[ŠNÂˆ™]\›ˆYNÂŸB‚š[›Ú™XİØİ[Y[™Ù]ÛÜİ\˜\Š
+HÛÛœİÂˆ™]\›ˆXÙNš›X^
+Kİ]X×ØØ\İ[Šİ]K™Ù]›Ü\J›ÛÜİ\˜\ˆ‹JJJNÂŸB‚š[›Ú™XİØİ[Y[™Ù]ÛÜ[™İ˜\œÊ
+HÛÛœİÂˆ™]\›ˆXÙNš›[Z]
+KLL‹İ]X×ØØ\İ[Šİ]K™Ù]›Ü\J›ÛÜ[™İ˜\œÈ‹
+JJNÂŸB‚˜›ÛÛ›Ú™XİØİ[Y[š\ÓÛÜ[˜X›Y
+
+HÛÛœİÂˆ™]\›ˆİ]X×ØØ\İ›ÛÛŠİ]K™Ù]›Ü\J›ÛÜ[˜X›Y‹˜[ÙJJNÂŸB‚˜›ÛÛ›Ú™XİØİ[Y[œÙ]ÛÜÙ][™ÜÊ[İ\˜\‹[[™İ˜\œË›ÛÛ[˜X›Y
+BÂˆİ\˜\ˆHXÙNš›[Z]
+KNNKİ\˜\ŠNÂˆ[™İ˜\œÈHXÙNš›[Z]
+KLL‹[™İ˜\œÊNÂˆÛÛœİ›ÛÛÚ[™ÙYHÙ]ÛÜİ\˜\Š
+HOHİ\˜\ˆÙ]ÛÜ[™İ˜\œÊ
+HOH[™İ˜\œÈ\ÓÛÜ[˜X›Y
+
+HOH[˜X›YÂˆYˆ
+XÚ[™ÙY
+H™]\›ˆ˜[ÙNÂˆİ]KœÙ]›Ü\J›ÛÜİ\˜\ˆ‹İ\˜\‹[ŠNÂˆİ]KœÙ]›Ü\J›ÛÜ[™İ˜\œÈ‹[™İ˜\œË[ŠNÂˆİ]KœÙ]›Ü\J›ÛÜ[˜X›Y‹[˜X›Y[ŠNÂˆ™]\›ˆYNÂŸB‚šXÙNÛÛİ\ˆ›Ú™XİØİ[Y[™Ù]˜XÚĞÛÛİ\Š[[™^
+HÛÛœİÂˆÛÛœİ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊ[™^˜XÚÜË™Ù][PÚ[™[Š
+JJH™]\›ˆßNÂˆÛÛœİ]]È˜XÚÈH˜XÚÜË™Ù]Ú[
+[™^
+NÂˆÛÛœİ]]ÈÛÛİ\ˆHİ]X×ØØ\İXÙNZ[ÌŠİ]X×ØØ\İXÙNš[Š˜XÚË™Ù]›Ü\J˜ÛÛİ\ˆ‹
+JJNÂˆ™]\›ˆÛÛİ\ˆOHÈXÙNÛÛİ\ßHˆXÙNÛÛİ\ŠÛÛİ\ŠNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]˜XÚĞÛÛİ\Š[[™^XÙNÛÛİ\ˆÛÛİ\ŠBÂˆ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊ[™^˜XÚÜË™Ù][PÚ[™[Š
+JJH™]\›Âˆ˜XÚÜË™Ù]Ú[
+[™^
+KœÙ]›Ü\J˜ÛÛİ\ˆ‹İ]X×ØØ\İXÙNš[ŠÛÛİ\‹™Ù]T‘ĞŠ
+JK[ŠNÂŸB‚˜›ÛÛ›Ú™XİØİ[Y[˜ÛÛ™U˜XÚÔ]\›œĞ[™\œ˜[™Ù[Y[
+ÛÛœİXÙN”İš[™ÉˆÛİ\˜ÙU˜XÚÒYˆÛÛœİXÙN”İš[™Éˆ\İ[˜][Û•˜XÚÒY
+BÂˆYˆ
+Ûİ\˜ÙU˜XÚÒYš\Ñ[\J
+H\İ[˜][Û•˜XÚÒYš\Ñ[\J
+HÛİ\˜ÙU˜XÚÒYOH\İ[˜][Û•˜XÚÒY
+Bˆ™]\›ˆ˜[ÙNÂˆ]]ÈÛİ\˜ÙHHš[™›Ú™Xİ˜XÚÊİ]KÛİ\˜ÙU˜XÚÒY
+NÂˆ]]È\İ[˜][ÛˆHš[™›Ú™Xİ˜XÚÊİ]K\İ[˜][Û•˜XÚÒY
+NÂˆYˆ
+\Ûİ\˜ÙKš\Õ˜[Y
+
+HY\İ[˜][Û‹š\Õ˜[Y
+
+BˆÛİ\˜ÙK™Ù]›Ü\JšÚ[™ŠKÔİš[™Ê
+HOHš[œİ[Y[‚ˆ\İ[˜][Û‹™Ù]›Ü\JšÚ[™ŠKÔİš[™Ê
+HOHš[œİ[Y[ŠBˆ™]\›ˆ˜[ÙNÂ‚ˆ]]ÈÛİ\˜ÙT]\›œÈHÛİ\˜ÙK™Ù]Ú[Ú]˜[YJ]\›œÕ\JNÂˆ›Üˆ
+[[™^HÈ[™^]\›”ÛİÛİ[È
+ÊÚ[™^
+BˆÂˆ]]Èœ›ÛHHš[™]\›”Ûİ
+İ]KÛİ\˜ÙU˜XÚÒY[™^
+NÂˆ]]ÈÈHš[™]\›”Ûİ
+İ]K\İ[˜][Û•˜XÚÒY[™^
+NÂˆYˆ
+Yœ›ÛKš\Õ˜[Y
+
+H]Ëš\Õ˜[Y
+
+JHÛÛ[YNÂˆËœÙ]›Ü\J›˜[YH‹œ›ÛK™Ù]›Ü\J›˜[YHŠK[ŠNÂˆËœÙ]›Ü\J˜Ü™X]Y‹œ›ÛK™Ù]›Ü\J˜Ü™X]Y‹˜[ÙJK[ŠNÂˆËœÙ]›Ü\J›[™İİ\È‹œ›ÛK™Ù]›Ü\J›[™İİ\È‹MŠK[ŠNÂˆ›Üˆ
+ÛÛœİ]]ÉˆÚ[\HˆÈ]\›“›İ\Õ\K]\›]]ÛX][Û“[™\Õ\HJBˆÂˆ]]Èœ›ÛPÚ[Hœ›ÛK™Ù]Ú[Ú]˜[YJÚ[\JNÂˆ]]ÈĞÚ[HË™Ù]Ú[Ú]˜[YJÚ[\JNÂˆYˆ
+]ĞÚ[š\Õ˜[Y
+
+JBˆÂˆĞÚ[HXÙN•˜[YU™YJÚ[\JNÂˆË˜YÚ[
+ĞÚ[LK[ŠNÂˆBˆĞÚ[œ™[[İ™P[Ú[™[Š[ŠNÂˆYˆ
+œ›ÛPÚ[š\Õ˜[Y
+
+JBˆ›Üˆ
+[Ú[HÈÚ[œ›ÛPÚ[™Ù][PÚ[™[Š
+NÈ
+ÊØÚ[
+BˆĞÚ[˜YÚ[
+œ›ÛPÚ[™Ù]Ú[
+Ú[
+K˜Ü™X]PÛÜJ
+KLK[ŠNÂˆBˆBˆ\İ[˜][Û‹œÙ]›Ü\JœÙ[XİY]\›’[™^‹Ûİ\˜ÙK™Ù]›Ü\JœÙ[XİY]\›’[™^‹
+K[ŠNÂ‚ˆËÈ]\›ˆÛİÈ]™H˜XÚË\ÜXÚYšXÈQËˆ™XZ[XXÚÛÜYYÛ\YØZ[œİBˆËÈX]Ú[™È\İ[˜][ÛˆÛİÛÈHÛÜYY\œ˜[™Ù[Y[™[XZ[œÈÙ[‹XÛÛZ[™Y‚ˆ]]È\İ[˜][ÛÛ\ÈH\İ[˜][Û‹™Ù]Ú[Ú]˜[YJÛ\Õ\JNÂˆ]]ÈÛİ\˜ÙPÛ\ÈHÛİ\˜ÙK™Ù]Ú[Ú]˜[YJÛ\Õ\JNÂˆYˆ
+Y\İ[˜][ÛÛ\Ëš\Õ˜[Y
+
+JBˆÂˆ\İ[˜][ÛÛ\ÈHXÙN•˜[YU™YJÛ\Õ\JNÂˆ\İ[˜][Û‹˜YÚ[
+\İ[˜][ÛÛ\ËLK[ŠNÂˆBˆ\İ[˜][ÛÛ\Ëœ™[[İ™P[Ú[™[Š[ŠNÂˆYˆ
+Ûİ\˜ÙPÛ\Ëš\Õ˜[Y
+
+JBˆÂˆ›Üˆ
+[HHÈHÛİ\˜ÙPÛ\Ë™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆÛÛœİ]]ÈÛİ\˜ÙPÛ\HÛİ\˜ÙPÛ\Ë™Ù]Ú[
+JNÂˆÛÛœİ]]È]\›’[™^HÙ]]\›’[™^›Ü’Y
+Ûİ\˜ÙU˜XÚÒYÛİ\˜ÙPÛ\™Ù]›Ü\Jœ]\›’YŠKÔİš[™Ê
+JNÂˆYˆ
+]\›’[™^
+HÛÛ[YNÂˆXÙN•˜[YU™YHÛÜYYÛ\
+^[\İÛ\\JNÂˆÛÜYYÛ\œÙ]›Ü\JšY‹™]ÒY
+
+K[ŠNÂˆÛÜYYÛ\œÙ]›Ü\Jœ]\›’Y‹Ù]]\›’Y
+\İ[˜][Û•˜XÚÒY]\›’[™^
+K[ŠNÂˆÛÜYYÛ\œÙ]›Ü\Jœİ\˜\ˆ‹Ûİ\˜ÙPÛ\™Ù]›Ü\Jœİ\˜\ˆ‹
+K[ŠNÂˆÛÜYYÛ\œÙ]›Ü\J›[™İ˜\œÈ‹Ûİ\˜ÙPÛ\™Ù]›Ü\J›[™İ˜\œÈ‹JK[ŠNÂˆ\İ[˜][ÛÛ\Ë˜YÚ[
+ÛÜYYÛ\LK[ŠNÂˆBˆB‚ˆ]]È\İ[˜][Û”ÛÛ™Ğ]]ÛX][ÛˆH\İ[˜][Û‹™Ù]Ú[Ú]˜[YJ]]ÛX][Û•\JNÂˆÛÛœİ]]ÈÛİ\˜ÙTÛÛ™Ğ]]ÛX][ÛˆHÛİ\˜ÙK™Ù]Ú[Ú]˜[YJ]]ÛX][Û•\JNÂˆYˆ
+Y\İ[˜][Û”ÛÛ™Ğ]]ÛX][Û‹š\Õ˜[Y
+
+JBˆÂˆ\İ[˜][Û”ÛÛ™Ğ]]ÛX][ÛˆHXÙN•˜[YU™YJ]]ÛX][Û•\JNÂˆ\İ[˜][Û‹˜YÚ[
+\İ[˜][Û”ÛÛ™Ğ]]ÛX][Û‹LK[ŠNÂˆBˆ\İ[˜][Û”ÛÛ™Ğ]]ÛX][Û‹œ™[[İ™P[Ú[™[Š[ŠNÂˆYˆ
+Ûİ\˜ÙTÛÛ™Ğ]]ÛX][Û‹š\Õ˜[Y
+
+JBˆ›Üˆ
+[HHÈHÛİ\˜ÙTÛÛ™Ğ]]ÛX][Û‹™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆ\İ[˜][Û”ÛÛ™Ğ]]ÛX][Û‹˜YÚ[
+Ûİ\˜ÙTÛÛ™Ğ]]ÛX][Û‹™Ù]Ú[
+JK˜Ü™X]PÛÜJ
+KLK[ŠNÂˆ™]\›ˆYNÂŸB‚š[›Ú™XİØİ[Y[™Ù]˜XÚÔÙ[XİY]\›’[™^
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY
+HÛÛœİÂˆÛÛœİ]]È˜XÚÈHš[™›Ú™Xİ˜XÚÊİ]K˜XÚÒY
+NÂˆYˆ
+]˜XÚËš\Õ˜[Y
+
+JH™]\›ˆÂˆ™]\›ˆXÙNš›[Z]
+]\›”ÛİÛİ[HKˆİ]X×ØØ\İ[Š˜XÚË™Ù]›Ü\JœÙ[XİY]\›’[™^‹
+JJNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]˜XÚÔÙ[XİY]\›’[™^
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[]\›’[™^
+BÂˆ]]È˜XÚÈHš[™›Ú™Xİ˜XÚÊİ]K˜XÚÒY
+NÂˆYˆ
+]˜XÚËš\Õ˜[Y
+
+JH™]\›ÂˆÛÛœİ]]ÈÛ[\YHXÙNš›[Z]
+]\›”ÛİÛİ[HK]\›’[™^
+NÂˆYˆ
+Ù]˜XÚÔÙ[XİY]\›’[™^
+˜XÚÒY
+HOHÛ[\Y
+H™]\›Âˆ˜XÚËœÙ]›Ü\JœÙ[XİY]\›’[™^‹Û[\Y[ŠNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]˜XÚÓZ^\”İ]J[[™^İX›HØZ[‘‹İX›H[‹›ÛÛ]]Y›ÛÛÛÛÊBÂˆÛÛœİ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊ[™^˜XÚÜË™Ù][PÚ[™[Š
+JJH™]\›ÂˆÛÛœİ]]È˜XÚÈH˜XÚÜË™Ù]Ú[
+[™^
+NÂˆÛÛœİ]]ÈZ^\ˆHİ]K™Ù]Ú[Ú]˜[YJZ^\•\JNÂˆ]]ÈÚ[›™[Hš[™Z^\Ú[›™[
+Z^\‹˜XÚË™Ù]›Ü\J›Z^\Ú[›™[YŠKÔİš[™Ê
+JNÂˆYˆ
+Ú[›™[š\Õ˜[Y
+
+JBˆÂˆÚ[›™[œÙ]›Ü\J™ØZ[‘ˆ‹XÙNš›[Z]
+MŒŒ‹ŒØZ[‘ŠK[ŠNÂˆÚ[›™[œÙ]›Ü\Jœ[ˆ‹XÙNš›[Z]
+LKŒKŒ[ŠK[ŠNÂˆÚ[›™[œÙ]›Ü\J›]]Y‹]]Y[ŠNÂˆÚ[›™[œÙ]›Ü\JœÛÛÈ‹ÛÛË[ŠNÂˆBŸB‚›ÚY›Ú™XİØİ[Y[œÙ]˜XÚÔÙ[™ØZ[Š[[™^[\ËİX›HØZ[‘ŠBÂˆÛÛœİ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊ[™^˜XÚÜË™Ù][PÚ[™[Š
+JBˆZXÙNš\ÔÜÚ]]™P[™™[İÊ\Ë
+JH™]\›ÂˆÛÛœİ]]È˜XÚÈH˜XÚÜË™Ù]Ú[
+[™^
+NÂˆÛÛœİ]]ÈZ^\ˆHİ]K™Ù]Ú[Ú]˜[YJZ^\•\JNÂˆ]]ÈÚ[›™[Hš[™Z^\Ú[›™[
+Z^\‹˜XÚË™Ù]›Ü\J›Z^\Ú[›™[YŠKÔİš[™Ê
+JNÂˆYˆ
+Ú[›™[š\Õ˜[Y
+
+JBˆÚ[›™[œÙ]›Ü\J™ˆ
+ÈXÙN”İš[™Ê\È
+ÈJH
+È”Ù[™ˆ‹ˆXÙNš›[Z]
+MŒŒ‹ŒØZ[‘ŠK[ŠNÂŸB‚˜›ÛÛ›Ú™XİØİ[Y[œÙ]™]\›“Z^\”İ]J[\ËÛÛœİXÙN”İš[™ÉˆÚ[›™[YˆÛÛœİXÙN”İš[™Éˆ˜[YKİX›HØZ[‘‹İX›H[‹ˆ›ÛÛ]]Y›ÛÛÛÛÊBÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊ\Ë
+HÚ[›™[Yš\Ñ[\J
+JH™]\›ˆ˜[ÙNÂ‚ˆ]]ÈZ^\ˆHİ]K™Ù]Ú[Ú]˜[YJZ^\•\JNÂˆXÙN•˜[YU™YHÚ[›™[Âˆ›Üˆ
+[HHÈHZ^\‹™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆ]]ÈØ[™Y]HHZ^\‹™Ù]Ú[
+JNÂˆYˆ
+Ø[™Y]K™Ù]›Ü\JšÚ[™ŠKÔİš[™Ê
+HOH™Ü™]\›ˆ‚ˆ	‰ˆİ]X×ØØ\İ[ŠØ[™Y]K™Ù]›Ü\J˜\È‹LJJHOH\ÊBˆÂˆÚ[›™[HØ[™Y]NÂˆœ™XZÎÂˆBˆB‚ˆÛÛœİ]]È›İ[™YØZ[ˆHXÙNš›[Z]
+MŒŒ‹ŒØZ[‘ŠNÂˆÛÛœİ]]È›İ[™Y[ˆHXÙNš›[Z]
+LKŒKŒ[ŠNÂˆÛÛœİ›ÛÛÚ[™ÙYHXÚ[›™[š\Õ˜[Y
+
+BˆÚ[›™[™Ù]›Ü\JšYŠKÔİš[™Ê
+HOHÚ[›™[YˆÚ[›™[™Ù]›Ü\J›˜[YHŠKÔİš[™Ê
+HOH˜[YBˆİ]X×ØØ\İ[ŠÚ[›™[™Ù]›Ü\J˜\È‹LJJHOH\Âˆİ˜XœÊİ]X×ØØ\İİX›OŠÚ[›™[™Ù]›Ü\J™ØZ[‘ˆ‹Œ
+JHH›İ[™YØZ[ŠHˆŒBˆİ˜XœÊİ]X×ØØ\İİX›OŠÚ[›™[™Ù]›Ü\Jœ[ˆ‹Œ
+JHH›İ[™Y[ŠHˆŒBˆİ]X×ØØ\İ›ÛÛŠÚ[›™[™Ù]›Ü\J›]]Y‹˜[ÙJJHOH]]Yˆİ]X×ØØ\İ›ÛÛŠÚ[›™[™Ù]›Ü\JœÛÛÈ‹˜[ÙJJHOHÛÛÂˆÚ[›™[™Ù]›Ü\J›İ]]YŠKÔİš[™Ê
+HOHZ^\‹™Ù]›Ü\J›X\İ\Ú[›™[YŠKÔİš[™Ê
+NÂ‚ˆYˆ
+XÚ[›™[š\Õ˜[Y
+
+JBˆÂˆÚ[›™[HXÙN•˜[YU™YJZ^\Ú[›™[\JNÂˆZ^\‹˜YÚ[
+Ú[›™[LK[ŠNÂˆB‚ˆÚ[›™[œÙ]›Ü\JšY‹Ú[›™[Y[ŠNÂˆÚ[›™[œÙ]›Ü\JšÚ[™‹™Ü™]\›ˆ‹[ŠNÂˆÚ[›™[œÙ]›Ü\J˜\È‹\Ë[ŠNÂˆÚ[›™[œÙ]›Ü\J›˜[YH‹˜[YK[ŠNÂˆÚ[›™[œÙ]›Ü\J™ØZ[‘ˆ‹›İ[™YØZ[‹[ŠNÂˆÚ[›™[œÙ]›Ü\Jœ[ˆ‹›İ[™Y[‹[ŠNÂˆÚ[›™[œÙ]›Ü\J›]]Y‹]]Y[ŠNÂˆÚ[›™[œÙ]›Ü\JœÛÛÈ‹ÛÛË[ŠNÂˆÚ[›™[œÙ]›Ü\J›İ]]Y‹Z^\‹™Ù]›Ü\J›X\İ\Ú[›™[YŠK[ŠNÂˆ™]\›ˆÚ[™ÙYÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]X\İ\“Z^\”İ]JİX›HØZ[‘‹İX›H[‹›ÛÛ]]Y
+BÂˆ]]ÈZ^\ˆHİ]K™Ù]Ú[Ú]˜[YJZ^\•\JNÂˆÛÛœİ]]ÈX\İ\’YHZ^\‹™Ù]›Ü\J›X\İ\Ú[›™[YŠKÔİš[™Ê
+NÂˆ]]ÈÚ[›™[Hš[™Z^\Ú[›™[
+Z^\‹X\İ\’Y
+NÂˆYˆ
+Ú[›™[š\Õ˜[Y
+
+JBˆÂˆÚ[›™[œÙ]›Ü\J™ØZ[‘ˆ‹XÙNš›[Z]
+MŒŒ‹ŒØZ[‘ŠK[ŠNÂˆÚ[›™[œÙ]›Ü\Jœ[ˆ‹XÙNš›[Z]
+LKŒKŒ[ŠK[ŠNÂˆÚ[›™[œÙ]›Ü\J›]]Y‹]]Y[ŠNÂˆBŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[™Ù]]\›’Y
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
+HÛÛœİÂˆ™]\›ˆš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+K™Ù]›Ü\JšYŠKÔİš[™Ê
+NÂŸB‚š[›Ú™XİØİ[Y[™Ù]]\›’[™^›Ü’Y
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒYÛÛœİXÙN”İš[™Éˆ]\›’Y
+HÛÛœİÂˆYˆ
+]\›’Yš\Ñ[\J
+JH™]\›ˆLNÂˆÛÛœİ]]È˜XÚÈHš[™›Ú™Xİ˜XÚÊİ]K˜XÚÒY
+NÂˆÛÛœİ]]È]\›œÈH˜XÚË™Ù]Ú[Ú]˜[YJ]\›œÕ\JNÂˆ›Üˆ
+[HHÈH]\›œË™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆÛÛœİ]]ÈÛİH]\›œË™Ù]Ú[
+JNÂˆYˆ
+Ûİ™Ù]›Ü\JšYŠKÔİš[™Ê
+HOH]\›’Y
+Bˆ™]\›ˆİ]X×ØØ\İ[ŠÛİ™Ù]›Ü\Jš[™^‹LJJNÂˆBˆ™]\›ˆLNÂŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[™Ù]]\›“˜[YJÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
+HÛÛœİÂˆ™]\›ˆš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+K™Ù]›Ü\J›˜[YHŠKÔİš[™Ê
+NÂŸB‚˜›ÛÛ›Ú™XİØİ[Y[š\Ô]\›Ü™X]Y
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
+HÛÛœİÂˆ™]\›ˆİ]X×ØØ\İ›ÛÛŠš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+K™Ù]›Ü\J˜Ü™X]Y‹˜[ÙJJNÂŸB‚˜›ÛÛ›Ú™XİØİ[Y[™Ù]]\›“›İJÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\
+HÛÛœİÂˆÛÛœİ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆÛÛœİ]]È›İ\ÈHÛİ™Ù]Ú[Ú]˜[YJ]\›“›İ\Õ\JNÂˆ›Üˆ
+[HHÈH›İ\Ë™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆÛÛœİ]]È›İHH›İ\Ë™Ù]Ú[
+JNÂˆYˆ
+İ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœ]Ú‹LJJHOH]Úˆ	‰ˆİ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœİ\‹LJJHOHİ\
+Bˆ™]\›ˆYNÂˆBˆ™]\›ˆ˜[ÙNÂŸB‚š[›Ú™XİØİ[Y[™Ù]]\›“›İU™[ØÚ]JÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\
+HÛÛœİÂˆÛÛœİ]]È›İ\ÈHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+K™Ù]Ú[Ú]˜[YJ]\›“›İ\Õ\JNÂˆ›Üˆ
+[HHÈH›İ\Ë™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆÛÛœİ]]È›İHH›İ\Ë™Ù]Ú[
+JNÂˆYˆ
+İ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœ]Ú‹LJJHOH]Úˆ	‰ˆİ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœİ\‹LJJHOHİ\
+Bˆ™]\›ˆXÙNš›[Z]
+KLËİ]X×ØØ\İ[Š›İK™Ù]›Ü\J™[ØÚ]H‹L
+JJNÂˆBˆ™]\›ˆLÂŸB‚š[›Ú™XİØİ[Y[™Ù]]\›“›İS[™İ
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\
+HÛÛœİÂˆÛÛœİ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆÛÛœİ]]È›İ\ÈHÛİ™Ù]Ú[Ú]˜[YJ]\›“›İ\Õ\JNÂˆ›Üˆ
+[HHÈH›İ\Ë™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆÛÛœİ]]È›İHH›İ\Ë™Ù]Ú[
+JNÂˆYˆ
+İ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœ]Ú‹LJJHOH]Úˆ	‰ˆİ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœİ\‹LJJHOHİ\
+Bˆ™]\›ˆXÙNš›X^
+Kİ]X×ØØ\İ[Š›İK™Ù]›Ü\J›[™İİ\È‹JJJNÂˆBˆ™]\›ˆNÂŸB‚š[›Ú™XİØİ[Y[™Ù]]\›“[™İİ\ÊÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
+HÛÛœİÂˆÛÛœİ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆ™]\›ˆXÙNš›[Z]
+Kİ]X×ØØ\İ[ŠÛİ™Ù]›Ü\J›[™İİ\È‹MŠJJNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]]\›Ü™X]Y
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^›ÛÛÜ™X]Y
+BÂˆ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆYˆ
+Ûİš\Õ˜[Y
+
+JBˆÛİœÙ]›Ü\J˜Ü™X]Y‹Ü™X]Y[ŠNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]]\›“›İJÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\›ÛÛ[˜X›Y
+BÂˆ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆYˆ
+\Ûİš\Õ˜[Y
+
+JBˆ™]\›Â‚ˆ]]È›İ\ÈHÛİ™Ù]Ú[Ú]˜[YJ]\›“›İ\Õ\JNÂˆ›Üˆ
+[HH›İ\Ë™Ù][PÚ[™[Š
+NÈKZHHÊBˆÂˆ]]È›İHH›İ\Ë™Ù]Ú[
+JNÂˆYˆ
+İ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœ]Ú‹LJJHOH]Úˆ	‰ˆİ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœİ\‹LJJHOHİ\
+BˆÂˆYˆ
+[˜X›Y
+BˆÂˆÛİœÙ]›Ü\J˜Ü™X]Y‹YK[ŠNÂˆ™]\›ÂˆBˆ›İ\Ëœ™[[İ™PÚ[
+K[ŠNÂˆBˆB‚ˆYˆ
+[˜X›Y
+BˆÂˆXÙN•˜[YU™YH›İJ]\›“›İU\JNÂˆ›İKœÙ]›Ü\Jœ]Ú‹]Ú[ŠNÂˆ›İKœÙ]›Ü\Jœİ\‹İ\[ŠNÂˆ›İKœÙ]›Ü\J™[ØÚ]H‹L[ŠNÂˆ›İKœÙ]›Ü\J›[™İİ\È‹K[ŠNÂˆ›İ\Ë˜YÚ[
+›İKLK[ŠNÂˆÛİœÙ]›Ü\J˜Ü™X]Y‹YK[ŠNÂˆBŸB‚›ÚY›Ú™XİØİ[Y[œÙ]]\›“›İU™[ØÚ]JÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\[™[ØÚ]JBÂˆÛÛœİ]]È›İ\ÈHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+K™Ù]Ú[Ú]˜[YJ]\›“›İ\Õ\JNÂˆ›Üˆ
+[HHÈH›İ\Ë™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆ]]È›İHH›İ\Ë™Ù]Ú[
+JNÂˆYˆ
+İ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœ]Ú‹LJJHOH]Úˆ	‰ˆİ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœİ\‹LJJHOHİ\
+BˆÂˆ›İKœÙ]›Ü\J™[ØÚ]H‹XÙNš›[Z]
+KLË™[ØÚ]JK[ŠNÂˆ™]\›ÂˆBˆBŸB‚›ÚY›Ú™XİØİ[Y[œÙ]]\›“›İS[™İ
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\[[™İİ\ÊBÂˆ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆ]]È›İ\ÈHÛİ™Ù]Ú[Ú]˜[YJ]\›“›İ\Õ\JNÂˆ›Üˆ
+[HHÈH›İ\Ë™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆ]]È›İHH›İ\Ë™Ù]Ú[
+JNÂˆYˆ
+İ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœ]Ú‹LJJHOH]Úˆ	‰ˆİ]X×ØØ\İ[Š›İK™Ù]›Ü\Jœİ\‹LJJHOHİ\
+BˆÂˆ›İKœÙ]›Ü\J›[™İİ\È‹XÙNš›[Z]
+KHİ\[™İİ\ÊK[ŠNÂˆ™]\›ÂˆBˆBŸB‚›ÚY›Ú™XİØİ[Y[œÙ]]\›“[™İİ\ÊÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[[™İİ\ÊBÂˆ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆYˆ
+Ûİš\Õ˜[Y
+
+JBˆÛİœÙ]›Ü\J›[™İİ\È‹XÙNš›[Z]
+K[™İİ\ÊK[ŠNÂŸB‚›˜[Y\ÜXÙBÂšXÙN•˜[YU™YHš[™]]ÛX][Û“[™JXÙN•˜[YU™YH[™\ËÛÛœİXÙN”İš[™ÉˆYÚ[“˜[YKˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\’Y
+BÂˆ›Üˆ
+[HHÈH[™\Ë™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆ]]È[™HH[™\Ë™Ù]Ú[
+JNÂˆYˆ
+[™K™Ù]\J
+HOH]]ÛX][Û“[™U\Bˆ	‰ˆ[™K™Ù]›Ü\JœYÚ[“˜[YHŠKÔİš[™Ê
+HOHYÚ[“˜[YBˆ	‰ˆ[™K™Ù]›Ü\Jœ\˜[Y]\’YŠKÔİš[™Ê
+HOH\˜[Y]\’Y
+Bˆ™]\›ˆ[™NÂˆBˆ™]\›ˆßNÂŸB‚”›Ú™XİØİ[Y[]]ÛX][Û“[™H™XY]]ÛX][Û“[™JÛÛœİXÙN•˜[YU™YIˆ[™JBÂˆ›Ú™XİØİ[Y[]]ÛX][Û“[™H™\İ[ÂˆYˆ
+[[™Kš\Õ˜[Y
+
+JH™]\›ˆ™\İ[Âˆ™\İ[œYÚ[“˜[YHH[™K™Ù]›Ü\JœYÚ[“˜[YHŠKÔİš[™Ê
+NÂˆ™\İ[œ\˜[Y]\’YH[™K™Ù]›Ü\Jœ\˜[Y]\’YŠKÔİš[™Ê
+NÂˆ™\İ[œ\˜[Y]\“˜[YHH[™K™Ù]›Ü\Jœ\˜[Y]\“˜[YHŠKÔİš[™Ê
+NÂˆ›Üˆ
+[HHÈH[™K™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆÛÛœİ]]ÈÚ[H[™K™Ù]Ú[
+JNÂˆYˆ
+Ú[™Ù]\J
+HOH]]ÛX][Û”Ú[\JHÛÛ[YNÂˆ™\İ[œÚ[Ë˜Y
+Èİ]X×ØØ\İ[ŠÚ[™Ù]›Ü\JœÜÚ][Ûˆ‹
+JKˆİ]X×ØØ\İ›Ø]ŠÚ[™Ù]›Ü\J˜[YH‹JJHJNÂˆBˆ™]\›ˆ™\İ[ÂŸB‚›ÚYÙ]]]ÛX][Û”Ú[
+XÙN•˜[YU™YH[™\ËÛÛœİXÙN”İš[™ÉˆYÚ[“˜[YKˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\’YÛÛœİXÙN”İš[™Éˆ\˜[Y]\“˜[YKˆ[ÜÚ][Û‹›Ø]˜[YK[X^ÜÚ][ÛŠBÂˆYˆ
+[[™\Ëš\Õ˜[Y
+
+HYÚ[“˜[YKš\Ñ[\J
+H\˜[Y]\’Yš\Ñ[\J
+JH™]\›Âˆ]]È[™HHš[™]]ÛX][Û“[™J[™\ËYÚ[“˜[YK\˜[Y]\’Y
+NÂˆYˆ
+[[™Kš\Õ˜[Y
+
+JBˆÂˆ[™HHXÙN•˜[YU™YJ]]ÛX][Û“[™U\JNÂˆ[™KœÙ]›Ü\JšY‹XÙN•]ZY
+
+KÔİš[™Ê
+K[ŠNÂˆ[™KœÙ]›Ü\JœYÚ[“˜[YH‹YÚ[“˜[YK[ŠNÂˆ[™KœÙ]›Ü\Jœ\˜[Y]\’Y‹\˜[Y]\’Y[ŠNÂˆ[™KœÙ]›Ü\Jœ\˜[Y]\“˜[YH‹\˜[Y]\“˜[YK[ŠNÂˆ[™\Ë˜YÚ[
+[™KLK[ŠNÂˆBˆ[™KœÙ]›Ü\Jœ\˜[Y]\“˜[YH‹\˜[Y]\“˜[YK[ŠNÂˆÛÛœİ]]È›İ[™YÜÚ][ÛˆHXÙNš›[Z]
+X^ÜÚ][Û‹ÜÚ][ÛŠNÂˆ›Üˆ
+[HHÈH[™K™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆ]]ÈÚ[H[™K™Ù]Ú[
+JNÂˆYˆ
+Ú[™Ù]\J
+HOH]]ÛX][Û”Ú[\Bˆ	‰ˆİ]X×ØØ\İ[ŠÚ[™Ù]›Ü\JœÜÚ][Ûˆ‹LJJHOH›İ[™YÜÚ][ÛŠBˆÂˆÚ[œÙ]›Ü\J˜[YH‹XÙNš›[Z]
+Œ‹KŒ‹˜[YJK[ŠNÂˆ™]\›ÂˆBˆBˆXÙN•˜[YU™YHÚ[
+]]ÛX][Û”Ú[\JNÂˆÚ[œÙ]›Ü\JœÜÚ][Ûˆ‹›İ[™YÜÚ][Û‹[ŠNÂˆÚ[œÙ]›Ü\J˜[YH‹XÙNš›[Z]
+Œ‹KŒ‹˜[YJK[ŠNÂˆ[™K˜YÚ[
+Ú[LK[ŠNÂŸBŸB‚š[›Ú™XİØİ[Y[™Ù]]\›]]ÛX][Û“[™PÛİ[
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
+HÛÛœİÂˆÛÛœİ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆ™]\›ˆÛİ™Ù]Ú[Ú]˜[YJ]\›]]ÛX][Û“[™\Õ\JK™Ù][PÚ[™[Š
+NÂŸB‚”›Ú™XİØİ[Y[]]ÛX][Û“[™H›Ú™XİØİ[Y[™Ù]]\›]]ÛX][Û“[™JÛÛœİXÙN”İš[™Éˆ˜XÚÒYˆ[Ûİ[™^[[™R[™^
+HÛÛœİÂˆÛÛœİ]]È[™\ÈHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+K™Ù]Ú[Ú]˜[YJ]\›]]ÛX][Û“[™\Õ\JNÂˆ™]\›ˆXÙNš\ÔÜÚ]]™P[™™[İÊ[™R[™^[™\Ë™Ù][PÚ[™[Š
+JBˆÈ™XY]]ÛX][Û“[™J[™\Ë™Ù]Ú[
+[™R[™^
+JHˆ]]ÛX][Û“[™^ßNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]]\›]]ÛX][Û•\™Ù]
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^ˆÛÛœİXÙN”İš[™ÉˆYÚ[“˜[YKˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\’YˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\“˜[YJBÂˆ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆYˆ
+\Ûİš\Õ˜[Y
+
+JH™]\›Âˆ]]È[™\ÈHÛİ™Ù]Ú[Ú]˜[YJ]\›]]ÛX][Û“[™\Õ\JNÂˆYˆ
+[[™\Ëš\Õ˜[Y
+
+JBˆÂˆ[™\ÈHXÙN•˜[YU™YJ]\›]]ÛX][Û“[™\Õ\JNÂˆÛİ˜YÚ[
+[™\ËLK[ŠNÂˆBˆ]]È[™HHš[™]]ÛX][Û“[™J[™\ËYÚ[“˜[YK\˜[Y]\’Y
+NÂˆYˆ
+[[™Kš\Õ˜[Y
+
+JBˆÂˆ[™HHXÙN•˜[YU™YJ]]ÛX][Û“[™U\JNÂˆ[™KœÙ]›Ü\JšY‹XÙN•]ZY
+
+KÔİš[™Ê
+K[ŠNÂˆ[™KœÙ]›Ü\JœYÚ[“˜[YH‹YÚ[“˜[YK[ŠNÂˆ[™KœÙ]›Ü\Jœ\˜[Y]\’Y‹\˜[Y]\’Y[ŠNÂˆ[™KœÙ]›Ü\Jœ\˜[Y]\“˜[YH‹\˜[Y]\“˜[YK[ŠNÂˆ[™\Ë˜YÚ[
+[™KLK[ŠNÂˆBˆ[™KœÙ]›Ü\Jœ\˜[Y]\“˜[YH‹\˜[Y]\“˜[YK[ŠNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]]\›]]ÛX][Û”Ú[
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^ˆÛÛœİXÙN”İš[™ÉˆYÚ[“˜[YKˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\’YˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\“˜[YKˆ[İ\›Ø]˜[YJBÂˆ]]ÈÛİHš[™]\›”Ûİ
+İ]K˜XÚÒYÛİ[™^
+NÂˆYˆ
+\Ûİš\Õ˜[Y
+
+JH™]\›Âˆ]]È[™\ÈHÛİ™Ù]Ú[Ú]˜[YJ]\›]]ÛX][Û“[™\Õ\JNÂˆYˆ
+[[™\Ëš\Õ˜[Y
+
+JBˆÂˆ[™\ÈHXÙN•˜[YU™YJ]\›]]ÛX][Û“[™\Õ\JNÂˆÛİ˜YÚ[
+[™\ËLK[ŠNÂˆBˆÙ]]]ÛX][Û”Ú[
+[™\ËYÚ[“˜[YK\˜[Y]\’Y\˜[Y]\“˜[YKİ\˜[YKMJNÂŸB‚š[›Ú™XİØİ[Y[™Ù]ÛÛ™Ğ]]ÛX][Û“[™PÛİ[
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY
+HÛÛœİÂˆ™]\›ˆš[™›Ú™Xİ˜XÚÊİ]K˜XÚÒY
+K™Ù]Ú[Ú]˜[YJ]]ÛX][Û•\JK™Ù][PÚ[™[Š
+NÂŸB‚”›Ú™XİØİ[Y[]]ÛX][Û“[™H›Ú™XİØİ[Y[™Ù]ÛÛ™Ğ]]ÛX][Û“[™JÛÛœİXÙN”İš[™Éˆ˜XÚÒYˆ[[™R[™^
+HÛÛœİÂˆÛÛœİ]]È[™\ÈHš[™›Ú™Xİ˜XÚÊİ]K˜XÚÒY
+K™Ù]Ú[Ú]˜[YJ]]ÛX][Û•\JNÂˆ™]\›ˆXÙNš\ÔÜÚ]]™P[™™[İÊ[™R[™^[™\Ë™Ù][PÚ[™[Š
+JBˆÈ™XY]]ÛX][Û“[™J[™\Ë™Ù]Ú[
+[™R[™^
+JHˆ]]ÛX][Û“[™^ßNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]ÛÛ™Ğ]]ÛX][Û”Ú[
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒYˆÛÛœİXÙN”İš[™ÉˆYÚ[“˜[YKˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\’YˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\“˜[YKˆ[ÛÛ™Ôİ\›Ø]˜[YJBÂˆ]]È˜XÚÈHš[™›Ú™Xİ˜XÚÊİ]K˜XÚÒY
+NÂˆYˆ
+]˜XÚËš\Õ˜[Y
+
+JH™]\›Âˆ]]È[™\ÈH˜XÚË™Ù]Ú[Ú]˜[YJ]]ÛX][Û•\JNÂˆYˆ
+[[™\Ëš\Õ˜[Y
+
+JBˆÂˆ[™\ÈHXÙN•˜[YU™YJ]]ÛX][Û•\JNÂˆ˜XÚË˜YÚ[
+[™\ËLK[ŠNÂˆBˆÙ]]]ÛX][Û”Ú[
+[™\ËYÚ[“˜[YK\˜[Y]\’Y\˜[Y]\“˜[YKÛÛ™Ôİ\˜[YKMLÍJNÂŸB‚›ÚY›Ú™XİØİ[Y[›[İ™U˜XÚÊ[Ûİ\˜ÙR[™^[\İ[˜][Û’[™^
+BÂˆ]]È˜XÚÜÈHİ]K™Ù]Ú[Ú]˜[YJ˜XÚÜÕ\JNÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊÛİ\˜ÙR[™^˜XÚÜË™Ù][PÚ[™[Š
+JBˆZXÙNš\ÔÜÚ]]™P[™™[İÊ\İ[˜][Û’[™^˜XÚÜË™Ù][PÚ[™[Š
+JBˆÛİ\˜ÙR[™^OH\İ[˜][Û’[™^
+Bˆ™]\›Âˆ˜XÚÜË›[İ™PÚ[
+Ûİ\˜ÙR[™^\İ[˜][Û’[™^[ŠNÂŸB‚šXÙN”İš[™È›Ú™XİØİ[Y[™Ù]^[\İ]\›’Y
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[˜\ŠHÛÛœİÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊ˜\‹MŠJH™]\›ˆßNÂˆÛÛœİ]]È˜XÚÈHš[™›Ú™Xİ˜XÚÊİ]K˜XÚÒY
+NÂˆÛÛœİ]]ÈÛ\ÈH˜XÚË™Ù]Ú[Ú]˜[YJÛ\Õ\JNÂˆ›Üˆ
+[HHÈHÛ\Ë™Ù][PÚ[™[Š
+NÈ
+ÊÚJBˆÂˆÛÛœİ]]ÈÛ\HÛ\Ë™Ù]Ú[
+JNÂˆÛÛœİ]]Èİ\Hİ]X×ØØ\İ[ŠÛ\™Ù]›Ü\Jœİ\˜\ˆ‹LJJNÂˆÛÛœİ]]È[™İHXÙNš›X^
+Kİ]X×ØØ\İ[ŠÛ\™Ù]›Ü\J›[™İ˜\œÈ‹JJJNÂˆYˆ
+˜\ˆHİ\	‰ˆ˜\ˆİ\
+È[™İ
+Bˆ™]\›ˆÛ\™Ù]›Ü\Jœ]\›’YŠKÔİš[™Ê
+NÂˆBˆ™]\›ˆßNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ]^[\İÛ\
+ÛÛœİXÙN”İš[™Éˆ˜XÚÒYÛÛœİXÙN”İš[™Éˆ]\›’Yˆ[İ\˜\‹[[™İ˜\œË›ÛÛ[˜X›Y
+BÂˆYˆ
+ZXÙNš\ÔÜÚ]]™P[™™[İÊİ\˜\‹MŠJH™]\›Âˆ]]È˜XÚÈHš[™›Ú™Xİ˜XÚÊİ]K˜XÚÒY
+NÂˆYˆ
+]˜XÚËš\Õ˜[Y
+
+JH™]\›Âˆ]]ÈÛ\ÈH˜XÚË™Ù]Ú[Ú]˜[YJÛ\Õ\JNÂˆYˆ
+XÛ\Ëš\Õ˜[Y
+
+JBˆÂˆÛ\ÈHXÙN•˜[YU™YJÛ\Õ\JNÂˆ˜XÚË˜YÚ[
+Û\ËLK[ŠNÂˆB‚ˆËÈHš\œİ^[\İ\ÜÈ\ÈH˜\ˆÜšYˆÛ™H]\›ˆÛ\ØØİ\Y\ÈÛ™H˜\‹‚ˆËÈ™\XÚ[™ÈHÙ[™[[İ™\È[ˆÛ\ˆÛ\]]ÜÚ][Ûˆ™Y›Ü™HY[™ÈH™]È™Y™\™[˜ÙK‚ˆ›Üˆ
+[HHÛ\Ë™Ù][PÚ[™[Š
+NÈKZHHÊBˆÂˆÛÛœİ]]ÈÛ\HÛ\Ë™Ù]Ú[
+JNÂˆÛÛœİ]]Èİ\Hİ]X×ØØ\İ[ŠÛ\™Ù]›Ü\Jœİ\˜\ˆ‹LJJNÂˆYˆ
+Û\™Ù]\J
+HOH^[\İÛ\\H	‰ˆİ\OHİ\˜\ŠBˆÛ\Ëœ™[[İ™PÚ[
+K[ŠNÂˆB‚ˆYˆ
+[˜X›Y	‰ˆ]\›’Yš\Ó›İ[\J
+JBˆÂˆXÙN•˜[YU™YHÛ\
+^[\İÛ\\JNÂˆÛ\œÙ]›Ü\JšY‹™]ÒY
+
+K[ŠNÂˆÛ\œÙ]›Ü\Jœ]\›’Y‹]\›’Y[ŠNÂˆÛ\œÙ]›Ü\Jœİ\˜\ˆ‹İ\˜\‹[ŠNÂˆÛ\œÙ]›Ü\J›[™İ˜\œÈ‹XÙNš›X^
+K[™İ˜\œÊK[ŠNÂˆÛ\Ë˜YÚ[
+Û\LK[ŠNÂˆBŸB‚š[›Ú™XİØİ[Y[™Ù]XÚÜÔ\”]X\\“›İJ
+HÛÛœİÂˆ™]\›ˆİ]X×ØØ\İ[Šİ]K™Ù]›Ü\JXÚÜÔ\”]X\\“›İH‹XÚÜÔ\”]X\\“›İJJNÂŸB‚™İX›H›Ú™XİØİ[Y[™Ù][š]X[[\ĞœJ
+HÛÛœİÂˆÛÛœİ]]ÈX\Hİ]K™Ù]Ú[Ú]˜[YJ[\ÓX\\JNÂˆ™]\›ˆX\™Ù][PÚ[™[Š
+HˆˆÈİ]X×ØØ\İİX›OŠX\™Ù]Ú[
+
+K™Ù]›Ü\J˜œH‹LŒŒ
+JBˆˆLŒŒÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ][š]X[[\ĞœJİX›HœJBÂˆ]]ÈX\Hİ]K™Ù]Ú[Ú]˜[YJ[\ÓX\\JNÂˆYˆ
+X\™Ù][PÚ[™[Š
+HOH
+BˆX\˜YÚ[
+XZÙU[\ÔÚ[
+œJKLK[ŠNÂˆ[ÙBˆX\™Ù]Ú[
+
+KœÙ]›Ü\J˜œH‹XÙNš›[Z]
+ŒŒÌŒœJK[ŠNÂˆİ]KœÙ]›Ü\J[\ĞœH‹XÙNš›[Z]
+ŒŒÌŒœJK[ŠNÂŸB‚”›Ú™XİØİ[Y[•[YTÚYÛ˜]\™H›Ú™XİØİ[Y[™Ù][š]X[[YTÚYÛ˜]\™J
+HÛÛœİÂˆÛÛœİ]]ÈX\Hİ]K™Ù]Ú[Ú]˜[YJY]\“X\\JNÂˆYˆ
+X\™Ù][PÚ[™[Š
+HOH
+Bˆ™]\›ˆßNÂ‚ˆÛÛœİ]]ÈÚ[HX\™Ù]Ú[
+
+NÂˆ™]\›ˆÈİ]X×ØØ\İ[ŠÚ[™Ù]›Ü\J›[Y\˜]Üˆ‹
+JKˆİ]X×ØØ\İ[ŠÚ[™Ù]›Ü\J™[›ÛZ[˜]Üˆ‹
+JHNÂŸB‚›ÚY›Ú™XİØİ[Y[œÙ][š]X[[YTÚYÛ˜]\™J[[Y\˜]Ü‹[[›ÛZ[˜]ÜŠBÂˆ[Y\˜]ÜˆHXÙNš›[Z]
+KÌ‹[Y\˜]ÜŠNÂˆYˆ
+[›ÛZ[˜]ÜˆOHH	‰ˆ[›ÛZ[˜]ÜˆOHˆ	‰ˆ[›ÛZ[˜]ÜˆOH	‰ˆ[›ÛZ[˜]ÜˆOHˆ	‰ˆ[›ÛZ[˜]ÜˆOHMˆ	‰ˆ[›ÛZ[˜]ÜˆOHÌŠBˆ[›ÛZ[˜]ÜˆHÂ‚ˆ]]ÈX\Hİ]K™Ù]Ú[Ú]˜[YJY]\“X\\JNÂˆYˆ
+X\™Ù][PÚ[™[Š
+HOH
+BˆX\˜YÚ[
+XZÙSY]\”Ú[
+[Y\˜]Ü‹[›ÛZ[˜]ÜŠKLK[ŠNÂˆ[ÙBˆÂˆ]]Èš\œİÚ[HX\™Ù]Ú[
+
+NÂˆš\œİÚ[œÙ]›Ü\J›[Y\˜]Üˆ‹[Y\˜]Ü‹[ŠNÂˆš\œİÚ[œÙ]›Ü\J™[›ÛZ[˜]Üˆ‹[›ÛZ[˜]Ü‹[ŠNÂˆBˆİ]KœÙ]›Ü\J[YTÚYÛ˜]\™S[Y\˜]Üˆ‹[Y\˜]Ü‹[ŠNÂˆİ]KœÙ]›Ü\J[YTÚYÛ˜]\™Q[›ÛZ[˜]Üˆ‹[›ÛZ[˜]Ü‹[ŠNÂŸB

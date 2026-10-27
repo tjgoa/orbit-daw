@@ -1,8032 +1,9265 @@
-#include <JuceHeader.h>
-#include <tracktion_engine/tracktion_engine.h>
-#include <cmath>
-#include <cstdio>
-#include <cstring>
-#include <map>
-
-#if JUCE_MAC || JUCE_LINUX
-#include <csignal>
-#include <fcntl.h>
-#include <limits.h>
-#include <unistd.h>
-#endif
-
-#include "Project/ProjectDocument.h"
-
-namespace te = tracktion::engine;
-
-namespace
-{
-#if JUCE_MAC || JUCE_LINUX
-char crashReportPath[PATH_MAX] = {};
-char crashReportHeader[512] = "Orbit crashed while running.";
-char currentVst3ScanTarget[PATH_MAX] = "(no VST3 plugin scan was active)";
-
-void writeSignalSafe(int fd, const char* text, size_t length)
-{
-    while (length > 0)
-    {
-        const auto written = ::write(fd, text, length);
-        if (written <= 0) return;
-        text += written;
-        length -= static_cast<size_t>(written);
-    }
-}
-
-void orbitFatalSignalHandler(int signalNumber)
-{
-    if (crashReportPath[0] != '\0')
-    {
-        const int fd = ::open(crashReportPath, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-        if (fd >= 0)
-        {
-            size_t headerLength = 0;
-            while (headerLength < sizeof(crashReportHeader) && crashReportHeader[headerLength] != '\0')
-                ++headerLength;
-            writeSignalSafe(fd, crashReportHeader, headerLength);
-            writeSignalSafe(fd, "\nFatal signal: ", 15);
-            const char* signalName = "UNKNOWN";
-            if (signalNumber == SIGABRT) signalName = "SIGABRT";
-            else if (signalNumber == SIGBUS) signalName = "SIGBUS";
-            else if (signalNumber == SIGFPE) signalName = "SIGFPE";
-            else if (signalNumber == SIGILL) signalName = "SIGILL";
-            else if (signalNumber == SIGSEGV) signalName = "SIGSEGV";
-            else if (signalNumber == SIGTRAP) signalName = "SIGTRAP";
-            size_t signalNameLength = 0;
-            while (signalName[signalNameLength] != '\0') ++signalNameLength;
-            writeSignalSafe(fd, signalName, signalNameLength);
-            writeSignalSafe(fd, " (", 2);
-            char digits[16];
-            size_t count = 0;
-            unsigned int number = static_cast<unsigned int>(signalNumber);
-            do { digits[count++] = static_cast<char>('0' + number % 10); number /= 10; } while (number > 0);
-            while (count > 0) writeSignalSafe(fd, &digits[--count], 1);
-            writeSignalSafe(fd, ")", 1);
-            writeSignalSafe(fd, "\nPlugin being scanned: ", 24);
-            size_t targetLength = 0;
-            while (targetLength < sizeof(currentVst3ScanTarget) && currentVst3ScanTarget[targetLength] != '\0')
-                ++targetLength;
-            writeSignalSafe(fd, currentVst3ScanTarget, targetLength);
-            static constexpr char footer[] = "\n\nThe operating system may also have created a detailed crash report in its DiagnosticReports folder.\n";
-            writeSignalSafe(fd, footer, sizeof(footer) - 1);
-            ::fsync(fd);
-            ::close(fd);
-        }
-    }
-
-    ::signal(signalNumber, SIG_DFL);
-    ::raise(signalNumber);
-    ::_exit(128 + signalNumber);
-}
-
-void installOrbitCrashReportHandler()
-{
-    const auto desktop = juce::File::getSpecialLocation(juce::File::userDesktopDirectory);
-    const auto stamp = juce::Time::getCurrentTime().formatted("%Y%m%d-%H%M%S");
-    const auto path = desktop.getChildFile("Orbit-Crash-Report-" + stamp + ".log").getFullPathName();
-    std::snprintf(crashReportPath, sizeof(crashReportPath), "%s", path.toRawUTF8());
-    std::snprintf(crashReportHeader, sizeof(crashReportHeader),
-                  "Orbit Build %s crashed.\nTime: %s\n", ProjectInfo::versionString, stamp.toRawUTF8());
-
-    for (const int signalNumber : { SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP })
-        std::signal(signalNumber, orbitFatalSignalHandler);
-}
-
-void setCurrentVst3ScanTarget(const juce::String& path)
-{
-    const auto utf8 = path.toRawUTF8();
-    std::snprintf(currentVst3ScanTarget, sizeof(currentVst3ScanTarget), "%s", utf8);
-}
-#else
-void installOrbitCrashReportHandler() {}
-void setCurrentVst3ScanTarget(const juce::String&) {}
-#endif
-
-class ToolbarButton final : public juce::TextButton
-{
-public:
-    enum class Symbol { none, play, stop, rewind, previous, next, record, playlist, mixer, master, settings, save, open };
-
-    explicit ToolbarButton(Symbol buttonSymbol = Symbol::none) : symbol(buttonSymbol)
-    {
-        setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(24, 31, 37));
-        setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(37, 112, 143));
-        setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(222, 232, 237));
-        setColour(juce::TextButton::textColourOnId, juce::Colours::white);
-    }
-
-    void setTextVisible(bool shouldShow) { showText = shouldShow; repaint(); }
-
-    void paintButton(juce::Graphics& g, bool highlighted, bool down) override
-    {
-        auto bounds = getLocalBounds().toFloat().reduced(0.5f);
-        auto fill = findColour(getToggleState() ? juce::TextButton::buttonOnColourId
-                                                : juce::TextButton::buttonColourId);
-        if (down) fill = fill.brighter(0.14f);
-        else if (highlighted) fill = fill.brighter(0.08f);
-        if (!isEnabled()) fill = fill.withAlpha(0.55f);
-        g.setColour(fill);
-        g.fillRoundedRectangle(bounds, 4.0f);
-        g.setColour(juce::Colour::fromRGB(92, 122, 137));
-        g.drawRoundedRectangle(bounds, 4.0f, 1.0f);
-
-        const auto iconColour = isEnabled() ? juce::Colour::fromRGB(185, 224, 238)
-                                            : juce::Colour::fromRGB(125, 145, 153);
-        const bool hasIcon = symbol != Symbol::none;
-        const float iconSize = hasIcon ? (showText ? 14.0f : juce::jmin(18.0f, static_cast<float>(getHeight()) * 0.62f)) : 0.0f;
-        const float iconX = !hasIcon ? bounds.getX() + 5.0f
-                          : showText ? bounds.getX() + 7.0f
-                                     : bounds.getCentreX() - iconSize * 0.5f;
-        const float iconY = bounds.getCentreY() - iconSize * 0.5f;
-        g.setColour(symbol == Symbol::record ? juce::Colour::fromRGB(225, 74, 67) : iconColour);
-        const auto triangle = [this, &g, iconX, iconY, iconSize](bool pointsRight, bool doubleArrow)
-        {
-            juce::Path path;
-            if (doubleArrow)
-            {
-                const float offset = iconSize * 0.48f;
-                path.addTriangle(iconX + (pointsRight ? 1.0f : iconSize * 0.52f), iconY + 1.0f,
-                                 iconX + (pointsRight ? iconSize * 0.48f : iconSize - 1.0f), iconY + iconSize * 0.5f,
-                                 iconX + (pointsRight ? 1.0f : iconSize * 0.52f), iconY + iconSize - 1.0f);
-                if (pointsRight)
-                    path.addTriangle(iconX + offset, iconY + 1.0f, iconX + iconSize - 1.0f, iconY + iconSize * 0.5f,
-                                     iconX + offset, iconY + iconSize - 1.0f);
-                else
-                    path.addTriangle(iconX + 1.0f, iconY + iconSize * 0.5f, iconX + iconSize - offset, iconY + 1.0f,
-                                     iconX + iconSize - offset, iconY + iconSize - 1.0f);
-            }
-            else if (pointsRight)
-                path.addTriangle(iconX + 1.0f, iconY + 1.0f, iconX + iconSize - 1.0f, iconY + iconSize * 0.5f,
-                                 iconX + 1.0f, iconY + iconSize - 1.0f);
-            else
-                path.addTriangle(iconX + iconSize - 1.0f, iconY + 1.0f, iconX + 1.0f, iconY + iconSize * 0.5f,
-                                 iconX + iconSize - 1.0f, iconY + iconSize - 1.0f);
-            g.fillPath(path);
-        };
-
-        switch (symbol)
-        {
-            case Symbol::play: triangle(true, false); break;
-            case Symbol::previous:
-                g.fillRect(iconX + iconSize - 2.0f, iconY + 1.0f, 2.0f, iconSize - 2.0f);
-                triangle(false, false);
-                break;
-            case Symbol::next:
-                g.fillRect(iconX, iconY + 1.0f, 2.0f, iconSize - 2.0f);
-                triangle(true, false);
-                break;
-            case Symbol::rewind:
-                g.fillRect(iconX, iconY + 1.0f, 2.0f, iconSize - 2.0f);
-                triangle(false, false);
-                break;
-            case Symbol::stop:
-                g.fillRoundedRectangle(iconX + 2.0f, iconY + 2.0f, iconSize - 4.0f, iconSize - 4.0f, 1.5f);
-                break;
-            case Symbol::record:
-                g.fillEllipse(iconX + 2.0f, iconY + 2.0f, iconSize - 4.0f, iconSize - 4.0f);
-                break;
-            case Symbol::playlist:
-                for (int row = 0; row < 3; ++row)
-                {
-                    const float y = iconY + 2.0f + row * 4.2f;
-                    g.fillRoundedRectangle(iconX, y, 4.0f, 3.0f, 0.7f);
-                    g.fillRect(iconX + 6.0f, y + 0.5f, iconSize - 7.0f, 1.2f);
-                }
-                break;
-            case Symbol::mixer:
-                for (int col = 0; col < 3; ++col)
-                {
-                    const float x = iconX + 3.0f + col * 4.7f;
-                    g.drawLine(x, iconY + 1.0f, x, iconY + iconSize - 1.0f, 1.2f);
-                    g.fillRoundedRectangle(x - 2.0f, iconY + (col == 1 ? 4.0f : 9.0f), 4.0f, 3.0f, 0.8f);
-                }
-                break;
-            case Symbol::master:
-                for (int col = 0; col < 4; ++col)
-                {
-                    const float h = 4.0f + static_cast<float>((col * 7) % 10);
-                    g.fillRoundedRectangle(iconX + 1.0f + col * 3.3f, iconY + iconSize - h,
-                                           2.2f, h, 0.7f);
-                }
-                break;
-            case Symbol::settings:
-                g.drawEllipse(iconX + 3.5f, iconY + 3.5f, iconSize - 7.0f, iconSize - 7.0f, 2.0f);
-                g.fillEllipse(iconX + iconSize * 0.42f, iconY + iconSize * 0.42f, iconSize * 0.16f, iconSize * 0.16f);
-                for (int spoke = 0; spoke < 8; ++spoke)
-                {
-                    const auto angle = juce::MathConstants<float>::twoPi * spoke / 8.0f;
-                    const auto center = juce::Point<float>(iconX + iconSize * 0.5f, iconY + iconSize * 0.5f);
-                    g.drawLine(center.x + std::cos(angle) * 5.5f, center.y + std::sin(angle) * 5.5f,
-                               center.x + std::cos(angle) * 7.5f, center.y + std::sin(angle) * 7.5f, 2.0f);
-                }
-                break;
-            case Symbol::save:
-                g.drawRoundedRectangle(iconX + 1.0f, iconY + 1.0f, iconSize - 2.0f, iconSize - 2.0f, 1.5f, 1.4f);
-                g.fillRect(iconX + 4.0f, iconY + 2.0f, iconSize - 8.0f, 4.0f);
-                g.drawRect(iconX + 4.0f, iconY + 8.0f, iconSize - 8.0f, iconSize - 10.0f, 1.2f);
-                break;
-            case Symbol::open:
-                g.drawLine(iconX + 1.0f, iconY + iconSize * 0.35f, iconX + 5.0f, iconY + iconSize * 0.35f, 1.8f);
-                g.drawLine(iconX + 5.0f, iconY + iconSize * 0.35f, iconX + 7.0f, iconY + iconSize * 0.5f, 1.8f);
-                g.drawRoundedRectangle(iconX + 1.0f, iconY + iconSize * 0.42f, iconSize - 2.0f,
-                                       iconSize * 0.45f, 1.2f, 1.5f);
-                break;
-            case Symbol::none: break;
-        }
-
-        if (showText)
-        {
-            g.setColour(findColour(getToggleState() ? juce::TextButton::textColourOnId
-                                                    : juce::TextButton::textColourOffId));
-            g.setFont(juce::FontOptions(10.5f, juce::Font::bold));
-            const auto textX = hasIcon ? static_cast<int>(iconX + iconSize + 6.0f) : 3;
-            const auto textWidth = hasIcon ? getWidth() - textX - 4 : getWidth() - 6;
-            g.drawFittedText(getButtonText(), juce::Rectangle<int>(textX, 0, textWidth, getHeight()),
-                juce::Justification::centredLeft, 1);
-        }
-    }
-
-private:
-    Symbol symbol;
-    bool showText = true;
-};
-
-class PianoRollButton final : public juce::TextButton
-{
-public:
-    using juce::TextButton::TextButton;
-
-    void paintButton(juce::Graphics& g, bool highlighted, bool down) override
-    {
-        juce::TextButton::paintButton(g, highlighted, down);
-        const auto x = 7.0f;
-        const auto y = static_cast<float>(getHeight()) * 0.5f - 7.0f;
-        const auto white = isEnabled() ? juce::Colour::fromRGB(190, 224, 238)
-                                       : juce::Colour::fromRGB(125, 145, 153);
-        g.setColour(white);
-        g.fillRoundedRectangle(x, y, 20.0f, 14.0f, 1.5f);
-        g.setColour(juce::Colour::fromRGB(74, 109, 125));
-        g.drawRoundedRectangle(x, y, 20.0f, 14.0f, 1.5f, 1.0f);
-        for (int key = 1; key < 7; ++key)
-            g.drawVerticalLine(static_cast<int>(x + static_cast<float>(key) * 20.0f / 7.0f), y + 7.0f, y + 13.0f);
-        g.setColour(juce::Colour::fromRGB(24, 39, 49));
-        for (const auto key : { 1, 2, 4, 5, 6 })
-        {
-            const auto keyX = x + static_cast<float>(key) * 20.0f / 7.0f - 1.2f;
-            g.fillRoundedRectangle(keyX, y, 2.5f, 7.5f, 0.8f);
-        }
-    }
-};
-
-class OutputMeterDisplay final : public juce::Component
-{
-public:
-    void paint(juce::Graphics& g) override
-    {
-        auto area = getLocalBounds().toFloat();
-        g.setColour(juce::Colour::fromRGB(18, 25, 30));
-        g.fillRoundedRectangle(area, 4.0f);
-        g.setColour(juce::Colour::fromRGB(81, 112, 126));
-        g.drawRoundedRectangle(area, 4.0f, 1.0f);
-        g.setColour(juce::Colour::fromRGB(177, 200, 210));
-        g.setFont(juce::FontOptions(9.0f, juce::Font::bold));
-        g.drawText("OUT", getLocalBounds().removeFromLeft(27), juce::Justification::centred);
-        auto meters = getLocalBounds().withTrimmedLeft(28).reduced(2, 5);
-        const int gap = 3;
-        const int channelWidth = (meters.getWidth() - gap) / 2;
-        for (int channel = 0; channel < 2; ++channel)
-        {
-            auto x = meters.getX() + channel * (channelWidth + gap);
-            g.setColour(juce::Colour::fromRGB(8, 15, 19));
-            g.fillRoundedRectangle(static_cast<float>(x), static_cast<float>(meters.getY()),
-                                   static_cast<float>(channelWidth), static_cast<float>(meters.getHeight()), 1.5f);
-            constexpr int segments = 14;
-            constexpr int segmentGap = 2;
-            const auto segmentHeight = juce::jmax(1, (meters.getHeight() - (segments - 1) * segmentGap) / segments);
-            for (int segment = 0; segment < segments; ++segment)
-            {
-                const auto y = meters.getBottom() - segmentHeight - segment * (segmentHeight + segmentGap);
-                const auto colour = segment >= 12 ? juce::Colour::fromRGB(184, 76, 62)
-                                  : segment >= 10 ? juce::Colour::fromRGB(203, 164, 66)
-                                                  : juce::Colour::fromRGB(48, 139, 158);
-                g.setColour(colour.withAlpha(0.48f));
-                g.fillRoundedRectangle(static_cast<float>(x + 2), static_cast<float>(y),
-                                       static_cast<float>(channelWidth - 4), static_cast<float>(segmentHeight), 0.8f);
-            }
-        }
-    }
-};
-
-class AudioSettingsWindow final : public juce::DocumentWindow
-{
-public:
-    explicit AudioSettingsWindow(juce::AudioDeviceManager& manager)
-        : DocumentWindow("Orbit Audio & MIDI Settings", juce::Colour::fromRGB(20, 29, 38), juce::DocumentWindow::closeButton)
-    {
-        setUsingNativeTitleBar(true);
-        setContentOwned(new juce::AudioDeviceSelectorComponent(manager, 0, 0, 1, 2, true, true, true, true), true);
-        setResizable(true, true);
-        centreWithSize(520, 460);
-    }
-
-    void closeButtonPressed() override { setVisible(false); }
-};
-
-class SearchPathEditor final : public juce::Component, private juce::ListBoxModel
-{
-public:
-    SearchPathEditor(juce::StringArray initialPaths,
-                     std::function<void(juce::StringArray)> save,
-                     std::function<void()> cancel,
-                     bool showVstStartupOption = false,
-                     bool scanVst3AtStartupInitially = false,
-                     std::function<void(bool)> saveVstStartupOption = {})
-        : paths(std::move(initialPaths)), onSave(std::move(save)), onCancel(std::move(cancel)),
-          hasVstStartupOption(showVstStartupOption), onSaveVstStartupOption(std::move(saveVstStartupOption))
-    {
-        title.setText(showVstStartupOption
-                          ? "Standard VST3 locations are included automatically. Add extra folders below."
-                          : "Folders Orbit searches",
-                      juce::dontSendNotification);
-        title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(208, 224, 233));
-        addAndMakeVisible(title);
-        folderList.setModel(this);
-        folderList.setRowHeight(30);
-        folderList.setMultipleSelectionEnabled(true);
-        addAndMakeVisible(folderList);
-
-        scanVst3AtStartup.setButtonText("Scan VST3 plugins at startup");
-        scanVst3AtStartup.setToggleState(scanVst3AtStartupInitially, juce::dontSendNotification);
-        scanVst3AtStartup.setVisible(hasVstStartupOption);
-        if (hasVstStartupOption) addAndMakeVisible(scanVst3AtStartup);
-
-        addFolder.setButtonText("Add Folder");
-        addFolder.onClick = [this] { chooseFolder(); };
-        addAndMakeVisible(addFolder);
-        removeFolder.setButtonText("Remove");
-        removeFolder.onClick = [this] { removeSelectedFolders(); };
-        addAndMakeVisible(removeFolder);
-        saveButton.setButtonText("Save");
-        saveButton.onClick = [this]
-        {
-            if (onSave) onSave(paths);
-            if (hasVstStartupOption && onSaveVstStartupOption)
-                onSaveVstStartupOption(scanVst3AtStartup.getToggleState());
-            if (onCancel) onCancel();
-        };
-        addAndMakeVisible(saveButton);
-        cancelButton.setButtonText("Cancel");
-        cancelButton.onClick = [this] { if (onCancel) onCancel(); };
-        addAndMakeVisible(cancelButton);
-    }
-
-    void resized() override
-    {
-        auto area = getLocalBounds().reduced(12);
-        title.setBounds(area.removeFromTop(24));
-        area.removeFromTop(6);
-        auto footer = area.removeFromBottom(34);
-        addFolder.setBounds(footer.removeFromLeft(112));
-        footer.removeFromLeft(6);
-        removeFolder.setBounds(footer.removeFromLeft(82));
-        auto right = footer.removeFromRight(176);
-        saveButton.setBounds(right.removeFromRight(92));
-        right.removeFromRight(6);
-        cancelButton.setBounds(right.removeFromRight(78));
-        if (hasVstStartupOption)
-        {
-            area.removeFromBottom(6);
-            scanVst3AtStartup.setBounds(area.removeFromBottom(24));
-        }
-        folderList.setBounds(area);
-    }
-
-private:
-    int getNumRows() override { return paths.size(); }
-
-    void paintListBoxItem(int row, juce::Graphics& g, int width, int height, bool selected) override
-    {
-        if (!juce::isPositiveAndBelow(row, paths.size())) return;
-        g.fillAll(selected ? juce::Colour::fromRGB(54, 109, 137)
-                           : (row % 2 == 0 ? juce::Colour::fromRGB(31, 45, 55)
-                                           : juce::Colour::fromRGB(37, 52, 62)));
-        g.setColour(juce::Colour::fromRGB(220, 231, 237));
-        g.setFont(13.0f);
-        g.drawText(paths[row], 10, 0, width - 20, height, juce::Justification::centredLeft, true);
-    }
-
-    void chooseFolder()
-    {
-        addFolder.setEnabled(false);
-        chooser = std::make_unique<juce::FileChooser>("Add a search folder",
-            juce::File::getSpecialLocation(juce::File::userHomeDirectory), "*");
-        juce::Component::SafePointer<SearchPathEditor> safeThis(this);
-        chooser->launchAsync(juce::FileBrowserComponent::openMode
-                             | juce::FileBrowserComponent::canSelectDirectories,
-            [safeThis](const juce::FileChooser& fileChooser)
-            {
-                if (safeThis == nullptr) return;
-                const auto folder = fileChooser.getResult();
-                if (folder.isDirectory())
-                {
-                    const auto fullPath = folder.getFullPathName();
-                    if (!safeThis->paths.contains(fullPath)) safeThis->paths.add(fullPath);
-                    safeThis->folderList.updateContent();
-                    safeThis->folderList.repaint();
-                }
-                safeThis->addFolder.setEnabled(true);
-            });
-    }
-
-    void removeSelectedFolders()
-    {
-        auto selected = folderList.getSelectedRows();
-        for (int i = selected.size(); --i >= 0;)
-            if (juce::isPositiveAndBelow(selected[i], paths.size())) paths.remove(selected[i]);
-        folderList.updateContent();
-        folderList.repaint();
-    }
-
-    juce::StringArray paths;
-    std::function<void(juce::StringArray)> onSave;
-    std::function<void()> onCancel;
-    juce::Label title;
-    juce::ListBox folderList;
-    juce::ToggleButton scanVst3AtStartup;
-    juce::TextButton addFolder, removeFolder, saveButton, cancelButton;
-    std::unique_ptr<juce::FileChooser> chooser;
-    bool hasVstStartupOption = false;
-    std::function<void(bool)> onSaveVstStartupOption;
-};
-
-class SearchPathsWindow final : public juce::DocumentWindow
-{
-public:
-    SearchPathsWindow(const juce::String& windowTitle, juce::StringArray paths,
-                      std::function<void(juce::StringArray)> onSave,
-                      bool showVstStartupOption = false,
-                      bool scanVst3AtStartupInitially = false,
-                      std::function<void(bool)> saveVstStartupOption = {})
-        : DocumentWindow(windowTitle, juce::Colour::fromRGB(20, 29, 38), juce::DocumentWindow::closeButton)
-    {
-        setUsingNativeTitleBar(true);
-        setContentOwned(new SearchPathEditor(std::move(paths), std::move(onSave), [this] { setVisible(false); },
-                                             showVstStartupOption, scanVst3AtStartupInitially,
-                                             std::move(saveVstStartupOption)), true);
-        setResizable(true, true);
-        centreWithSize(620, 390);
-    }
-
-    void closeButtonPressed() override { setVisible(false); }
-};
-
-class Vst3InstrumentBrowser final : public juce::DocumentWindow,
-                                    private juce::ListBoxModel,
-                                    private juce::Timer
-{
-public:
-    Vst3InstrumentBrowser(juce::AudioPluginFormatManager& formats, juce::KnownPluginList& knownPlugins,
-                          std::function<juce::StringArray()> getSearchPaths,
-                          std::function<void()> openPathSettings,
-                          std::function<void(const juce::PluginDescription&)> onInsert)
-        : DocumentWindow("Insert VST3 Instrument", juce::Colour::fromRGB(20, 29, 38),
-                         juce::DocumentWindow::closeButton),
-          pluginFormats(formats), pluginList(knownPlugins), readPaths(std::move(getSearchPaths)),
-          showPathSettings(std::move(openPathSettings)), insertPlugin(std::move(onInsert))
-    {
-        setUsingNativeTitleBar(true);
-        list.setColour(juce::ListBox::backgroundColourId, juce::Colour::fromRGB(25, 38, 48));
-        list.setModel(this);
-        list.setRowHeight(34);
-        list.setMultipleSelectionEnabled(false);
-
-        scanButton.onClick = [this] { beginScan(); };
-        pathsButton.onClick = [this] { if (showPathSettings) showPathSettings(); };
-        insertButton.onClick = [this]
-        {
-            const int selected = list.getSelectedRow();
-            if (!juce::isPositiveAndBelow(selected, instruments.size())) return;
-            if (insertPlugin) insertPlugin(instruments.getReference(selected));
-            setVisible(false);
-        };
-        closeButton.onClick = [this] { setVisible(false); };
-        addAndMakeVisible(&list);
-        addAndMakeVisible(&scanButton);
-        addAndMakeVisible(&pathsButton);
-        addAndMakeVisible(&insertButton);
-        addAndMakeVisible(&closeButton);
-        addAndMakeVisible(&information);
-        setResizable(true, true);
-        setSize(640, 430);
-        refreshInstrumentList();
-    }
-
-    ~Vst3InstrumentBrowser() override { stopTimer(); }
-    void closeButtonPressed() override { setVisible(false); }
-    bool needsInitialScan() const { return !hasStartedScan; }
-    void scanNow() { beginScan(); }
-
-private:
-    int getNumRows() override { return instruments.size(); }
-    void paintListBoxItem(int row, juce::Graphics& g, int width, int height, bool selected) override
-    {
-        if (!juce::isPositiveAndBelow(row, instruments.size())) return;
-        g.fillAll(selected ? juce::Colour::fromRGB(38, 111, 143) : juce::Colour::fromRGB(25, 38, 48));
-        const auto& description = instruments.getReference(row);
-        g.setColour(juce::Colour::fromRGB(229, 237, 241));
-        g.setFont(14.0f);
-        g.drawText(description.name, 10, 2, width - 20, height / 2, juce::Justification::centredLeft);
-        g.setColour(juce::Colour::fromRGB(151, 178, 190));
-        g.setFont(11.0f);
-        g.drawText(description.manufacturerName + "  Â·  VST3", 10, height / 2, width - 20,
-                   height / 2 - 2, juce::Justification::centredLeft);
-    }
-
-    void resized() override
-    {
-        DocumentWindow::resized();
-        auto bounds = getLocalBounds().reduced(12);
-        auto buttons = bounds.removeFromBottom(34);
-        information.setBounds(bounds.removeFromTop(48));
-        list.setBounds(bounds);
-        scanButton.setBounds(buttons.removeFromLeft(100));
-        buttons.removeFromLeft(8);
-        pathsButton.setBounds(buttons.removeFromLeft(132));
-        buttons.removeFromLeft(8);
-        insertButton.setBounds(buttons.removeFromRight(104));
-        buttons.removeFromRight(8);
-        closeButton.setBounds(buttons.removeFromRight(88));
-    }
-
-    void beginScan()
-    {
-        stopTimer();
-        scanner.reset();
-        hasStartedScan = true;
-        auto* format = findVst3Format();
-        if (format == nullptr)
-        {
-            information.setText("VST3 hosting is unavailable in this build.", juce::dontSendNotification);
-            return;
-        }
-
-        auto searchPath = format->getDefaultLocationsToSearch();
-        const auto configuredPaths = readPaths ? readPaths() : juce::StringArray{};
-        for (const auto& path : configuredPaths)
-        {
-            juce::File folder(path);
-            if (folder.isDirectory())
-                searchPath.add(folder);
-        }
-        if (searchPath.getNumPaths() == 0)
-        {
-            information.setText("Add one or more VST3 folders, then scan again.", juce::dontSendNotification);
-            if (showPathSettings) showPathSettings();
-            return;
-        }
-
-        const auto stamp = juce::Time::getCurrentTime().formatted("%Y%m%d-%H%M%S");
-        scanLogFile = juce::File::getSpecialLocation(juce::File::userDesktopDirectory)
-                          .getChildFile("Orbit-VST3-Scan-" + stamp + ".log");
-        scanLog = std::make_unique<juce::FileOutputStream>(scanLogFile);
-        if (scanLog != nullptr && scanLog->openedOk())
-        {
-            scanLog->writeText("Orbit VST3 scan started: " + juce::Time::getCurrentTime().toString(true, true)
-                               + "\nSearch folders (standard plus custom):\n", false, false, nullptr);
-            for (int i = 0; i < searchPath.getNumPaths(); ++i)
-                scanLog->writeText("  " + searchPath[i].getFullPathName() + "\n", false, false, nullptr);
-            const auto blacklistedFiles = pluginList.getBlacklistedFiles();
-            scanLog->writeText("\nPreviously blacklisted after a scan crash: "
-                               + juce::String(blacklistedFiles.size()) + "\n", false, false, nullptr);
-            for (const auto& blacklisted : blacklistedFiles)
-                scanLog->writeText("  " + blacklisted + "\n", false, false, nullptr);
-            scanLog->flush();
-        }
-
-        auto deadMansPedal = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-                                  .getChildFile("Orbit").getChildFile("vst3-scan-dead-mans-pedal.txt");
-        deadMansPedal.getParentDirectory().createDirectory();
-        scanner = std::make_unique<juce::PluginDirectoryScanner>(pluginList, *format, searchPath, true,
-                                                                 deadMansPedal, false);
-        information.setText("Scanning VST3 instrumentsâ€¦ " + juce::String(searchPath.getNumPaths())
-                            + " search folder(s). Scan log: Desktop/" + scanLogFile.getFileName(),
-                            juce::dontSendNotification);
-        scanTotalCandidates = format->searchPathsForPlugins(searchPath, true, false).size();
-        scanCompletedCandidates = 0;
-        if (scanLog != nullptr && scanLog->openedOk())
-        {
-            scanLog->writeText("\nPlugin bundles found to check: " + juce::String(scanTotalCandidates) + "\n",
-                               false, false, nullptr);
-            scanLog->flush();
-        }
-        scanButton.setEnabled(false);
-        startTimerHz(15);
-    }
-
-    void timerCallback() override
-    {
-        if (scanner == nullptr) { stopTimer(); return; }
-        const auto currentPlugin = scanner->getNextPluginFileThatWillBeScanned();
-        setCurrentVst3ScanTarget(currentPlugin);
-        if (currentPlugin.isNotEmpty())
-        {
-            ++scanCompletedCandidates;
-            information.setText("Scanning " + juce::File(currentPlugin).getFileName()
-                                    + "  (" + juce::String(scanCompletedCandidates) + "/"
-                                    + juce::String(scanTotalCandidates) + ")",
-                                juce::dontSendNotification);
-            if (scanLog != nullptr && scanLog->openedOk())
-            {
-                scanLog->writeText("Checking: " + currentPlugin + "\n", false, false, nullptr);
-                scanLog->flush();
-            }
-        }
-        juce::String currentFile;
-        const bool moreToScan = scanner->scanNextFile(true, currentFile);
-        if (moreToScan)
-        {
-            const auto progress = juce::roundToInt(scanner->getProgress() * 100.0f);
-            if (currentPlugin.isNotEmpty() && scanLog != nullptr && scanLog->openedOk())
-            {
-                scanLog->writeText("Checked: " + currentPlugin + "\n", false, false, nullptr);
-                scanLog->flush();
-            }
-            information.setText("Scanning " + juce::File(currentPlugin).getFileName()
-                                    + "  (" + juce::String(progress) + "% complete)",
-                                juce::dontSendNotification);
-            return;
-        }
-        if (currentPlugin.isNotEmpty() && scanLog != nullptr && scanLog->openedOk())
-            scanLog->writeText("Checked: " + currentPlugin + "\n", false, false, nullptr);
-        const auto failedFiles = scanner->getFailedFiles();
-        if (scanLog != nullptr && scanLog->openedOk())
-        {
-            scanLog->writeText("\nFailed plugin bundles: " + juce::String(failedFiles.size()) + "\n",
-                               false, false, nullptr);
-            for (const auto& failed : failedFiles)
-                scanLog->writeText("  " + failed + "\n", false, false, nullptr);
-            scanLog->writeText("\nVST3 instruments available after scan:\n", false, false, nullptr);
-            for (const auto& instrument : instruments)
-                scanLog->writeText("  " + instrument.name + " â€” " + instrument.manufacturerName + "\n",
-                                   false, false, nullptr);
-        }
-        scanner.reset();
-        stopTimer();
-        scanButton.setEnabled(true);
-        refreshInstrumentList();
-        int discoveredVst3Types = 0;
-        for (const auto& description : pluginList.getTypes())
-            if (description.pluginFormatName == "VST3") ++discoveredVst3Types;
-        const auto summary = "\nScan complete. VST3 plugins discovered: " + juce::String(discoveredVst3Types)
-            + "; instruments available: " + juce::String(instruments.size())
-            + "; bundles that failed: " + juce::String(failedFiles.size()) + "\nLog: " + scanLogFile.getFullPathName() + "\n";
-        if (scanLog != nullptr && scanLog->openedOk())
-        {
-            scanLog->writeText(summary, false, false, nullptr);
-            scanLog->flush();
-            scanLog.reset();
-        }
-        information.setText("Done. " + juce::String(instruments.size()) + " VST3 instrument(s) ready; "
-                            + juce::String(failedFiles.size()) + " bundle(s) failed. Plugin names are in the Desktop scan log.",
-                            juce::dontSendNotification);
-        setCurrentVst3ScanTarget("(no VST3 plugin scan was active)");
-    }
-
-    juce::AudioPluginFormat* findVst3Format() const
-    {
-        for (int i = 0; i < pluginFormats.getNumFormats(); ++i)
-            if (auto* format = pluginFormats.getFormat(i); format != nullptr && format->getName() == "VST3")
-                return format;
-        return nullptr;
-    }
-
-    void refreshInstrumentList()
-    {
-        instruments.clear();
-        for (const auto& description : pluginList.getTypes())
-            if (description.pluginFormatName == "VST3" && description.isInstrument)
-                instruments.add(description);
-        std::sort(instruments.begin(), instruments.end(), [](const auto& a, const auto& b)
-        {
-            return a.name.compareIgnoreCase(b.name) < 0;
-        });
-        list.updateContent();
-        insertButton.setEnabled(!instruments.isEmpty());
-    }
-
-    juce::AudioPluginFormatManager& pluginFormats;
-    juce::KnownPluginList& pluginList;
-    std::function<juce::StringArray()> readPaths;
-    std::function<void()> showPathSettings;
-    std::function<void(const juce::PluginDescription&)> insertPlugin;
-    juce::ListBox list{"VST3 instruments", this};
-    juce::Label information;
-    juce::TextButton scanButton{"Scan"}, pathsButton{"VST Pathsâ€¦"}, insertButton{"Insert"}, closeButton{"Close"};
-    juce::Array<juce::PluginDescription> instruments;
-    std::unique_ptr<juce::PluginDirectoryScanner> scanner;
-    juce::File scanLogFile;
-    std::unique_ptr<juce::FileOutputStream> scanLog;
-    int scanTotalCandidates = 0;
-    int scanCompletedCandidates = 0;
-    bool hasStartedScan = false;
-};
-
-class PlaylistGrid final : public juce::Component
-{
-public:
-    static constexpr int barCount = 64;
-    PlaylistGrid()
-    {
-        zoomOut.setButtonText("H-");
-        zoomOut.setTooltip("Zoom out in the Playlist.");
-        zoomOut.onClick = [this] { setHorizontalZoom(horizontalZoom - 0.1f); };
-        addAndMakeVisible(zoomOut);
-        zoomIn.setButtonText("+");
-        zoomIn.setTooltip("Zoom in in the Playlist.");
-        zoomIn.onClick = [this] { setHorizontalZoom(horizontalZoom + 0.1f); };
-        addAndMakeVisible(zoomIn);
-        verticalZoomOut.setButtonText("V-");
-        verticalZoomOut.setTooltip("Reduce Playlist track height.");
-        verticalZoomOut.onClick = [this] { setVerticalZoom(verticalZoom - 0.1f); };
-        addAndMakeVisible(verticalZoomOut);
-        verticalZoomIn.setButtonText("V+");
-        verticalZoomIn.setTooltip("Increase Playlist track height.");
-        verticalZoomIn.onClick = [this] { setVerticalZoom(verticalZoom + 0.1f); };
-        addAndMakeVisible(verticalZoomIn);
-        pencilTool.setButtonText("Draw");
-        pencilTool.setTooltip("Draw tool: click or drag to place the selected pattern, replacing a clip when needed.");
-        pencilTool.setClickingTogglesState(false);
-        pencilTool.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-        addAndMakeVisible(pencilTool);
-        selectTool.setButtonText("Move");
-        selectTool.setTooltip("Selection tool: drag clips to move them.");
-        selectTool.setClickingTogglesState(false);
-        addAndMakeVisible(selectTool);
-        pencilTool.setToggleState(true, juce::dontSendNotification);
-        pencilTool.onClick = [this] { pencilTool.setToggleState(true, juce::dontSendNotification); selectTool.setToggleState(false, juce::dontSendNotification); if (onToolChanged) onToolChanged(true); };
-        selectTool.onClick = [this] { pencilTool.setToggleState(false, juce::dontSendNotification); selectTool.setToggleState(true, juce::dontSendNotification); if (onToolChanged) onToolChanged(false); };
-        // The controls are hosted in the fixed Playlist toolbar so they stay
-        // reachable while the timeline itself is scrolled.
-        for (auto* control : { &zoomOut, &zoomIn, &verticalZoomOut, &verticalZoomIn, &pencilTool, &selectTool })
-            control->setVisible(false);
-    }
-
-    int labelWidth() const { return 190; }
-    int headerHeight() const { return 34; }
-    int rowHeight() const { return juce::roundToInt(46.0f * verticalZoom); }
-    int barWidth() const { return juce::roundToInt(92.0f * horizontalZoom); }
-    int contentWidth() const { return labelWidth() + barCount * barWidth(); }
-    int contentHeight() const { return headerHeight() + juce::jmax(1, trackCount ? trackCount() : 0) * rowHeight(); }
-    float currentHorizontalZoom() const { return horizontalZoom; }
-    float currentVerticalZoom() const { return verticalZoom; }
-
-    void setHorizontalZoom(float nextZoom)
-    {
-        horizontalZoom = juce::jlimit(0.55f, 1.55f, nextZoom);
-        refreshLayout();
-    }
-
-    void setVerticalZoom(float nextZoom)
-    {
-        verticalZoom = juce::jlimit(0.65f, 1.5f, nextZoom);
-        refreshLayout();
-    }
-
-    void setDrawMode(bool shouldDraw)
-    {
-        pencilTool.setToggleState(shouldDraw, juce::dontSendNotification);
-        selectTool.setToggleState(!shouldDraw, juce::dontSendNotification);
-        if (onToolChanged) onToolChanged(shouldDraw);
-    }
-
-    void refreshLayout()
-    {
-        if (onZoomChanged) onZoomChanged();
-    }
-    bool pencilActive() const { return pencilTool.getToggleState(); }
-
-    std::function<void(bool)> onToolChanged;
-    std::function<void()> onPaintFinished;
-    std::function<bool()> isPencilToolActive;
-    std::function<void(int, bool)> setTrackMute;
-    std::function<bool(int)> getTrackMute;
-    std::function<void(int, bool)> setTrackSolo;
-    std::function<bool(int)> getTrackSolo;
-    std::function<void(int, bool)> setTrackRecordArm;
-    std::function<bool(int)> getTrackRecordArm;
-
-    std::function<void()> onZoomChanged;
-    std::function<int()> trackCount;
-    std::function<juce::String(int)> trackName;
-    std::function<juce::String(int, int)> clipName;
-    std::function<std::vector<juce::Point<int>>(int, int)> clipNotes;
-    std::function<void(int, int)> cellClicked;
-    std::function<void(int, int)> cellPainted;
-    std::function<void(int, int, int, int)> clipDragged;
-    std::function<void(int, int, juce::Component*)> showPatternMenu;
-    std::function<void(int, int)> cellDeleted;
-    std::function<void(int, int, int)> scrollPattern;
-
-private:
-    float horizontalZoom = 1.0f;
-    float verticalZoom = 1.0f;
-    juce::TextButton zoomOut, zoomIn, verticalZoomOut, verticalZoomIn, pencilTool, selectTool;
-    void resized() override
-    {
-        const auto h = headerHeight();
-        pencilTool.setBounds(5, 4, 40, juce::jmax(20, h - 8));
-        selectTool.setBounds(47, 4, 40, juce::jmax(20, h - 8));
-        zoomOut.setButtonText("Hâˆ’");
-        zoomIn.setButtonText("H+");
-        zoomOut.setBounds(labelWidth() - 112, 4, 25, juce::jmax(20, h - 8));
-        zoomIn.setBounds(labelWidth() - 86, 4, 25, juce::jmax(20, h - 8));
-        zoomOut.setButtonText("H-");
-        verticalZoomOut.setButtonText("V-");
-        verticalZoomOut.setBounds(labelWidth() - 59, 4, 29, juce::jmax(20, h - 8));
-        verticalZoomIn.setBounds(labelWidth() - 29, 4, 25, juce::jmax(20, h - 8));
-    }
-
-public:
-
-    class PlaylistCellButton final : public juce::TextButton
-    {
-    public:
-        std::function<void()> onActivate;
-        std::function<void(int, int)> onDragToCell;
-        std::function<void(int, int, juce::Component*)> onPatternMenu;
-        std::function<void(int, int)> onDeleteClip;
-        std::function<void(int, int, int)> onPatternScroll;
-        std::function<bool()> pencilMode;
-        std::function<void(int, int)> paintCell;
-        std::function<void()> paintFinished;
-        std::function<bool()> sourceHasClip;
-        int barWidthForDrag = 92;
-        int rowHeightForDrag = 46;
-
-        PlaylistCellButton()
-        {
-            setClickingTogglesState(false);
-            setColour(juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
-            setColour(juce::TextButton::buttonOnColourId, juce::Colours::transparentBlack);
-            setColour(juce::TextButton::textColourOffId, juce::Colours::transparentBlack);
-            setColour(juce::TextButton::textColourOnId, juce::Colours::transparentBlack);
-            onClick = [this]
-            {
-                if (!dragGesture && pencilMode && pencilMode())
-                {
-                    if (sourceHasClip && sourceHasClip())
-                    {
-                        if (onActivate) onActivate();
-                    }
-                    else if (paintCell) paintCell(trackIndex, barIndex);
-                }
-                else if (!dragGesture && onActivate) onActivate();
-            };
-        }
-
-        void configure(int track, int bar, const juce::String& trackLabel,
-                       const juce::String& currentClip,
-                       std::function<void(int, int)> activate,
-                       std::function<void(int, int)> paint,
-                       std::function<void()> finishPaint,
-                       std::function<bool()> pencil,
-                       std::function<void(int, int, int, int)> drag,
-                       int scaledBarWidth, int scaledRowHeight)
-        {
-            barIndex = bar;
-            trackIndex = track;
-            barWidthForDrag = scaledBarWidth;
-            rowHeightForDrag = scaledRowHeight;
-            dragGesture = false;
-            onActivate = [activateCallback = std::move(activate), track, bar]
-            {
-                if (activateCallback) activateCallback(track, bar);
-            };
-            onDragToCell = [dragCallback = std::move(drag), track, bar](int destinationTrack, int destinationBar)
-            {
-                if (dragCallback) dragCallback(track, bar, destinationTrack, destinationBar);
-            };
-            paintCell = std::move(paint);
-            paintFinished = std::move(finishPaint);
-            pencilMode = std::move(pencil);
-            sourceHasClip = [currentClip] { return currentClip.isNotEmpty(); };
-            const auto barLabel = "Bar " + juce::String(bar + 1);
-            setButtonText(currentClip.isNotEmpty() ? currentClip : barLabel);
-            setTitle(trackLabel + ", " + barLabel);
-            setDescription(currentClip.isNotEmpty()
-                ? "Contains pattern " + currentClip + ". Drag it to move the clip."
-                : "Empty playlist cell. Activate to place the selected pattern here.");
-            setTooltip(trackLabel + ", " + barLabel + (currentClip.isNotEmpty()
-                ? " â€” " + currentClip : " â€” empty; activate to place the selected pattern"));
-        }
-
-        void mouseDown(const juce::MouseEvent& event) override
-        {
-            if (event.mods.isRightButtonDown())
-            {
-                if (sourceHasClip && sourceHasClip() && onDeleteClip)
-                    onDeleteClip(trackIndex, barIndex);
-                rightClickHandled = true;
-                return;
-            }
-            dragGesture = false;
-            dragSourceHasClip = sourceHasClip && sourceHasClip();
-            juce::TextButton::mouseDown(event);
-        }
-
-        void mouseDrag(const juce::MouseEvent& event) override
-        {
-            if (event.getDistanceFromDragStart() >= 8)
-            {
-                if (pencilMode && pencilMode())
-                {
-                    dragGesture = true;
-                    if (paintCell) paintCell(trackIndex, barIndex);
-                    const auto pointInGrid = event.getEventRelativeTo(getParentComponent()).position;
-                    const auto* grid = dynamic_cast<const PlaylistGrid*>(getParentComponent());
-                    const int destinationTrack = grid != nullptr
-                        ? static_cast<int>((pointInGrid.y - grid->headerHeight()) / rowHeightForDrag) : -1;
-                    const int destinationBar = grid != nullptr
-                        ? static_cast<int>((pointInGrid.x - grid->labelWidth()) / barWidthForDrag) : -1;
-                    if (destinationTrack >= 0 && destinationBar >= 0 && paintCell)
-                        paintCell(destinationTrack, destinationBar);
-                }
-                else if (dragSourceHasClip) dragGesture = true;
-            }
-            juce::TextButton::mouseDrag(event);
-        }
-
-        void mouseUp(const juce::MouseEvent& event) override
-        {
-            if (rightClickHandled)
-            {
-                rightClickHandled = false;
-                return;
-            }
-            const auto pointInGrid = event.getEventRelativeTo(getParentComponent()).position;
-            const auto* grid = dynamic_cast<const PlaylistGrid*>(getParentComponent());
-            const int destinationTrack = grid != nullptr
-                ? static_cast<int>((pointInGrid.y - grid->headerHeight()) / rowHeightForDrag) : -1;
-            const int destinationBar = grid != nullptr
-                ? static_cast<int>((pointInGrid.x - grid->labelWidth()) / barWidthForDrag) : -1;
-            const bool shouldMove = dragGesture && dragSourceHasClip && !(pencilMode && pencilMode())
-                && destinationTrack >= 0 && destinationBar >= 0;
-            juce::TextButton::mouseUp(event);
-            if (shouldMove && onDragToCell)
-                onDragToCell(destinationTrack, destinationBar);
-            if (pencilMode && pencilMode() && paintFinished) paintFinished();
-            dragGesture = false;
-            dragSourceHasClip = false;
-        }
-
-        void mouseDoubleClick(const juce::MouseEvent& event) override
-        {
-            if (sourceHasClip && sourceHasClip() && onPatternMenu)
-                onPatternMenu(trackIndex, barIndex, this);
-            juce::TextButton::mouseDoubleClick(event);
-        }
-
-        void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override
-        {
-            if (sourceHasClip && sourceHasClip() && onPatternScroll && std::abs(wheel.deltaY) > 0.001f)
-                onPatternScroll(trackIndex, barIndex, wheel.deltaY > 0.0f ? -1 : 1);
-            else
-                juce::TextButton::mouseWheelMove(event, wheel);
-        }
-
-    private:
-        int barIndex = -1;
-        int trackIndex = -1;
-        bool dragGesture = false;
-        bool dragSourceHasClip = false;
-        bool rightClickHandled = false;
-    };
-
-    class TrackControls final : public juce::Component
-    {
-    public:
-        juce::TextButton mute { "M" }, solo { "S" }, record { "R" };
-        TrackControls()
-        {
-            for (auto* button : { &mute, &solo, &record })
-            {
-                button->setClickingTogglesState(true);
-                button->setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 51, 62));
-                button->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(164, 72, 66));
-                button->setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(197, 214, 224));
-                button->setColour(juce::TextButton::textColourOnId, juce::Colours::white);
-                addAndMakeVisible(*button);
-            }
-        }
-        void resized() override
-        {
-            auto area = getLocalBounds().reduced(1, 9);
-            mute.setBounds(area.removeFromLeft(25)); area.removeFromLeft(2);
-            solo.setBounds(area.removeFromLeft(25)); area.removeFromLeft(2);
-            record.setBounds(area.removeFromLeft(25));
-        }
-    };
-
-    void paint(juce::Graphics& g) override
-    {
-        const auto labelWidthPx = labelWidth();
-        const auto headerHeightPx = headerHeight();
-        const auto rowHeightPx = rowHeight();
-        const auto barWidthPx = barWidth();
-        g.fillAll(juce::Colour::fromRGB(20, 29, 38));
-        g.setColour(juce::Colour::fromRGB(29, 43, 55));
-        g.fillRect(0, 0, getWidth(), headerHeightPx);
-        g.setColour(juce::Colour::fromRGB(178, 198, 211));
-        g.setFont(14.0f);
-        g.drawText("GENERATOR", 8, 0, labelWidthPx - 112, headerHeightPx, juce::Justification::centredLeft);
-        for (int bar = 0; bar < barCount; ++bar)
-        {
-            if (bar % highlightEveryBars == 0)
-            {
-                g.setColour(juce::Colour::fromRGB(178, 198, 211));
-                g.drawText("Bar " + juce::String(bar + 1), labelWidthPx + bar * barWidthPx, 0, barWidthPx, headerHeightPx,
-                           juce::Justification::centred);
-            }
-        }
-
-        const auto count = trackCount ? trackCount() : 0;
-        for (int row = 0; row < count; ++row)
-        {
-            const auto y = headerHeightPx + row * rowHeightPx;
-            g.setColour(row % 2 == 0 ? juce::Colour::fromRGB(25, 38, 49) : juce::Colour::fromRGB(22, 33, 43));
-            g.fillRect(0, y, getWidth(), rowHeightPx);
-            g.setColour(juce::Colour::fromRGB(178, 198, 211));
-            g.drawText(juce::String(row + 1) + "   " + (trackName ? trackName(row) : juce::String{}),
-                       8, y, labelWidthPx - 108, rowHeightPx, juce::Justification::centredLeft);
-            for (int bar = 0; bar < barCount; ++bar)
-            {
-                const auto x = labelWidthPx + bar * barWidthPx;
-                g.setColour(juce::Colour::fromRGB(43, 61, 74));
-                g.drawRect(x, y, barWidthPx, rowHeightPx, 1);
-                const auto label = clipName ? clipName(row, bar) : juce::String{};
-                if (showPatternLabels && label.isNotEmpty())
-                {
-                    if (clipNotes)
-                    {
-                        const auto notes = clipNotes(row, bar);
-                        g.setColour(juce::Colour::fromRGB(78, 166, 198).withAlpha(0.30f));
-                        for (const auto note : notes)
-                        {
-                            const auto noteX = x + 3 + note.x * (barWidthPx - 8) / 64;
-                            const auto noteY = y + rowHeightPx - 7 - note.y * (rowHeightPx - 18) / 36;
-                            g.fillRoundedRectangle(static_cast<float>(noteX), static_cast<float>(noteY),
-                                                   juce::jmax(2.0f, static_cast<float>(barWidthPx) / 64.0f * 2.0f),
-                                                   2.0f, 1.0f);
-                        }
-                    }
-                    g.setColour(juce::Colour::fromRGB(39, 125, 165).withAlpha(0.60f));
-                    g.fillRoundedRectangle(static_cast<float>(x + 3), static_cast<float>(y + 4),
-                                           static_cast<float>(barWidthPx - 6), static_cast<float>(rowHeightPx - 8), 5.0f);
-                    g.setColour(juce::Colours::white);
-                    g.drawText(label, x + 3, y + 4, barWidthPx - 6, rowHeightPx - 8, juce::Justification::centred);
-                }
-            }
-        }
-        g.setColour(juce::Colour::fromRGB(65, 94, 112));
-        g.drawRect(getLocalBounds(), 1);
-    }
-
-    void mouseDown(const juce::MouseEvent& event) override
-    {
-        const auto row = (event.y - headerHeight()) / rowHeight();
-        const auto bar = (event.x - labelWidth()) / barWidth();
-        if (event.x < labelWidth() || event.y < headerHeight() || !trackCount
-            || !juce::isPositiveAndBelow(row, trackCount()) || !juce::isPositiveAndBelow(bar, barCount))
-            return;
-        dragSourceRow = row;
-        dragSourceBar = bar;
-        dragSourceHasClip = clipName && clipName(row, bar).isNotEmpty();
-    }
-
-    void mouseUp(const juce::MouseEvent& event) override
-    {
-        if (dragSourceRow < 0 || dragSourceBar < 0) return;
-        const auto destinationRow = (event.y - headerHeight()) / rowHeight();
-        const auto destinationBar = (event.x - labelWidth()) / barWidth();
-        const bool moved = dragSourceHasClip && event.getDistanceFromDragStart() >= 8
-            && juce::isPositiveAndBelow(destinationRow, trackCount ? trackCount() : 0)
-            && juce::isPositiveAndBelow(destinationBar, barCount);
-        if (moved)
-        {
-            if (clipDragged && (destinationRow != dragSourceRow || destinationBar != dragSourceBar))
-                clipDragged(dragSourceRow, dragSourceBar, destinationRow, destinationBar);
-        }
-        else if (event.getDistanceFromDragStart() < 8 && cellClicked)
-        {
-            cellClicked(dragSourceRow, dragSourceBar);
-        }
-        dragSourceRow = dragSourceBar = -1;
-        dragSourceHasClip = false;
-        repaint();
-    }
-
-    void refreshCellButtons()
-    {
-        const auto rows = trackCount ? juce::jmax(0, trackCount()) : 0;
-        while (static_cast<int>(trackControls.size()) < rows)
-        {
-            auto controls = std::make_unique<TrackControls>();
-            addAndMakeVisible(*controls);
-            trackControls.push_back(std::move(controls));
-        }
-        while (static_cast<int>(trackControls.size()) > rows)
-            trackControls.pop_back();
-        const auto requiredCount = rows * barCount;
-        if (static_cast<int>(cellButtons.size()) != requiredCount)
-        {
-            cellButtons.clear();
-            cellButtons.reserve(static_cast<size_t>(requiredCount));
-            for (int row = 0; row < rows; ++row)
-                for (int bar = 0; bar < barCount; ++bar)
-                {
-                    auto button = std::make_unique<PlaylistCellButton>();
-                    addAndMakeVisible(*button);
-                    cellButtons.push_back(std::move(button));
-                }
-        }
-
-        for (int row = 0; row < rows; ++row)
-        {
-            auto& controls = *trackControls[static_cast<size_t>(row)];
-            controls.setBounds(labelWidth() - 100, headerHeight() + row * rowHeight(), 78, rowHeight());
-            controls.mute.setToggleState(getTrackMute && getTrackMute(row), juce::dontSendNotification);
-            controls.solo.setToggleState(getTrackSolo && getTrackSolo(row), juce::dontSendNotification);
-            controls.record.setToggleState(getTrackRecordArm && getTrackRecordArm(row), juce::dontSendNotification);
-            auto* controlPtr = &controls;
-            controls.mute.onClick = [this, row, controlPtr] { if (setTrackMute) setTrackMute(row, controlPtr->mute.getToggleState()); };
-            controls.solo.onClick = [this, row, controlPtr] { if (setTrackSolo) setTrackSolo(row, controlPtr->solo.getToggleState()); };
-            controls.record.onClick = [this, row, controlPtr] { if (setTrackRecordArm) setTrackRecordArm(row, controlPtr->record.getToggleState()); };
-            controls.record.setTooltip("Arm this generator for MIDI recording.");
-            controls.mute.setTooltip("Mute this generator.");
-            controls.solo.setTooltip("Solo this generator.");
-        }
-
-        for (int row = 0; row < rows; ++row)
-            for (int bar = 0; bar < barCount; ++bar)
-            {
-                const auto index = static_cast<size_t>(row * barCount + bar);
-                auto& button = *cellButtons[index];
-                const auto currentClip = clipName ? clipName(row, bar) : juce::String{};
-                button.configure(row, bar, trackName ? trackName(row) : juce::String("Generator ") + juce::String(row + 1),
-                                 currentClip, cellClicked, cellPainted, onPaintFinished, isPencilToolActive,
-                                 clipDragged, barWidth(), rowHeight());
-                button.onPatternMenu = showPatternMenu;
-                button.onDeleteClip = cellDeleted;
-                button.onPatternScroll = scrollPattern;
-                button.setBounds(labelWidth() + bar * barWidth(), headerHeight() + row * rowHeight(), barWidth(), rowHeight());
-            }
-    }
-
-    void showSettings()
-    {
-        juce::AlertWindow dialog("Playlist Settings", "Timeline cells are bar-snapped. Draw places the selected pattern; Move drags existing clips.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addComboBox("barHighlight", { "Every bar", "Every 2 bars", "Every 4 bars", "Every 8 bars" },
-                           "Highlight ruler every:");
-        if (auto* combo = dialog.getComboBoxComponent("barHighlight"))
-            combo->setSelectedId(highlightEveryBars == 1 ? 1 : highlightEveryBars == 2 ? 2 : highlightEveryBars == 8 ? 4 : 3,
-                                 juce::dontSendNotification);
-        dialog.addComboBox("patternLabels", { "Show labels", "Hide labels" }, "Pattern labels:");
-        if (auto* combo = dialog.getComboBoxComponent("patternLabels"))
-            combo->setSelectedId(showPatternLabels ? 1 : 2, juce::dontSendNotification);
-        dialog.addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
-        dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
-        if (dialog.runModalLoop() != 1) return;
-        if (auto* combo = dialog.getComboBoxComponent("barHighlight"))
-            highlightEveryBars = combo->getSelectedId() == 1 ? 1 : combo->getSelectedId() == 2 ? 2
-                : combo->getSelectedId() == 4 ? 8 : 4;
-        if (auto* combo = dialog.getComboBoxComponent("patternLabels"))
-            showPatternLabels = combo->getSelectedId() != 2;
-        repaint();
-    }
-
-private:
-    int dragSourceRow = -1;
-    int dragSourceBar = -1;
-    bool dragSourceHasClip = false;
-    int highlightEveryBars = 4;
-    bool showPatternLabels = true;
-    std::vector<std::unique_ptr<PlaylistCellButton>> cellButtons;
-    std::vector<std::unique_ptr<TrackControls>> trackControls;
-};
-
-class PlaylistSurface final : public juce::Component
-{
-public:
-    explicit PlaylistSurface(PlaylistGrid* playlistGrid) : grid(playlistGrid)
-    {
-        viewport.setViewedComponent(grid, true);
-        addAndMakeVisible(viewport);
-        configure(drawButton, "Draw", "Draw the selected pattern into Playlist cells.", [this]
-        {
-            grid->setDrawMode(true);
-            drawButton.setToggleState(true, juce::dontSendNotification);
-            moveButton.setToggleState(false, juce::dontSendNotification);
-        });
-        configure(moveButton, "Move", "Move existing clips without painting new ones.", [this]
-        {
-            grid->setDrawMode(false);
-            drawButton.setToggleState(false, juce::dontSendNotification);
-            moveButton.setToggleState(true, juce::dontSendNotification);
-        });
-        drawButton.setToggleState(true, juce::dontSendNotification);
-        configure(horizontalOut, "Hâˆ’", "Zoom out horizontally.", [this] { grid->setHorizontalZoom(horizontalZoom() - 0.1f); });
-        configure(horizontalIn, "H+", "Zoom in horizontally.", [this] { grid->setHorizontalZoom(horizontalZoom() + 0.1f); });
-        configure(verticalOut, "Vâˆ’", "Reduce track height.", [this] { grid->setVerticalZoom(verticalZoom() - 0.1f); });
-        configure(verticalIn, "V+", "Increase track height.", [this] { grid->setVerticalZoom(verticalZoom() + 0.1f); });
-        configure(settingsButton, "Settingsâ€¦", "Configure Playlist grid and clip labels.", [this] { grid->showSettings(); });
-        for (auto* button : { &drawButton, &moveButton, &horizontalOut, &horizontalIn, &verticalOut, &verticalIn, &settingsButton })
-            addAndMakeVisible(*button);
-    }
-
-    void resized() override
-    {
-        auto area = getLocalBounds();
-        auto toolbar = area.removeFromTop(36).reduced(4, 3);
-        drawButton.setBounds(toolbar.removeFromLeft(56)); toolbar.removeFromLeft(4);
-        moveButton.setBounds(toolbar.removeFromLeft(56)); toolbar.removeFromLeft(12);
-        horizontalOut.setBounds(toolbar.removeFromLeft(34)); toolbar.removeFromLeft(3);
-        horizontalIn.setBounds(toolbar.removeFromLeft(34)); toolbar.removeFromLeft(10);
-        verticalOut.setBounds(toolbar.removeFromLeft(34)); toolbar.removeFromLeft(3);
-        verticalIn.setBounds(toolbar.removeFromLeft(34));
-        settingsButton.setBounds(toolbar.removeFromRight(96));
-        viewport.setBounds(area);
-    }
-
-private:
-    static void configure(juce::TextButton& button, const juce::String& text,
-                          const juce::String& tooltip, std::function<void()> action)
-    {
-        button.setButtonText(text);
-        button.setTooltip(tooltip);
-        button.setClickingTogglesState(false);
-        button.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 51, 62));
-        button.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-        button.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(197, 214, 224));
-        button.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
-        button.onClick = std::move(action);
-    }
-
-    float horizontalZoom() const { return grid->currentHorizontalZoom(); }
-    float verticalZoom() const { return grid->currentVerticalZoom(); }
-    PlaylistGrid* grid = nullptr;
-    juce::Viewport viewport;
-    juce::TextButton drawButton, moveButton, horizontalOut, horizontalIn, verticalOut, verticalIn, settingsButton;
-};
-
-class PlaylistWindow final : public juce::DocumentWindow
-{
-public:
-    PlaylistWindow(std::function<int()> getTrackCount,
-                   std::function<juce::String(int)> getTrackName,
-                   std::function<juce::String(int, int)> getClipName,
-                   std::function<void(int, int)> onCellClicked,
-                   std::function<void(int, int)> onCellPainted,
-                   std::function<void()> onPaintFinished,
-                   std::function<bool(int)> getMute,
-                   std::function<void(int, bool)> setMute,
-                   std::function<bool(int)> getSolo,
-                   std::function<void(int, bool)> setSolo,
-                   std::function<bool(int)> getRecordArm,
-                   std::function<void(int, bool)> setRecordArm,
-                   std::function<void(int, int, int, int)> onClipDragged,
-                   std::function<void(int, int, juce::Component*)> onPatternMenu,
-                   std::function<void(int, int)> onCellDeleted,
-                   std::function<void(int, int, int)> onPatternScroll)
-        : DocumentWindow("Orbit Playlist", juce::Colour::fromRGB(20, 29, 38), juce::DocumentWindow::allButtons)
-    {
-        setUsingNativeTitleBar(true);
-        grid = new PlaylistGrid();
-        grid->trackCount = std::move(getTrackCount);
-        grid->trackName = std::move(getTrackName);
-        grid->clipName = std::move(getClipName);
-        grid->cellClicked = std::move(onCellClicked);
-        grid->cellPainted = std::move(onCellPainted);
-        grid->onPaintFinished = std::move(onPaintFinished);
-        grid->clipDragged = std::move(onClipDragged);
-        grid->showPatternMenu = std::move(onPatternMenu);
-        grid->cellDeleted = std::move(onCellDeleted);
-        grid->scrollPattern = std::move(onPatternScroll);
-        grid->getTrackMute = std::move(getMute);
-        grid->setTrackMute = std::move(setMute);
-        grid->getTrackSolo = std::move(getSolo);
-        grid->setTrackSolo = std::move(setSolo);
-        grid->getTrackRecordArm = std::move(getRecordArm);
-        grid->setTrackRecordArm = std::move(setRecordArm);
-        grid->isPencilToolActive = [this] { return grid != nullptr && grid->pencilActive(); };
-        grid->onToolChanged = [](bool) {};
-        grid->onZoomChanged = [this] { refresh(); };
-        setContentOwned(new PlaylistSurface(grid), true);
-        setResizable(true, true);
-        centreWithSize(1040, 460);
-        setVisible(false);
-    }
-
-    void refresh()
-    {
-        if (grid == nullptr) return;
-        grid->setSize(grid->contentWidth(), grid->contentHeight());
-        grid->refreshCellButtons();
-        grid->repaint();
-    }
-    void showSettings() { if (grid != nullptr) grid->showSettings(); }
-    void setClipPreview(std::function<std::vector<juce::Point<int>>(int, int)> provider)
-    {
-        if (grid != nullptr) grid->clipNotes = std::move(provider);
-    }
-    void closeButtonPressed() override { setVisible(false); }
-
-private:
-    PlaylistGrid* grid = nullptr;
-};
-
-class EqResponseGraph final : public juce::Component
-{
-public:
-    std::function<float(float)> responseAtFrequency;
-    std::function<float(int)> bandFrequency;
-    std::function<float(int)> bandGain;
-    std::function<void(int, float, float)> setBand;
-    std::function<void()> onClick;
-
-    EqResponseGraph() { setMouseCursor(juce::MouseCursor::PointingHandCursor); }
-
-    void mouseDown(const juce::MouseEvent& event) override
-    {
-        selectedBand = -1;
-        didDragBand = false;
-        const auto bounds = getLocalBounds().toFloat();
-        for (int band = 0; band < 4; ++band)
-        {
-            const auto frequency = bandFrequency ? bandFrequency(band) : 0.0f;
-            if (frequency < 20.0f) continue;
-            const auto gain = bandGain ? bandGain(band) : 0.0f;
-            const juce::Point<float> point(frequencyToX(frequency, bounds), gainToY(gain, bounds));
-            if (point.getDistanceFrom(event.position) <= 12.0f)
-            {
-                selectedBand = band;
-                break;
-            }
-        }
-    }
-
-    void mouseDrag(const juce::MouseEvent& event) override
-    {
-        if (selectedBand < 0 || !setBand) return;
-        if (event.getDistanceFromDragStart() > 2) didDragBand = true;
-        if (!didDragBand) return;
-        const auto bounds = getLocalBounds().toFloat();
-        if (bounds.getWidth() <= 0.0f || bounds.getHeight() <= 0.0f) return;
-        const auto x = juce::jlimit(bounds.getX(), bounds.getRight(), event.position.x);
-        const auto y = juce::jlimit(bounds.getY(), bounds.getBottom(), event.position.y);
-        const auto frequency = xToFrequency(x, bounds);
-        const auto gain = juce::jmap(y, bounds.getBottom(), bounds.getY(), -18.0f, 18.0f);
-        setBand(selectedBand, frequency, gain);
-        repaint();
-    }
-
-    void mouseUp(const juce::MouseEvent&) override
-    {
-        // A simple click continues to open the full EQ editor; dragging a node
-        // directly edits that band's frequency and gain in the project.
-        if (!didDragBand && onClick) onClick();
-        selectedBand = -1;
-        didDragBand = false;
-    }
-
-    void paint(juce::Graphics& g) override
-    {
-        auto bounds = getLocalBounds().toFloat();
-        g.fillAll(juce::Colour::fromRGB(22, 39, 52));
-        if (bounds.getWidth() < 4.0f || bounds.getHeight() < 4.0f) return;
-
-        constexpr float minDb = -18.0f;
-        constexpr float maxDb = 18.0f;
-        for (int db = -18; db <= 18; db += 6)
-        {
-            const auto y = juce::jmap(static_cast<float>(db), minDb, maxDb, bounds.getBottom(), bounds.getY());
-            g.setColour(db == 0 ? juce::Colour::fromRGB(96, 132, 151) : juce::Colour::fromRGB(48, 72, 89));
-            g.drawHorizontalLine(juce::roundToInt(y), bounds.getX(), bounds.getRight());
-        }
-        for (float frequency : { 20.0f, 50.0f, 100.0f, 200.0f, 500.0f, 1000.0f, 2000.0f, 5000.0f, 10000.0f, 20000.0f })
-        {
-            const auto x = frequencyToX(frequency, bounds);
-            g.setColour(juce::Colour::fromRGB(40, 62, 77));
-            g.drawVerticalLine(juce::roundToInt(x), bounds.getY(), bounds.getBottom());
-        }
-
-        juce::Path curve;
-        constexpr int points = 180;
-        for (int i = 0; i < points; ++i)
-        {
-            const auto proportion = static_cast<float>(i) / static_cast<float>(points - 1);
-            const auto frequency = 20.0f * std::pow(1000.0f, proportion);
-            const auto db = juce::jlimit(minDb, maxDb, responseAtFrequency ? responseAtFrequency(frequency) : 0.0f);
-            const auto x = bounds.getX() + proportion * bounds.getWidth();
-            const auto y = juce::jmap(db, minDb, maxDb, bounds.getBottom(), bounds.getY());
-            if (i == 0) curve.startNewSubPath(x, y); else curve.lineTo(x, y);
-        }
-        g.setColour(juce::Colour::fromRGB(93, 211, 241));
-        g.strokePath(curve, juce::PathStrokeType(getHeight() < 90 ? 1.5f : 2.5f));
-        for (int band = 0; band < 4; ++band)
-        {
-            const auto frequency = bandFrequency ? bandFrequency(band) : 0.0f;
-            if (frequency < 20.0f) continue;
-            const auto gain = bandGain ? bandGain(band) : 0.0f;
-            const auto point = juce::Point<float>(frequencyToX(frequency, bounds), gainToY(gain, bounds));
-            g.setColour(juce::Colour::fromRGB(18, 41, 53));
-            g.fillEllipse(point.x - 5.0f, point.y - 5.0f, 10.0f, 10.0f);
-            g.setColour(juce::Colour::fromRGB(174, 239, 255));
-            g.fillEllipse(point.x - 3.5f, point.y - 3.5f, 7.0f, 7.0f);
-        }
-        g.setColour(juce::Colour::fromRGB(174, 207, 224));
-        g.drawRect(getLocalBounds(), 1);
-    }
-
-private:
-    int selectedBand = -1;
-    bool didDragBand = false;
-
-    static float gainToY(float gain, juce::Rectangle<float> bounds)
-    {
-        return juce::jmap(juce::jlimit(-18.0f, 18.0f, gain), -18.0f, 18.0f, bounds.getBottom(), bounds.getY());
-    }
-
-    static float frequencyToX(float frequency, juce::Rectangle<float> bounds)
-    {
-        return bounds.getX() + std::log(frequency / 20.0f) / std::log(1000.0f) * bounds.getWidth();
-    }
-
-    static float xToFrequency(float x, juce::Rectangle<float> bounds)
-    {
-        const auto proportion = juce::jlimit(0.0f, 1.0f, (x - bounds.getX()) / bounds.getWidth());
-        return 20.0f * std::pow(1000.0f, proportion);
-    }
-};
-
-class EqualiserWindow final : public juce::DocumentWindow
-{
-public:
-    std::function<float(int, int)> getParameter;
-    std::function<float(int, float)> getResponse;
-    std::function<void(int, int, float)> setParameter;
-    std::function<void(int, int, float, float)> setBandValues;
-    std::function<juce::String(int)> getTrackName;
-
-    EqualiserWindow()
-        : DocumentWindow("Orbit Equaliser", juce::Colour::fromRGB(23, 41, 54), juce::DocumentWindow::allButtons)
-    {
-        setUsingNativeTitleBar(true);
-        setContentNonOwned(&content, false);
-        content.setOpaque(true);
-        content.addAndMakeVisible(title);
-        title.setFont(juce::FontOptions(18.0f, juce::Font::bold));
-        title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(238, 248, 252));
-        content.addAndMakeVisible(graph);
-
-        static const std::array<const char*, 4> bandNames { "LOW SHELF", "LOW MID", "HIGH MID", "HIGH SHELF" };
-        static const std::array<const char*, 3> parameterNames { "Frequency", "Gain", "Q" };
-        for (int band = 0; band < 4; ++band)
-        {
-            bandTitles[static_cast<size_t>(band)].setText(bandNames[static_cast<size_t>(band)], juce::dontSendNotification);
-            bandTitles[static_cast<size_t>(band)].setJustificationType(juce::Justification::centredLeft);
-            bandTitles[static_cast<size_t>(band)].setFont(juce::FontOptions(12.0f, juce::Font::bold));
-            bandTitles[static_cast<size_t>(band)].setColour(juce::Label::textColourId, juce::Colour::fromRGB(187, 221, 237));
-            content.addAndMakeVisible(bandTitles[static_cast<size_t>(band)]);
-            for (int parameter = 0; parameter < 3; ++parameter)
-            {
-                auto& label = parameterTitles[static_cast<size_t>(band)][static_cast<size_t>(parameter)];
-                label.setText(parameterNames[static_cast<size_t>(parameter)], juce::dontSendNotification);
-                label.setFont(juce::FontOptions(10.5f));
-                label.setColour(juce::Label::textColourId, juce::Colour::fromRGB(205, 223, 232));
-                content.addAndMakeVisible(label);
-
-                auto& slider = controls[static_cast<size_t>(band)][static_cast<size_t>(parameter)];
-                slider.setSliderStyle(juce::Slider::LinearHorizontal);
-                slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-                if (parameter == 0)
-                {
-                    slider.setRange(20.0, 20000.0, 1.0);
-                    slider.setSkewFactorFromMidPoint(1000.0);
-                    slider.setTextValueSuffix(" Hz");
-                }
-                else if (parameter == 1)
-                {
-                    slider.setRange(-20.0, 20.0, 0.1);
-                    slider.setTextValueSuffix(" dB");
-                }
-                else
-                {
-                    slider.setRange(0.1, 4.0, 0.01);
-                }
-                slider.setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(128, 222, 244));
-                slider.setColour(juce::Slider::trackColourId, juce::Colour::fromRGB(69, 124, 152));
-                slider.setPopupDisplayEnabled(true, true, &content);
-                slider.setColour(juce::Slider::textBoxTextColourId, juce::Colours::white);
-                slider.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour::fromRGB(33, 57, 73));
-                slider.onValueChange = [this, band, parameter]
-                {
-                    if (trackIndex >= 0 && setParameter)
-                        setParameter(trackIndex, band * 3 + parameter, static_cast<float>(controls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].getValue()));
-                    graph.repaint();
-                };
-                content.addAndMakeVisible(slider);
-            }
-        }
-
-        graph.responseAtFrequency = [this](float frequency)
-        {
-            return trackIndex >= 0 && getResponse ? getResponse(trackIndex, frequency) : 0.0f;
-        };
-        graph.bandFrequency = [this](int band)
-        {
-            return trackIndex >= 0 && getParameter ? getParameter(trackIndex, band * 3) : 0.0f;
-        };
-        graph.bandGain = [this](int band)
-        {
-            return trackIndex >= 0 && getParameter ? getParameter(trackIndex, band * 3 + 1) : 0.0f;
-        };
-        graph.setBand = [this](int band, float frequency, float gain)
-        {
-            if (trackIndex >= 0 && setBandValues) setBandValues(trackIndex, band, frequency, gain);
-        };
-        setResizable(true, true);
-        centreWithSize(760, 610);
-        setVisible(false);
-    }
-
-    void openForTrack(int index)
-    {
-        trackIndex = index;
-        const auto trackName = getTrackName ? getTrackName(index) : "Generator";
-        title.setText(trackName + " - 4-Band Equaliser", juce::dontSendNotification);
-        refreshParameterValues(index);
-        setVisible(true);
-        toFront(true);
-    }
-
-    void refreshParameterValues(int index)
-    {
-        if (trackIndex != index) return;
-        for (int band = 0; band < 4; ++band)
-            for (int parameter = 0; parameter < 3; ++parameter)
-                if (getParameter)
-                    controls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setValue(
-                        getParameter(index, band * 3 + parameter), juce::dontSendNotification);
-        graph.repaint();
-    }
-
-    void closeButtonPressed() override { setVisible(false); }
-
-    void resized() override
-    {
-        DocumentWindow::resized();
-        auto area = content.getLocalBounds().reduced(18);
-        title.setBounds(area.removeFromTop(28));
-        area.removeFromTop(8);
-        graph.setBounds(area.removeFromTop(190));
-        area.removeFromTop(10);
-        const int rowHeight = area.getHeight() / 4;
-        for (int band = 0; band < 4; ++band)
-        {
-            auto row = area.removeFromTop(rowHeight);
-            bandTitles[static_cast<size_t>(band)].setBounds(row.removeFromTop(19));
-            const int columnWidth = row.getWidth() / 3;
-            for (int parameter = 0; parameter < 3; ++parameter)
-            {
-                auto column = row.removeFromLeft(columnWidth).reduced(4, 0);
-                parameterTitles[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setBounds(column.removeFromTop(15));
-                controls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setBounds(column);
-            }
-        }
-    }
-
-private:
-    juce::Component content;
-    juce::Label title;
-    EqResponseGraph graph;
-    std::array<juce::Label, 4> bandTitles;
-    std::array<std::array<juce::Label, 3>, 4> parameterTitles;
-    std::array<std::array<juce::Slider, 3>, 4> controls;
-    int trackIndex = -1;
-};
-
-class PluginParameterWindow final : public juce::DocumentWindow
-{
-    class ParameterRow final : public juce::Component
-    {
-    public:
-        ParameterRow(te::AutomatableParameter::Ptr parameter, std::function<void()> onChanged)
-            : parameterRef(std::move(parameter)), changed(std::move(onChanged))
-        {
-            addAndMakeVisible(label);
-            label.setText(parameterRef->getParameterName(), juce::dontSendNotification);
-            label.setColour(juce::Label::textColourId, juce::Colour::fromRGB(228, 241, 248));
-            label.setTooltip(parameterRef->getCurrentValueAsStringWithLabel());
-            addAndMakeVisible(value);
-            value.setSliderStyle(juce::Slider::LinearHorizontal);
-            const auto parameterRange = parameterRef->getValueRange();
-            value.setRange(parameterRange.getStart(), parameterRange.getEnd(), parameterRef->valueRange.interval);
-            value.setValue(parameterRef->getCurrentValue(), juce::dontSendNotification);
-            value.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-            value.setTextValueSuffix(parameterRef->getLabel().isNotEmpty() ? " " + parameterRef->getLabel() : juce::String{});
-            value.textFromValueFunction = [parameterHandle = parameterRef](double v) { return parameterHandle->valueToString(static_cast<float>(v)); };
-            value.valueFromTextFunction = [parameterHandle = parameterRef](const juce::String& s) { return static_cast<double>(parameterHandle->stringToValue(s)); };
-            value.setPopupDisplayEnabled(true, true, this);
-            value.onDragStart = [parameterHandle = parameterRef] { parameterHandle->parameterChangeGestureBegin(); };
-            value.onDragEnd = [parameterHandle = parameterRef] { parameterHandle->parameterChangeGestureEnd(); };
-            value.onValueChange = [this]
-            {
-                parameterRef->setParameter(static_cast<float>(value.getValue()), juce::sendNotification);
-                label.setTooltip(parameterRef->getCurrentValueAsStringWithLabel());
-                if (changed) changed();
-            };
-            value.setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(106, 210, 236));
-            value.setColour(juce::Slider::trackColourId, juce::Colour::fromRGB(44, 78, 100));
-            value.setColour(juce::Slider::textBoxTextColourId, juce::Colour::fromRGB(242, 249, 252));
-            value.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour::fromRGB(33, 56, 71));
-            value.setColour(juce::Slider::textBoxOutlineColourId, juce::Colour::fromRGB(97, 146, 170));
-        }
-
-        void resized() override
-        {
-            auto area = getLocalBounds().reduced(10, 3);
-            label.setBounds(area.removeFromLeft(190));
-            value.setBounds(area);
-        }
-
-    private:
-        te::AutomatableParameter::Ptr parameterRef;
-        std::function<void()> changed;
-        juce::Label label;
-        juce::Slider value;
-    };
-
-    class ParameterList final : public juce::Component
-    {
-    public:
-        void setParameters(te::Plugin::Ptr plugin, std::function<void()> changed)
-        {
-            rows.clear();
-            pluginRef = std::move(plugin);
-            if (pluginRef != nullptr)
-                for (int i = 0; i < pluginRef->getNumAutomatableParameters(); ++i)
-                {
-                    auto row = std::make_unique<ParameterRow>(pluginRef->getAutomatableParameter(i), changed);
-                    addAndMakeVisible(*row);
-                    rows.push_back(std::move(row));
-                }
-            setSize(500, juce::jmax(80, static_cast<int>(rows.size()) * 42 + 16));
-            resized();
-        }
-
-        void clearParameters()
-        {
-            rows.clear();
-            pluginRef = nullptr;
-            setSize(500, 80);
-        }
-
-        void resized() override
-        {
-            auto y = 8;
-            for (auto& row : rows)
-            {
-                row->setBounds(0, y, getWidth(), 38);
-                y += 42;
-            }
-        }
-
-        void paint(juce::Graphics& g) override { g.fillAll(juce::Colour::fromRGB(27, 43, 55)); }
-
-    private:
-        te::Plugin::Ptr pluginRef;
-        std::vector<std::unique_ptr<ParameterRow>> rows;
-    };
-
-public:
-    PluginParameterWindow()
-        : DocumentWindow("Orbit Effect", juce::Colour::fromRGB(25, 44, 58), juce::DocumentWindow::allButtons)
-    {
-        setUsingNativeTitleBar(true);
-        setContentNonOwned(&viewport, false);
-        viewport.setViewedComponent(&parameters, false);
-        setResizable(true, true);
-        setVisible(false);
-    }
-
-    void showPlugin(te::Plugin::Ptr plugin, std::function<void()> onChanged)
-    {
-        if (plugin == nullptr) return;
-        parameters.setParameters(plugin, std::move(onChanged));
-        setName(plugin->getName());
-        setName("Orbit - " + plugin->getName());
-        viewport.setViewPosition(0, 0);
-        centreWithSize(690, juce::jlimit(180, 640, parameters.getHeight() + 48));
-        setVisible(true);
-        toFront(true);
-    }
-
-    void clearPlugin()
-    {
-        setVisible(false);
-        parameters.clearParameters();
-    }
-
-    void resized() override
-    {
-        DocumentWindow::resized();
-        viewport.setBounds(getLocalBounds().reduced(8));
-    }
-
-    void closeButtonPressed() override { clearPlugin(); }
-
-private:
-    juce::Viewport viewport;
-    ParameterList parameters;
-};
-
-class MixerWindow final : public juce::Component
-{
-public:
-    std::function<int()> getTrackCount;
-    std::function<juce::String(int)> getTrackName;
-    std::function<void(int, const juce::String&)> renameTrack;
-    std::function<double(int)> getTrackGain;
-    std::function<void(int, double)> setTrackGain;
-    std::function<double(int)> getTrackPan;
-    std::function<void(int, double)> setTrackPan;
-    std::function<bool(int)> getTrackMuted;
-    std::function<void(int, bool)> setTrackMuted;
-    std::function<bool(int)> isGeneratorTrack;
-    std::function<bool(int)> getTrackSolo;
-    std::function<void(int, bool)> setTrackSolo;
-    std::function<float(int, float)> getTrackEqResponse;
-    std::function<float(int, int)> getTrackEqParameter;
-    std::function<void(int, int, float)> setTrackEqParameter;
-    std::function<void(int, int, float, float)> setTrackEqBand;
-    std::function<bool(int)> getTrackEqEnabled;
-    std::function<void(int, bool)> setTrackEqEnabled;
-    std::function<void(int)> onOpenEq;
-    std::function<void()> onFocus;
-    std::function<juce::StringArray(int)> getInsertNames;
-    std::function<bool(int, int)> getInsertEnabled;
-    std::function<void(int, int)> toggleInsert;
-    std::function<void(int, int)> editInsert;
-    std::function<void(int, int)> removeInsert;
-    std::function<void(int, int)> addInsert;
-    std::function<double(int, int)> getTrackSendGain;
-    std::function<void(int, int, double)> setTrackSendGain;
-    std::function<int(int)> getTrackOutputBus;
-    std::function<void(int, int)> setTrackOutputBus;
-    std::function<bool(int)> hasFxReturn;
-    std::function<void(int)> onOpenFxReturn;
-    std::function<te::LevelMeterPlugin*(int)> getTrackMeter;
-    std::function<te::EditPlaybackContext*()> getMasterMeterContext;
-    std::function<double()> getMasterGain;
-    std::function<void(double)> setMasterGain;
-    std::function<double()> getMasterPan;
-    std::function<void(double)> setMasterPan;
-    std::function<bool()> getMasterMuted;
-    std::function<void(bool)> setMasterMuted;
-    MixerWindow()
-    {
-        content.setOpaque(true);
-        minimizeButton.setButtonText("âˆ’");
-        closeButton.setButtonText("Ã—");
-        minimizeButton.setTooltip("Minimize mixer");
-        closeButton.setTooltip("Close mixer");
-        for (auto* button : { &minimizeButton, &closeButton })
-        {
-            button->setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 48, 58));
-            button->setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(220, 235, 243));
-            addAndMakeVisible(button);
-        }
-        focusListener.onMouseDown = [this] { if (onFocus) onFocus(); };
-        minimizeButton.onClick = [this]
-        {
-            minimized = !minimized;
-            updateMinimizeButton();
-            if (onMinimizeChanged) onMinimizeChanged(minimized);
-            resized();
-        };
-        closeButton.onClick = [this] { if (onClose) onClose(); };
-        addAndMakeVisible(content);
-        content.addAndMakeVisible(viewport);
-        // Keep channel strips flush with the fitted panel width. Vertical
-        // navigation remains available from the wheel without reserving a
-        // permanent scrollbar gutter; horizontal scrolling appears only when
-        // all strips cannot fit in the available workspace.
-        viewport.setScrollBarsShown(false, true, true, false);
-        viewport.setViewedComponent(&strips, false);
-        strips.setOpaque(false);
-        strips.addAndMakeVisible(masterStrip);
-        masterStrip.addMouseListener(&focusListener, true);
-        strips.setSize(640, 1);
-        effectWindow = std::make_unique<PluginParameterWindow>();
-    }
-
-    std::function<void(bool)> onMinimizeChanged;
-    std::function<void()> onClose;
-    std::function<void(juce::Point<int>)> onDragged;
-    std::function<void()> onDragEnded;
-    bool isMinimized() const { return minimized; }
-    void setMinimized(bool shouldMinimize)
-    {
-        minimized = shouldMinimize;
-        updateMinimizeButton();
-        resized();
-    }
-
-    void mouseDown(const juce::MouseEvent& event) override
-    {
-        if (onFocus) onFocus();
-        if (event.eventComponent == this && event.y < titleBarHeight) dragOrigin = getPosition();
-    }
-
-    void mouseDrag(const juce::MouseEvent& event) override
-    {
-        if (event.eventComponent == this && event.getMouseDownY() < titleBarHeight && onDragged)
-            onDragged(dragOrigin + event.getOffsetFromDragStart());
-    }
-
-    void mouseUp(const juce::MouseEvent& event) override
-    {
-        if (event.eventComponent == this && event.getMouseDownY() < titleBarHeight && onDragEnded) onDragEnded();
-    }
-
-    void refresh(int selectedTrack)
-    {
-        const auto count = getTrackCount ? getTrackCount() : 0;
-        while (channelStrips.size() < count)
-        {
-            auto* strip = new ChannelStrip();
-            strip->addMouseListener(&focusListener, true);
-            channelStrips.add(strip);
-        }
-        while (channelStrips.size() > count) channelStrips.removeLast();
-        for (int i = 0; i < count; ++i)
-        {
-            auto* strip = channelStrips[i];
-            if (strip->getParentComponent() != &strips) strips.addAndMakeVisible(strip);
-            strip->setNameText(getTrackName ? getTrackName(i) : "Generator " + juce::String(i + 1));
-            const bool generator = !isGeneratorTrack || isGeneratorTrack(i);
-            strip->setNameEditable(generator);
-            strip->setFooterText(juce::String(i + 1) + "  "
-                                 + (getTrackName ? getTrackName(i) : "Generator " + juce::String(i + 1)));
-            strip->setSelected(i == selectedTrack);
-            strip->setMeterPlugin(getTrackMeter ? getTrackMeter(i) : nullptr);
-            strip->setGainValue(getTrackGain ? getTrackGain(i) : 0.0);
-            strip->setPanValue(getTrackPan ? getTrackPan(i) : 0.0);
-            for (int bus = 0; bus < 8; ++bus)
-                strip->setSendValue(bus, getTrackSendGain ? getTrackSendGain(i, bus) : -60.0);
-            strip->setOutputBus(getTrackOutputBus ? getTrackOutputBus(i) : -1);
-            strip->setMuteState(getTrackMuted && getTrackMuted(i));
-            strip->setSoloState(getTrackSolo && getTrackSolo(i));
-            strip->setEqResponse([this, i](float frequency)
-            {
-                return getTrackEqResponse ? getTrackEqResponse(i, frequency) : 0.0f;
-            });
-            strip->setEqEnabled(getTrackEqEnabled && getTrackEqEnabled(i));
-            strip->setEqBandCallbacks(
-                [this, i](int band) { return getTrackEqParameter ? getTrackEqParameter(i, band * 3) : 0.0f; },
-                [this, i](int band) { return getTrackEqParameter ? getTrackEqParameter(i, band * 3 + 1) : 0.0f; },
-                [this, i](int band, float frequency, float gain)
-                {
-                    if (setTrackEqBand) setTrackEqBand(i, band, frequency, gain);
-                });
-            strip->getEqParameter = [this, i](int parameter)
-            {
-                return getTrackEqParameter ? getTrackEqParameter(i, parameter) : 0.0f;
-            };
-            strip->refreshEqParameterValues();
-            strip->onEqParameter = [this, i](int parameter, float value)
-            {
-                if (setTrackEqParameter) setTrackEqParameter(i, parameter, value);
-            };
-            strip->onToggleEq = [this, i](bool enabled)
-            {
-                if (setTrackEqEnabled) setTrackEqEnabled(i, enabled);
-            };
-            strip->setMixControlsVisible(true);
-            // setMixControlsVisible enables the channel's send controls too.
-            // Apply track-kind visibility after it so FX return strips do not
-            // expose dead send knobs that only accept generator-track indices.
-            strip->setSendsVisible(!isGeneratorTrack || isGeneratorTrack(i));
-            strip->setOutputRoutesVisible(!isGeneratorTrack || isGeneratorTrack(i));
-            const auto insertNames = getInsertNames ? getInsertNames(i) : juce::StringArray{};
-            for (int slot = 0; slot < 4; ++slot)
-            {
-                const auto name = slot < insertNames.size() ? insertNames[slot] : juce::String{};
-                strip->setInsertRow(slot, name, name.isNotEmpty() && getInsertEnabled && getInsertEnabled(i, slot));
-            }
-            // Insert slots can become visible without changing the strip size.
-            // Re-run layout so their buttons receive bounds immediately.
-            strip->resized();
-            strip->onGain = [this, i](double value) { if (setTrackGain) setTrackGain(i, value); };
-            strip->onPan = [this, i](double value) { if (setTrackPan) setTrackPan(i, value); };
-            strip->onSend = [this, i](int bus, double value)
-            {
-                if (setTrackSendGain) setTrackSendGain(i, bus, value);
-            };
-            strip->onOutputBus = [this, i](int bus)
-            {
-                if (setTrackOutputBus) setTrackOutputBus(i, bus);
-            };
-            strip->onMute = [this, i](bool value) { if (setTrackMuted) setTrackMuted(i, value); };
-            strip->onSolo = [this, i](bool value) { if (setTrackSolo) setTrackSolo(i, value); };
-            strip->onRename = [this, i](const juce::String& value)
-            {
-                if (renameTrack) renameTrack(i, value);
-            };
-            strip->onOpenEq = [this, i] { if (onOpenEq) onOpenEq(i); };
-            strip->onToggleInsert = [this, i](int slot) { if (toggleInsert) toggleInsert(i, slot); };
-            strip->onEditInsert = [this, i](int slot) { if (editInsert) editInsert(i, slot); };
-            strip->onRemoveInsert = [this, i](int slot) { if (removeInsert) removeInsert(i, slot); };
-            strip->onAddInsert = [this, i]
-            {
-                showInsertChooser([this, i](int kind)
-                {
-                    if (addInsert) addInsert(i, kind);
-                });
-            };
-        }
-        masterStrip.setNameText("MASTER");
-        masterStrip.setFooterText("MASTER");
-        masterStrip.setMasterMeterContextSupplier(getMasterMeterContext);
-        masterStrip.setGainValue(getMasterGain ? getMasterGain() : 0.0);
-        masterStrip.setPanValue(getMasterPan ? getMasterPan() : 0.0);
-        masterStrip.setMuteState(getMasterMuted && getMasterMuted());
-        masterStrip.setMixControlsVisible(false);
-        masterStrip.setMasterControlsVisible(true);
-        masterStrip.setSendsVisible(false);
-        masterStrip.setEqResponse([this, count](float frequency)
-        {
-            return getTrackEqResponse ? getTrackEqResponse(count, frequency) : 0.0f;
-        });
-        masterStrip.setEqEnabled(getTrackEqEnabled && getTrackEqEnabled(count));
-        masterStrip.setEqBandCallbacks(
-            [this, count](int band) { return getTrackEqParameter ? getTrackEqParameter(count, band * 3) : 0.0f; },
-            [this, count](int band) { return getTrackEqParameter ? getTrackEqParameter(count, band * 3 + 1) : 0.0f; },
-            [this, count](int band, float frequency, float gain)
-            {
-                if (setTrackEqBand) setTrackEqBand(count, band, frequency, gain);
-            });
-        masterStrip.getEqParameter = [this, count](int parameter)
-        {
-            return getTrackEqParameter ? getTrackEqParameter(count, parameter) : 0.0f;
-        };
-        masterStrip.refreshEqParameterValues();
-        masterStrip.onEqParameter = [this, count](int parameter, float value)
-        {
-            if (setTrackEqParameter) setTrackEqParameter(count, parameter, value);
-        };
-        masterStrip.onToggleEq = [this, count](bool enabled)
-        {
-            if (setTrackEqEnabled) setTrackEqEnabled(count, enabled);
-        };
-        masterStrip.onOpenEq = [this, count] { if (onOpenEq) onOpenEq(count); };
-        const auto masterInserts = getInsertNames ? getInsertNames(count) : juce::StringArray{};
-        for (int slot = 0; slot < 4; ++slot)
-        {
-            const auto insertName = slot < masterInserts.size() ? masterInserts[slot] : juce::String{};
-            masterStrip.setInsertRow(slot, insertName, insertName.isNotEmpty()
-                && getInsertEnabled && getInsertEnabled(count, slot));
-        }
-        masterStrip.resized();
-        masterStrip.onToggleInsert = [this, count](int slot) { if (toggleInsert) toggleInsert(count, slot); };
-        masterStrip.onEditInsert = [this, count](int slot) { if (editInsert) editInsert(count, slot); };
-        masterStrip.onRemoveInsert = [this, count](int slot) { if (removeInsert) removeInsert(count, slot); };
-        masterStrip.onAddInsert = [this, count]
-        {
-            showInsertChooser([this, count](int kind)
-            {
-                if (addInsert) addInsert(count, kind);
-            });
-        };
-        masterStrip.onGain = [this](double value) { if (setMasterGain) setMasterGain(value); };
-        masterStrip.onPan = [this](double value) { if (setMasterPan) setMasterPan(value); };
-        masterStrip.onMute = [this](bool value) { if (setMasterMuted) setMasterMuted(value); };
-        layoutStrips();
-        content.repaint();
-    }
-
-    void resized() override
-    {
-        content.setBounds(getLocalBounds().reduced(1).withTrimmedTop(titleBarHeight - 1));
-        minimizeButton.setBounds(getWidth() - 56, 2, 24, titleBarHeight - 4);
-        closeButton.setBounds(getWidth() - 29, 2, 24, titleBarHeight - 4);
-        viewport.setBounds(content.getLocalBounds());
-        viewport.setVisible(!minimized);
-        layoutStrips();
-    }
-
-    void paint(juce::Graphics& g) override
-    {
-        g.setColour(juce::Colour::fromRGB(25, 46, 60));
-        g.fillRect(getLocalBounds());
-        g.setColour(juce::Colour::fromRGB(32, 42, 52));
-        g.fillRect(0, 0, getWidth(), titleBarHeight);
-        g.setColour(juce::Colour::fromRGB(222, 235, 242));
-        g.setFont(juce::Font(13.0f, juce::Font::bold));
-        g.drawText("Mixing Desk", 9, 0, juce::jmax(0, getWidth() - 70), titleBarHeight,
-                   juce::Justification::centred);
-        g.setColour(juce::Colour::fromRGB(151, 194, 216));
-        g.drawRect(getLocalBounds().toFloat().reduced(0.5f), 1.0f);
-    }
-
-    void focusMaster() { masterStrip.gain.grabKeyboardFocus(); }
-    void repaintEqGraphs()
-    {
-        for (auto* strip : channelStrips) strip->repaintEqGraph();
-        masterStrip.repaintEqGraph();
-    }
-    void refreshEqControls()
-    {
-        for (auto* strip : channelStrips) strip->refreshEqParameterValues();
-        masterStrip.refreshEqParameterValues();
-    }
-    void showEffectEditor(te::Plugin::Ptr plugin, std::function<void()> onChanged)
-    {
-        if (effectWindow != nullptr) effectWindow->showPlugin(std::move(plugin), std::move(onChanged));
-    }
-    void showInsertChooser(std::function<void(int)> onSelected)
-    {
-        auto* dialog = new juce::AlertWindow("Add Insert", "Choose an effect for this mixer strip.",
-                                             juce::MessageBoxIconType::NoIcon, this);
-        dialog->addButton("Compressor", 1);
-        dialog->addButton("Reverb", 2);
-        dialog->addButton("Delay", 3);
-        dialog->addButton("Chorus", 4);
-        dialog->addButton("Phaser", 5);
-        dialog->addButton("Low-pass Filter", 6);
-        dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-        dialog->centreAroundComponent(this, 860, 270);
-        dialog->enterModalState(true, juce::ModalCallbackFunction::create(
-            [selectionCallback = std::move(onSelected)](int result)
-            {
-                if (result > 0 && selectionCallback) selectionCallback(result);
-            }), true);
-    }
-
-    void detachMeters()
-    {
-        if (effectWindow != nullptr) effectWindow->clearPlugin();
-        for (auto* strip : channelStrips) strip->detachMeter();
-        masterStrip.detachMeter();
-        masterStrip.setMasterMeterContextSupplier({});
-    }
-
-private:
-    class FocusListener final : public juce::MouseListener
-    {
-    public:
-        std::function<void()> onMouseDown;
-        void mouseDown(const juce::MouseEvent&) override
-        {
-            if (onMouseDown) onMouseDown();
-        }
-    } focusListener;
-    static constexpr int titleBarHeight = 26;
-    juce::TextButton minimizeButton, closeButton;
-    juce::Point<int> dragOrigin;
-    bool minimized = false;
-
-    void updateMinimizeButton()
-    {
-        minimizeButton.setButtonText(minimized ? "+" : "âˆ’");
-        minimizeButton.setTooltip(minimized ? "Restore mixer" : "Minimize mixer");
-    }
-
-    void layoutStrips()
-    {
-        // Use a consistent narrow strip width so the console stays compact.
-        // The viewport adds horizontal scrolling when the active bank grows.
-        const int count = channelStrips.size();
-        const int columns = count + 1; // generator strips plus Master
-        constexpr int columnStep = 116;
-        constexpr int columnWidth = 110;
-        constexpr int minimumStripHeight = 760;
-        const int stripHeight = juce::jmax(minimumStripHeight, viewport.getHeight());
-
-        for (int i = 0; i < count; ++i)
-            channelStrips[i]->setBounds(i * columnStep, 0, columnWidth, stripHeight);
-        masterStrip.setBounds(count * columnStep, 0, columnWidth, stripHeight);
-        strips.setSize(columns * columnStep, stripHeight);
-    }
-
-    class SmallActionButton final : public juce::TextButton
-    {
-    public:
-        void setDrawsBypassIndicator(bool shouldDrawBypass) { drawsBypass = shouldDrawBypass; repaint(); }
-        void setActive(bool active) { isActive = active; repaint(); }
-
-    protected:
-        void paintButton(juce::Graphics& g, bool highlighted, bool down) override
-        {
-            auto bounds = getLocalBounds().toFloat().reduced(1.0f);
-            auto background = findColour(juce::TextButton::buttonColourId);
-            if (highlighted) background = background.brighter(0.16f);
-            if (down) background = background.darker(0.12f);
-            g.setColour(background);
-            g.fillRoundedRectangle(bounds, 3.0f);
-            g.setColour(juce::Colour::fromRGB(116, 157, 178));
-            g.drawRoundedRectangle(bounds, 3.0f, 1.0f);
-
-            const auto centre = bounds.getCentre();
-            if (drawsBypass)
-            {
-                const auto radius = juce::jmin(3.8f, bounds.getHeight() * 0.22f);
-                g.setColour(isActive ? juce::Colour::fromRGB(72, 207, 229)
-                                     : juce::Colour::fromRGB(34, 47, 56));
-                g.fillEllipse(centre.x - radius, centre.y - radius, radius * 2.0f, radius * 2.0f);
-                if (isActive)
-                {
-                    g.setColour(juce::Colour::fromRGB(183, 242, 250).withAlpha(0.72f));
-                    g.drawEllipse(centre.x - radius, centre.y - radius, radius * 2.0f, radius * 2.0f, 0.8f);
-                }
-            }
-            else
-            {
-                g.setColour(juce::Colour::fromRGB(232, 244, 249));
-                g.drawLine(centre.x - 3.0f, centre.y - 3.0f,
-                           centre.x + 3.0f, centre.y + 3.0f, 1.2f);
-                g.drawLine(centre.x + 3.0f, centre.y - 3.0f,
-                           centre.x - 3.0f, centre.y + 3.0f, 1.2f);
-            }
-        }
-
-    private:
-        bool drawsBypass = false;
-        bool isActive = false;
-    };
-
-    class EqHeaderButton final : public juce::TextButton
-    {
-    public:
-        void setEnabledIndicator(bool enabled) { isEnabled = enabled; repaint(); }
-
-    protected:
-        void paintButton(juce::Graphics& g, bool highlighted, bool down) override
-        {
-            juce::TextButton::paintButton(g, highlighted, down);
-            const auto bounds = getLocalBounds().toFloat().reduced(1.0f);
-            const auto centreY = bounds.getCentreY();
-            const auto radius = juce::jmin(3.5f, bounds.getHeight() * 0.18f);
-            g.setColour(isEnabled ? juce::Colour::fromRGB(72, 207, 229)
-                                  : juce::Colour::fromRGB(34, 47, 56));
-            g.fillEllipse(bounds.getX() + 7.0f, centreY - radius, radius * 2.0f, radius * 2.0f);
-            if (isEnabled)
-            {
-                g.setColour(juce::Colour::fromRGB(183, 242, 250).withAlpha(0.72f));
-                g.drawEllipse(bounds.getX() + 7.0f, centreY - radius, radius * 2.0f, radius * 2.0f, 0.8f);
-            }
-            g.setColour(juce::Colour::fromRGB(225, 240, 248));
-            g.drawLine(bounds.getRight() - 11.0f, centreY - 2.0f,
-                       bounds.getRight() - 8.0f, centreY + 1.0f, 1.1f);
-            g.drawLine(bounds.getRight() - 8.0f, centreY + 1.0f,
-                       bounds.getRight() - 5.0f, centreY - 2.0f, 1.1f);
-        }
-
-    private:
-        bool isEnabled = false;
-    };
-
-    class ChannelStrip final : public juce::Component, private juce::Timer
-    {
-    public:
-        class InsertSlotButton final : public juce::TextButton
-        {
-        public:
-            void setInsertActive(bool active) { insertActive = active; repaint(); }
-        protected:
-            void paintButton(juce::Graphics& g, bool highlighted, bool down) override
-            {
-                juce::TextButton::paintButton(g, highlighted, down);
-                const auto centreY = static_cast<float>(getHeight()) * 0.5f;
-                const auto colour = insertActive ? juce::Colour::fromRGB(68, 205, 227)
-                                                 : juce::Colour::fromRGB(23, 35, 43);
-                g.setColour(colour);
-                g.fillEllipse(5.0f, centreY - 3.3f, 6.6f, 6.6f);
-                g.setColour(insertActive ? juce::Colour::fromRGB(185, 243, 250).withAlpha(0.75f)
-                                         : juce::Colour::fromRGB(103, 131, 144));
-                g.drawEllipse(5.0f, centreY - 3.3f, 6.6f, 6.6f, 0.8f);
-            }
-        private:
-            bool insertActive = false;
-        };
-
-        ChannelStrip()
-        {
-            startTimerHz(20);
-            addAndMakeVisible(name);
-            name.setJustificationType(juce::Justification::centred);
-            name.setFont(juce::FontOptions(13.0f, juce::Font::bold));
-            name.setColour(juce::Label::textColourId, juce::Colour::fromRGB(244, 250, 253));
-            name.setEditable(false, true, false);
-            name.onTextChange = [this]
-            {
-                const auto cleaned = name.getText().trim();
-                if (cleaned.isNotEmpty() && onRename) onRename(cleaned);
-            };
-            addAndMakeVisible(footer);
-            footer.setJustificationType(juce::Justification::centred);
-            footer.setFont(juce::FontOptions(10.5f, juce::Font::bold));
-            footer.setColour(juce::Label::textColourId, juce::Colour::fromRGB(242, 249, 252));
-            footer.setColour(juce::Label::backgroundColourId, juce::Colour::fromRGB(29, 69, 94));
-            footer.setColour(juce::Label::outlineColourId, juce::Colour::fromRGB(106, 164, 193));
-            addAndMakeVisible(mute);
-            addAndMakeVisible(solo);
-            addAndMakeVisible(eqButton);
-            addAndMakeVisible(eqGraph);
-            eqGraph.onClick = [this] { if (onOpenEq) onOpenEq(); };
-            addAndMakeVisible(insertsTitle);
-            insertsTitle.setText("INSERTS", juce::dontSendNotification);
-            insertsTitle.setFont(juce::FontOptions(10.5f, juce::Font::bold));
-            insertsTitle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
-            insertsTitle.setBorderSize(juce::BorderSize<int>(0, 0, 0, 14));
-            addAndMakeVisible(sendsTitle);
-            sendsTitle.setText("SENDS", juce::dontSendNotification);
-            sendsTitle.setFont(juce::FontOptions(10.5f, juce::Font::bold));
-            sendsTitle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
-            sendsTitle.setBorderSize(juce::BorderSize<int>(0, 0, 0, 14));
-            eqButton.setButtonText("EQ");
-            eqButton.setTitle("Toggle equaliser");
-            eqButton.setClickingTogglesState(true);
-            eqButton.setTooltip("Enable or bypass the Tracktion equaliser. Click the graph to open its full controls.");
-            eqButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(53, 103, 130));
-            eqButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(43, 118, 145));
-            eqButton.onClick = [this] { if (onToggleEq) onToggleEq(eqButton.getToggleState()); };
-            static const std::array<const char*, 4> bandNames { "Hi Shelf", "High Mid", "Low Mid", "Low Shelf" };
-            static const std::array<const char*, 3> parameterNames { "Gain", "Frequency", "Q" };
-            static const std::array<const char*, 3> compactParameterNames { "Gain", "Freq", "Q" };
-            for (int band = 0; band < 4; ++band)
-            {
-                auto& bandTitle = eqBandTitles[static_cast<size_t>(band)];
-                bandTitle.setText(bandNames[static_cast<size_t>(band)], juce::dontSendNotification);
-                bandTitle.setFont(juce::FontOptions(9.0f, juce::Font::bold));
-                bandTitle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
-                bandTitle.setJustificationType(juce::Justification::centredLeft);
-                addAndMakeVisible(bandTitle);
-                for (int parameter = 0; parameter < 3; ++parameter)
-                {
-                    auto& control = eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)];
-                    addAndMakeVisible(control);
-                    control.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-                    control.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-                    control.setPopupDisplayEnabled(true, true, this);
-                    control.setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(186, 225, 242));
-                    control.setColour(juce::Slider::rotarySliderFillColourId, juce::Colour::fromRGB(62, 169, 205));
-                    control.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour::fromRGB(34, 58, 74));
-                    if (parameter == 0)
-                    {
-                        control.setRange(-20.0, 20.0, 0.1);
-                        control.setTextValueSuffix(" dB");
-                    }
-                    else if (parameter == 1)
-                    {
-                        control.setRange(20.0, 20000.0, 1.0);
-                        control.setSkewFactorFromMidPoint(1000.0);
-                        control.setTextValueSuffix(" Hz");
-                    }
-                    else
-                    {
-                        control.setRange(0.1, 4.0, 0.01);
-                    }
-                    control.setTooltip(juce::String(bandNames[static_cast<size_t>(band)]) + " "
-                                       + parameterNames[static_cast<size_t>(parameter)]
-                                       + " â€” drag to adjust; the value appears while you move the knob");
-                    const bool parameterUsed = parameter < 2 || band == 1;
-                    control.setVisible(parameterUsed);
-                    control.onValueChange = [this, band, parameter]
-                    {
-                        if (onEqParameter)
-                        {
-                            // The compact strip shows Gain, Frequency, Q while
-                            // Tracktion stores each band's values as Frequency,
-                            // Gain, Q. Translate the UI order to the engine order.
-                            const auto engineKind = parameter == 0 ? 1 : parameter == 1 ? 0 : 2;
-                            onEqParameter((3 - band) * 3 + engineKind,
-                                static_cast<float>(eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].getValue()));
-                        }
-                    };
-
-                    auto& controlLabel = eqControlLabels[static_cast<size_t>(band)][static_cast<size_t>(parameter)];
-                    controlLabel.setText(compactParameterNames[static_cast<size_t>(parameter)], juce::dontSendNotification);
-                    controlLabel.setFont(juce::FontOptions(8.5f));
-                    controlLabel.setJustificationType(juce::Justification::centred);
-                    controlLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(205, 227, 237));
-                    addAndMakeVisible(controlLabel);
-                    controlLabel.setVisible(parameterUsed);
-                }
-            }
-            for (int slot = 0; slot < 4; ++slot)
-            {
-                auto& insert = insertButtons[static_cast<size_t>(slot)];
-                auto& edit = editInsertButtons[static_cast<size_t>(slot)];
-                auto& bypass = bypassInsertButtons[static_cast<size_t>(slot)];
-                auto& remove = removeInsertButtons[static_cast<size_t>(slot)];
-                addAndMakeVisible(insert);
-                addAndMakeVisible(edit);
-                addAndMakeVisible(bypass);
-                addAndMakeVisible(remove);
-                bypass.setDrawsBypassIndicator(true);
-                insert.setClickingTogglesState(false);
-                insert.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(47, 91, 117));
-                remove.setButtonText("x");
-                remove.setTitle("Remove insert");
-                remove.setTooltip("Remove this effect insert");
-                remove.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(63, 86, 101));
-                insert.onClick = [this, slot]
-                {
-                    if (insertSlotHasEffect[static_cast<size_t>(slot)])
-                    {
-                        if (onEditInsert) onEditInsert(slot);
-                    }
-                    else if (onAddInsert)
-                        onAddInsert();
-                };
-                edit.setButtonText("E");
-                edit.setTooltip("Open effect controls");
-                edit.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(44, 80, 101));
-                edit.onClick = [this, slot] { if (onEditInsert) onEditInsert(slot); };
-                bypass.setButtonText("B");
-                bypass.setTitle("Bypass insert");
-                bypass.setTooltip("Bypass or enable this insert");
-                bypass.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(44, 80, 101));
-                bypass.onClick = [this, slot] { if (onToggleInsert) onToggleInsert(slot); };
-                remove.onClick = [this, slot] { if (onRemoveInsert) onRemoveInsert(slot); };
-                insert.setVisible(false);
-                edit.setVisible(false);
-                bypass.setVisible(false);
-                remove.setVisible(false);
-            }
-            addAndMakeVisible(addInsertButton);
-            addInsertButton.setButtonText("+ Insert");
-            addInsertButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(44, 80, 101));
-            addInsertButton.onClick = [this] { if (onAddInsert) onAddInsert(); };
-            mute.setButtonText("M");
-            solo.setButtonText("S");
-            mute.setClickingTogglesState(true);
-            solo.setClickingTogglesState(true);
-            mute.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(183, 87, 71));
-            solo.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(193, 153, 71));
-            mute.onClick = [this] { if (onMute) onMute(mute.getToggleState()); };
-            solo.onClick = [this] { if (onSolo) onSolo(solo.getToggleState()); };
-            addAndMakeVisible(pan);
-            for (auto* label : { &panLeft, &panTitle, &panRight })
-            {
-                addAndMakeVisible(*label);
-                label->setFont(juce::FontOptions(9.0f, juce::Font::bold));
-                label->setColour(juce::Label::textColourId, juce::Colour::fromRGB(215, 234, 243));
-                label->setJustificationType(juce::Justification::centred);
-            }
-            panLeft.setText("L", juce::dontSendNotification);
-            panTitle.setText("Pan", juce::dontSendNotification);
-            panRight.setText("R", juce::dontSendNotification);
-            pan.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-            pan.setRange(-1.0, 1.0, 0.01);
-            pan.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-            pan.setTextValueSuffix(" Pan");
-            pan.setPopupDisplayEnabled(true, true, this);
-            pan.onValueChange = [this] { if (onPan) onPan(pan.getValue()); };
-            for (int bus = 0; bus < 8; ++bus)
-            {
-                auto& label = sendNames[static_cast<size_t>(bus)];
-                auto& send = sends[static_cast<size_t>(bus)];
-                addAndMakeVisible(label);
-                label.setText(juce::String(bus + 1), juce::dontSendNotification);
-                label.setJustificationType(juce::Justification::centredRight);
-                label.setFont(juce::FontOptions(10.5f, juce::Font::bold));
-                label.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
-                addAndMakeVisible(send);
-                send.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-                send.setRange(-60.0, 6.0, 0.1);
-                send.setValue(-60.0, juce::dontSendNotification);
-                send.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-                send.setTextValueSuffix(" dB");
-                send.setPopupDisplayEnabled(true, true, this);
-                send.setTooltip("FX " + juce::String(bus + 1) + " post-fader send level");
-                send.onValueChange = [this, bus] { if (onSend) onSend(bus, sends[static_cast<size_t>(bus)].getValue()); };
-                send.setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(186, 225, 242));
-                send.setColour(juce::Slider::rotarySliderFillColourId, juce::Colour::fromRGB(62, 169, 205));
-                send.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour::fromRGB(34, 58, 74));
-                send.setColour(juce::Slider::textBoxTextColourId, juce::Colour::fromRGB(242, 249, 252));
-                send.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour::fromRGB(43, 73, 94));
-                send.setColour(juce::Slider::textBoxOutlineColourId, juce::Colour::fromRGB(125, 169, 193));
-            }
-            for (int bus = 0; bus < 8; ++bus)
-            {
-                auto& route = outputBusButtons[static_cast<size_t>(bus)];
-                addAndMakeVisible(route);
-                route.setButtonText(juce::String(bus + 1));
-                route.setClickingTogglesState(false);
-                route.setTooltip("Route this channel to Bus " + juce::String(bus + 1));
-                route.onClick = [this, bus] { if (onOutputBus) onOutputBus(bus); };
-                route.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 58, 72));
-                route.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-                route.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(208, 231, 243));
-                route.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
-            }
-            addAndMakeVisible(outputMasterButton);
-            outputMasterButton.setClickingTogglesState(false);
-            outputMasterButton.setTooltip("Route this channel to the Master output");
-            outputMasterButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 58, 72));
-            outputMasterButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-            outputMasterButton.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(208, 231, 243));
-            outputMasterButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
-            outputMasterButton.onClick = [this] { if (onOutputBus) onOutputBus(-1); };
-            addAndMakeVisible(gain);
-            gain.setSliderStyle(juce::Slider::LinearVertical);
-            gain.setRange(-60.0, 6.0, 0.1);
-            gain.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
-            gain.setTextValueSuffix(" dB");
-            gain.setPopupDisplayEnabled(true, true, this);
-            gain.onValueChange = [this] { if (onGain) onGain(gain.getValue()); };
-            for (auto* slider : { &gain, &pan })
-            {
-                slider->setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(186, 225, 242));
-                slider->setColour(juce::Slider::trackColourId, juce::Colour::fromRGB(44, 78, 100));
-                slider->setColour(juce::Slider::textBoxTextColourId, juce::Colour::fromRGB(242, 249, 252));
-                slider->setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour::fromRGB(43, 73, 94));
-                slider->setColour(juce::Slider::textBoxOutlineColourId, juce::Colour::fromRGB(125, 169, 193));
-            }
-        }
-
-        ~ChannelStrip() override
-        {
-            stopTimer();
-            detachMeter();
-        }
-
-        std::function<void(double)> onGain, onPan;
-        std::function<void(const juce::String&)> onRename;
-        std::function<void(int, double)> onSend;
-        std::function<void(int)> onOutputBus;
-        std::function<void(bool)> onMute, onSolo, onToggleEq;
-        std::function<void()> onOpenEq;
-        std::function<void(int, float)> onEqParameter;
-        std::function<float(int)> getEqParameter;
-        std::function<void(int)> onEditInsert;
-        std::function<void(int)> onToggleInsert, onRemoveInsert;
-        std::function<void()> onAddInsert;
-        juce::Slider gain;
-        juce::Label footer;
-        juce::Label insertsTitle;
-        juce::Label sendsTitle;
-        std::array<juce::Label, 4> eqBandTitles;
-        std::array<std::array<juce::Slider, 3>, 4> eqControls;
-        std::array<juce::Label, 8> sendNames;
-        std::array<juce::Slider, 8> sends;
-        std::array<juce::TextButton, 8> outputBusButtons;
-        juce::TextButton outputMasterButton { "Master" };
-        void setNameText(const juce::String& text) { name.setText(text, juce::dontSendNotification); }
-        void setNameEditable(bool editable)
-        {
-            name.setEditable(false, editable, false);
-            name.setTooltip(editable ? "Double-click to rename this channel" : juce::String{});
-        }
-        void setFooterText(const juce::String& text) { footer.setText(text, juce::dontSendNotification); }
-        void setGainValue(double value) { gain.setValue(value, juce::dontSendNotification); }
-        void setPanValue(double value) { pan.setValue(value, juce::dontSendNotification); }
-        void refreshEqParameterValues()
-        {
-            if (!getEqParameter) return;
-            for (int band = 0; band < 4; ++band)
-                for (int parameter = 0; parameter < 3; ++parameter)
-                    eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setValue(
-                        getEqParameter((3 - band) * 3 + (parameter == 0 ? 1 : parameter == 1 ? 0 : 2)),
-                        juce::dontSendNotification);
-        }
-        void setSendValue(int bus, double value)
-        {
-            if (juce::isPositiveAndBelow(bus, 8))
-                sends[static_cast<size_t>(bus)].setValue(value, juce::dontSendNotification);
-        }
-        void setOutputBus(int bus)
-        {
-            for (int i = 0; i < 8; ++i)
-                outputBusButtons[static_cast<size_t>(i)].setToggleState(i == bus, juce::dontSendNotification);
-            outputMasterButton.setToggleState(bus < 0, juce::dontSendNotification);
-        }
-        void setMuteState(bool value) { mute.setToggleState(value, juce::dontSendNotification); }
-        void setSoloState(bool value) { solo.setToggleState(value, juce::dontSendNotification); }
-        void setEqEnabled(bool value)
-        {
-            eqButton.setToggleState(value, juce::dontSendNotification);
-            eqButton.setEnabledIndicator(value);
-            eqButton.setTooltip(value
-                ? "Equaliser enabled â€” click to bypass; click the graph to open full controls."
-                : "Equaliser bypassed â€” click to enable; click the graph to open full controls.");
-        }
-        void setPanVisible(bool shouldShow) { pan.setVisible(shouldShow); }
-        void setMixControlsVisible(bool shouldShow)
-        {
-            mute.setVisible(shouldShow);
-            solo.setVisible(shouldShow);
-            sendsTitle.setVisible(shouldShow);
-            for (int bus = 0; bus < 8; ++bus)
-            {
-                sendNames[static_cast<size_t>(bus)].setVisible(shouldShow && bus < 4);
-                sends[static_cast<size_t>(bus)].setVisible(shouldShow && bus < 4);
-            }
-            outputMasterButton.setVisible(shouldShow && !masterEqView);
-            for (auto& route : outputBusButtons) route.setVisible(shouldShow && !masterEqView);
-            eqButton.setVisible(shouldShow);
-            eqGraph.setVisible(shouldShow);
-            for (int band = 0; band < 4; ++band)
-            {
-                eqBandTitles[static_cast<size_t>(band)].setVisible(shouldShow);
-                for (int parameter = 0; parameter < 3; ++parameter)
-                {
-                    const bool parameterUsed = parameter < 2 || band == 1;
-                    eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(shouldShow && parameterUsed);
-                    eqControlLabels[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(shouldShow && parameterUsed);
-                }
-            }
-            insertsTitle.setVisible(shouldShow);
-            addInsertButton.setVisible(false);
-            if (!shouldShow)
-                for (int slot = 0; slot < 4; ++slot)
-                {
-                    insertButtons[static_cast<size_t>(slot)].setVisible(false);
-                    editInsertButtons[static_cast<size_t>(slot)].setVisible(false);
-                    bypassInsertButtons[static_cast<size_t>(slot)].setVisible(false);
-                    removeInsertButtons[static_cast<size_t>(slot)].setVisible(false);
-                }
-        }
-        void setMasterControlsVisible(bool shouldShow)
-        {
-            masterEqView = shouldShow;
-            sendsTitle.setVisible(false);
-            for (int bus = 0; bus < 8; ++bus)
-            {
-                sendNames[static_cast<size_t>(bus)].setVisible(false);
-                sends[static_cast<size_t>(bus)].setVisible(false);
-                outputBusButtons[static_cast<size_t>(bus)].setVisible(false);
-            }
-            outputMasterButton.setVisible(false);
-            mute.setVisible(shouldShow);
-            mute.setEnabled(shouldShow);
-            solo.setVisible(shouldShow);
-            solo.setEnabled(false);
-            solo.setTooltip("The master output cannot be soloed");
-            eqButton.setVisible(shouldShow);
-            eqGraph.setVisible(shouldShow);
-            for (int band = 0; band < 4; ++band)
-            {
-                eqBandTitles[static_cast<size_t>(band)].setVisible(false);
-                for (int parameter = 0; parameter < 3; ++parameter)
-                {
-                    eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(false);
-                    eqControlLabels[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(false);
-                }
-            }
-            insertsTitle.setVisible(shouldShow);
-            addInsertButton.setVisible(false);
-            resized();
-        }
-        void setSendsVisible(bool shouldShow)
-        {
-            sendsTitle.setVisible(shouldShow);
-            for (int bus = 0; bus < 8; ++bus)
-            {
-                sendNames[static_cast<size_t>(bus)].setVisible(shouldShow && bus < 4);
-                sends[static_cast<size_t>(bus)].setVisible(shouldShow && bus < 4);
-            }
-        }
-        void setOutputRoutesVisible(bool shouldShow)
-        {
-            outputMasterButton.setVisible(shouldShow && !masterEqView);
-            for (auto& route : outputBusButtons) route.setVisible(shouldShow && !masterEqView);
-        }
-        void setEqResponse(std::function<float(float)> callback)
-        {
-            eqGraph.responseAtFrequency = std::move(callback);
-            eqGraph.repaint();
-        }
-        void setEqBandCallbacks(std::function<float(int)> frequency,
-                                std::function<float(int)> gainValue,
-                                std::function<void(int, float, float)> setBand)
-        {
-            eqGraph.bandFrequency = std::move(frequency);
-            eqGraph.bandGain = std::move(gainValue);
-            eqGraph.setBand = std::move(setBand);
-            eqGraph.repaint();
-        }
-        void repaintEqGraph() { eqGraph.repaint(); }
-        void setMeterPlugin(te::LevelMeterPlugin* plugin)
-        {
-            if (meterPlugin == plugin) return;
-            detachMeter();
-            if (plugin == nullptr) return;
-            meterPluginRef = plugin;
-            meterPlugin = plugin;
-            meterPlugin->measurer.addClient(meterClient);
-            meterVisible = true;
-        }
-        void setMasterMeterContextSupplier(std::function<te::EditPlaybackContext*()> supplier)
-        {
-            masterMeterContextSupplier = std::move(supplier);
-            isMasterMeter = static_cast<bool>(masterMeterContextSupplier);
-        }
-        void detachMeter()
-        {
-            if (meterPlugin != nullptr)
-                meterPlugin->measurer.removeClient(meterClient);
-            meterPlugin = nullptr;
-            meterPluginRef = nullptr;
-            if (auto* context = masterMeterContext.get())
-                context->masterLevels.removeClient(meterClient);
-            masterMeterContext = {};
-            leftPeakDb = rightPeakDb = -100.0f;
-            leftPeakHoldDb = rightPeakHoldDb = -100.0f;
-            leftPeakHoldTicks = rightPeakHoldTicks = 0;
-            clipHeld = false;
-            meterVisible = false;
-        }
-        void setInsertRow(int slot, const juce::String& insertName, bool enabled)
-        {
-            if (!juce::isPositiveAndBelow(slot, 4)) return;
-            auto& insert = insertButtons[static_cast<size_t>(slot)];
-            auto& edit = editInsertButtons[static_cast<size_t>(slot)];
-            auto& bypass = bypassInsertButtons[static_cast<size_t>(slot)];
-            auto& remove = removeInsertButtons[static_cast<size_t>(slot)];
-            const bool visible = slot < 3;
-            const bool populated = visible && insertName.isNotEmpty();
-            insertSlotHasEffect[static_cast<size_t>(slot)] = populated;
-            insert.setVisible(visible);
-            remove.setVisible(populated);
-            // The effect-name button already opens its editor. Hiding the
-            // duplicate E control gives the name enough room to read at the
-            // reference mixerâ€™s narrow channel width.
-            edit.setVisible(false);
-            bypass.setVisible(populated);
-            insert.setButtonText(populated ? "    " + insertName : juce::String{});
-            insert.setInsertActive(populated && enabled);
-            insert.setColour(juce::TextButton::buttonColourId,
-                             !populated ? juce::Colour::fromRGB(48, 78, 95)
-                                : enabled ? juce::Colour::fromRGB(47, 91, 117) : juce::Colour::fromRGB(55, 69, 78));
-            insert.setTooltip(populated ? "Open " + insertName + " controls" : "Add an effect to this insert slot");
-            bypass.setButtonText("");
-            bypass.setTooltip(enabled ? "Bypass this effect" : "Enable this effect");
-            bypass.setActive(enabled);
-            bypass.setColour(juce::TextButton::buttonColourId,
-                             enabled ? juce::Colour::fromRGB(44, 80, 101) : juce::Colour::fromRGB(55, 69, 78));
-        }
-        void setSelected(bool selected) { isSelected = selected; repaint(); }
-
-        void mouseMove(const juce::MouseEvent& event) override
-        {
-            setMouseCursor(meterVisible && meterBounds.contains(event.getPosition())
-                               ? juce::MouseCursor::PointingHandCursor
-                               : juce::MouseCursor::NormalCursor);
-        }
-
-        void mouseDown(const juce::MouseEvent& event) override
-        {
-            if (!meterVisible || !meterBounds.contains(event.getPosition()))
-                return;
-
-            leftPeakHoldDb = rightPeakHoldDb = -100.0f;
-            leftPeakHoldTicks = rightPeakHoldTicks = 0;
-            clipHeld = false;
-            repaint(meterBounds.expanded(2));
-        }
-
-        void paint(juce::Graphics& g) override
-        {
-            auto box = getLocalBounds().toFloat().reduced(1.0f);
-            const auto base = isSelected ? juce::Colour::fromRGB(91, 143, 171) : juce::Colour::fromRGB(71, 117, 146);
-            g.setGradientFill(juce::ColourGradient(base.brighter(0.12f), 0.0f, 0.0f,
-                                                   base.darker(0.16f), 0.0f, getHeight(), false));
-            g.fillRoundedRectangle(box, 5.0f);
-            g.setColour(juce::Colour::fromRGB(161, 197, 216));
-            g.drawRoundedRectangle(box, 5.0f, 1.0f);
-            g.setColour(juce::Colour::fromRGB(43, 81, 105));
-            g.fillRect(5.0f, 35.0f, box.getWidth() - 10.0f, 1.0f);
-            if (sendsTitle.isVisible())
-            {
-                const auto centreY = sendsTitle.getBounds().toFloat().getCentreY();
-                g.setColour(juce::Colour::fromRGB(72, 211, 235));
-                g.fillEllipse(static_cast<float>(sendsTitle.getX() - 12), centreY - 3.0f, 6.0f, 6.0f);
-                g.setColour(juce::Colour::fromRGB(190, 245, 252).withAlpha(0.75f));
-                g.drawEllipse(static_cast<float>(sendsTitle.getX() - 12), centreY - 3.0f, 6.0f, 6.0f, 0.8f);
-            }
-            if (insertsTitle.isVisible())
-            {
-                const auto centreY = insertsTitle.getBounds().toFloat().getCentreY();
-                g.setColour(juce::Colour::fromRGB(234, 62, 52));
-                g.fillEllipse(static_cast<float>(insertsTitle.getX() - 12), centreY - 3.0f, 6.0f, 6.0f);
-                g.setColour(juce::Colour::fromRGB(255, 183, 166).withAlpha(0.75f));
-                g.drawEllipse(static_cast<float>(insertsTitle.getX() - 12), centreY - 3.0f, 6.0f, 6.0f, 0.8f);
-            }
-            paintMeter(g);
-        }
-
-        void resized() override
-        {
-            auto area = getLocalBounds().reduced(6, 6);
-            footer.setBounds(area.removeFromBottom(25));
-            area.removeFromBottom(4);
-            name.setBounds(area.removeFromTop(28));
-            area.removeFromTop(3);
-            if (sends[0].isVisible())
-            {
-                // Four auxiliary send knobs arranged like the Orion reference.
-                sendsTitle.setBounds(area.removeFromTop(13).withTrimmedLeft(16));
-                auto sendArea = area.removeFromTop(72);
-                for (int bus = 0; bus < 4; ++bus)
-                {
-                    const auto row = bus / 2;
-                    const auto column = bus % 2;
-                    const auto cellX = area.getX() + column * (area.getWidth() / 2);
-                    auto cell = juce::Rectangle<int>(cellX, sendArea.getY() + row * 36,
-                                                     area.getWidth() / 2, 36).reduced(1, 0);
-                    auto sendNameArea = cell.removeFromTop(8).removeFromRight(20);
-                    sendNames[static_cast<size_t>(bus)].setBounds(sendNameArea);
-                    const auto knobSize = juce::jmin(30, cell.getWidth() - 2, cell.getHeight());
-                    sends[static_cast<size_t>(bus)].setBounds(cell.withSizeKeepingCentre(knobSize, knobSize));
-                }
-                area.removeFromTop(2);
-            }
-            if (eqButton.isVisible())
-            {
-                insertsTitle.setBounds(area.removeFromTop(16).withTrimmedLeft(16));
-                for (int slot = 0; slot < 4; ++slot)
-                {
-                    if (slot >= 3)
-                    {
-                        insertButtons[static_cast<size_t>(slot)].setBounds({});
-                        editInsertButtons[static_cast<size_t>(slot)].setBounds({});
-                        bypassInsertButtons[static_cast<size_t>(slot)].setBounds({});
-                        removeInsertButtons[static_cast<size_t>(slot)].setBounds({});
-                        continue;
-                    }
-                    auto row = area.removeFromTop(23);
-                    if (insertSlotHasEffect[static_cast<size_t>(slot)])
-                    {
-                        auto removeArea = row.removeFromRight(17);
-                        auto bypassArea = row.removeFromRight(17);
-                        row.removeFromRight(2);
-                        insertButtons[static_cast<size_t>(slot)].setBounds(row);
-                        bypassInsertButtons[static_cast<size_t>(slot)].setBounds(bypassArea);
-                        removeInsertButtons[static_cast<size_t>(slot)].setBounds(removeArea);
-                    }
-                    else
-                    {
-                        insertButtons[static_cast<size_t>(slot)].setBounds(row);
-                        bypassInsertButtons[static_cast<size_t>(slot)].setBounds({});
-                        removeInsertButtons[static_cast<size_t>(slot)].setBounds({});
-                    }
-                    area.removeFromTop(1);
-                }
-                addInsertButton.setBounds({});
-                area.removeFromTop(2);
-                eqButton.setBounds(area.removeFromTop(22));
-                area.removeFromTop(2);
-                if (masterEqView)
-                {
-                    // The reference Master strip gives its EQ response graph
-                    // a dedicated display area instead of repeating the four
-                    // compact channel EQ control rows.
-                    const auto graphHeight = juce::jmin(210, juce::jmax(110, area.getHeight() / 3));
-                    eqGraph.setBounds(area.removeFromTop(graphHeight));
-                    area.removeFromTop(3);
-                }
-                else
-                {
-                    eqGraph.setBounds(area.removeFromTop(42));
-                    area.removeFromTop(3);
-                    for (int band = 0; band < 4; ++band)
-                    {
-                        eqBandTitles[static_cast<size_t>(band)].setBounds(area.removeFromTop(13));
-                        auto controls = area.removeFromTop(54);
-                        const int parameterCount = band == 1 ? 3 : 2;
-                        const std::array<float, 3> twoKnobPositions { 0.30f, 0.70f, 0.0f };
-                        const std::array<float, 3> threeKnobPositions { 0.18f, 0.50f, 0.82f };
-                        for (int parameter = 0; parameter < parameterCount; ++parameter)
-                        {
-                            const auto xPosition = parameterCount == 3
-                                ? threeKnobPositions[static_cast<size_t>(parameter)]
-                                : twoKnobPositions[static_cast<size_t>(parameter)];
-                            const int knobSize = juce::jmin(46, controls.getHeight());
-                            const int diagonalOffset = parameterCount == 3
-                                ? (parameter == 1 ? 0 : 7)
-                                : (parameter == 0 ? 7 : 0);
-                            const int x = controls.getX() + juce::roundToInt(
-                                xPosition * static_cast<float>(controls.getWidth())) - knobSize / 2;
-                            eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setBounds(
-                                juce::Rectangle<int>(x, controls.getY() + diagonalOffset, knobSize, knobSize)
-                                    .constrainedWithin(controls));
-                        }
-                        auto labels = area.removeFromTop(11);
-                        for (int parameter = 0; parameter < parameterCount; ++parameter)
-                        {
-                            const auto xPosition = parameterCount == 3
-                                ? threeKnobPositions[static_cast<size_t>(parameter)]
-                                : twoKnobPositions[static_cast<size_t>(parameter)];
-                            const int labelWidth = parameterCount == 3 ? 34 : 48;
-                            const int x = controls.getX() + juce::roundToInt(
-                                xPosition * static_cast<float>(controls.getWidth())) - labelWidth / 2;
-                            eqControlLabels[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setBounds(
-                                juce::Rectangle<int>(x, labels.getY(), labelWidth, labels.getHeight())
-                                    .constrainedWithin(labels));
-                        }
-                        area.removeFromTop(2);
-                    }
-                }
-                area.removeFromTop(2);
-            }
-            if (mute.isVisible())
-            {
-                auto modeButtons = area.removeFromTop(26);
-                mute.setBounds(modeButtons.removeFromLeft((modeButtons.getWidth() - 4) / 2));
-                modeButtons.removeFromLeft(4);
-                solo.setBounds(modeButtons);
-                area.removeFromTop(2);
-                auto panArea = area.removeFromTop(70);
-                auto panLabelRow = panArea.removeFromTop(14);
-                panLeft.setBounds(panLabelRow.removeFromLeft(18));
-                panRight.setBounds(panLabelRow.removeFromRight(18));
-                panTitle.setBounds(panLabelRow);
-                const int panWidth = juce::jmin(64, panArea.getWidth());
-                pan.setBounds(panArea.withSizeKeepingCentre(panWidth, panArea.getHeight()));
-                area.removeFromTop(4);
-            }
-            if (!masterEqView && outputMasterButton.isVisible())
-            {
-                auto routeArea = area.removeFromBottom(48);
-                outputMasterButton.setBounds(routeArea.removeFromTop(15));
-                routeArea.removeFromTop(2);
-                for (int rowIndex = 0; rowIndex < 2; ++rowIndex)
-                {
-                    auto row = routeArea.removeFromTop(13);
-                    for (int column = 0; column < 4; ++column)
-                    {
-                        const int bus = rowIndex * 4 + column;
-                        auto cell = row.removeFromLeft(row.getWidth() / (4 - column));
-                        outputBusButtons[static_cast<size_t>(bus)].setBounds(cell.reduced(1, 0));
-                    }
-                }
-            }
-            auto meterArea = area.removeFromRight(34);
-            area.removeFromRight(3);
-            gain.setBounds(area);
-            meterBounds = meterArea.reduced(2, 0);
-        }
-
-
-    private:
-        void timerCallback() override
-        {
-            if (isMasterMeter && masterMeterContextSupplier)
-            {
-                auto* currentContext = masterMeterContextSupplier();
-                if (masterMeterContext.get() != currentContext)
-                {
-                    detachMeter();
-                    if (currentContext != nullptr)
-                    {
-                        masterMeterContext = currentContext;
-                        currentContext->masterLevels.addClient(meterClient);
-                        meterVisible = true;
-                    }
-                }
-            }
-
-            const auto left = meterClient.getAndClearAudioLevel(0).dB;
-            const auto right = meterClient.getAndClearAudioLevel(1).dB;
-            leftPeakDb = left > -100.0f ? juce::jmax(left, leftPeakDb - 1.1f) : juce::jmax(-100.0f, leftPeakDb - 1.1f);
-            rightPeakDb = right > -100.0f ? juce::jmax(right, rightPeakDb - 1.1f) : juce::jmax(-100.0f, rightPeakDb - 1.1f);
-            updatePeakHold(left, leftPeakHoldDb, leftPeakHoldTicks);
-            updatePeakHold(right, rightPeakHoldDb, rightPeakHoldTicks);
-            // The level measurer reports peaks in dBFS, where full scale is 0 dB.
-            // Treat a sample that reaches 0 dBFS as a clip as well as any overs.
-            if (left >= 0.0f || right >= 0.0f)
-                clipHeld = true;
-            repaint(meterBounds.expanded(2));
-        }
-
-        static void updatePeakHold(float incomingDb, float& heldDb, int& holdTicks)
-        {
-            if (incomingDb > heldDb)
-            {
-                heldDb = incomingDb;
-                holdTicks = 40;
-            }
-            else if (holdTicks > 0)
-            {
-                --holdTicks;
-            }
-            else
-            {
-                heldDb = juce::jmax(-100.0f, heldDb - 0.1f);
-            }
-        }
-
-        void paintMeter(juce::Graphics& g)
-        {
-            if (!meterVisible || meterBounds.isEmpty()) return;
-            g.setColour(juce::Colour::fromRGB(19, 33, 43));
-            g.fillRoundedRectangle(meterBounds.toFloat(), 2.0f);
-            const int gap = 2;
-            constexpr int scaleWidth = 12;
-            const int channelWidth = (meterBounds.getWidth() - scaleWidth - gap - 2) / 2;
-            static constexpr std::array<int, 7> scaleValues { 0, -6, -12, -18, -24, -36, -60 };
-            const auto meterTop = meterBounds.getY() + 2;
-            const auto meterHeight = meterBounds.getHeight() - 4;
-            g.setFont(7.5f);
-            for (const auto db : scaleValues)
-            {
-                const auto level = static_cast<float>(db + 60) / 60.0f;
-                const auto y = meterTop + juce::roundToInt((1.0f - level) * static_cast<float>(meterHeight));
-                g.setColour(juce::Colour::fromRGB(194, 216, 225));
-                g.drawFittedText(db == 0 ? "0" : juce::String(db),
-                                 meterBounds.getX(), y - 4, scaleWidth - 2, 9,
-                                 juce::Justification::centredRight, 1);
-                g.setColour(juce::Colour::fromRGB(125, 158, 173));
-                g.drawHorizontalLine(y, static_cast<float>(meterBounds.getX() + scaleWidth - 2),
-                                     static_cast<float>(meterBounds.getX() + scaleWidth + 2));
-            }
-            const auto drawChannel = [&g, this, channelWidth](int x, float db, float heldDb)
-            {
-                const auto channel = juce::Rectangle<int>(x, meterBounds.getY() + 2,
-                                                           channelWidth, meterBounds.getHeight() - 4);
-                g.setColour(juce::Colour::fromRGB(31, 49, 60));
-                g.fillRect(channel);
-                constexpr int segmentCount = 30; // 2 dB per LED over the -60 to 0 dB range
-                constexpr int segmentGap = 2;
-                const int segmentHeight = juce::jmax(2,
-                    (channel.getHeight() - (segmentCount - 1) * segmentGap) / segmentCount);
-                for (int segment = 0; segment < segmentCount; ++segment)
-                {
-                    const float thresholdDb = -60.0f + (static_cast<float>(segment) + 1.0f)
-                        * (60.0f / static_cast<float>(segmentCount));
-                    if (db < thresholdDb) continue;
-
-                    if (thresholdDb > -6.0f)
-                        g.setColour(juce::Colour::fromRGB(227, 101, 81));
-                    else if (thresholdDb > -18.0f)
-                        g.setColour(juce::Colour::fromRGB(204, 231, 241));
-                    else
-                        g.setColour(juce::Colour::fromRGB(86, 203, 231));
-
-                    const int y = channel.getBottom() - (segment + 1) * (segmentHeight + segmentGap)
-                        + segmentGap;
-                    g.fillRect(x, y, channelWidth, segmentHeight);
-                }
-
-                if (heldDb > -60.0f)
-                {
-                    const auto heldLevel = juce::jlimit(0.0f, 1.0f, (heldDb + 60.0f) / 60.0f);
-                    const auto markerY = channel.getBottom()
-                        - juce::roundToInt(heldLevel * static_cast<float>(channel.getHeight()));
-                    g.setColour(juce::Colour::fromRGB(232, 247, 252));
-                    g.fillRect(x, juce::jlimit(channel.getY(), channel.getBottom() - 2, markerY - 1),
-                               channelWidth, 2);
-                }
-            };
-            drawChannel(meterBounds.getX() + scaleWidth, leftPeakDb, leftPeakHoldDb);
-            drawChannel(meterBounds.getX() + scaleWidth + channelWidth + gap, rightPeakDb, rightPeakHoldDb);
-            if (clipHeld)
-            {
-                g.setColour(juce::Colour::fromRGB(235, 75, 61));
-                g.fillRect(meterBounds.getX() + scaleWidth, meterBounds.getY() + 2,
-                           meterBounds.getWidth() - scaleWidth - 2, 3);
-            }
-            g.setColour(juce::Colour::fromRGB(147, 185, 202));
-            g.drawRoundedRectangle(meterBounds.toFloat(), 2.0f, 1.0f);
-        }
-
-        juce::Label name;
-        juce::Slider pan;
-        juce::TextButton mute, solo;
-        EqHeaderButton eqButton;
-        EqResponseGraph eqGraph;
-        std::array<InsertSlotButton, 4> insertButtons;
-        std::array<juce::TextButton, 4> editInsertButtons;
-        std::array<SmallActionButton, 4> bypassInsertButtons;
-        std::array<SmallActionButton, 4> removeInsertButtons;
-        juce::TextButton addInsertButton;
-        std::array<bool, 4> insertSlotHasEffect{};
-        te::LevelMeterPlugin* meterPlugin = nullptr;
-        te::Plugin::Ptr meterPluginRef;
-        te::LevelMeasurer::Client meterClient;
-        juce::WeakReference<te::EditPlaybackContext> masterMeterContext;
-        std::function<te::EditPlaybackContext*()> masterMeterContextSupplier;
-        juce::Rectangle<int> meterBounds;
-        juce::Label panLeft, panTitle, panRight;
-        std::array<std::array<juce::Label, 3>, 4> eqControlLabels;
-        float leftPeakDb = -100.0f, rightPeakDb = -100.0f;
-        float leftPeakHoldDb = -100.0f, rightPeakHoldDb = -100.0f;
-        int leftPeakHoldTicks = 0, rightPeakHoldTicks = 0;
-        bool clipHeld = false;
-        bool meterVisible = false, isMasterMeter = false;
-        bool masterEqView = false;
-        bool isSelected = false;
-    };
-
-    class MixerPanel final : public juce::Component
-    {
-    public:
-        void paint(juce::Graphics& g) override { g.fillAll(juce::Colour::fromRGB(68, 112, 139)); }
-    };
-
-    MixerPanel content;
-    juce::Viewport viewport;
-    juce::Component strips;
-    juce::OwnedArray<ChannelStrip> channelStrips;
-    ChannelStrip masterStrip;
-    std::unique_ptr<PluginParameterWindow> effectWindow;
-};
-
-class PianoRollGrid final : public juce::Component
-{
-public:
-    // Keep the maximized editor's time ruler broad like Orion's piano roll.
-    // A pattern can still be shorter; the red boundary shows its current end.
-    static constexpr int baseVisibleStepCount = 48;
-    std::function<int()> getActiveStepCount;
-    std::function<bool(int, int)> noteIsOn;
-    std::function<bool()> areAllNotesSelected;
-    std::function<int(int, int)> getNoteLength;
-    std::function<void(int, int, bool)> noteClicked;
-    std::function<void(int, int, int)> noteLengthChanged;
-    std::function<void(int)> paintLengthUpdated;
-
-    int activeSteps() const { return juce::jlimit(1, 64, getActiveStepCount ? getActiveStepCount() : 16); }
-    int visibleSteps() const { return juce::jmax(baseVisibleStepCount, activeSteps()); }
-    int labelWidth() const { return 58; }
-    int headerHeight() const { return 30; }
-    int rowHeight() const { return juce::jmax(22, (getHeight() - headerHeight() - 8 - (velocityLaneVisible ? 116 : 0)) / 37); }
-    int stepWidth() const { return juce::jmax(22, (getWidth() - labelWidth()) / visibleSteps()); }
-    void setVelocityLaneVisible(bool visible) { velocityLaneVisible = visible; repaint(); }
-    bool isVelocityLaneVisible() const { return velocityLaneVisible; }
-    void setKeyboardOptions(bool coloured, bool labels)
-    {
-        colouredKeys = coloured;
-        showNoteNames = labels;
-        repaint();
-    }
-    void setGridOptions(int stepsPerBar, int emphasis)
-    {
-        subdivisionsPerBar = juce::jlimit(4, 64, stepsPerBar);
-        highlightEveryN = juce::jlimit(1, subdivisionsPerBar, emphasis);
-        repaint();
-    }
-    int getSubdivisionsPerBar() const { return subdivisionsPerBar; }
-    int getHighlightEveryN() const { return highlightEveryN; }
-    bool hasColouredKeys() const { return colouredKeys; }
-    bool hasNoteNames() const { return showNoteNames; }
-
-    void paint(juce::Graphics& g) override
-    {
-        constexpr int velocityHeight = 116;
-        const auto labelWidthPx = labelWidth();
-        const auto headerHeightPx = headerHeight();
-        const auto rowHeightPx = rowHeight();
-        const auto stepWidthPx = stepWidth();
-        g.fillAll(juce::Colour::fromRGB(20, 29, 38));
-        g.setColour(juce::Colour::fromRGB(29, 43, 55));
-        g.fillRect(0, 0, getWidth(), headerHeightPx);
-        g.setFont(12.0f);
-        const auto activeStepCount = activeSteps();
-        const auto visibleStepCount = visibleSteps();
-        for (int step = 0; step < visibleStepCount; ++step)
-        {
-            g.setColour(step < activeStepCount ? juce::Colour::fromRGB(178, 198, 211)
-                                                : juce::Colour::fromRGB(90, 111, 124));
-            g.drawText(juce::String(step + 1), labelWidthPx + step * stepWidthPx, 0, stepWidthPx, headerHeightPx,
-                       juce::Justification::centred);
-        }
-
-        for (int pitch = 84; pitch >= 48; --pitch)
-        {
-            const auto row = 84 - pitch;
-            const auto y = headerHeightPx + row * rowHeightPx;
-            const bool blackKey = ((pitch % 12) == 1 || (pitch % 12) == 3 || (pitch % 12) == 6
-                                   || (pitch % 12) == 8 || (pitch % 12) == 10);
-            const auto keyWidth = blackKey ? (labelWidthPx * 3) / 5 : labelWidthPx - 2;
-            g.setColour(colouredKeys
-                ? (blackKey ? juce::Colour::fromRGB(24, 34, 43) : juce::Colour::fromRGB(224, 232, 237))
-                : juce::Colour::fromRGB(196, 207, 215));
-            g.fillRect(0, y, keyWidth, rowHeightPx);
-            g.setColour(blackKey ? juce::Colour::fromRGB(13, 21, 28) : juce::Colour::fromRGB(106, 126, 139));
-            g.drawRect(0, y, keyWidth, rowHeightPx, 1);
-            g.setColour(blackKey ? juce::Colour::fromRGB(178, 198, 211) : juce::Colour::fromRGB(28, 43, 53));
-            if (showNoteNames)
-                g.drawText(pitchLabel(pitch), 4, y, labelWidthPx - 8, rowHeightPx, juce::Justification::centredRight);
-
-            for (int step = 0; step < visibleStepCount; ++step)
-            {
-                const auto x = labelWidthPx + step * stepWidthPx;
-                const bool inPattern = step < activeStepCount;
-                const bool active = inPattern && noteIsOn && noteIsOn(pitch, step);
-                g.setColour(inPattern
-                    ? (blackKey ? juce::Colour::fromRGB(24, 34, 43) : juce::Colour::fromRGB(32, 46, 58))
-                    : (blackKey ? juce::Colour::fromRGB(18, 27, 35) : juce::Colour::fromRGB(23, 34, 42)));
-                g.fillRect(x + 1, y + 1, stepWidthPx - 2, rowHeightPx - 2);
-                if (active)
-                {
-                    const auto noteLength = juce::jlimit(1, activeStepCount - step,
-                        getNoteLength ? getNoteLength(pitch, step) : 1);
-                    const auto noteWidth = juce::jmax(4, noteLength * stepWidthPx - 5);
-                    g.setColour(juce::Colour::fromRGB(48, 158, 199));
-                    g.fillRoundedRectangle(static_cast<float>(x + 2), static_cast<float>(y + 3),
-                                           static_cast<float>(noteWidth), static_cast<float>(rowHeightPx - 6), 3.0f);
-                    g.setColour(juce::Colour::fromRGB(156, 232, 250));
-                    g.drawRoundedRectangle(static_cast<float>(x + 2), static_cast<float>(y + 3),
-                                           static_cast<float>(noteWidth), static_cast<float>(rowHeightPx - 6), 3.0f, 1.0f);
-                    if (areAllNotesSelected && areAllNotesSelected())
-                    {
-                        g.setColour(juce::Colour::fromRGB(255, 220, 125));
-                        g.drawRoundedRectangle(static_cast<float>(x + 1), static_cast<float>(y + 2),
-                                               static_cast<float>(noteWidth + 2), static_cast<float>(rowHeightPx - 4), 3.0f, 2.0f);
-                    }
-                }
-                g.setColour(!inPattern ? juce::Colour::fromRGB(40, 55, 66)
-                    : step % subdivisionsPerBar == 0 ? juce::Colour::fromRGB(100, 137, 155)
-                    : step % highlightEveryN == 0 ? juce::Colour::fromRGB(82, 113, 130)
-                                                   : juce::Colour::fromRGB(53, 75, 90));
-                g.drawRect(x, y, stepWidthPx, rowHeightPx, 1);
-            }
-        }
-
-        const auto velocityTop = headerHeightPx + 37 * rowHeightPx + 8;
-        if (velocityLaneVisible)
-        {
-            g.setColour(juce::Colour::fromRGB(29, 43, 55));
-            g.fillRect(0, velocityTop, getWidth(), velocityHeight);
-            g.setColour(juce::Colour::fromRGB(178, 198, 211));
-            g.setFont(11.0f);
-            g.drawText("Velocity", 4, velocityTop, labelWidthPx - 8, 20, juce::Justification::centredLeft);
-            for (int step = 0; step < visibleStepCount; ++step)
-            {
-                const auto x = labelWidthPx + step * stepWidthPx;
-                const bool inPattern = step < activeStepCount;
-                g.setColour(inPattern ? juce::Colour::fromRGB(53, 75, 90) : juce::Colour::fromRGB(38, 52, 62));
-                g.drawVerticalLine(x, static_cast<float>(velocityTop + 22), static_cast<float>(velocityTop + velocityHeight));
-                bool active = false;
-                for (int pitch = 48; pitch <= 84 && inPattern && !active; ++pitch)
-                    active = noteIsOn && noteIsOn(pitch, step);
-                if (active)
-                {
-                    g.setColour(juce::Colour::fromRGB(48, 158, 199));
-                    g.fillRect(x + stepWidthPx / 2 - 5, velocityTop + 30, 10, velocityHeight - 38);
-                }
-            }
-        }
-        const auto boundaryX = labelWidthPx + activeStepCount * stepWidthPx;
-        g.setColour(juce::Colour::fromRGB(220, 73, 69));
-        const auto gridBottom = velocityLaneVisible ? velocityTop + velocityHeight : velocityTop;
-        g.fillRect(boundaryX - 1, headerHeightPx, 2, gridBottom - headerHeightPx);
-    }
-
-    void mouseDown(const juce::MouseEvent& event) override
-    {
-        const auto pitch = 84 - (event.y - headerHeight()) / rowHeight();
-        const auto step = (event.x - labelWidth()) / stepWidth();
-        if (event.x < labelWidth() || event.y < headerHeight() || pitch < 48 || pitch > 84
-            || !juce::isPositiveAndBelow(step, activeSteps()))
-            return;
-        if (event.mods.isRightButtonDown())
-        {
-            if (noteIsOn && noteIsOn(pitch, step) && noteClicked) noteClicked(pitch, step, true);
-            return;
-        }
-        dragPitch = pitch;
-        dragStartStep = step;
-        dragWasExisting = noteIsOn && noteIsOn(pitch, step);
-        dragChanged = false;
-        if (!dragWasExisting && noteClicked)
-        {
-            noteClicked(pitch, step, false);
-            if (paintLength > 1 && noteLengthChanged)
-                noteLengthChanged(pitch, step, juce::jmin(paintLength, activeSteps() - step));
-        }
-    }
-
-    void mouseDrag(const juce::MouseEvent& event) override
-    {
-        if (dragPitch < 0 || !noteLengthChanged) return;
-        if (event.getDistanceFromDragStart() < 5) return;
-        const auto endStep = juce::jlimit(dragStartStep, activeSteps() - 1,
-            (event.x - labelWidth()) / stepWidth());
-        const auto length = endStep - dragStartStep + 1;
-        if (length > 1 || dragWasExisting)
-        {
-            noteLengthChanged(dragPitch, dragStartStep, length);
-            paintLength = length;
-            if (paintLengthUpdated) paintLengthUpdated(paintLength);
-            dragChanged = true;
-        }
-    }
-
-    void setPaintLength(int length) { paintLength = juce::jlimit(1, 64, length); }
-    int getPaintLength() const { return paintLength; }
-
-    void mouseUp(const juce::MouseEvent&) override
-    {
-        dragPitch = -1;
-        dragStartStep = -1;
-        dragWasExisting = false;
-        dragChanged = false;
-    }
-
-private:
-    int dragPitch = -1;
-    int dragStartStep = -1;
-    bool dragWasExisting = false;
-    bool dragChanged = false;
-    int paintLength = 1;
-    int subdivisionsPerBar = 16;
-    int highlightEveryN = 4;
-    bool velocityLaneVisible = true;
-    bool colouredKeys = true;
-    bool showNoteNames = true;
-    static juce::String pitchLabel(int pitch)
-    {
-        static const char* names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-        return juce::String(names[pitch % 12]) + juce::String(pitch / 12 - 1);
-    }
-};
-
-class PianoRollWindow final : public juce::Component
-{
-public:
-    std::function<void()> onClose;
-    PianoRollWindow(std::function<int()> activeStepCount,
-                    std::function<bool(int, int)> isNoteOn,
-                    std::function<bool()> areAllNotesSelected,
-                    std::function<int(int, int)> getNoteLength,
-                    std::function<void(int, int, bool)> onNoteClicked,
-                    std::function<void(int, int, int)> onNoteLengthChanged)
-    {
-        setOpaque(true);
-        addAndMakeVisible(title);
-        title.setText("PIANO ROLL", juce::dontSendNotification);
-        title.setFont(juce::FontOptions(13.0f, juce::Font::bold));
-        title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(218, 237, 246));
-        // Let the editor receive title-bar pointer events directly. A label
-        // that intercepts the gesture prevents the parent drag handlers from
-        // seeing the same mouse-down/drag sequence consistently.
-        title.setInterceptsMouseClicks(false, false);
-        addAndMakeVisible(closeButton);
-        closeButton.setButtonText("Ã—");
-        closeButton.onClick = [this] { if (onClose) onClose(); else setVisible(false); };
-        addAndMakeVisible(lengthSelector);
-        for (int length = 1; length <= 64; ++length)
-            lengthSelector.addItem(juce::String(length) + (length == 1 ? " step" : " steps"), length);
-        lengthSelector.setSelectedId(1, juce::dontSendNotification);
-        lengthSelector.setTooltip("Default note length for new piano-roll notes");
-        lengthSelector.onChange = [this]
-        {
-            if (grid != nullptr) grid->setPaintLength(lengthSelector.getSelectedId());
-        };
-        addAndMakeVisible(settingsButton);
-        settingsButton.setButtonText("âš™");
-        settingsButton.setTooltip("Piano roll options");
-        settingsButton.onClick = [this] { showSettings(); };
-        grid = new PianoRollGrid();
-        grid->getActiveStepCount = std::move(activeStepCount);
-        grid->noteIsOn = std::move(isNoteOn);
-        grid->areAllNotesSelected = std::move(areAllNotesSelected);
-        grid->getNoteLength = std::move(getNoteLength);
-        grid->noteClicked = std::move(onNoteClicked);
-        grid->noteLengthChanged = std::move(onNoteLengthChanged);
-        grid->paintLengthUpdated = [this](int length)
-        {
-            lengthSelector.setSelectedId(length, juce::dontSendNotification);
-        };
-        grid->setSize(58 + grid->visibleSteps() * 58, 30 + 37 * 22 + 8 + 116);
-        viewport.setViewedComponent(grid, true);
-        addAndMakeVisible(viewport);
-        setVisible(false);
-    }
-
-    void refresh(const juce::String& patternName)
-    {
-        title.setText("PIANO ROLL  |  " + patternName, juce::dontSendNotification);
-        if (grid == nullptr) return;
-        resized();
-        grid->repaint();
-    }
-
-    void resized() override
-    {
-        auto area = getLocalBounds().reduced(6);
-        auto header = area.removeFromTop(28);
-        title.setBounds(header);
-        closeButton.setBounds(header.removeFromRight(28).reduced(1));
-        auto footer = area.removeFromBottom(27);
-        settingsButton.setBounds(footer.removeFromRight(28).reduced(1));
-        lengthSelector.setBounds(footer.removeFromRight(104).reduced(2, 2));
-        viewport.setBounds(area);
-        resizeGridToViewport();
-    }
-
-    void paint(juce::Graphics& g) override
-    {
-        g.fillAll(juce::Colour::fromRGB(22, 32, 42));
-        g.setColour(juce::Colour::fromRGB(103, 139, 157));
-        g.drawRoundedRectangle(getLocalBounds().toFloat().reduced(0.5f), 5.0f, 1.0f);
-    }
-
-private:
-    void showSettings()
-    {
-        juce::PopupMenu menu;
-        const bool laneVisible = grid != nullptr && grid->isVelocityLaneVisible();
-        menu.addItem(1, "Show velocity lane", true, laneVisible);
-        menu.addItem(2, "Colour keyboard keys", true, grid != nullptr && grid->hasColouredKeys());
-        menu.addItem(3, "Show note names", true, grid != nullptr && grid->hasNoteNames());
-        menu.addSeparator();
-        juce::PopupMenu subdivisions;
-        for (const int count : { 8, 16, 24, 32, 48, 64 })
-            subdivisions.addItem(100 + count, juce::String(count) + " subdivisions per bar",
-                                 true, grid != nullptr && grid->getSubdivisionsPerBar() == count);
-        menu.addSubMenu("Grid subdivisions per bar", subdivisions);
-        juce::PopupMenu emphasis;
-        for (const int count : { 1, 2, 4, 8, 16 })
-            emphasis.addItem(200 + count, "Highlight every " + juce::String(count) + " steps",
-                             true, grid != nullptr && grid->getHighlightEveryN() == count);
-        menu.addSubMenu("Highlight grid every", emphasis);
-        juce::Component::SafePointer<PianoRollWindow> safeThis(this);
-        menu.showMenuAsync({}, [safeThis](int result)
-        {
-            if (safeThis == nullptr || safeThis->grid == nullptr) return;
-            if (result == 1)
-            {
-                safeThis->grid->setVelocityLaneVisible(!safeThis->grid->isVelocityLaneVisible());
-                safeThis->resizeGridToViewport();
-            }
-            else if (result == 2 || result == 3)
-                safeThis->grid->setKeyboardOptions(result == 2 ? !safeThis->grid->hasColouredKeys()
-                                                               : safeThis->grid->hasColouredKeys(),
-                                                  result == 3 ? !safeThis->grid->hasNoteNames()
-                                                               : safeThis->grid->hasNoteNames());
-            else if (result >= 108 && result <= 164)
-                safeThis->grid->setGridOptions(result - 100, juce::jmin(safeThis->grid->getHighlightEveryN(), result - 100));
-            else if (result >= 201 && result <= 216)
-                safeThis->grid->setGridOptions(safeThis->grid->getSubdivisionsPerBar(), result - 200);
-        });
-    }
-
-    void resizeGridToViewport()
-    {
-        if (grid == nullptr) return;
-        constexpr int labelWidth = 58;
-        constexpr int headerHeight = 30;
-        const int velocityArea = 8 + (grid->isVelocityLaneVisible() ? 116 : 0);
-        const auto columns = grid->visibleSteps();
-        const auto stepWidth = juce::jmax(22, (viewport.getWidth() - labelWidth) / columns);
-        const auto rowHeight = juce::jmax(22, (viewport.getHeight() - headerHeight - velocityArea) / 37);
-        grid->setSize(labelWidth + columns * stepWidth,
-                      headerHeight + 37 * rowHeight + velocityArea);
-    }
-
-    PianoRollGrid* grid = nullptr;
-    juce::Viewport viewport;
-    juce::Label title;
-    juce::TextButton closeButton, settingsButton;
-    juce::ComboBox lengthSelector;
-};
-
-// A dedicated drag source makes the generator move gesture independent from
-// JUCE's parent hit testing and any controls layered over the generator.
-class GeneratorDragLabel final : public juce::Label
-{
-public:
-    std::function<void(juce::Point<int>)> dragStarted;
-    std::function<void(juce::Point<int>)> dragged;
-    std::function<void()> dragEnded;
-
-    void mouseDown(const juce::MouseEvent& event) override
-    {
-        if (dragStarted)
-            dragStarted(event.getEventRelativeTo(getParentComponent()).position.toInt());
-    }
-
-    void mouseDrag(const juce::MouseEvent& event) override
-    {
-        if (dragged)
-            dragged(event.getEventRelativeTo(getParentComponent()).position.toInt());
-    }
-
-    void mouseUp(const juce::MouseEvent&) override
-    {
-        if (dragEnded) dragEnded();
-    }
-};
-
-class GeneratorResizeHandle final : public juce::Component
-{
-public:
-    std::function<void(juce::Point<int>)> resizeStarted;
-    std::function<void(juce::Point<int>)> resizedByDrag;
-    std::function<void()> resizeEnded;
-
-    explicit GeneratorResizeHandle(juce::String handleTitle = "Resize generator")
-    {
-        setMouseCursor(juce::MouseCursor::BottomRightCornerResizeCursor);
-        setTitle(handleTitle);
-    }
-
-    void mouseDown(const juce::MouseEvent& event) override
-    {
-        if (resizeStarted)
-            resizeStarted(event.getEventRelativeTo(getParentComponent()).position.toInt());
-    }
-
-    void mouseDrag(const juce::MouseEvent& event) override
-    {
-        if (resizedByDrag)
-            resizedByDrag(event.getEventRelativeTo(getParentComponent()).position.toInt());
-    }
-
-    void mouseUp(const juce::MouseEvent&) override
-    {
-        if (resizeEnded) resizeEnded();
-    }
-
-    void paint(juce::Graphics& g) override
-    {
-        g.setColour(juce::Colour::fromRGB(112, 145, 160));
-        for (int inset = 4; inset <= 12; inset += 4)
-            g.drawLine(static_cast<float>(getWidth() - inset), static_cast<float>(getHeight()),
-                       static_cast<float>(getWidth()), static_cast<float>(getHeight() - inset), 1.4f);
-    }
-};
-
-class MixerMoveHandle final : public juce::Component
-{
-public:
-    std::function<void(juce::Point<int>)> dragStarted;
-    std::function<void(juce::Point<int>)> dragged;
-    std::function<void()> dragEnded;
-
-    MixerMoveHandle()
-    {
-        setMouseCursor(juce::MouseCursor::DraggingHandCursor);
-        setTitle("Move mixer");
-    }
-
-    void mouseDown(const juce::MouseEvent& event) override
-    {
-        if (dragStarted) dragStarted(event.getEventRelativeTo(getParentComponent()).position.toInt());
-    }
-
-    void mouseDrag(const juce::MouseEvent& event) override
-    {
-        if (dragged) dragged(event.getEventRelativeTo(getParentComponent()).position.toInt());
-    }
-
-    void mouseUp(const juce::MouseEvent&) override
-    {
-        if (dragEnded) dragEnded();
-    }
-
-    void paint(juce::Graphics& g) override
-    {
-        g.setColour(juce::Colour::fromRGB(183, 218, 233));
-        const auto centreX = getWidth() * 0.5f;
-        const auto centreY = getHeight() * 0.5f;
-        for (int row = -1; row <= 1; ++row)
-            for (int column = -1; column <= 1; ++column)
-                g.fillEllipse(centreX + column * 4.0f - 1.2f, centreY + row * 4.0f - 1.2f, 2.4f, 2.4f);
-    }
-};
-
-class OrbitPluginEditorContent final : public te::Plugin::EditorComponent
-{
-public:
-    explicit OrbitPluginEditorContent(te::ExternalPlugin& external)
-        : editor(external.getAudioPluginInstance() != nullptr
-                     ? std::unique_ptr<juce::AudioProcessorEditor>(external.getAudioPluginInstance()->createEditorIfNeeded())
-                     : nullptr)
-    {
-        if (editor == nullptr && external.getAudioPluginInstance() != nullptr)
-            editor = std::make_unique<juce::GenericAudioProcessorEditor>(*external.getAudioPluginInstance());
-        if (editor != nullptr)
-        {
-            addAndMakeVisible(*editor);
-            setSize(juce::jmax(220, editor->getWidth()), juce::jmax(120, editor->getHeight()));
-        }
-        else
-        {
-            setSize(320, 120);
-        }
-    }
-
-    bool allowWindowResizing() override { return editor != nullptr && editor->isResizable(); }
-    juce::ComponentBoundsConstrainer* getBoundsConstrainer() override
-    {
-        return editor != nullptr ? editor->getConstrainer() : nullptr;
-    }
-    void resized() override
-    {
-        if (editor != nullptr) editor->setBounds(getLocalBounds());
-    }
-
-private:
-    std::unique_ptr<juce::AudioProcessorEditor> editor;
-};
-
-class OrbitPluginWindow final : public juce::DocumentWindow
-{
-public:
-    explicit OrbitPluginWindow(te::Plugin::WindowState& state)
-        : DocumentWindow(state.plugin.getName(), juce::Colour::fromRGB(20, 29, 38), closeButton),
-          pluginState(state), plugin(state.plugin)
-    {
-        setUsingNativeTitleBar(true);
-        if (auto* external = dynamic_cast<te::ExternalPlugin*>(&plugin))
-            editor = std::make_unique<OrbitPluginEditorContent>(*external);
-        if (editor != nullptr)
-        {
-            setContentNonOwned(editor.get(), true);
-            setResizable(editor->allowWindowResizing(), false);
-            if (editor->allowWindowResizing()) setConstrainer(editor->getBoundsConstrainer());
-            centreWithSize(juce::jmax(260, editor->getWidth()), juce::jmax(150, editor->getHeight()));
-        }
-        else
-        {
-            auto* message = new juce::Label({}, "This plugin does not provide an editor.");
-            message->setJustificationType(juce::Justification::centred);
-            setContentOwned(message, true);
-            centreWithSize(360, 120);
-        }
-        setVisible(true);
-        toFront(false);
-    }
-
-    void closeButtonPressed() override { pluginState.closeWindowExplicitly(); }
-
-private:
-    te::Plugin::WindowState& pluginState;
-    te::Plugin& plugin;
-    std::unique_ptr<te::Plugin::EditorComponent> editor;
-};
-
-class OrbitUIBehaviour final : public te::UIBehaviour
-{
-public:
-    std::unique_ptr<juce::Component> createPluginWindow(te::PluginWindowState& state) override
-    {
-        if (auto* pluginState = dynamic_cast<te::Plugin::WindowState*>(&state))
-            return std::make_unique<OrbitPluginWindow>(*pluginState);
-        return {};
-    }
-};
-
-class ProjectView final : public juce::Component, private juce::Timer
-{
-public:
-    void mouseDown(const juce::MouseEvent&) override { bringGeneratorToFront(); }
-    ProjectView() : engine("Orbit", std::make_unique<OrbitUIBehaviour>(), nullptr)
-    {
-        juce::PropertiesFile::Options settingsOptions;
-        settingsOptions.applicationName = "Orbit";
-        settingsOptions.filenameSuffix = "settings";
-        settingsOptions.osxLibrarySubFolder = "Application Support";
-        applicationProperties.setStorageParameters(settingsOptions);
-        if (auto* settings = applicationProperties.getUserSettings())
-            showHints = settings->getBoolValue("showHints", true);
-        tooltipWindow = std::make_unique<juce::TooltipWindow>(this, showHints ? 650 : 2147483647);
-
-        title.setText("Orbit", juce::dontSendNotification);
-        title.setFont(juce::FontOptions(30.0f, juce::Font::bold));
-        title.setJustificationType(juce::Justification::centredLeft);
-        addAndMakeVisible(title);
-
-        const std::array<std::pair<juce::TextButton*, juce::String>, 7> menuDefinitions {{
-            { &fileMenuButton, "File" }, { &editMenuButton, "Edit" }, { &viewMenuButton, "View" },
-            { &insertMenuButton, "Insert" }, { &optionsMenuButton, "Options" },
-            { &windowMenuButton, "Window" }, { &helpMenuButton, "Help" }
-        }};
-        for (int i = 0; i < static_cast<int>(menuDefinitions.size()); ++i)
-        {
-            auto* button = menuDefinitions[static_cast<size_t>(i)].first;
-            button->setButtonText(menuDefinitions[static_cast<size_t>(i)].second);
-            button->setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(42, 48, 54));
-            button->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(57, 67, 75));
-            button->setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(224, 231, 235));
-            button->setColour(juce::TextButton::textColourOnId, juce::Colours::white);
-            button->onClick = [this, i, button] { showMenu(*button, i); };
-            addAndMakeVisible(*button);
-        }
-
-        configureButton(newProjectButton, "New Project", [this] { createProject(); });
-        configureButton(openButton, "Open", [this] { openProject(); });
-        configureButton(saveButton, "Save", [this] { saveProject(); });
-        configureButton(midiExportButton, "Export MIDI", [this] { exportMidi(); });
-        configureButton(audioSettingsButton, "Audio Settings", [this] { showAudioSettings(); });
-        configureButton(addTrackButton, "Add Instrument", [this] { addInstrumentTrack(); });
-        configureButton(patternButton, "New Pattern", [this] { addPattern(); });
-        configureButton(playlistButton, "Playlist", [this] { showPlaylist(); });
-        configureButton(playButton, "Play", [this] { togglePlayback(); });
-        configureButton(stopButton, "Stop", [this] { stopPlayback(); });
-        configureButton(mixerButton, "Mixer", [this] { toggleMixerView(); });
-        configureButton(masterButton, "Master", [this] { showMixer(true); });
-        configureButton(recordButton, "Record", [] {});
-        recordButton.setEnabled(false);
-        recordButton.setTooltip("Audio recording is not implemented yet.");
-        playButton.setTextVisible(false);
-        stopButton.setTextVisible(false);
-        recordButton.setTextVisible(false);
-        rewindButton.setTextVisible(false);
-        previousButton.setTextVisible(false);
-        nextButton.setTextVisible(false);
-        playlistButton.setButtonText("Playlist");
-        mixerButton.setButtonText("Mixer");
-        masterButton.setButtonText("Master");
-        stopButton.setButtonText("Stop");
-        stopButton.setTooltip("Stop playback.");
-        playButton.setButtonText("Play");
-        playButton.setTooltip("Start playback.");
-        rewindButton.setTooltip("Return playback to the beginning.");
-        configureButton(rewindButton, "Rewind", [this] { rewindPlayback(); });
-        configureButton(previousButton, "Previous Bar", [this] { skipTransport(-1); });
-        configureButton(nextButton, "Next Bar", [this] { skipTransport(1); });
-        configureButton(generatorMuteButton, "M", [this]
-        {
-            const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-            const auto index = tracks.indexOf(instrumentTrack);
-            if (juce::isPositiveAndBelow(index, tracks.size())) setTrackMute(index, generatorMuteButton.getToggleState());
-        });
-        configureButton(generatorSoloButton, "S", [this]
-        {
-            const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-            const auto index = tracks.indexOf(instrumentTrack);
-            if (juce::isPositiveAndBelow(index, tracks.size())) setTrackSolo(index, generatorSoloButton.getToggleState());
-        });
-        generatorMuteButton.setClickingTogglesState(true);
-        generatorSoloButton.setClickingTogglesState(true);
-        generatorMuteButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(136, 70, 66));
-        generatorSoloButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(151, 123, 53));
-        generatorMuteButton.setTooltip("Mute this generator.");
-        generatorSoloButton.setTooltip("Solo this generator.");
-        configureButton(generatorSettingsButton, "Pattern Settings", [this]
-        {
-            juce::PopupMenu settings;
-            settings.addItem(1, "Pattern settings will be added in a later iteration", false);
-            settings.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&generatorSettingsButton), [](int) {});
-        });
-        generatorSettingsButton.setTextVisible(false);
-        configureButton(openPresetButton, "Open Pattern Preset", [this]
-        {
-            status.setText("Pattern preset loading is not implemented yet.", juce::dontSendNotification);
-        });
-        configureButton(savePresetButton, "Save Pattern Preset", [this]
-        {
-            status.setText("Pattern preset saving is not implemented yet.", juce::dontSendNotification);
-        });
-        openPresetButton.setTextVisible(false);
-        savePresetButton.setTextVisible(false);
-        patternPresetSelector.addItem("Default", 1);
-        patternPresetSelector.setSelectedId(1, juce::dontSendNotification);
-        patternPresetSelector.setTooltip("Selected pattern preset.");
-        patternLengthDisplay.setText("016", juce::dontSendNotification);
-        patternLengthDisplay.setJustificationType(juce::Justification::centred);
-        patternLengthDisplay.setTooltip("Current pattern length: 16 steps.");
-        patternLengthDisplay.setColour(juce::Label::textColourId, juce::Colour::fromRGB(203, 221, 229));
-        patternLengthDisplay.setColour(juce::Label::backgroundColourId, juce::Colour::fromRGB(25, 36, 43));
-        patternLengthDisplay.setColour(juce::Label::outlineColourId, juce::Colour::fromRGB(91, 122, 136));
-        patternLengthDisplay.setBorderSize({1, 4, 1, 4});
-        addAndMakeVisible(patternPresetSelector);
-        addAndMakeVisible(patternLengthDisplay);
-        configureButton(patternLengthDownButton, "âˆ’", [this] { adjustPatternLength(-1); });
-        patternLengthDownButton.setTooltip("Shorten this pattern by one step.");
-        addAndMakeVisible(patternLengthDownButton);
-        configureButton(patternLengthUpButton, "+", [this] { adjustPatternLength(1); });
-        patternLengthUpButton.setTooltip("Extend this pattern by one step.");
-        addAndMakeVisible(patternLengthUpButton);
-        addAndMakeVisible(outputMeter);
-        configureButton(loopButton, "LOOP", [this] { setLoopEnabled(loopButton.getToggleState()); });
-        loopButton.setClickingTogglesState(true);
-        loopButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-        loopButton.setTooltip("Toggle the transport loop range.");
-        configureButton(metronomeButton, "METRO", [this] { setMetronomeEnabled(metronomeButton.getToggleState()); });
-        metronomeButton.setClickingTogglesState(true);
-        metronomeButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-        metronomeButton.setTooltip("Toggle Tracktion Engine's click track.");
-        loopStartSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-        loopStartSlider.setRange(1, 999, 1);
-        loopStartSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 38, 22);
-        loopStartSlider.setValue(1, juce::dontSendNotification);
-        loopStartSlider.setTooltip("Loop start bar.");
-        loopStartLabel.setText("START", juce::dontSendNotification);
-        loopLengthLabel.setText("LENGTH", juce::dontSendNotification);
-        timeSignatureLabel.setText("4/4", juce::dontSendNotification);
-        for (auto* label : { &loopStartLabel, &loopLengthLabel, &timeSignatureLabel })
-        {
-            label->setColour(juce::Label::textColourId, juce::Colour::fromRGB(176, 193, 203));
-            label->setFont(juce::FontOptions(10.0f, juce::Font::bold));
-            addAndMakeVisible(*label);
-        }
-        loopStartSlider.onValueChange = [this] { updateLoopRange(); };
-        loopLengthSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-        loopLengthSlider.setRange(1, 64, 1);
-        loopLengthSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 32, 22);
-        loopLengthSlider.setValue(4, juce::dontSendNotification);
-        loopLengthSlider.setTooltip("Loop length in bars.");
-        loopLengthSlider.onValueChange = [this] { updateLoopRange(); };
-        const std::array<juce::Component*, 23> actionButtons {{
-            &newProjectButton, &openButton, &saveButton, &midiExportButton, &audioSettingsButton, &addTrackButton,
-            &patternButton, &playlistButton, &playButton, &stopButton, &mixerButton, &masterButton,
-            &recordButton, &rewindButton, &previousButton, &nextButton, &loopButton, &metronomeButton,
-            &generatorMuteButton, &generatorSoloButton, &generatorSettingsButton, &openPresetButton, &savePresetButton
-        }};
-        for (auto* button : actionButtons) addAndMakeVisible(*button);
-        addAndMakeVisible(loopStartSlider);
-        addAndMakeVisible(loopLengthSlider);
-
-        tempoLabel.setText("BPM", juce::dontSendNotification);
-        tempoLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 207, 221));
-        addAndMakeVisible(tempoLabel);
-        tempoSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-        tempoSlider.setRange(20.0, 300.0, 0.1);
-        tempoSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 54, 24);
-        tempoSlider.setValue(120.0, juce::dontSendNotification);
-        tempoSlider.onValueChange = [this]
-        {
-            if (edit == nullptr || !hasProject) return;
-            const auto bpm = tempoSlider.getValue();
-            if (auto* tempo = edit->tempoSequence.getTempo(0)) tempo->setBpm(bpm);
-            project.setInitialTempoBpm(bpm);
-            updateLoopRange();
-            isDirty = true;
-            const auto meter = project.getInitialTimeSignature();
-            musicalDetails.setText("Tracks: " + juce::String(project.getTrackCount()) + "   |   "
-                                       + juce::String(bpm, 1) + " BPM   |   "
-                                       + juce::String(meter.numerator) + "/" + juce::String(meter.denominator)
-                                       + "   |   Built-in 4OSC   |   64 patterns per generator",
-                                   juce::dontSendNotification);
-            status.setText("Tempo changed. Save to keep the change.", juce::dontSendNotification);
-        };
-        tempoLabel.setEnabled(false);
-        tempoSlider.setEnabled(false);
-        addAndMakeVisible(tempoSlider);
-
-        trackSelector.setTextWhenNothingSelected("Select generator");
-        trackSelector.setTooltip("Choose the generator whose patterns, piano roll, and mixer settings you are editing.");
-        trackSelector.setEnabled(false);
-        trackSelector.onChange = [this] { selectInstrumentTrack(); };
-        addAndMakeVisible(trackSelector);
-
-        status.setText("Create a project, add an instrument, then add a pattern.", juce::dontSendNotification);
-        status.setColour(juce::Label::textColourId, juce::Colour::fromRGB(170, 204, 222));
-        addAndMakeVisible(status);
-        projectDetails.setColour(juce::Label::textColourId, juce::Colours::white);
-        musicalDetails.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 199, 210));
-        audioDetails.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 199, 210));
-        addAndMakeVisible(projectDetails);
-        addAndMakeVisible(musicalDetails);
-        addAndMakeVisible(audioDetails);
-
-        generatorDragHandle.setText("Instrument 1 Â· Pattern A1", juce::dontSendNotification);
-        generatorDragHandle.setFont(juce::FontOptions(13.0f, juce::Font::bold));
-        generatorDragHandle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(213, 229, 239));
-        generatorDragHandle.setJustificationType(juce::Justification::centredLeft);
-        generatorDragHandle.setBorderSize(juce::BorderSize<int>(0, 28, 0, 24));
-        generatorDragHandle.setTitle("Move generator");
-        // This dedicated title label owns the move gesture and forwards its
-        // coordinates to ProjectView, avoiding parent hit-test ambiguity.
-        generatorDragHandle.setInterceptsMouseClicks(true, false);
-        generatorDragHandle.setMouseCursor(juce::MouseCursor::DraggingHandCursor);
-        generatorDragHandle.setTooltip("Drag this header to move the generator. Resize from the panel's bottom-right corner.");
-        generatorDragHandle.dragStarted = [this](juce::Point<int> point) { beginGeneratorDrag(point); };
-        generatorDragHandle.dragged = [this](juce::Point<int> point) { moveGeneratorPanel(point); };
-        generatorDragHandle.dragEnded = [this] { endGeneratorDrag(); };
-        addAndMakeVisible(generatorDragHandle);
-        generatorDragHandle.addMouseListener(this, true);
-
-        generatorResizeHandle.resizeStarted = [this](juce::Point<int> point) { beginGeneratorResize(point); };
-        generatorResizeHandle.resizedByDrag = [this](juce::Point<int> point) { resizeGeneratorPanel(point); };
-        generatorResizeHandle.resizeEnded = [this] { endGeneratorResize(); };
-        generatorResizeHandle.setInterceptsMouseClicks(true, false);
-        addAndMakeVisible(generatorResizeHandle);
-        generatorResizeHandle.addMouseListener(this, true);
-
-        generatorCollapseButton.setButtonText("âˆ’");
-        generatorCollapseButton.setTooltip("Collapse the generator to its pattern controls");
-        generatorCollapseButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(36, 53, 64));
-        generatorCollapseButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(46, 112, 139));
-        generatorCollapseButton.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(206, 226, 236));
-        generatorCollapseButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
-        generatorCollapseButton.onClick = [this] { toggleGeneratorCollapsed(); };
-        addAndMakeVisible(generatorCollapseButton);
-        generatorCollapseButton.setVisible(false);
-
-        patternTitle.setText("Select an instrument generator to edit patterns", juce::dontSendNotification);
-        patternTitle.setColour(juce::Label::textColourId, juce::Colours::white);
-        addAndMakeVisible(patternTitle);
-        patternTitle.setVisible(false);
-
-        pitchSelector.addItemList(makePitchNames(), 1);
-        pitchSelector.setSelectedId(pitchToItemId(60), juce::dontSendNotification);
-        pitchSelector.setTooltip("Choose a note pitch to edit in the 16-step pattern.");
-        pitchSelector.onChange = [this] { loadSelectedPitchSteps(); };
-        pitchSelector.setEnabled(false);
-        addAndMakeVisible(pitchSelector);
-        pitchSelector.setVisible(false);
-
-        pianoRollButton.setButtonText("PIANO ROLL");
-        pianoRollButton.setTooltip("Open the selected pattern in the piano roll");
-        pianoRollButton.setTitle("Open piano roll");
-        pianoRollButton.onClick = [this] { showPianoRoll(); };
-        pianoRollButton.setEnabled(false);
-        addAndMakeVisible(pianoRollButton);
-        pianoRollButton.setVisible(false);
-        generatorMuteButton.setEnabled(false);
-        generatorSoloButton.setEnabled(false);
-        patternPresetSelector.setEnabled(false);
-        patternPresetSelector.setVisible(false);
-        patternLengthDisplay.setVisible(false);
-        patternLengthDownButton.setVisible(false);
-        patternLengthUpButton.setVisible(false);
-        generatorMuteButton.setVisible(false);
-        generatorSoloButton.setVisible(false);
-        generatorSettingsButton.setVisible(false);
-        openPresetButton.setVisible(false);
-        savePresetButton.setVisible(false);
-
-        for (int i = 0; i < 8; ++i)
-        {
-            patternBankButtons[static_cast<size_t>(i)] = std::make_unique<juce::TextButton>(juce::String::charToString(static_cast<juce::juce_wchar>('A' + i)));
-            auto* bankButton = patternBankButtons[static_cast<size_t>(i)].get();
-            bankButton->setClickingTogglesState(true);
-            bankButton->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-            bankButton->setTooltip("Select pattern bank " + juce::String::charToString(static_cast<juce::juce_wchar>('A' + i)));
-            bankButton->onClick = [this, i] { selectPatternBank(i); };
-            bankButton->setEnabled(false);
-            addAndMakeVisible(*bankButton);
-            bankButton->setVisible(false);
-
-            patternSlotButtons[static_cast<size_t>(i)] = std::make_unique<juce::TextButton>(juce::String(i + 1));
-            auto* slotButton = patternSlotButtons[static_cast<size_t>(i)].get();
-            slotButton->setClickingTogglesState(true);
-            slotButton->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(55, 114, 131));
-            slotButton->setTooltip("Select pattern slot " + juce::String(i + 1));
-            slotButton->onClick = [this, i] { selectPatternSlot(i); };
-            slotButton->setEnabled(false);
-            addAndMakeVisible(*slotButton);
-            slotButton->setVisible(false);
-        }
-        patternBankButtons[0]->setToggleState(true, juce::dontSendNotification);
-        patternSlotButtons[0]->setToggleState(true, juce::dontSendNotification);
-
-        playlistWindow = std::make_unique<PlaylistWindow>(
-            [this] { return project.getTrackCount(); },
-            [this](int row) { return project.getTrackName(row); },
-            [this](int row, int bar) { return getPlaylistClipLabel(row, bar); },
-            [this](int row, int bar) { togglePlaylistClip(row, bar); },
-            [this](int row, int bar) { paintPlaylistClip(row, bar); },
-            [this] { finishPlaylistPaintGesture(); },
-            [this](int row) { return getTrackMute(row); },
-            [this](int row, bool value) { setTrackMute(row, value); },
-            [this](int row) { return getTrackSolo(row); },
-            [this](int row, bool value) { setTrackSolo(row, value); },
-            [this](int row) { return getTrackRecordArm(row); },
-            [this](int row, bool value) { setTrackRecordArm(row, value); },
-            [this](int row, int sourceBar, int destinationRow, int destinationBar)
-            {
-                movePlaylistClip(row, sourceBar, destinationRow, destinationBar);
-            },
-            [this](int row, int bar, juce::Component* target) { showPlaylistPatternMenu(row, bar, target); },
-            [this](int row, int bar) { deletePlaylistClip(row, bar); },
-            [this](int row, int bar, int direction) { scrollPlaylistPattern(row, bar, direction); });
-        playlistWindow->setClipPreview([this](int row, int bar) { return getPlaylistPreviewNotes(row, bar); });
-
-        pianoRollWindow = std::make_unique<PianoRollWindow>(
-            [this] { return project.getPatternLengthSteps(selectedProjectTrackId(), selectedPatternIndex()); },
-            [this](int pitch, int step)
-            {
-                if (pitch < minimumPitch || pitch > maximumPitch || step < 0 || step >= 64) return false;
-                return noteGrid[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(step)];
-            },
-            [this] { return allNotesSelected; },
-            [this](int pitch, int step)
-            {
-                return project.getPatternNoteLength(selectedProjectTrackId(), selectedPatternIndex(), pitch, step);
-            },
-            [this](int pitch, int step, bool erase) { togglePianoRollNote(pitch, step, erase); },
-            [this](int pitch, int step, int length) { setPianoRollNoteLength(pitch, step, length); });
-        pianoRollWindow->onClose = [this] { closePianoRollView(); };
-        pianoRollWindow->addMouseListener(this, true);
-        addAndMakeVisible(*pianoRollWindow);
-        pianoRollWindow->setVisible(false);
-        generatorDockViewport.setViewedComponent(&generatorDockStrip, false);
-        generatorDockViewport.setScrollBarsShown(false, true);
-        addAndMakeVisible(generatorDockViewport);
-        generatorDockViewport.setVisible(false);
-
-        mixerWindow = std::make_unique<MixerWindow>();
-        addAndMakeVisible(*mixerWindow);
-        mixerWindow->setVisible(false);
-        mixerWindow->onFocus = [this]
-        {
-            if (mixerWindow != nullptr) mixerWindow->toFront(false);
-            mixerMoveHandle.setVisible(false);
-            mixerResizeHandle.setVisible(false);
-        };
-        mixerWindow->onDragged = [this](juce::Point<int> position)
-        {
-            if (!mixerBoundsInitialised || mixerWindow == nullptr) return;
-            const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-            mixerPanelBounds.setPosition(
-                juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - mixerPanelBounds.getWidth()), position.x),
-                juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - mixerPanelBounds.getHeight()), position.y));
-            mixerWindow->setBounds(mixerPanelBounds);
-            draggingMixer = true;
-            layoutMixerHandles();
-        };
-        mixerWindow->onDragEnded = [this] { saveMixerPanelBounds(); };
-        mixerWindow->onMinimizeChanged = [this](bool minimized)
-        {
-            if (mixerWindow == nullptr) return;
-            const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-            if (minimized) mixerPanelBounds.setHeight(26);
-            else mixerPanelBounds.setHeight(area.getHeight());
-            mixerWindow->setBounds(mixerPanelBounds);
-            layoutMixerHandles();
-            saveMixerPanelBounds();
-        };
-        mixerWindow->onClose = [this]
-        {
-            if (mixerWindow != nullptr) mixerWindow->setVisible(false);
-            layoutMixerHandles();
-            repaint();
-        };
-        for (auto* control : std::array<juce::Component*, 14> {
-                 &pianoRollButton, &generatorMuteButton, &generatorSoloButton, &generatorSettingsButton,
-                 &patternPresetSelector, &openPresetButton, &savePresetButton, &patternLengthDownButton,
-                 &patternLengthDisplay, &patternLengthUpButton, &trackSelector,
-                 &generatorCollapseButton, &generatorDragHandle, &generatorResizeHandle })
-            control->addMouseListener(this, true);
-        for (auto& button : patternBankButtons) button->addMouseListener(this, true);
-        for (auto& button : patternSlotButtons) button->addMouseListener(this, true);
-        mixerMoveHandle.dragStarted = [this](juce::Point<int> point)
-        {
-            if (!mixerBoundsInitialised || mixerWindow == nullptr) return;
-            mixerDragOffset = point - mixerPanelBounds.getPosition();
-            draggingMixer = true;
-            mixerWindow->toFront(false);
-            mixerMoveHandle.toFront(false);
-            mixerResizeHandle.toFront(false);
-        };
-        mixerMoveHandle.dragged = [this](juce::Point<int> point) { moveMixerPanel(point); };
-        mixerMoveHandle.dragEnded = [this] { endMixerDrag(); };
-        mixerResizeHandle.resizeStarted = [this](juce::Point<int> point)
-        {
-            if (!mixerBoundsInitialised || mixerWindow == nullptr) return;
-            resizingMixer = true;
-            mixerResizeStart = point;
-            mixerResizeStartBounds = mixerPanelBounds;
-            mixerWindow->toFront(false);
-            mixerMoveHandle.toFront(false);
-            mixerResizeHandle.toFront(false);
-        };
-        mixerResizeHandle.resizedByDrag = [this](juce::Point<int> point) { resizeMixerPanel(point); };
-        mixerResizeHandle.resizeEnded = [this] { endMixerResize(); };
-        addAndMakeVisible(mixerMoveHandle);
-        addAndMakeVisible(mixerResizeHandle);
-        mixerMoveHandle.setVisible(false);
-        mixerResizeHandle.setVisible(false);
-        mixerWindow->getTrackCount = [this] { return edit != nullptr ? getMixerTracks().size() : 0; };
-        mixerWindow->getTrackName = [this](int index)
-        {
-            const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-            return juce::isPositiveAndBelow(index, tracks.size()) ? tracks.getUnchecked(index)->getName() : juce::String{};
-        };
-        mixerWindow->renameTrack = [this](int index, const juce::String& value)
-        {
-            const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-            const auto cleaned = value.trim();
-            if (!juce::isPositiveAndBelow(index, tracks.size()) || cleaned.isEmpty()) return;
-            auto* track = tracks.getUnchecked(index);
-            if (track->getName() == cleaned && project.getTrackName(index) == cleaned) return;
-            if (track->getName() != cleaned) track->setName(cleaned);
-            project.setTrackName(index, cleaned);
-            isDirty = true;
-            refreshTrackSelector();
-            refreshMixerControls();
-            if (mixerWindow != nullptr) mixerWindow->refresh(getMixerTracks().indexOf(instrumentTrack));
-            status.setText("Renamed mixer channel to " + cleaned + ". Save to keep the change.", juce::dontSendNotification);
-        };
-        mixerWindow->getTrackGain = [this](int index) { return getTrackGainDb(index); };
-        mixerWindow->setTrackGain = [this](int index, double value) { setTrackGainDb(index, value); };
-        mixerWindow->getTrackPan = [this](int index) { return getTrackPan(index); };
-        mixerWindow->setTrackPan = [this](int index, double value) { setTrackPan(index, value); };
-        mixerWindow->getTrackMuted = [this](int index) { return getTrackMute(index); };
-        mixerWindow->setTrackMuted = [this](int index, bool value) { setTrackMute(index, value); };
-        mixerWindow->isGeneratorTrack = [this](int index) { return index < getGeneratorTracks().size(); };
-        mixerWindow->getTrackSolo = [this](int index) { return getTrackSolo(index); };
-        mixerWindow->setTrackSolo = [this](int index, bool value) { setTrackSolo(index, value); };
-        mixerWindow->getTrackEqResponse = [this](int index, float frequency) { return getTrackEqResponse(index, frequency); };
-        mixerWindow->getTrackEqParameter = [this](int index, int parameter) { return getTrackEqParameter(index, parameter); };
-        mixerWindow->setTrackEqParameter = [this](int index, int parameter, float value)
-        {
-            setTrackEqParameter(index, parameter, value);
-        };
-        mixerWindow->setTrackEqBand = [this](int index, int band, float frequency, float gain)
-        {
-            setTrackEqBand(index, band, frequency, gain);
-        };
-        mixerWindow->getTrackEqEnabled = [this](int index)
-        {
-            const auto* eq = getTrackEqualiser(index);
-            return eq != nullptr && eq->isEnabled();
-        };
-        mixerWindow->setTrackEqEnabled = [this](int index, bool enabled)
-        {
-            setTrackEqEnabled(index, enabled);
-        };
-        mixerWindow->onOpenEq = [this](int index) { openTrackEqualiser(index); };
-        mixerWindow->getInsertNames = [this](int index) { return getInsertNames(index); };
-        mixerWindow->getInsertEnabled = [this](int index, int slot) { return getInsertEnabled(index, slot); };
-        mixerWindow->toggleInsert = [this](int index, int slot) { toggleInsert(index, slot); };
-        mixerWindow->editInsert = [this](int index, int slot) { openInsertEditor(index, slot); };
-        mixerWindow->removeInsert = [this](int index, int slot) { removeInsert(index, slot); };
-        mixerWindow->addInsert = [this](int index, int kind) { addInsert(index, kind); };
-        mixerWindow->getTrackSendGain = [this](int index, int bus) { return getTrackSendGainDb(index, bus); };
-        mixerWindow->setTrackSendGain = [this](int index, int bus, double value) { setTrackSendGainDb(index, bus, value); };
-        mixerWindow->getTrackOutputBus = [this](int index) { return getTrackOutputBus(index); };
-        mixerWindow->setTrackOutputBus = [this](int index, int bus) { setTrackOutputBus(index, bus); };
-        mixerWindow->hasFxReturn = [this](int bus) { return getFxReturnTrack(bus) != nullptr; };
-        mixerWindow->onOpenFxReturn = [this](int bus) { openFxReturnEditor(bus); };
-        mixerWindow->getTrackMeter = [this](int index) -> te::LevelMeterPlugin*
-        {
-            const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-            return juce::isPositiveAndBelow(index, tracks.size()) ? tracks.getUnchecked(index)->getLevelMeterPlugin() : nullptr;
-        };
-        mixerWindow->getMasterMeterContext = [this]() -> te::EditPlaybackContext*
-        {
-            return edit != nullptr ? edit->getCurrentPlaybackContext() : nullptr;
-        };
-        mixerWindow->getMasterGain = [this] { return edit != nullptr && edit->getMasterVolumePlugin() != nullptr
-                                                     ? getMasterGainDb() : 0.0; };
-        mixerWindow->setMasterGain = [this](double value) { setMasterGainDb(value); };
-        mixerWindow->getMasterPan = [this] { return edit != nullptr && edit->getMasterVolumePlugin() != nullptr
-                                                   ? edit->getMasterVolumePlugin()->getPan() : 0.0; };
-        mixerWindow->setMasterPan = [this](double value) { setMasterPan(value); };
-        mixerWindow->getMasterMuted = [this] { return isMasterMuted(); };
-        mixerWindow->setMasterMuted = [this](bool value) { setMasterMuted(value); };
-
-        equaliserWindow = std::make_unique<EqualiserWindow>();
-        equaliserWindow->getTrackName = [this](int index)
-        {
-            const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-            if (edit != nullptr && index == tracks.size()) return juce::String("Master");
-            return juce::isPositiveAndBelow(index, tracks.size()) ? tracks.getUnchecked(index)->getName() : juce::String("Generator");
-        };
-        equaliserWindow->getParameter = [this](int index, int parameter) { return getTrackEqParameter(index, parameter); };
-        equaliserWindow->getResponse = [this](int index, float frequency) { return getTrackEqResponse(index, frequency); };
-        equaliserWindow->setParameter = [this](int index, int parameter, float value) { setTrackEqParameter(index, parameter, value); };
-        equaliserWindow->setBandValues = [this](int index, int band, float frequency, float gain)
-        {
-            setTrackEqBand(index, band, frequency, gain);
-        };
-
-        for (int i = 0; i < 16; ++i)
-        {
-            steps[static_cast<size_t>(i)] = std::make_unique<juce::TextButton>(juce::String(i + 1));
-            auto* step = steps[static_cast<size_t>(i)].get();
-            step->setClickingTogglesState(true);
-            step->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-            step->setEnabled(false);
-            step->onClick = [this, i] { updatePatternStep(i, steps[static_cast<size_t>(i)]->getToggleState()); };
-            addAndMakeVisible(*step);
-            step->setVisible(false);
-        }
-
-        arrangementTitle.setText("Playlist window: click a timeline cell to place the selected pattern", juce::dontSendNotification);
-        arrangementTitle.setColour(juce::Label::textColourId, juce::Colours::white);
-        addAndMakeVisible(arrangementTitle);
-
-        mixerTitle.setText("Mixer - Instrument 1", juce::dontSendNotification);
-        mixerTitle.setColour(juce::Label::textColourId, juce::Colours::white);
-        addAndMakeVisible(mixerTitle);
-        levelLabel.setText("Level", juce::dontSendNotification);
-        panLabel.setText("Pan", juce::dontSendNotification);
-        levelLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 199, 210));
-        panLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 199, 210));
-        addAndMakeVisible(levelLabel);
-        addAndMakeVisible(panLabel);
-        levelSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-        levelSlider.setRange(-60.0, 6.0, 0.1);
-        levelSlider.setValue(0.0, juce::dontSendNotification);
-        levelSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 22);
-        levelSlider.setTextValueSuffix(" dB");
-        levelSlider.onValueChange = [this]
-        {
-            if (instrumentTrack == nullptr) return;
-            if (auto* volumePan = instrumentTrack->getVolumePlugin())
-            {
-                volumePan->setVolumeDb(static_cast<float>(levelSlider.getValue()));
-                isDirty = true;
-                status.setText("Track level changed. Save to keep the changes.", juce::dontSendNotification);
-            }
-        };
-        panSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-        panSlider.setRange(-1.0, 1.0, 0.01);
-        panSlider.setValue(0.0, juce::dontSendNotification);
-        panSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 60, 22);
-        panSlider.onValueChange = [this]
-        {
-            if (instrumentTrack == nullptr) return;
-            if (auto* volumePan = instrumentTrack->getVolumePlugin())
-            {
-                volumePan->setPan(static_cast<float>(panSlider.getValue()));
-                isDirty = true;
-                status.setText("Track pan changed. Save to keep the changes.", juce::dontSendNotification);
-            }
-        };
-        levelSlider.setEnabled(false);
-        panSlider.setEnabled(false);
-        addAndMakeVisible(levelSlider);
-        addAndMakeVisible(panSlider);
-
-        meterStatus.setText("Track output: no recent audio activity", juce::dontSendNotification);
-        meterStatus.setColour(juce::Label::textColourId, juce::Colour::fromRGB(170, 204, 222));
-        addAndMakeVisible(meterStatus);
-
-        buildLabel.setText("Build 66  -  v0.3.45", juce::dontSendNotification);
-        buildLabel.setJustificationType(juce::Justification::centredRight);
-        buildLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(154, 181, 196));
-        addAndMakeVisible(buildLabel);
-        setSize(1220, 760);
-        const std::array<juce::Component*, 18> hiddenComponents {{
-            &title, &newProjectButton, &openButton, &saveButton, &midiExportButton, &audioSettingsButton,
-            &addTrackButton, &patternButton, &arrangementTitle, &mixerTitle, &levelLabel,
-            &panLabel, &levelSlider, &panSlider, &meterStatus, &projectDetails, &musicalDetails, &audioDetails
-        }};
-        for (auto* component : hiddenComponents)
-            component->setVisible(false);
-        createProject();
-        updateAudioStatus();
-        auto* settings = applicationProperties.getUserSettings();
-        startTimerHz(juce::jlimit(2, 60, settings != nullptr ? settings->getIntValue("updateRateHz", 30) : 30));
-        lastAutoSaveMs = juce::Time::getMillisecondCounter();
-        if (settings != nullptr && settings->getBoolValue("scanVst3AtStartup", false))
-        {
-            juce::Component::SafePointer<ProjectView> safeThis(this);
-            juce::MessageManager::callAsync([safeThis]
-            {
-                if (safeThis != nullptr) safeThis->startVst3Scan();
-            });
-        }
-    }
-
-    ~ProjectView() override
-    {
-        stopTimer();
-        if (mixerWindow != nullptr) mixerWindow->detachMeters();
-        detachTrackMeter();
-        if (edit != nullptr)
-            edit->getTransport().stop(false, false);
-    }
-
-    void timerCallback() override
-    {
-        updateAudioStatus();
-        updateMeterStatus();
-        if (auto* settings = applicationProperties.getUserSettings())
-        {
-            const auto intervalMinutes = juce::jlimit(0, 240, settings->getIntValue("autoSaveMinutes", 0));
-            const auto now = juce::Time::getMillisecondCounter();
-            const auto intervalMs = static_cast<juce::uint32>(intervalMinutes * 60 * 1000);
-            if (intervalMinutes > 0 && hasProject && edit != nullptr && isDirty && project.hasFile()
-                && static_cast<juce::uint32>(now - lastAutoSaveMs) >= intervalMs)
-            {
-                lastAutoSaveMs = now;
-                saveToFile(project.getFile());
-            }
-        }
-    }
-
-    void paint(juce::Graphics& g) override
-    {
-        g.fillAll(juce::Colour::fromRGB(72, 96, 108));
-        if (!generatorPanelBounds.isEmpty())
-        {
-            g.setColour(juce::Colour::fromRGB(65, 87, 98));
-            g.fillRoundedRectangle(generatorPanelBounds.toFloat(), 8.0f);
-            g.setColour(juce::Colour::fromRGB(106, 137, 151));
-            g.drawRoundedRectangle(generatorPanelBounds.toFloat(), 8.0f, 1.0f);
-            auto titleBar = generatorPanelBounds.withHeight(22).toFloat();
-            g.setColour(juce::Colour::fromRGB(45, 65, 77));
-            g.fillRoundedRectangle(titleBar, 7.0f);
-            g.fillRect(titleBar.withY(titleBar.getBottom() - 7.0f));
-            g.setColour(juce::Colour::fromRGB(80, 111, 127));
-            g.drawHorizontalLine(generatorPanelBounds.getY() + 21,
-                                 static_cast<float>(generatorPanelBounds.getX() + 1),
-                                 static_cast<float>(generatorPanelBounds.getRight() - 1));
-            g.setColour(juce::Colour::fromRGB(157, 193, 208));
-            for (int row = 0; row < 3; ++row)
-                for (int column = 0; column < 2; ++column)
-                    g.fillEllipse(static_cast<float>(generatorPanelBounds.getX() + 9 + column * 5),
-                                  static_cast<float>(generatorPanelBounds.getY() + 6 + row * 5), 2.0f, 2.0f);
-        }
-        if (!generatorInstrumentBounds.isEmpty() && (pianoRollWindow == nullptr || !pianoRollWindow->isVisible()))
-        {
-            g.setColour(juce::Colour::fromRGB(39, 57, 68));
-            g.fillRoundedRectangle(generatorInstrumentBounds.toFloat(), 5.0f);
-            g.setColour(juce::Colour::fromRGB(96, 129, 145));
-            g.drawRoundedRectangle(generatorInstrumentBounds.toFloat(), 5.0f, 1.0f);
-            auto instrumentHeader = generatorInstrumentBounds.withHeight(30).reduced(10, 0);
-            g.setColour(juce::Colour::fromRGB(182, 207, 220));
-            g.setFont(13.0f);
-            g.drawText("INSTRUMENT GUI", instrumentHeader.removeFromLeft(170), juce::Justification::centredLeft);
-            g.setColour(juce::Colour::fromRGB(124, 166, 184));
-            g.drawText(getInstrumentHeaderText(), instrumentHeader, juce::Justification::centredRight);
-            g.setColour(juce::Colour::fromRGB(72, 99, 113));
-            g.drawHorizontalLine(generatorInstrumentBounds.getY() + 32,
-                                 static_cast<float>(generatorInstrumentBounds.getX() + 10),
-                                 static_cast<float>(generatorInstrumentBounds.getRight() - 10));
-        }
-        g.setColour(juce::Colour::fromRGB(51, 60, 67));
-        g.fillRect(0, 0, getWidth(), 28);
-        g.setColour(juce::Colour::fromRGB(27, 32, 37));
-        g.fillRect(0, 28, getWidth(), 54);
-        g.setColour(juce::Colour::fromRGB(35, 54, 65));
-        g.fillRect(0, getHeight() - 22, getWidth(), 22);
-    }
-
-    void beginGeneratorDrag(juce::Point<int> point)
-    {
-        if (generatorPanelBounds.isEmpty()) return;
-        bringGeneratorToFront();
-        generatorDragStartPosition = generatorPanelBounds.getPosition();
-        generatorDragOffset = point - generatorPanelBounds.getPosition();
-        draggingGenerator = true;
-        resizingGenerator = false;
-    }
-
-    void mouseDrag(const juce::MouseEvent& event) override
-    {
-        if (!draggingGenerator) return;
-        const auto point = event.getEventRelativeTo(this).position.toInt();
-        moveGeneratorPanel(point);
-        resized();
-        repaint();
-    }
-
-    void beginGeneratorResize(juce::Point<int> point)
-    {
-        if (generatorPanelBounds.isEmpty()) return;
-        resizingGenerator = true;
-        draggingGenerator = false;
-        generatorDragStart = point;
-        generatorResizeStart = generatorPanelBounds;
-    }
-
-    void resizeGeneratorPanel(juce::Point<int> point)
-    {
-        if (!resizingGenerator) return;
-        const auto available = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        const auto delta = point - generatorDragStart;
-        const auto maxWidth = available.getWidth();
-        const auto maxHeight = available.getHeight();
-        generatorPanelBounds.setWidth(juce::jlimit(juce::jmin(800, maxWidth), maxWidth,
-            generatorResizeStart.getWidth() + delta.x));
-        const auto minimumHeight = generatorCollapsed ? 34 : 350;
-        generatorPanelBounds.setHeight(juce::jlimit(juce::jmin(minimumHeight, maxHeight), maxHeight,
-            generatorResizeStart.getHeight() + delta.y));
-        resized();
-        repaint();
-    }
-
-    void moveGeneratorPanel(juce::Point<int> point)
-    {
-        if (!draggingGenerator) return;
-        auto available = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        const auto x = juce::jlimit(available.getX(),
-            juce::jmax(available.getX(), available.getRight() - generatorPanelBounds.getWidth()),
-            point.x - generatorDragOffset.x);
-        const auto y = juce::jlimit(available.getY(),
-            juce::jmax(available.getY(), available.getBottom() - generatorPanelBounds.getHeight()),
-            point.y - generatorDragOffset.y);
-        generatorPanelBounds.setPosition(x, y);
-        if (generatorCollapsed && !expandedGeneratorBounds.isEmpty())
-            expandedGeneratorBounds.setPosition(x, y);
-        resized();
-        repaint();
-    }
-
-    void mouseUp(const juce::MouseEvent&) override
-    {
-        draggingGenerator = false;
-        reportGeneratorMove();
-    }
-
-    void endGeneratorResize()
-    {
-        resizingGenerator = false;
-        status.setText("Generator resized. The piano roll grid fits the updated panel.", juce::dontSendNotification);
-    }
-
-    void endGeneratorDrag()
-    {
-        draggingGenerator = false;
-        reportGeneratorMove();
-    }
-
-    void reportGeneratorMove()
-    {
-        if (generatorPanelBounds.getPosition() != generatorDragStartPosition)
-            status.setText("Generator moved. Its embedded piano roll and pattern controls stay linked.",
-                           juce::dontSendNotification);
-    }
-
-    void mouseMove(const juce::MouseEvent& event) override
-    {
-        const auto point = event.getEventRelativeTo(this).position.toInt();
-        auto resizeBounds = generatorPanelBounds;
-        resizeBounds = resizeBounds.removeFromRight(18).removeFromBottom(18);
-        if (!generatorPanelBounds.isEmpty() && resizeBounds.contains(point))
-            setMouseCursor(juce::MouseCursor::BottomRightCornerResizeCursor);
-        else
-            setMouseCursor(!generatorPanelBounds.isEmpty()
-                           && generatorPanelBounds.withHeight(22).contains(point)
-                               ? juce::MouseCursor::DraggingHandCursor
-                               : juce::MouseCursor::NormalCursor);
-    }
-
-    void mouseExit(const juce::MouseEvent&) override
-    {
-        setMouseCursor(juce::MouseCursor::NormalCursor);
-    }
-
-    void resized() override
-    {
-        auto menuRow = getLocalBounds().removeFromTop(28).reduced(4, 2);
-        fileMenuButton.setBounds(menuRow.removeFromLeft(48));
-        editMenuButton.setBounds(menuRow.removeFromLeft(48));
-        viewMenuButton.setBounds(menuRow.removeFromLeft(50));
-        insertMenuButton.setBounds(menuRow.removeFromLeft(54));
-        optionsMenuButton.setBounds(menuRow.removeFromLeft(68));
-        windowMenuButton.setBounds(menuRow.removeFromLeft(62));
-        helpMenuButton.setBounds(menuRow.removeFromLeft(50));
-
-        auto transportRow = getLocalBounds().withTrimmedTop(28).removeFromTop(54).reduced(8, 3);
-        auto meterBounds = transportRow.removeFromRight(154).reduced(0, 7);
-        outputMeter.setBounds(meterBounds);
-        const auto controlY = transportRow.getY() + 15;
-        tempoLabel.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(24));
-        tempoSlider.setBounds(transportRow.removeFromLeft(104).withY(controlY).withHeight(24));
-        transportRow.removeFromLeft(8);
-        playButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(3);
-        stopButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(3);
-        rewindButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(3);
-        previousButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(3);
-        nextButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(3);
-        recordButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(9);
-        loopButton.setBounds(transportRow.removeFromLeft(52).withY(controlY).withHeight(26)); transportRow.removeFromLeft(5);
-        auto startBounds = transportRow.removeFromLeft(96);
-        loopStartLabel.setBounds(startBounds.withY(transportRow.getY()).withHeight(12));
-        loopStartSlider.setBounds(startBounds.withY(controlY).withHeight(24));
-        transportRow.removeFromLeft(5);
-        auto lengthBounds = transportRow.removeFromLeft(92);
-        loopLengthLabel.setBounds(lengthBounds.withY(transportRow.getY()).withHeight(12));
-        loopLengthSlider.setBounds(lengthBounds.withY(controlY).withHeight(24));
-        transportRow.removeFromLeft(7);
-        metronomeButton.setBounds(transportRow.removeFromLeft(64).withY(controlY).withHeight(26)); transportRow.removeFromLeft(5);
-        timeSignatureLabel.setBounds(transportRow.removeFromLeft(38).withY(controlY).withHeight(24)); transportRow.removeFromLeft(7);
-        playlistButton.setBounds(transportRow.removeFromLeft(88).withY(controlY).withHeight(30)); transportRow.removeFromLeft(4);
-        mixerButton.setBounds(transportRow.removeFromLeft(82).withY(controlY).withHeight(30)); transportRow.removeFromLeft(4);
-        masterButton.setBounds(transportRow.removeFromLeft(88).withY(controlY).withHeight(30));
-
-        auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        generatorDockViewport.setBounds(10, juce::jmax(82, getHeight() - 49), juce::jmax(0, getWidth() - 20), 25);
-        const int dockButtonWidth = 150;
-        generatorDockStrip.setSize(static_cast<int>(generatorDockButtons.size()) * dockButtonWidth, 25);
-        for (int i = 0; i < static_cast<int>(generatorDockButtons.size()); ++i)
-            generatorDockButtons[static_cast<size_t>(i)]->setBounds(i * dockButtonWidth, 0, dockButtonWidth - 3, 23);
-        if (mixerWindow != nullptr && mixerBoundsInitialised)
-        {
-            const auto minWidth = juce::jmin(220, area.getWidth());
-            const auto minHeight = juce::jmin(420, area.getHeight());
-            const auto panelHeight = mixerWindow->isMinimized() ? 26
-                : juce::jlimit(minHeight, area.getHeight(), mixerPanelBounds.getHeight());
-            mixerPanelBounds.setSize(juce::jlimit(minWidth, area.getWidth(), mixerPanelBounds.getWidth()), panelHeight);
-            mixerPanelBounds.setX(juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - mixerPanelBounds.getWidth()),
-                                               mixerPanelBounds.getX()));
-            mixerPanelBounds.setY(juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - mixerPanelBounds.getHeight()),
-                                               mixerPanelBounds.getY()));
-            mixerWindow->setBounds(mixerPanelBounds);
-            layoutMixerHandles();
-        }
-        generatorInstrumentBounds = {};
-        if (instrumentTrack != nullptr && !allGeneratorsMinimized)
-        {
-            if (generatorPanelBounds.isEmpty())
-                generatorPanelBounds = { area.getX(), area.getY(), juce::jmin(area.getWidth(), 1040), juce::jmin(area.getHeight(), 560) };
-            const auto panelWidth = juce::jlimit(juce::jmin(800, area.getWidth()), area.getWidth(), generatorPanelBounds.getWidth());
-            const auto minimumPanelHeight = generatorCollapsed ? 34 : 350;
-            const auto panelHeight = juce::jlimit(juce::jmin(minimumPanelHeight, area.getHeight()),
-                                                  area.getHeight(), generatorPanelBounds.getHeight());
-            generatorPanelBounds.setSize(panelWidth, panelHeight);
-            generatorPanelBounds.setX(juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - panelWidth), generatorPanelBounds.getX()));
-            generatorPanelBounds.setY(juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - panelHeight), generatorPanelBounds.getY()));
-            generatorResizeHandle.setBounds(generatorPanelBounds.getRight() - 18,
-                generatorPanelBounds.getBottom() - 18, 18, 18);
-            auto panel = generatorPanelBounds;
-            auto generatorHeader = panel.removeFromTop(22);
-            generatorCollapseButton.setBounds(generatorHeader.removeFromRight(24).reduced(1));
-            trackSelector.setBounds(generatorHeader.removeFromRight(190).reduced(4, 0));
-            generatorDragHandle.setBounds(generatorHeader);
-            trackSelector.setVisible(instrumentTrack != nullptr);
-            patternTitle.setBounds(0, 0, 0, 0);
-            auto patternControls = panel.removeFromTop(56).reduced(8, 0);
-            generatorMuteButton.setBounds(patternControls.removeFromLeft(27).withY(patternControls.getY() + 2).withHeight(22));
-            patternControls.removeFromLeft(3);
-            generatorSoloButton.setBounds(patternControls.removeFromLeft(27).withY(patternControls.getY() + 2).withHeight(22));
-            patternControls.removeFromLeft(6);
-            const auto bankX = patternControls.getX();
-            for (int i = 0; i < 8; ++i)
-            {
-                const auto x = bankX + i * 34;
-                patternBankButtons[static_cast<size_t>(i)]->setBounds(x, patternControls.getY(), 31, 23);
-                patternSlotButtons[static_cast<size_t>(i)]->setBounds(x, patternControls.getY() + 26, 31, 23);
-            }
-            patternControls.removeFromLeft(8 * 34 + 8);
-            const auto controlY = patternControls.getY() + 13;
-            pianoRollButton.setBounds(patternControls.removeFromLeft(136).withHeight(27).withY(controlY));
-            patternControls.removeFromLeft(4);
-            generatorSettingsButton.setBounds(patternControls.removeFromLeft(28).withHeight(27).withY(controlY));
-            patternControls.removeFromLeft(4);
-            patternPresetSelector.setBounds(patternControls.removeFromLeft(128).withHeight(27).withY(controlY));
-            patternControls.removeFromLeft(3);
-            openPresetButton.setBounds(patternControls.removeFromLeft(28).withHeight(27).withY(controlY));
-            patternControls.removeFromLeft(2);
-            savePresetButton.setBounds(patternControls.removeFromLeft(28).withHeight(27).withY(controlY));
-            patternControls.removeFromLeft(5);
-            patternLengthDownButton.setBounds(patternControls.removeFromLeft(20).withHeight(27).withY(controlY));
-            patternLengthDisplay.setBounds(patternControls.removeFromLeft(42).withHeight(27).withY(controlY));
-            patternLengthUpButton.setBounds(patternControls.removeFromLeft(20).withHeight(27).withY(controlY));
-            for (auto* control : std::array<juce::Component*, 10> {
-                     &pianoRollButton, &generatorMuteButton, &generatorSoloButton, &generatorSettingsButton,
-                     &patternPresetSelector, &openPresetButton, &savePresetButton, &patternLengthDownButton,
-                     &patternLengthDisplay, &patternLengthUpButton })
-                control->setVisible(!generatorCollapsed && instrumentTrack != nullptr);
-            for (auto& button : patternBankButtons) button->setVisible(!generatorCollapsed && instrumentTrack != nullptr);
-            for (auto& button : patternSlotButtons) button->setVisible(!generatorCollapsed && instrumentTrack != nullptr);
-            generatorInstrumentBounds = generatorCollapsed ? juce::Rectangle<int>{}
-                : generatorPanelBounds.withTrimmedLeft(12).withTrimmedRight(12)
-                    .withY(patternControls.getBottom() + 8).withBottom(generatorPanelBounds.getBottom() - 10);
-            if (pianoRollWindow != nullptr)
-            {
-                // Keep the editor inside its generator. The outer generator
-                // resize grip grows the entire unit, including this view.
-                auto rollBounds = generatorInstrumentBounds;
-                if (!generatorCollapsed)
-                {
-                    rollBounds.setRight(juce::jmax(rollBounds.getX(), generatorPanelBounds.getRight() - 20));
-                    rollBounds.setBottom(juce::jmax(rollBounds.getY(), generatorPanelBounds.getBottom() - 20));
-                }
-                pianoRollWindow->setBounds(rollBounds);
-                if (generatorCollapsed) pianoRollWindow->setVisible(false);
-            }
-            if (activeInstrumentEditor != nullptr)
-            {
-                auto editorBounds = generatorInstrumentBounds;
-                if (!generatorCollapsed)
-                {
-                    editorBounds.setRight(juce::jmax(editorBounds.getX(), generatorPanelBounds.getRight() - 20));
-                    editorBounds.setBottom(juce::jmax(editorBounds.getY(), generatorPanelBounds.getBottom() - 20));
-                }
-                activeInstrumentEditor->setBounds(editorBounds);
-                activeInstrumentEditor->setVisible(!generatorCollapsed
-                                                   && (pianoRollWindow == nullptr || !pianoRollWindow->isVisible()));
-            }
-        }
-        else
-        {
-            generatorPanelBounds = {};
-            if (activeInstrumentEditor != nullptr)
-                activeInstrumentEditor->setVisible(false);
-            if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
-            generatorDragHandle.setVisible(false);
-            generatorResizeHandle.setVisible(false);
-            generatorCollapseButton.setVisible(false);
-            trackSelector.setVisible(false);
-            for (auto& button : patternBankButtons) button->setVisible(false);
-            for (auto& button : patternSlotButtons) button->setVisible(false);
-            for (auto* control : std::array<juce::Component*, 10> {
-                     &pianoRollButton, &generatorMuteButton, &generatorSoloButton, &generatorSettingsButton,
-                     &patternPresetSelector, &openPresetButton, &savePresetButton, &patternLengthDownButton,
-                     &patternLengthDisplay, &patternLengthUpButton })
-                control->setVisible(false);
-        }
-        status.setBounds(10, getHeight() - 21, juce::jmax(0, getWidth() - 205), 18);
-        buildLabel.setBounds(getWidth() - 180, getHeight() - 22, 170, 18);
-        if (generatorDockViewport.isVisible()) generatorDockViewport.toFront(false);
-    }
-
-private:
-    struct ProjectSnapshot
-    {
-        ProjectDocument document;
-        juce::ValueTree editState;
-        bool hadProject = false;
-        bool dirty = false;
-        juce::String selectedTrackId;
-        int bank = 0;
-        int slot = 0;
-        int pitch = 60;
-    };
-
-    struct UndoEntry
-    {
-        ProjectSnapshot snapshot;
-        juce::String label;
-    };
-
-    struct PatternClipboard
-    {
-        bool hasNotes = false;
-        int lengthSteps = 16;
-        std::array<std::array<bool, 64>, 37> notes{};
-        std::array<std::array<int, 64>, 37> lengths{};
-        std::array<std::array<int, 64>, 37> velocities{};
-    };
-
-    struct PatternData
-    {
-        bool created = false;
-        int lengthSteps = 16;
-        std::array<std::array<bool, 64>, 37> notes{};
-        std::array<std::array<int, 64>, 37> lengths{};
-        std::array<std::array<int, 64>, 37> velocities{};
-    };
-
-    void showMenu(juce::TextButton& source, int menuKind)
-    {
-        juce::PopupMenu menu;
-        if (menuKind == 0) // File
-        {
-            menu.addItem(101, "New Projectâ€¦");
-            menu.addItem(102, "Open Projectâ€¦");
-            menu.addItem(103, "Save Project");
-            menu.addSeparator();
-            menu.addItem(106, "Project Settingsâ€¦", hasProject);
-            menu.addSeparator();
-            menu.addItem(104, "Export MIDIâ€¦", hasProject && hasPattern && patternClip != nullptr);
-            menu.addSeparator();
-            menu.addItem(105, "Quit Orbit");
-        }
-        else if (menuKind == 1) // Edit
-        {
-            menu.addItem(201, undoHistory.empty() ? "Undo" : "Undo " + undoHistory.back().label,
-                         !undoHistory.empty());
-            menu.addItem(202, redoHistory.empty() ? "Redo" : "Redo " + redoHistory.back().label,
-                         !redoHistory.empty());
-            menu.addSeparator();
-            menu.addItem(203, "Cut Pattern Notes", hasPattern);
-            menu.addItem(204, "Copy Pattern Notes", hasPattern);
-            menu.addItem(205, "Paste Pattern Notes", instrumentTrack != nullptr && patternClipboard.hasNotes);
-            menu.addItem(213, "Select All Notes", hasPattern);
-            menu.addSeparator();
-            menu.addItem(206, "Randomize", instrumentTrack != nullptr);
-            menu.addItem(207, "Randomize Optionsâ€¦", instrumentTrack != nullptr);
-            menu.addItem(208, "Humanizeâ€¦", hasPattern);
-            menu.addItem(209, "Quantizeâ€¦", hasPattern);
-            menu.addItem(210, "Transposeâ€¦", hasPattern);
-            menu.addItem(211, "Scale Velocitiesâ€¦", hasPattern);
-            menu.addItem(212, "Lengthâ€¦", hasPattern);
-            menu.addItem(214, "Apply Groove Templateâ€¦ (not available yet)", false);
-            menu.addItem(215, "Apply Pluck Templateâ€¦ (not available yet)", false);
-        }
-        else if (menuKind == 2) // View
-        {
-            menu.addItem(301, "Playlist", true, playlistWindow != nullptr && playlistWindow->isVisible());
-            menu.addItem(302, "Mixing Console", true, mixerWindow != nullptr && mixerWindow->isVisible());
-            menu.addItem(303, "Master Section", true, mixerWindow != nullptr && mixerWindow->isVisible());
-            menu.addItem(304, "Event Editor / Piano Roll", hasPattern,
-                         pianoRollWindow != nullptr && pianoRollWindow->isVisible());
-            menu.addSeparator();
-            menu.addItem(305, "Audio Output Settingsâ€¦");
-            menu.addItem(308, "Tempoâ€¦", hasProject);
-            menu.addItem(309, "Time Signatureâ€¦", hasProject);
-            menu.addItem(311, "Time (not available yet)", false);
-            menu.addItem(310, "Modulesâ€¦", hasProject);
-            auto* topWindow = dynamic_cast<juce::ResizableWindow*>(getTopLevelComponent());
-            menu.addItem(307, "Full Screen (F11)", topWindow != nullptr,
-                         topWindow != nullptr && topWindow->isFullScreen());
-            menu.addItem(306, "Show Status Bar", true, status.isVisible());
-            menu.addItem(312, "Show Hints", true, showHints);
-        }
-        else if (menuKind == 3) // Insert
-        {
-            // Keep the Insert hierarchy close to Orion: built-in instruments
-            // live under Synths, while third-party instruments have their own
-            // separate VST Instruments section.
-            menu.addItem(420, "Drum Rack (not available yet)", false);
-            menu.addItem(421, "Piano (not available yet)", false);
-            menu.addItem(422, "Pro-9 (not available yet)", false);
-            menu.addItem(423, "Sampler (not available yet)", false);
-            juce::PopupMenu synths;
-            synths.addItem(401, "Built-in 4OSC Synth");
-            menu.addSubMenu("Synths", synths);
-            menu.addSeparator();
-
-            juce::PopupMenu templates;
-            templates.addItem(410, "Instrument Template (not available yet)", false);
-            templates.addItem(411, "Pattern Template (not available yet)", false);
-            menu.addSubMenu("Templates", templates);
-
-            juce::PopupMenu vstEffects;
-            vstEffects.addItem(409, "VST3 effects are not available yet", false);
-            menu.addSubMenu("VST Effects", vstEffects);
-
-            juce::PopupMenu vst3Instruments;
-            vst3Instruments.addItem(404, "Scan / Manage VST3 Instrumentsâ€¦", hasProject);
-            vst3Instruments.addSeparator();
-            addKnownVst3InstrumentsToMenu(vst3Instruments);
-            menu.addSubMenu("VST Instruments", vst3Instruments);
-
-            juce::PopupMenu directX;
-            directX.addItem(424, "DirectX instruments are not available", false);
-            menu.addSubMenu("DirectX", directX);
-            menu.addSeparator();
-            juce::PopupMenu fxDynamics;
-            fxDynamics.addItem(425, "No dynamics effects available yet", false);
-            menu.addSubMenu("FX Dynamics", fxDynamics);
-            juce::PopupMenu fxEchoDelay;
-            fxEchoDelay.addItem(426, "No echo/delay effects available yet", false);
-            menu.addSubMenu("FX Echo/Delay", fxEchoDelay);
-            juce::PopupMenu fxReverb;
-            fxReverb.addItem(427, "No reverb effects available yet", false);
-            menu.addSubMenu("FX Reverb", fxReverb);
-            juce::PopupMenu fxFilter;
-            fxFilter.addItem(408, "Built-in Equaliser", instrumentTrack != nullptr);
-            menu.addSubMenu("FX Filter", fxFilter);
-            juce::PopupMenu fxMisc;
-            fxMisc.addItem(428, "No miscellaneous effects available yet", false);
-            menu.addSubMenu("FX Misc", fxMisc);
-            juce::PopupMenu fxHolder;
-            fxHolder.addItem(429, "No FX holders available yet", false);
-            menu.addSubMenu("FX Holder", fxHolder);
-            menu.addSeparator();
-            juce::PopupMenu audioTrack;
-            audioTrack.addItem(406, "Audio Track (not available yet)", false);
-            menu.addSubMenu("Audio Track", audioTrack);
-            menu.addItem(407, "MIDI Out (not available yet)", false);
-        }
-        else if (menuKind == 4) // Options
-        {
-            menu.addItem(501, "Loop", hasProject, loopButton.getToggleState());
-            menu.addItem(502, "Metronome", hasProject, metronomeButton.getToggleState());
-            menu.addSeparator();
-            menu.addItem(503, "Audio Output Settingsâ€¦");
-            menu.addItem(504, "Audio Input Settingsâ€¦");
-            menu.addSeparator();
-            menu.addItem(505, "MIDI Input Settingsâ€¦");
-            menu.addItem(506, "MIDI In Controllersâ€¦ (not available)", false);
-            menu.addSeparator();
-            menu.addItem(507, "Sample Pathsâ€¦");
-            menu.addItem(508, "VST Pathsâ€¦");
-            menu.addItem(514, "Skins (not available yet)", false);
-            menu.addItem(515, "Wallpapers (not available yet)", false);
-            menu.addSeparator();
-            menu.addItem(509, "Time Signatureâ€¦", hasProject);
-            menu.addItem(510, "Timebaseâ€¦ (coming in a later pass)", false);
-            menu.addSeparator();
-            menu.addItem(511, "Preferencesâ€¦");
-            menu.addItem(512, "Project Settingsâ€¦", hasProject);
-            menu.addItem(513, "Playlist Settingsâ€¦");
-        }
-        else if (menuKind == 5) // Window
-        {
-            menu.addItem(601, "Playlist", true, playlistWindow != nullptr && playlistWindow->isVisible());
-            menu.addItem(602, "Mixing Console", true, mixerWindow != nullptr && mixerWindow->isVisible());
-            menu.addItem(603, "Master Section", true, mixerWindow != nullptr && mixerWindow->isVisible());
-            menu.addItem(604, "Piano Roll", hasPattern,
-                         pianoRollWindow != nullptr && pianoRollWindow->isVisible());
-            menu.addSeparator();
-            menu.addItem(609, "Compact Mixer", mixerWindow != nullptr);
-            menu.addItem(610, "Expand Mixer", mixerWindow != nullptr);
-            menu.addItem(611, "Minimize Mixer", mixerWindow != nullptr && mixerWindow->isVisible());
-            menu.addSeparator();
-            menu.addItem(605, "Hide All Child Windows");
-            menu.addItem(606, "Minimize All Windows to Pattern Controls");
-            menu.addItem(607, "Cascade Open Windows");
-            menu.addItem(608, generatorCollapsed ? "Restore Generator" : "Minimize Generator",
-                         instrumentTrack != nullptr, generatorCollapsed);
-            menu.addItem(612, allGeneratorsMinimized ? "Restore Generator Panels" : "Minimize All Generators",
-                         !getGeneratorTracks().isEmpty(), allGeneratorsMinimized);
-        }
-        else
-        {
-            menu.addItem(701, "About Orbit");
-        }
-
-        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&source),
-            [this, menuKind](int result) { handleMenuResult(menuKind, result); });
-    }
-
-    void handleMenuResult(int menuKind, int item)
-    {
-        if (item == 0) return;
-        const int vst3Index = item - 1000;
-        if (juce::isPositiveAndBelow(vst3Index, vst3MenuDescriptions.size()))
-        {
-            addVst3Instrument(vst3MenuDescriptions.getReference(vst3Index));
-            return;
-        }
-        switch (item)
-        {
-            case 201: undoProjectAction(); break;
-            case 202: redoProjectAction(); break;
-            case 203: copyOrCutPatternNotes(true); break;
-            case 204: copyOrCutPatternNotes(false); break;
-            case 205: pastePatternNotes(); break;
-            case 206: randomizeCurrentPattern(); break;
-            case 207: showRandomizeOptions(); break;
-            case 208: humanizeCurrentPattern(); break;
-            case 209: showQuantizeDialog(); break;
-            case 210: showTransposeDialog(); break;
-            case 211: showScaleVelocitiesDialog(); break;
-            case 212: showLengthDialog(); break;
-            case 213: selectAllPatternNotes(); break;
-            case 101: createProject(); break;
-            case 102: openProject(); break;
-            case 103: saveProject(); break;
-            case 104: exportMidi(); break;
-            case 106: case 512: showProjectSettings(); break;
-            case 511: showPreferences(); break;
-            case 513: showPlaylistSettings(); break;
-            case 105: juce::JUCEApplication::getInstance()->systemRequestedQuit(); break;
-            case 301: showPlaylist(); break;
-            case 302: showMixer(); break;
-            case 303: showMixer(true); break;
-            case 304: showPianoRoll(); break;
-            case 305: case 503: showAudioSettings(); break;
-            case 308: showTempoDialog(); break;
-            case 309: case 509: showTimeSignatureDialog(); break;
-            case 310: showModules(); break;
-            case 307:
-                if (auto* window = dynamic_cast<juce::ResizableWindow*>(getTopLevelComponent()))
-                    window->setFullScreen(!window->isFullScreen());
-                break;
-            case 504: case 505: showAudioSettings(); break;
-            case 507: showSamplePathsDialog(); break;
-            case 508: showVstPathsDialog(); break;
-            case 306:
-                status.setVisible(!status.isVisible());
-                buildLabel.setVisible(status.isVisible());
-                resized();
-                break;
-            case 312:
-                showHints = !showHints;
-                if (tooltipWindow != nullptr)
-                {
-                    tooltipWindow->hideTip();
-                    tooltipWindow->setMillisecondsBeforeTipAppears(showHints ? 650 : 2147483647);
-                }
-                if (auto* settings = applicationProperties.getUserSettings())
-                {
-                    settings->setValue("showHints", showHints);
-                    applicationProperties.saveIfNeeded();
-                }
-                break;
-            case 401: insertBuiltInInstrument(); break;
-            case 404: showVst3InstrumentBrowser(); break;
-            case 405: addPattern(); break;
-            case 408:
-                if (instrumentTrack != nullptr)
-                    openTrackEqualiser(getMixerTracks().indexOf(instrumentTrack));
-                break;
-            case 501: loopButton.setToggleState(!loopButton.getToggleState(), juce::sendNotification); break;
-            case 502: metronomeButton.setToggleState(!metronomeButton.getToggleState(), juce::sendNotification); break;
-            case 601: showPlaylist(); break;
-            case 602: showMixer(); break;
-            case 603: showMixer(true); break;
-            case 604: showPianoRoll(); break;
-            case 605:
-                if (playlistWindow != nullptr) playlistWindow->setVisible(false);
-                if (mixerWindow != nullptr) mixerWindow->setVisible(false);
-                layoutMixerHandles();
-                if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
-                if (equaliserWindow != nullptr) equaliserWindow->setVisible(false);
-                if (audioSettingsWindow != nullptr) audioSettingsWindow->setVisible(false);
-                break;
-            case 606:
-                if (mixerWindow != nullptr) mixerWindow->setVisible(false);
-                layoutMixerHandles();
-                for (auto* window : { static_cast<juce::DocumentWindow*>(playlistWindow.get()),
-                                      static_cast<juce::DocumentWindow*>(equaliserWindow.get()),
-                                      static_cast<juce::DocumentWindow*>(audioSettingsWindow.get()) })
-                    if (window != nullptr && window->isVisible()) window->setMinimised(true);
-                if (instrumentTrack != nullptr && !generatorCollapsed)
-                    toggleGeneratorCollapsed();
-                break;
-            case 607: cascadeOpenWindows(); break;
-            case 608: toggleGeneratorCollapsed(); break;
-            case 612:
-                allGeneratorsMinimized = !allGeneratorsMinimized;
-                if (allGeneratorsMinimized)
-                {
-                    generatorCollapsed = false;
-                    pianoRollMaximized = false;
-                    if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
-                    if (!pianoRollRestoreBounds.isEmpty()) generatorPanelBounds = pianoRollRestoreBounds;
-                    pianoRollButton.setButtonText("PIANO ROLL");
-                    status.setText("All generator panels minimized. Select one from the generator bar to restore it.",
-                                   juce::dontSendNotification);
-                }
-                resized();
-                break;
-            case 609: setMixerPanelSize(false); break;
-            case 610: setMixerPanelSize(true); break;
-            case 611:
-                if (mixerWindow != nullptr) mixerWindow->setVisible(false);
-                layoutMixerHandles();
-                break;
-            case 701: juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::NoIcon, "About Orbit",
-                "Orbit is a standalone, pattern-first DAW built with JUCE and Tracktion Engine."); break;
-            default: break;
-        }
-        juce::ignoreUnused(menuKind);
-    }
-
-    void showProjectSettings()
-    {
-        if (!hasProject) return;
-        juce::AlertWindow dialog("Project Settings", "General information and project-level options.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("name", project.getName(), "Project name:");
-        dialog.addTextEditor("description", project.getDescription(), "Description:");
-        if (auto* description = dialog.getTextEditor("description"))
-        {
-            description->setMultiLine(true);
-            description->setReturnKeyStartsNewLine(true);
-        }
-        dialog.addTextEditor("creatorUrl", project.getCreatorUrl(), "Creator webpage URL:");
-        dialog.addTextBlock("Changes are stored in the Orbit project file. Instrument bundling and alternate tuning tables are not available yet.");
-        dialog.addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
-        dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
-        if (dialog.runModalLoop() != 1) return;
-
-        const auto name = dialog.getTextEditorContents("name").trim();
-        const auto description = dialog.getTextEditorContents("description").trim();
-        const auto creatorUrl = dialog.getTextEditorContents("creatorUrl").trim();
-        if (name == project.getName() && description == project.getDescription()
-            && creatorUrl == project.getCreatorUrl()) return;
-        rememberUndo("Change project settings");
-        project.setName(name);
-        project.setDescription(description);
-        project.setCreatorUrl(creatorUrl);
-        isDirty = true;
-        refreshProjectView("Project settings updated. Save to keep the change.");
-    }
-
-    void showPreferences()
-    {
-        auto* settings = applicationProperties.getUserSettings();
-        if (settings == nullptr) return;
-        juce::AlertWindow dialog("Preferences", "Visual update and automatic save settings.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("updateRate", juce::String(settings->getIntValue("updateRateHz", 30)),
-                             "Update rate (frames per second):");
-        dialog.addTextEditor("vuDecay", juce::String(settings->getIntValue("vuDecay", 75)),
-                             "VU decay (percent):");
-        dialog.addTextEditor("autoSave", juce::String(settings->getIntValue("autoSaveMinutes", 0)),
-                             "Auto-save every N minutes (0 disables):");
-        dialog.addTextEditor("defaultProject", settings->getValue("defaultProjectPath"),
-                             "Default project file:");
-        dialog.addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
-        dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
-        if (dialog.runModalLoop() != 1) return;
-
-        const auto updateRate = juce::jlimit(2, 60, dialog.getTextEditorContents("updateRate").getIntValue());
-        const auto vuDecay = juce::jlimit(1, 100, dialog.getTextEditorContents("vuDecay").getIntValue());
-        const auto autoSaveMinutes = juce::jlimit(0, 240, dialog.getTextEditorContents("autoSave").getIntValue());
-        settings->setValue("updateRateHz", updateRate);
-        settings->setValue("vuDecay", vuDecay);
-        settings->setValue("autoSaveMinutes", autoSaveMinutes);
-        settings->setValue("defaultProjectPath", dialog.getTextEditorContents("defaultProject").trim());
-        applicationProperties.saveIfNeeded();
-        startTimerHz(updateRate);
-        lastAutoSaveMs = juce::Time::getMillisecondCounter();
-        status.setText("Preferences saved.", juce::dontSendNotification);
-    }
-
-    void showSamplePathsDialog()
-    {
-        showSearchPathsDialog("Sample Paths", "samplePaths", "Sample search folders saved.");
-    }
-
-    void showVstPathsDialog()
-    {
-        showSearchPathsDialog("VST Paths", "vstPaths",
-            "VST3 search folders saved.", true);
-    }
-
-    juce::StringArray getVstSearchPaths()
-    {
-        juce::StringArray paths;
-        if (auto* settings = applicationProperties.getUserSettings())
-        {
-            paths.addTokens(settings->getValue("vstPaths"), ";\n\r", "\"");
-            paths.trim();
-            paths.removeEmptyStrings();
-        }
-        return paths;
-    }
-
-    void showVst3InstrumentBrowser()
-    {
-        if (!hasProject) return;
-        if (vst3InstrumentBrowser == nullptr)
-        {
-            auto& plugins = engine.getPluginManager();
-            vst3InstrumentBrowser = std::make_unique<Vst3InstrumentBrowser>(
-                plugins.pluginFormatManager, plugins.knownPluginList,
-                [this] { return getVstSearchPaths(); },
-                [this] { showVstPathsDialog(); },
-                [this](const juce::PluginDescription& description) { addVst3Instrument(description); });
-        }
-        vst3InstrumentBrowser->setVisible(true);
-        vst3InstrumentBrowser->toFront(true);
-        if (vst3InstrumentBrowser->needsInitialScan()) vst3InstrumentBrowser->scanNow();
-    }
-
-    void startVst3Scan()
-    {
-        if (vst3InstrumentBrowser == nullptr)
-        {
-            auto& plugins = engine.getPluginManager();
-            vst3InstrumentBrowser = std::make_unique<Vst3InstrumentBrowser>(
-                plugins.pluginFormatManager, plugins.knownPluginList,
-                [this] { return getVstSearchPaths(); },
-                [this] { showVstPathsDialog(); },
-                [this](const juce::PluginDescription& description) { addVst3Instrument(description); });
-        }
-        vst3InstrumentBrowser->setVisible(false);
-        vst3InstrumentBrowser->scanNow();
-    }
-
-    juce::String getVst3InstrumentGroup(const juce::PluginDescription& description)
-    {
-        const auto pluginPath = juce::File(description.fileOrIdentifier)
-                                   .getFullPathName().replaceCharacter('\\', '/');
-        const auto customPaths = getVstSearchPaths();
-        for (const auto& path : customPaths)
-        {
-            const juce::File root(path);
-            const auto rootPath = root.getFullPathName().replaceCharacter('\\', '/').trimCharactersAtEnd("/");
-            if (rootPath.isEmpty() || !pluginPath.startsWithIgnoreCase(rootPath + "/")) continue;
-            const auto relativePath = pluginPath.substring(rootPath.length() + 1);
-            const auto firstFolder = relativePath.upToFirstOccurrenceOf("/", false, false);
-            if (firstFolder.endsWithIgnoreCase(".vst3")) return root.getFileName();
-            return firstFolder.isNotEmpty() ? firstFolder : root.getFileName();
-        }
-
-        juce::Array<juce::File> roots;
-        auto& formats = engine.getPluginManager().pluginFormatManager;
-        for (int i = 0; i < formats.getNumFormats(); ++i)
-            if (auto* format = formats.getFormat(i); format != nullptr && format->getName() == "VST3")
-            {
-                const auto defaults = format->getDefaultLocationsToSearch();
-                for (int pathIndex = 0; pathIndex < defaults.getNumPaths(); ++pathIndex)
-                    roots.add(defaults[pathIndex]);
-            }
-
-        for (const auto& root : roots)
-        {
-            auto rootPath = root.getFullPathName().replaceCharacter('\\', '/').trimCharactersAtEnd("/");
-            if (rootPath.isEmpty() || !pluginPath.startsWithIgnoreCase(rootPath + "/")) continue;
-            auto relativePath = pluginPath.substring(rootPath.length() + 1);
-            const auto firstFolder = relativePath.upToFirstOccurrenceOf("/", false, false);
-            if (firstFolder.endsWithIgnoreCase(".vst3")) return {};
-            if (firstFolder.isNotEmpty()) return firstFolder;
-            return {};
-        }
-        return juce::File(description.fileOrIdentifier).getParentDirectory().getFileName();
-    }
-
-    void addKnownVst3InstrumentsToMenu(juce::PopupMenu& menu)
-    {
-        vst3MenuDescriptions.clear();
-        juce::Array<juce::PluginDescription> instruments;
-        for (const auto& description : engine.getPluginManager().knownPluginList.getTypes())
-            if (description.pluginFormatName == "VST3" && description.isInstrument)
-                instruments.add(description);
-        std::sort(instruments.begin(), instruments.end(), [](const auto& a, const auto& b)
-        {
-            return a.name.compareIgnoreCase(b.name) < 0;
-        });
-        if (instruments.isEmpty())
-        {
-            menu.addItem(405, "No VST3 instruments scanned yet", false);
-            return;
-        }
-
-        std::map<juce::String, juce::PopupMenu> grouped;
-        for (const auto& description : instruments)
-        {
-            const int id = 1000 + vst3MenuDescriptions.size();
-            vst3MenuDescriptions.add(description);
-            juce::PopupMenu::Item item(description.name);
-            item.setID(id);
-            const auto group = getVst3InstrumentGroup(description);
-            if (group.isEmpty()) menu.addItem(std::move(item));
-            else grouped[group].addItem(std::move(item));
-        }
-        for (auto& [group, groupMenu] : grouped)
-            menu.addSubMenu(group, groupMenu);
-    }
-
-    juce::String getInstrumentHeaderText() const
-    {
-        if (instrumentTrack != nullptr)
-            for (auto* plugin : instrumentTrack->pluginList)
-                if (auto* external = dynamic_cast<te::ExternalPlugin*>(plugin))
-                    return external->getName() + "  Â·  VST3 INSTRUMENT";
-        return "4OSC  Â·  BUILT-IN SYNTH";
-    }
-
-    void addVst3Instrument(const juce::PluginDescription& description)
-    {
-        if (!hasProject || edit == nullptr)
-        {
-            showError("Project required", "Create or open a project before inserting a VST3 instrument.");
-            return;
-        }
-        rememberUndo("Insert VST3 Instrument");
-
-        auto insertedTrack = edit->insertNewAudioTrack(te::TrackInsertPoint::getEndOfTracks(*edit), nullptr);
-        auto* track = insertedTrack.get();
-        if (track == nullptr)
-        {
-            showError("Could not add VST3 instrument", "Tracktion Engine could not create an audio track.");
-            return;
-        }
-
-        auto plugin = edit->getPluginCache().createNewPlugin(te::ExternalPlugin::xmlTypeName, description);
-        if (plugin == nullptr)
-        {
-            edit->deleteTrack(track);
-            showError("Could not load VST3 instrument", "The selected plugin could not be instantiated. Check its installation and architecture.");
-            return;
-        }
-
-        const auto trackName = description.name.isNotEmpty() ? description.name
-                                                              : "VST3 Instrument " + juce::String(project.getTrackCount() + 1);
-        track->setName(trackName);
-        track->pluginList.insertPlugin(plugin, 0, nullptr);
-        project.addInstrumentTrack();
-        instrumentTrack = track;
-        patternClip = nullptr;
-        updateActiveInstrumentEditor();
-        refreshTrackSelector();
-        readPatternSteps();
-        refreshMixerControls();
-        isDirty = true;
-        if (pianoRollWindow != nullptr) pianoRollWindow->refresh("A1");
-        refreshProjectView("Added VST3 instrument " + description.name + ". Save to keep the change.");
-    }
-
-    void showSearchPathsDialog(const juce::String& title, const juce::String& settingsKey,
-                               const juce::String& savedStatus, bool includeVstStartupOption = false)
-    {
-        auto* settings = applicationProperties.getUserSettings();
-        if (settings == nullptr) return;
-        juce::StringArray paths;
-        paths.addTokens(settings->getValue(settingsKey), ";\n\r", "\"");
-        paths.trim();
-        paths.removeEmptyStrings();
-        auto window = std::make_unique<SearchPathsWindow>(title, std::move(paths),
-            [this, settingsKey, savedStatus](juce::StringArray updatedPaths)
-            {
-                if (auto* userSettings = applicationProperties.getUserSettings())
-                {
-                    userSettings->setValue(settingsKey, updatedPaths.joinIntoString(";"));
-                    applicationProperties.saveIfNeeded();
-                    status.setText(savedStatus, juce::dontSendNotification);
-                }
-            }, includeVstStartupOption,
-            includeVstStartupOption && settings->getBoolValue("scanVst3AtStartup", false),
-            [this](bool enabled)
-            {
-                if (auto* userSettings = applicationProperties.getUserSettings())
-                {
-                    userSettings->setValue("scanVst3AtStartup", enabled);
-                    applicationProperties.saveIfNeeded();
-                }
-            });
-        window->setVisible(true);
-        window->toFront(true);
-        if (settingsKey == "samplePaths") samplePathsWindow = std::move(window);
-        else vstPathsWindow = std::move(window);
-    }
-
-    void showTempoDialog()
-    {
-        if (!hasProject || edit == nullptr) return;
-        juce::AlertWindow dialog("Tempo", "Set the project's initial tempo.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("bpm", juce::String(tempoSlider.getValue(), 1), "Beats per minute:");
-        dialog.addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
-        dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
-        if (dialog.runModalLoop() != 1) return;
-
-        const auto bpm = juce::jlimit(20.0, 300.0, dialog.getTextEditorContents("bpm").getDoubleValue());
-        if (std::abs(bpm - tempoSlider.getValue()) < 0.0001) return;
-        rememberUndo("Change tempo");
-        tempoSlider.setValue(bpm, juce::sendNotificationSync);
-    }
-
-    void showTimeSignatureDialog()
-    {
-        if (!hasProject || edit == nullptr) return;
-        const auto current = project.getInitialTimeSignature();
-        juce::AlertWindow dialog("Time Signature", "Set the project's initial meter.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("numerator", juce::String(current.numerator), "Beats per bar:");
-        dialog.addTextEditor("denominator", juce::String(current.denominator), "Beat unit (1, 2, 4, 8, 16, 32):");
-        dialog.addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
-        dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
-        if (dialog.runModalLoop() != 1) return;
-
-        const auto numerator = juce::jlimit(1, 32, dialog.getTextEditorContents("numerator").getIntValue());
-        auto denominator = dialog.getTextEditorContents("denominator").getIntValue();
-        if (denominator != 1 && denominator != 2 && denominator != 4 && denominator != 8
-            && denominator != 16 && denominator != 32)
-            denominator = 4;
-        if (current.numerator == numerator && current.denominator == denominator) return;
-
-        rememberUndo("Change time signature");
-        project.setInitialTimeSignature(numerator, denominator);
-        if (auto* initialMeter = edit->tempoSequence.getTimeSig(0))
-            initialMeter->setStringTimeSig(juce::String(numerator) + "/" + juce::String(denominator));
-        updateLoopRange();
-        const auto signatureText = juce::String(numerator) + "/" + juce::String(denominator);
-        timeSignatureLabel.setText(signatureText, juce::dontSendNotification);
-        musicalDetails.setText("Tracks: " + juce::String(project.getTrackCount()) + "   |   "
-                                   + juce::String(tempoSlider.getValue(), 1) + " BPM   |   " + signatureText
-                                   + "   |   Built-in 4OSC   |   64 patterns per generator",
-                               juce::dontSendNotification);
-        isDirty = true;
-        status.setText("Time signature changed. Save to keep the change.", juce::dontSendNotification);
-    }
-
-    void showModules()
-    {
-        if (!hasProject || edit == nullptr) return;
-        const auto tracks = getGeneratorTracks();
-        if (tracks.isEmpty())
-        {
-            showError("Modules", "This project has no active instrument generators.");
-            return;
-        }
-
-        juce::StringArray names;
-        const auto selectedIndex = tracks.indexOf(instrumentTrack);
-        for (int i = 0; i < tracks.size(); ++i)
-            names.add(tracks.getUnchecked(i)->getName() + "  Â·  Built-in 4OSC instrument");
-
-        juce::AlertWindow dialog("Modules", "Select a generator to activate in the project workspace.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addComboBox("generator", names, "Generator:");
-        if (auto* selector = dialog.getComboBoxComponent("generator"))
-            selector->setSelectedItemIndex(juce::jmax(0, selectedIndex), juce::dontSendNotification);
-        dialog.addButton("Activate", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
-        dialog.addButton("Close", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
-        if (dialog.runModalLoop() != 1) return;
-        if (auto* selector = dialog.getComboBoxComponent("generator"))
-            trackSelector.setSelectedId(selector->getSelectedItemIndex() + 1, juce::sendNotificationSync);
-    }
-
-    void showPlaylistSettings()
-    {
-        showPlaylist();
-        if (playlistWindow != nullptr) playlistWindow->showSettings();
-    }
-
-    void selectAllPatternNotes()
-    {
-        if (instrumentTrack == nullptr || !hasPattern) return;
-        const auto hasAnyNotes = std::any_of(noteGrid.begin(), noteGrid.end(), [](const auto& pitchSteps)
-        {
-            return std::any_of(pitchSteps.begin(), pitchSteps.end(), [](bool active) { return active; });
-        });
-        allNotesSelected = hasAnyNotes;
-        if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
-        status.setText(hasAnyNotes ? "Selected all notes in the current pattern."
-                                   : "The current pattern has no notes to select.",
-                       juce::dontSendNotification);
-    }
-
-    void copyOrCutPatternNotes(bool cut)
-    {
-        if (instrumentTrack == nullptr || edit == nullptr || !hasPattern) return;
-        patternClipboard = {};
-        patternClipboard.lengthSteps = selectedPatternLength();
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        bool foundNote = false;
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                const auto enabled = project.getPatternNote(trackId, patternIndex, pitch, step);
-                patternClipboard.notes[row][column] = enabled;
-                if (enabled)
-                {
-                    foundNote = true;
-                    patternClipboard.lengths[row][column] = project.getPatternNoteLength(trackId, patternIndex, pitch, step);
-                    patternClipboard.velocities[row][column] = project.getPatternNoteVelocity(trackId, patternIndex, pitch, step);
-                }
-            }
-        patternClipboard.hasNotes = foundNote;
-        if (!cut || !foundNote) return;
-
-        rememberUndo("Cut pattern notes");
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-                if (patternClipboard.notes[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(step)])
-                    project.setPatternNote(trackId, patternIndex, pitch, step, false);
-        readPatternSteps();
-        allNotesSelected = false;
-        refreshPatternLengthDisplay();
-        loadSelectedPitchSteps();
-        isDirty = true;
-        rebuildPatternClip();
-        status.setText("Cut notes from Pattern " + juce::String::charToString(static_cast<juce::juce_wchar>('A' + patternIndex / 8))
-                       + juce::String(patternIndex % 8 + 1) + ".", juce::dontSendNotification);
-    }
-
-    void pastePatternNotes()
-    {
-        if (instrumentTrack == nullptr || edit == nullptr || !patternClipboard.hasNotes) return;
-        rememberUndo("Paste pattern notes");
-        allNotesSelected = false;
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        project.setPatternCreated(trackId, patternIndex, true);
-        project.setPatternLengthSteps(trackId, patternIndex, patternClipboard.lengthSteps);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                const auto enabled = patternClipboard.notes[row][column];
-                project.setPatternNote(trackId, patternIndex, pitch, step, enabled);
-                if (enabled)
-                {
-                    project.setPatternNoteLength(trackId, patternIndex, pitch, step,
-                        patternClipboard.lengths[row][column]);
-                    project.setPatternNoteVelocity(trackId, patternIndex, pitch, step,
-                        patternClipboard.velocities[row][column]);
-                }
-            }
-        readPatternSteps();
-        refreshPatternLengthDisplay();
-        loadSelectedPitchSteps();
-        isDirty = true;
-        rebuildPatternClip();
-        status.setText("Pasted notes into the selected pattern.", juce::dontSendNotification);
-    }
-
-    PatternData capturePatternData(const juce::String& trackId, int patternIndex) const
-    {
-        PatternData data;
-        data.created = project.isPatternCreated(trackId, patternIndex);
-        data.lengthSteps = project.getPatternLengthSteps(trackId, patternIndex);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                data.notes[row][column] = project.getPatternNote(trackId, patternIndex, pitch, step);
-                if (data.notes[row][column])
-                {
-                    data.lengths[row][column] = project.getPatternNoteLength(trackId, patternIndex, pitch, step);
-                    data.velocities[row][column] = project.getPatternNoteVelocity(trackId, patternIndex, pitch, step);
-                }
-            }
-        return data;
-    }
-
-    void writePatternData(const juce::String& trackId, int patternIndex, const PatternData& data)
-    {
-        project.setPatternCreated(trackId, patternIndex, data.created);
-        project.setPatternLengthSteps(trackId, patternIndex, data.lengthSteps);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                const auto enabled = data.notes[row][column];
-                project.setPatternNote(trackId, patternIndex, pitch, step, enabled);
-                if (enabled)
-                {
-                    project.setPatternNoteLength(trackId, patternIndex, pitch, step,
-                        juce::jlimit(1, 64 - step, data.lengths[row][column]));
-                    project.setPatternNoteVelocity(trackId, patternIndex, pitch, step,
-                        juce::jlimit(1, 127, data.velocities[row][column]));
-                }
-            }
-    }
-
-    void finishPatternEdit(const juce::String& message)
-    {
-        readPatternSteps();
-        refreshPatternLengthDisplay();
-        loadSelectedPitchSteps();
-        isDirty = true;
-        rebuildPatternClip();
-        status.setText(message + " Save to keep the change.", juce::dontSendNotification);
-    }
-
-    void showRandomizeOptions()
-    {
-        juce::AlertWindow dialog("Randomize Options", "Set the note range and density used by Randomize.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("density", juce::String(randomDensityPercent), "Density (percent):");
-        dialog.addTextEditor("low", juce::String(randomPitchLow), "Lowest pitch (MIDI note):");
-        dialog.addTextEditor("high", juce::String(randomPitchHigh), "Highest pitch (MIDI note):");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        randomDensityPercent = juce::jlimit(1, 100, dialog.getTextEditorContents("density").getIntValue());
-        randomPitchLow = juce::jlimit(minimumPitch, maximumPitch, dialog.getTextEditorContents("low").getIntValue());
-        randomPitchHigh = juce::jlimit(randomPitchLow, maximumPitch, dialog.getTextEditorContents("high").getIntValue());
-        status.setText("Randomize options saved.", juce::dontSendNotification);
-    }
-
-    void randomizeCurrentPattern()
-    {
-        if (instrumentTrack == nullptr || edit == nullptr) return;
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        const auto length = data.lengthSteps;
-        auto& random = juce::Random::getSystemRandom();
-        for (int step = 0; step < length; ++step)
-        {
-            if (random.nextInt(100) >= randomDensityPercent) continue;
-            const auto pitch = random.nextInt(juce::Range<int>(randomPitchLow, randomPitchHigh + 1));
-            const auto row = static_cast<size_t>(pitch - minimumPitch);
-            const auto column = static_cast<size_t>(step);
-            data.notes[row][column] = true;
-            data.lengths[row][column] = 1;
-            data.velocities[row][column] = random.nextInt(juce::Range<int>(70, 121));
-        }
-        data.created = true;
-        rememberUndo("Randomize pattern");
-        writePatternData(trackId, patternIndex, data);
-        finishPatternEdit("Pattern randomized.");
-    }
-
-    void humanizeCurrentPattern()
-    {
-        if (instrumentTrack == nullptr || edit == nullptr || !hasPattern) return;
-        juce::AlertWindow dialog("Humanize", "Vary note start times by up to one step and velocities by the selected amount.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("timing", "1", "Timing variation (steps, 0â€“4):");
-        dialog.addTextEditor("velocity", "8", "Velocity variation (0â€“32):");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto timing = juce::jlimit(0, 4, dialog.getTextEditorContents("timing").getIntValue());
-        const auto velocity = juce::jlimit(0, 32, dialog.getTextEditorContents("velocity").getIntValue());
-        if (timing == 0 && velocity == 0) return;
-
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        PatternData result = data;
-        for (auto& row : result.notes) row.fill(false);
-        auto& random = juce::Random::getSystemRandom();
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < data.lengthSteps; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                if (!data.notes[row][column]) continue;
-                const auto shift = timing == 0 ? 0 : random.nextInt(2 * timing + 1) - timing;
-                const auto movedStep = juce::jlimit(0, data.lengthSteps - 1, step + shift);
-                const auto movedColumn = static_cast<size_t>(movedStep);
-                result.notes[row][movedColumn] = true;
-                result.lengths[row][movedColumn] = data.lengths[row][column];
-                result.velocities[row][movedColumn] = juce::jlimit(1, 127,
-                    data.velocities[row][column] + (velocity == 0 ? 0 : random.nextInt(2 * velocity + 1) - velocity));
-            }
-        rememberUndo("Humanize pattern");
-        writePatternData(trackId, patternIndex, result);
-        finishPatternEdit("Pattern humanized.");
-    }
-
-    void showQuantizeDialog()
-    {
-        if (!hasPattern) return;
-        juce::AlertWindow dialog("Quantize", "Snap note starts to a rhythmic grid.", juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("resolution", "16", "Resolution (notes per bar):");
-        dialog.addTextEditor("durations", "0", "Also quantize durations? 1 = yes, 0 = no:");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto resolution = juce::jlimit(1, 64, dialog.getTextEditorContents("resolution").getIntValue());
-        const auto quantizeDurations = dialog.getTextEditorContents("durations").getIntValue() != 0;
-        const auto grid = juce::jmax(1, 16 / resolution);
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        PatternData result = data;
-        for (auto& row : result.notes) row.fill(false);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < data.lengthSteps; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                if (!data.notes[row][column]) continue;
-                const auto snapped = juce::jlimit(0, data.lengthSteps - 1, ((step + grid / 2) / grid) * grid);
-                const auto outColumn = static_cast<size_t>(snapped);
-                result.notes[row][outColumn] = true;
-                result.lengths[row][outColumn] = quantizeDurations
-                    ? juce::jmax(1, ((data.lengths[row][column] + grid / 2) / grid) * grid)
-                    : data.lengths[row][column];
-                result.velocities[row][outColumn] = data.velocities[row][column];
-            }
-        rememberUndo("Quantize pattern");
-        writePatternData(trackId, patternIndex, result);
-        finishPatternEdit("Pattern quantized.");
-    }
-
-    void showTransposeDialog()
-    {
-        if (!hasPattern) return;
-        juce::AlertWindow dialog("Transpose", "Transpose this pattern or more patterns on the selected generator.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("semitones", "1", "Semitones:");
-        dialog.addTextEditor("scope", "0", "Scope: 0 current pattern, 1 generator, 2 all generators:");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto amount = juce::jlimit(-48, 48, dialog.getTextEditorContents("semitones").getIntValue());
-        const auto scope = juce::jlimit(0, 2, dialog.getTextEditorContents("scope").getIntValue());
-        if (amount == 0) return;
-        const auto selectedTrack = selectedProjectTrackId();
-        rememberUndo("Transpose pattern");
-        for (int t = 0; t < project.getTrackCount(); ++t)
-        {
-            const auto trackId = project.getTrackId(t);
-            if (scope != 2 && trackId != selectedTrack) continue;
-            const auto first = scope == 0 ? selectedPatternIndex() : 0;
-            const auto last = scope == 0 ? first + 1 : 64;
-            for (int pattern = first; pattern < last; ++pattern)
-            {
-                auto data = capturePatternData(trackId, pattern);
-                if (!data.created) continue;
-                PatternData result = data;
-                for (auto& row : result.notes) row.fill(false);
-                for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                    for (int step = 0; step < 64; ++step)
-                    {
-                        const auto row = static_cast<size_t>(pitch - minimumPitch);
-                        const auto column = static_cast<size_t>(step);
-                        if (!data.notes[row][column]) continue;
-                        const auto newPitch = pitch + amount;
-                        if (newPitch < minimumPitch || newPitch > maximumPitch) continue;
-                        const auto newRow = static_cast<size_t>(newPitch - minimumPitch);
-                        result.notes[newRow][column] = true;
-                        result.lengths[newRow][column] = data.lengths[row][column];
-                        result.velocities[newRow][column] = data.velocities[row][column];
-                    }
-                writePatternData(trackId, pattern, result);
-            }
-        }
-        finishPatternEdit("Transpose applied.");
-    }
-
-    void showScaleVelocitiesDialog()
-    {
-        if (!hasPattern) return;
-        juce::AlertWindow dialog("Scale Velocities", "Scale note velocities across the selected pattern.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("begin", "1", "Begin velocity (1â€“127):");
-        dialog.addTextEditor("end", "127", "End velocity (1â€“127):");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto begin = juce::jlimit(1, 127, dialog.getTextEditorContents("begin").getIntValue());
-        const auto end = juce::jlimit(1, 127, dialog.getTextEditorContents("end").getIntValue());
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        std::vector<std::pair<int, int>> locations;
-        for (int step = 0; step < 64; ++step)
-            for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                if (data.notes[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(step)])
-                    locations.emplace_back(pitch, step);
-        if (locations.empty()) return;
-        rememberUndo("Scale velocities");
-        for (size_t i = 0; i < locations.size(); ++i)
-        {
-            const auto fraction = locations.size() <= 1 ? 0.0 : static_cast<double>(i) / (locations.size() - 1);
-            const auto velocity = juce::roundToInt(begin + (end - begin) * fraction);
-            project.setPatternNoteVelocity(trackId, patternIndex, locations[i].first, locations[i].second, velocity);
-        }
-        finishPatternEdit("Note velocities scaled.");
-    }
-
-    void showLengthDialog()
-    {
-        if (!hasPattern) return;
-        juce::AlertWindow dialog("Length", "Scale pattern note positions and/or durations.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("percent", "100", "Scale percent:");
-        dialog.addTextEditor("starts", "0", "Scale start times? 1 = yes, 0 = no:");
-        dialog.addTextEditor("durations", "1", "Scale durations? 1 = yes, 0 = no:");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto percent = juce::jlimit(10, 800, dialog.getTextEditorContents("percent").getIntValue());
-        const auto scaleStarts = dialog.getTextEditorContents("starts").getIntValue() != 0;
-        const auto scaleDurations = dialog.getTextEditorContents("durations").getIntValue() != 0;
-        if (!scaleStarts && !scaleDurations) return;
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        PatternData result = data;
-        for (auto& row : result.notes) row.fill(false);
-        if (scaleStarts)
-            result.lengthSteps = juce::jlimit(1, 64, juce::roundToInt(data.lengthSteps * percent / 100.0));
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                if (!data.notes[row][column]) continue;
-                const auto moved = scaleStarts ? juce::jlimit(0, result.lengthSteps - 1,
-                    juce::roundToInt(step * percent / 100.0)) : step;
-                const auto outColumn = static_cast<size_t>(moved);
-                result.notes[row][outColumn] = true;
-                result.lengths[row][outColumn] = scaleDurations
-                    ? juce::jlimit(1, 64 - moved, juce::roundToInt(data.lengths[row][column] * percent / 100.0))
-                    : data.lengths[row][column];
-                result.velocities[row][outColumn] = data.velocities[row][column];
-            }
-        rememberUndo("Scale pattern length");
-        writePatternData(trackId, patternIndex, result);
-        finishPatternEdit("Pattern length updated.");
-    }
-
-    void insertBuiltInInstrument()
-    {
-        if (!hasProject || edit == nullptr)
-            createProject();
-        if (hasProject && edit != nullptr)
-            addInstrumentTrack();
-    }
-
-    ProjectSnapshot captureProjectSnapshot()
-    {
-        ProjectSnapshot snapshot;
-        snapshot.document = project;
-        snapshot.hadProject = hasProject && edit != nullptr;
-        snapshot.dirty = isDirty;
-        snapshot.bank = selectedBankIndex;
-        snapshot.slot = selectedSlotIndex;
-        snapshot.pitch = selectedPitch();
-        if (snapshot.hadProject)
-        {
-            edit->flushState();
-            snapshot.editState = edit->state.createCopy();
-            snapshot.document.setTracktionEditState(snapshot.editState);
-            const auto tracks = getGeneratorTracks();
-            const auto selectedIndex = tracks.indexOf(instrumentTrack);
-            if (juce::isPositiveAndBelow(selectedIndex, project.getTrackCount()))
-                snapshot.selectedTrackId = project.getTrackId(selectedIndex);
-        }
-        return snapshot;
-    }
-
-    void rememberUndo(const juce::String& label)
-    {
-        undoHistory.push_back({ captureProjectSnapshot(), label });
-        if (undoHistory.size() > 50)
-            undoHistory.erase(undoHistory.begin());
-        redoHistory.clear();
-    }
-
-    void restoreProjectSnapshot(const ProjectSnapshot& snapshot, const juce::String& message)
-    {
-        resetPatternButtons();
-        project = snapshot.document;
-        edit.reset();
-        if (snapshot.hadProject && snapshot.editState.isValid())
-            edit = te::loadEditFromState(engine, snapshot.editState.createCopy());
-        hasProject = snapshot.hadProject && edit != nullptr;
-        isDirty = snapshot.dirty;
-        selectedBankIndex = snapshot.bank;
-        selectedSlotIndex = snapshot.slot;
-        pitchSelector.setSelectedId(pitchToItemId(snapshot.pitch), juce::dontSendNotification);
-        for (int i = 0; i < 8; ++i)
-        {
-            patternBankButtons[static_cast<size_t>(i)]->setToggleState(i == selectedBankIndex, juce::dontSendNotification);
-            patternSlotButtons[static_cast<size_t>(i)]->setToggleState(i == selectedSlotIndex, juce::dontSendNotification);
-        }
-        if (hasProject)
-        {
-            const auto tracks = getGeneratorTracks();
-            for (int i = 0; i < tracks.size() && i < project.getTrackCount(); ++i)
-                if (project.getTrackId(i) == snapshot.selectedTrackId)
-                {
-                    instrumentTrack = tracks.getUnchecked(i);
-                    break;
-                }
-            if (instrumentTrack == nullptr)
-                findFirstInstrumentTrack();
-            if (instrumentTrack != nullptr)
-            {
-                const auto selectedIndex = tracks.indexOf(instrumentTrack);
-                trackSelector.setSelectedId(selectedIndex + 1, juce::dontSendNotification);
-                readPatternSteps();
-                refreshMixerControls();
-            }
-        }
-        refreshTrackSelector();
-        refreshProjectView(message);
-    }
-
-    void undoProjectAction()
-    {
-        if (undoHistory.empty()) return;
-        auto current = captureProjectSnapshot();
-        const auto label = undoHistory.back().label;
-        redoHistory.push_back({ std::move(current), label });
-        auto target = std::move(undoHistory.back());
-        undoHistory.pop_back();
-        restoreProjectSnapshot(target.snapshot, "Undid " + label + ".");
-    }
-
-    void redoProjectAction()
-    {
-        if (redoHistory.empty()) return;
-        auto current = captureProjectSnapshot();
-        const auto label = redoHistory.back().label;
-        undoHistory.push_back({ std::move(current), label });
-        auto target = std::move(redoHistory.back());
-        redoHistory.pop_back();
-        restoreProjectSnapshot(target.snapshot, "Redid " + label + ".");
-    }
-
-    void rewindPlayback()
-    {
-        if (edit == nullptr) return;
-        edit->getTransport().stop(false, false);
-        edit->getTransport().setPosition(tracktion::TimePosition::fromSeconds(0.0));
-        playButton.setButtonText("Play");
-        status.setText("Returned to the start.", juce::dontSendNotification);
-    }
-
-    void skipTransport(int bars)
-    {
-        if (edit == nullptr) return;
-        auto& transport = edit->getTransport();
-        const auto barSeconds = 240.0 / juce::jmax(20.0, tempoSlider.getValue());
-        const auto current = transport.getPosition().inSeconds();
-        transport.setPosition(tracktion::TimePosition::fromSeconds(juce::jmax(0.0, current + bars * barSeconds)));
-    }
-
-    void updateLoopRange()
-    {
-        if (edit == nullptr) return;
-        const auto bpm = juce::jmax(20.0, tempoSlider.getValue());
-        const auto secondsPerBar = 240.0 / bpm; // current project meter is 4/4
-        const auto startSeconds = (loopStartSlider.getValue() - 1.0) * secondsPerBar;
-        const auto lengthSeconds = loopLengthSlider.getValue() * secondsPerBar;
-        auto& transport = edit->getTransport();
-        transport.setLoopRange({ tracktion::TimePosition::fromSeconds(startSeconds),
-                                 tracktion::TimePosition::fromSeconds(startSeconds + lengthSeconds) });
-        transport.looping = loopButton.getToggleState();
-    }
-
-    void setLoopEnabled(bool enabled)
-    {
-        if (edit != nullptr)
-        {
-            updateLoopRange();
-            edit->getTransport().looping = enabled;
-        }
-        status.setText(enabled ? "Loop enabled." : "Loop disabled.", juce::dontSendNotification);
-    }
-
-    void setMetronomeEnabled(bool enabled)
-    {
-        if (edit != nullptr)
-        {
-            edit->clickTrackEnabled = enabled;
-            edit->clickTrackEmphasiseBars = true;
-            isDirty = true;
-        }
-        status.setText(enabled ? "Metronome enabled." : "Metronome disabled.", juce::dontSendNotification);
-    }
-
-    static void configureButton(juce::TextButton& button, const juce::String& text, std::function<void()> action)
-    {
-        button.setButtonText(text);
-        button.onClick = std::move(action);
-    }
-
-    static juce::StringArray makePitchNames()
-    {
-        juce::StringArray names;
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            names.add(pitchName(pitch));
-        return names;
-    }
-
-    static juce::String pitchName(int midiNote)
-    {
-        static const char* noteNames[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-        return juce::String(noteNames[midiNote % 12]) + juce::String(midiNote / 12 - 1);
-    }
-
-    static int pitchToItemId(int midiNote) { return midiNote - minimumPitch + 1; }
-    int selectedPitch() const { return minimumPitch + pitchSelector.getSelectedId() - 1; }
-
-    void loadSelectedPitchSteps()
-    {
-        const auto pitch = selectedPitch();
-        for (int i = 0; i < 16; ++i)
-            steps[static_cast<size_t>(i)]->setToggleState(noteGrid[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(i)],
-                                                          juce::dontSendNotification);
-        const auto titleText = getSelectedPatternTitle();
-        generatorDragHandle.setText(titleText, juce::dontSendNotification);
-        patternTitle.setText({}, juce::dontSendNotification);
-        refreshPatternLengthDisplay();
-        if (pianoRollWindow != nullptr) pianoRollWindow->refresh(titleText);
-    }
-
-    juce::String getSelectedPatternTitle() const
-    {
-        const auto patternIndex = selectedPatternIndex();
-        const auto patternLabel = juce::String::charToString(
-            static_cast<juce::juce_wchar>('A' + patternIndex / 8)) + juce::String(patternIndex % 8 + 1);
-        const auto generatorName = instrumentTrack != nullptr ? instrumentTrack->getName() : juce::String("Generator");
-        return generatorName + "  Â·  Pattern " + patternLabel;
-    }
-
-    int selectedPatternLength() const
-    {
-        return juce::jlimit(1, 64, project.getPatternLengthSteps(selectedProjectTrackId(), selectedPatternIndex()));
-    }
-
-    void refreshPatternLengthDisplay()
-    {
-        const auto length = selectedPatternLength();
-        patternLengthDisplay.setText(juce::String(length).paddedLeft('0', 3), juce::dontSendNotification);
-        patternLengthDisplay.setTooltip("Pattern length: " + juce::String(length) + " steps. Use + and âˆ’ to adjust.");
-    }
-
-    void adjustPatternLength(int delta)
-    {
-        if (instrumentTrack == nullptr || edit == nullptr) return;
-        const auto nextLength = juce::jlimit(1, 64, selectedPatternLength() + delta);
-        if (nextLength == selectedPatternLength()) return;
-        rememberUndo("Change pattern length");
-        project.setPatternLengthSteps(selectedProjectTrackId(), selectedPatternIndex(), nextLength);
-        isDirty = true;
-        refreshPatternLengthDisplay();
-        if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
-        rebuildPatternClip();
-        status.setText("Pattern length: " + juce::String(nextLength) + " steps.", juce::dontSendNotification);
-    }
-
-    void showPianoRoll()
-    {
-        if (pianoRollWindow == nullptr || instrumentTrack == nullptr) return;
-        if (pianoRollWindow->isVisible())
-        {
-            closePianoRollView();
-            return;
-        }
-        if (generatorCollapsed)
-        {
-            generatorCollapsed = false;
-            if (!expandedGeneratorBounds.isEmpty()) generatorPanelBounds = expandedGeneratorBounds;
-            generatorCollapseButton.setButtonText("âˆ’");
-            generatorCollapseButton.setTooltip("Minimize this generator");
-            pianoRollWasVisibleWhenCollapsed = false;
-        }
-        allGeneratorsMinimized = false;
-        pianoRollWindow->refresh(getSelectedPatternTitle());
-        pianoRollRestoreBounds = generatorPanelBounds;
-        pianoRollMaximized = true;
-        generatorPanelBounds = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(50).reduced(14, 10);
-        pianoRollButton.setButtonText("INSTRUMENT");
-        pianoRollButton.setTooltip("Return to the VST or built-in instrument");
-        pianoRollWindow->setVisible(true);
-        if (activeInstrumentEditor != nullptr) activeInstrumentEditor->setVisible(false);
-        resized();
-        bringGeneratorToFront();
-        status.setText("Piano Roll expanded across the generator workspace.", juce::dontSendNotification);
-    }
-
-    void closePianoRollView()
-    {
-        if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
-        if (pianoRollMaximized && !pianoRollRestoreBounds.isEmpty())
-            generatorPanelBounds = pianoRollRestoreBounds;
-        pianoRollMaximized = false;
-        pianoRollButton.setButtonText("PIANO ROLL");
-        pianoRollButton.setTooltip("Open the selected pattern in the piano roll");
-        resized();
-        if (activeInstrumentEditor != nullptr && instrumentTrack != nullptr && !generatorCollapsed)
-            activeInstrumentEditor->setVisible(true);
-        bringGeneratorToFront();
-    }
-
-    void toggleGeneratorCollapsed()
-    {
-        if (instrumentTrack == nullptr) return;
-        if (!generatorCollapsed)
-        {
-            if (pianoRollWindow != nullptr && pianoRollWindow->isVisible()) closePianoRollView();
-            expandedGeneratorBounds = generatorPanelBounds;
-            pianoRollWasVisibleWhenCollapsed = false;
-            generatorCollapsed = true;
-            allGeneratorsMinimized = true;
-            if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
-        }
-        else
-        {
-            generatorCollapsed = false;
-            allGeneratorsMinimized = false;
-            if (!expandedGeneratorBounds.isEmpty()) generatorPanelBounds = expandedGeneratorBounds;
-            generatorCollapseButton.setButtonText("âˆ’");
-            generatorCollapseButton.setTooltip("Minimize this generator");
-        }
-        resized();
-        if (generatorCollapsed)
-            status.setText("Generator minimized. Use its tab at the bottom to restore it or switch generators.",
-                           juce::dontSendNotification);
-        else
-        {
-            if (pianoRollWindow != nullptr && pianoRollWasVisibleWhenCollapsed)
-            {
-                pianoRollWindow->refresh(getSelectedPatternTitle());
-                pianoRollWindow->setVisible(true);
-                pianoRollWindow->toFront(false);
-            }
-            pianoRollWasVisibleWhenCollapsed = false;
-            status.setText("Generator restored.", juce::dontSendNotification);
-        }
-        repaint();
-    }
-
-    void togglePianoRollNote(int pitch, int step, bool erase)
-    {
-        if (instrumentTrack == nullptr || pitch < minimumPitch || pitch > maximumPitch
-            || !juce::isPositiveAndBelow(step, 64)) return;
-        if (!hasPattern)
-        {
-            project.setPatternCreated(selectedProjectTrackId(), selectedPatternIndex(), true);
-            hasPattern = true;
-        }
-        const auto row = static_cast<size_t>(pitch - minimumPitch);
-        const auto column = static_cast<size_t>(step);
-        const bool enabled = !erase;
-        if (noteGrid[row][column] == enabled) return;
-        allNotesSelected = false;
-        noteGrid[row][column] = enabled;
-        project.setPatternNote(selectedProjectTrackId(), selectedPatternIndex(), pitch, step, enabled);
-        if (pitch == selectedPitch() && step < static_cast<int>(steps.size()))
-            steps[column]->setToggleState(enabled, juce::dontSendNotification);
-        isDirty = true;
-        status.setText(erase ? "Piano roll note removed." : "Piano roll note added.", juce::dontSendNotification);
-        if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
-        rebuildPatternClip();
-    }
-
-    void setPianoRollNoteLength(int pitch, int step, int length)
-    {
-        if (instrumentTrack == nullptr || !juce::isPositiveAndBelow(step, 64)) return;
-        project.setPatternNoteLength(selectedProjectTrackId(), selectedPatternIndex(), pitch, step, length);
-        isDirty = true;
-        if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
-        rebuildPatternClip();
-    }
-
-    void createProject()
-    {
-        if (hasProject && isDirty)
-        {
-            auto* dialog = new juce::AlertWindow("Create New Project?",
-                "Discard the current unsaved project and start a new one?",
-                juce::MessageBoxIconType::WarningIcon, this);
-            dialog->addButton("Discard", 1);
-            dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-            dialog->centreAroundComponent(this, 420, 150);
-            dialog->enterModalState(true, juce::ModalCallbackFunction::create(
-                [safeThis = juce::Component::SafePointer<ProjectView>(this)](int result)
-                {
-                    if (safeThis != nullptr && result == 1)
-                        safeThis->createProjectDiscardingCurrent();
-                }), true);
-            return;
-        }
-        createProjectDiscardingCurrent();
-    }
-
-    void createProjectDiscardingCurrent()
-    {
-        // Release references into the current Edit before replacing it. Tracktion
-        // owns the tracks, and releasing an AudioTrack after its Edit is gone is unsafe.
-        resetPatternButtons();
-        project = ProjectDocument::createNew();
-        edit = te::loadEditFromState(engine, te::createEmptyEdit(engine));
-        hasProject = edit != nullptr;
-        isDirty = true;
-        undoHistory.clear();
-        redoHistory.clear();
-        refreshTrackSelector();
-        refreshMixerControls();
-        if (mixerWindow != nullptr) mixerWindow->refresh(-1);
-        refreshProjectView(hasProject ? "New project created. Add an instrument and a pattern." : "Tracktion could not create an edit.");
-    }
-
-    void openProject()
-    {
-        if (hasProject && isDirty)
-        {
-            showError("Unsaved changes", "Save the current project before opening another.");
-            return;
-        }
-        auto startLocation = juce::File{};
-        if (auto* settings = applicationProperties.getUserSettings())
-        {
-            const auto configured = settings->getValue("defaultProjectPath").trim();
-            if (configured.isNotEmpty())
-            {
-                const juce::File configuredFile(configured);
-                startLocation = configuredFile.isDirectory() ? configuredFile : configuredFile.getParentDirectory();
-            }
-        }
-        fileChooser = std::make_unique<juce::FileChooser>("Open an Orbit project", startLocation, "*.orbit");
-        fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-            [this](const juce::FileChooser& chooser)
-            {
-                const auto file = chooser.getResult();
-                if (file == juce::File{}) return;
-                juce::String error;
-                auto loaded = ProjectDocument::loadFromFile(file, error);
-                if (!loaded)
-                {
-                    showError("Could not open project", error);
-                    return;
-                }
-                auto engineState = loaded->getTracktionEditState();
-                if (!engineState.isValid())
-                {
-                    showError("Older project format", "This project has no saved audio-engine state yet. Create a new project for the instrument workflow.");
-                    return;
-                }
-                auto restoredEdit = te::loadEditFromState(engine, engineState);
-                if (restoredEdit == nullptr)
-                {
-                    showError("Could not open audio session", "Tracktion Engine could not restore this project's audio state.");
-                    return;
-                }
-                resetPatternButtons();
-                edit = std::move(restoredEdit);
-                project = std::move(*loaded);
-                hasProject = true;
-                isDirty = false;
-                undoHistory.clear();
-                redoHistory.clear();
-                migratePlaylistState();
-                ensureExistingFxReturns();
-                findFirstInstrumentTrack();
-                updateActiveInstrumentEditor();
-                refreshTrackSelector();
-                readPatternSteps();
-                refreshMixerControls();
-                refreshProjectView("Opened project and restored its Tracktion session.");
-            });
-    }
-
-    void saveProject()
-    {
-        if (!hasProject || edit == nullptr) return;
-        const auto currentFile = project.getFile();
-        if (currentFile.existsAsFile()) { saveToFile(currentFile); return; }
-        auto suggestedFile = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                                 .getChildFile("Untitled Project.orbit");
-        if (auto* settings = applicationProperties.getUserSettings())
-        {
-            const auto configured = settings->getValue("defaultProjectPath").trim();
-            if (configured.isNotEmpty())
-            {
-                auto configuredFile = juce::File(configured);
-                if (configuredFile.isDirectory()) configuredFile = configuredFile.getChildFile("Untitled Project.orbit");
-                if (configuredFile.getFileName().isNotEmpty()) suggestedFile = configuredFile;
-            }
-        }
-        fileChooser = std::make_unique<juce::FileChooser>("Save Orbit project", suggestedFile, "*.orbit");
-        fileChooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
-            [this](const juce::FileChooser& chooser)
-            {
-                auto file = chooser.getResult();
-                if (file == juce::File{}) return;
-                if (!file.hasFileExtension("orbit")) file = file.withFileExtension("orbit");
-                saveToFile(file);
-            });
-    }
-
-    void exportMidi()
-    {
-        if (!hasPattern || patternClip == nullptr || edit == nullptr)
-        {
-            showError("No MIDI pattern", "Create or open a project with a MIDI pattern before exporting.");
-            return;
-        }
-
-        const auto suggestedName = project.getName().isNotEmpty() ? project.getName() + ".mid" : "Orbit Pattern.mid";
-        fileChooser = std::make_unique<juce::FileChooser>("Export MIDI pattern",
-            juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile(suggestedName), "*.mid");
-        fileChooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
-            [this](const juce::FileChooser& chooser)
-            {
-                auto file = chooser.getResult();
-                if (file == juce::File{}) return;
-                if (!file.hasFileExtension("mid")) file = file.withFileExtension("mid");
-
-                auto notes = patternClip->getSequence().exportToPlaybackMidiSequence(
-                    *patternClip, te::MidiList::TimeBase::beatsRaw, false);
-                if (notes.getNumEvents() == 0)
-                {
-                    showError("Nothing to export", "The pattern contains no MIDI notes.");
-                    return;
-                }
-
-                for (int i = 0; i < notes.getNumEvents(); ++i)
-                {
-                    auto* event = notes.getEventPointer(i);
-                    event->message.setTimeStamp(event->message.getTimeStamp() * te::Edit::ticksPerQuarterNote);
-                }
-                notes.updateMatchedPairs();
-
-                juce::MidiMessageSequence tempo;
-                auto tempoEvent = juce::MidiMessage::tempoMetaEvent(juce::roundToInt(60000000.0 / project.getInitialTempoBpm()));
-                tempoEvent.setTimeStamp(0.0);
-                tempo.addEvent(tempoEvent);
-                const auto meter = project.getInitialTimeSignature();
-                auto meterEvent = juce::MidiMessage::timeSignatureMetaEvent(meter.numerator, meter.denominator);
-                meterEvent.setTimeStamp(0.0);
-                tempo.addEvent(meterEvent);
-
-                juce::MidiFile midiFile;
-                midiFile.addTrack(tempo);
-                midiFile.addTrack(notes);
-                midiFile.setTicksPerQuarterNote(te::Edit::ticksPerQuarterNote);
-                juce::FileOutputStream output(file);
-                if (!output.openedOk() || !midiFile.writeTo(output))
-                {
-                    showError("MIDI export failed", "Orbit could not write the MIDI file.");
-                    return;
-                }
-                output.flush();
-                status.setText("Exported MIDI pattern: " + file.getFileName(), juce::dontSendNotification);
-            });
-    }
-
-    void saveToFile(const juce::File& file)
-    {
-        project.setName(file.getFileNameWithoutExtension());
-        for (auto* track : getMixerTracks()) syncTrackMixerState(track);
-        syncMasterMixerState();
-        edit->flushState();
-        project.setTracktionEditState(edit->state);
-        juce::String error;
-        if (!project.saveToFile(file, error)) { showError("Could not save project", error); return; }
-        isDirty = false;
-        refreshProjectView("Saved project with instrument and MIDI state: " + file.getFileName());
-    }
-
-    void addInstrumentTrack()
-    {
-        if (!hasProject || edit == nullptr) return;
-        rememberUndo("Insert Instrument");
-        const auto trackName = "Instrument " + juce::String(project.getTrackCount() + 1);
-        project.addInstrumentTrack();
-        const auto existingTracks = getGeneratorTracks();
-        te::AudioTrack* track = existingTracks.size() == 1 && project.getTrackCount() == 1
-                                    ? existingTracks[0]
-                                    : nullptr;
-        if (track == nullptr)
-        {
-            auto insertedTrack = edit->insertNewAudioTrack(te::TrackInsertPoint::getEndOfTracks(*edit), nullptr);
-            track = insertedTrack.get();
-        }
-        if (track == nullptr) { showError("Could not add track", "Tracktion Engine could not create an instrument track."); return; }
-        track->setName(trackName);
-        if (auto synth = edit->getPluginCache().createNewPlugin(te::FourOscPlugin::xmlTypeName, {}))
-            track->pluginList.insertPlugin(*synth, 0, nullptr);
-        instrumentTrack = track;
-        refreshTrackSelector();
-        readPatternSteps();
-        refreshMixerControls();
-        isDirty = true;
-        refreshProjectView("Added a Tracktion instrument track with the built-in 4OSC synth.");
-    }
-
-    void addPattern()
-    {
-        if (!hasProject || edit == nullptr) return;
-        if (instrumentTrack == nullptr) findFirstInstrumentTrack();
-        if (instrumentTrack == nullptr) { showError("Add an instrument first", "Create an instrument track before adding a MIDI pattern."); return; }
-        const auto patternIndex = selectedPatternIndex();
-        const auto trackId = selectedProjectTrackId();
-        project.setPatternCreated(trackId, patternIndex, true);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-                project.setPatternNote(trackId, patternIndex, pitch, step, false);
-        for (auto& pitchSteps : noteGrid) pitchSteps.fill(false);
-        pitchSelector.setSelectedId(pitchToItemId(60), juce::dontSendNotification);
-        pitchSelector.setEnabled(true);
-        pianoRollButton.setEnabled(true);
-        for (int i = 0; i < 16; ++i)
-        {
-            const bool enabled = i == 0 || i == 4 || i == 8 || i == 12;
-            noteGrid[static_cast<size_t>(60 - minimumPitch)][static_cast<size_t>(i)] = enabled;
-            project.setPatternNote(trackId, patternIndex, 60, i, enabled);
-        }
-        project.setPatternCreated(trackId, patternIndex, true);
-        hasPattern = true;
-        for (auto& step : steps) step->setEnabled(true);
-        loadSelectedPitchSteps();
-        rebuildPatternClip();
-        isDirty = true;
-        refreshProjectView("Pattern created. Open Playlist and click a timeline cell to place its labeled clip.");
-    }
-
-    void updatePatternStep(int index, bool enabled)
-    {
-        if (!hasPattern || index < 0 || index >= 16) return;
-        noteGrid[static_cast<size_t>(selectedPitch() - minimumPitch)][static_cast<size_t>(index)] = enabled;
-        project.setPatternNote(selectedProjectTrackId(), selectedPatternIndex(), selectedPitch(), index, enabled);
-        rebuildPatternClip();
-        isDirty = true;
-        status.setText("Pattern edited. Save to keep the changes.", juce::dontSendNotification);
-    }
-
-    void rebuildPatternClip()
-    {
-        refreshEnginePlaylist();
-    }
-
-    void refreshEnginePlaylist()
-    {
-        if (edit == nullptr) return;
-        patternClip = nullptr;
-        const auto engineTracks = getGeneratorTracks();
-        for (int trackIndex = 0; trackIndex < engineTracks.size() && trackIndex < project.getTrackCount(); ++trackIndex)
-        {
-            auto* track = engineTracks.getUnchecked(trackIndex);
-            const auto trackId = project.getTrackId(trackIndex);
-            std::vector<te::MidiClip*> oldClips;
-            for (int item = 0; item < track->getNumTrackItems(); ++item)
-                if (auto* clip = dynamic_cast<te::MidiClip*>(track->getTrackItem(item)))
-                    oldClips.push_back(clip);
-            for (auto* clip : oldClips)
-                track->deleteRegionOfClip(clip, clip->getEditTimeRange(), nullptr);
-
-            for (int bar = 0; bar < PlaylistGrid::barCount; ++bar)
-            {
-                const auto patternId = project.getPlaylistPatternId(trackId, bar);
-                const auto patternIndex = project.getPatternIndexForId(trackId, patternId);
-                if (patternIndex < 0 || !project.isPatternCreated(trackId, patternIndex)) continue;
-                const auto name = project.getPatternName(trackId, patternIndex);
-                const auto start = bar * 2.0;
-                const auto patternLength = project.getPatternLengthSteps(trackId, patternIndex);
-                const auto clipSeconds = juce::jmax(2.0, patternLength * 0.125);
-                auto inserted = track->insertMIDIClip(name, { tracktion::TimePosition::fromSeconds(start),
-                                                              tracktion::TimePosition::fromSeconds(start + clipSeconds) }, nullptr);
-                auto* clip = inserted.get();
-                if (clip == nullptr) continue;
-                clip->setLoopRangeBeats({ tracktion::BeatPosition::fromBeats(0.0), tracktion::BeatPosition::fromBeats(patternLength * 0.25) });
-                for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                    for (int step = 0; step < patternLength; ++step)
-                        if (project.getPatternNote(trackId, patternIndex, pitch, step))
-                            clip->getSequence().addNote(pitch, tracktion::BeatPosition::fromBeats(step * 0.25),
-                                                        tracktion::BeatDuration::fromBeats(project.getPatternNoteLength(trackId, patternIndex, pitch, step) * 0.25),
-                                                        project.getPatternNoteVelocity(trackId, patternIndex, pitch, step), 0, nullptr);
-                if (track == instrumentTrack && patternIndex == selectedPatternIndex())
-                    patternClip = clip;
-            }
-        }
-        if (playlistWindow != nullptr) playlistWindow->refresh();
-    }
-
-    void showPlaylist()
-    {
-        if (playlistWindow == nullptr) return;
-        playlistWindow->refresh();
-        playlistWindow->setVisible(true);
-        playlistWindow->setMinimised(false);
-        playlistWindow->toFront(true);
-    }
-
-    void cascadeOpenWindows()
-    {
-        const auto mainBounds = getScreenBounds();
-        int offset = 0;
-        for (auto* window : { static_cast<juce::DocumentWindow*>(playlistWindow.get()),
-                              static_cast<juce::DocumentWindow*>(equaliserWindow.get()),
-                              static_cast<juce::DocumentWindow*>(audioSettingsWindow.get()) })
-        {
-            if (window == nullptr || !window->isVisible()) continue;
-            window->setMinimised(false);
-            window->setTopLeftPosition(mainBounds.getX() + 30 + offset, mainBounds.getY() + 90 + offset);
-            window->toFront(false);
-            offset += 28;
-        }
-        if (pianoRollWindow != nullptr && pianoRollWindow->isVisible())
-            pianoRollWindow->toFront(false);
-    }
-
-    void stopPlayback()
-    {
-        if (edit != nullptr) edit->getTransport().stop(false, false);
-        playButton.setButtonText("Play");
-        status.setText("Stopped.", juce::dontSendNotification);
-    }
-
-    void showMixer(bool focusMaster = false)
-    {
-        if (mixerWindow == nullptr) return;
-        const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-        mixerWindow->refresh(tracks.indexOf(instrumentTrack));
-        initialiseMixerPanelBounds();
-        mixerWindow->setMinimized(false);
-        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        const auto stripCount = mixerWindow->getTrackCount ? mixerWindow->getTrackCount() : 0;
-        const auto contentWidth = (stripCount + 1) * 116 + 2;
-        const auto width = juce::jlimit(juce::jmin(220, area.getWidth()), area.getWidth(), contentWidth);
-        mixerPanelBounds.setSize(width, area.getHeight());
-        mixerPanelBounds.setPosition(juce::jmax(area.getX(), area.getRight() - width), area.getY());
-        mixerWindow->setVisible(true);
-        mixerWindow->toFront(false);
-        resized();
-        if (focusMaster) mixerWindow->focusMaster();
-    }
-
-    void initialiseMixerPanelBounds()
-    {
-        if (mixerBoundsInitialised || mixerWindow == nullptr) return;
-        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        const auto stripCount = mixerWindow->getTrackCount ? mixerWindow->getTrackCount() : 0;
-        const auto stripContentWidth = (stripCount + 1) * 116;
-        const auto defaultWidth = juce::jlimit(juce::jmin(300, area.getWidth()), area.getWidth(),
-                                               juce::jmax(360, stripContentWidth + 38));
-        mixerPanelBounds = { juce::jmax(area.getX(), area.getRight() - defaultWidth), area.getY(),
-                             defaultWidth, area.getHeight() };
-
-        if (auto* settings = applicationProperties.getUserSettings();
-            settings != nullptr && settings->getBoolValue("mixerPanelBoundsSet", false))
-        {
-            mixerPanelBounds.setPosition(settings->getIntValue("mixerPanelX", area.getX()),
-                                         settings->getIntValue("mixerPanelY", area.getY()));
-            mixerPanelBounds.setSize(settings->getIntValue("mixerPanelWidth", defaultWidth),
-                                     settings->getIntValue("mixerPanelHeight", area.getHeight()));
-        }
-        mixerBoundsInitialised = true;
-        resized();
-    }
-
-    void layoutMixerHandles()
-    {
-        // Mixer movement is handled by its compact title bar. Keep the legacy
-        // overlay handles hidden so they cannot cover generator controls.
-        mixerMoveHandle.setVisible(false);
-        mixerResizeHandle.setVisible(false);
-    }
-
-    void moveMixerPanel(juce::Point<int> point)
-    {
-        if (!draggingMixer || mixerWindow == nullptr) return;
-        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        mixerPanelBounds.setPosition(
-            juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - mixerPanelBounds.getWidth()),
-                         point.x - mixerDragOffset.x),
-            juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - mixerPanelBounds.getHeight()),
-                         point.y - mixerDragOffset.y));
-        mixerWindow->setBounds(mixerPanelBounds);
-        layoutMixerHandles();
-    }
-
-    void resizeMixerPanel(juce::Point<int> point)
-    {
-        if (!resizingMixer || mixerWindow == nullptr) return;
-        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        const auto delta = point - mixerResizeStart;
-        mixerPanelBounds.setSize(
-            juce::jlimit(juce::jmin(300, area.getWidth()), area.getWidth(), mixerResizeStartBounds.getWidth() + delta.x),
-            juce::jlimit(juce::jmin(420, area.getHeight()), area.getHeight(), mixerResizeStartBounds.getHeight() + delta.y));
-        mixerWindow->setBounds(mixerPanelBounds);
-        layoutMixerHandles();
-    }
-
-    void endMixerDrag()
-    {
-        draggingMixer = false;
-        saveMixerPanelBounds();
-        status.setText("Mixer moved. Its size and position are saved.", juce::dontSendNotification);
-    }
-
-    void endMixerResize()
-    {
-        resizingMixer = false;
-        saveMixerPanelBounds();
-        status.setText("Mixer resized. Its size and position are saved.", juce::dontSendNotification);
-    }
-
-    void saveMixerPanelBounds()
-    {
-        if (auto* settings = applicationProperties.getUserSettings())
-        {
-            settings->setValue("mixerPanelBoundsSet", true);
-            settings->setValue("mixerPanelX", mixerPanelBounds.getX());
-            settings->setValue("mixerPanelY", mixerPanelBounds.getY());
-            settings->setValue("mixerPanelWidth", mixerPanelBounds.getWidth());
-            settings->setValue("mixerPanelHeight", mixerPanelBounds.getHeight());
-            settings->saveIfNeeded();
-        }
-    }
-
-    void toggleMixerView()
-    {
-        if (mixerWindow == nullptr) return;
-        if (mixerWindow->isVisible())
-        {
-            mixerWindow->setVisible(false);
-            layoutMixerHandles();
-            repaint();
-            return;
-        }
-        showMixer();
-    }
-
-    void setMixerPanelSize(bool expanded)
-    {
-        if (mixerWindow == nullptr) return;
-        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        initialiseMixerPanelBounds();
-        const auto stripCount = mixerWindow->getTrackCount ? mixerWindow->getTrackCount() : 0;
-        const auto width = juce::jlimit(juce::jmin(220, area.getWidth()), area.getWidth(),
-                                        (stripCount + 1) * 116 + 2);
-        const auto height = expanded ? area.getHeight() : juce::jmin(area.getHeight(), 520);
-        mixerPanelBounds = { juce::jmax(area.getX(), area.getRight() - width),
-                             expanded ? area.getY() : area.getBottom() - height, width, height };
-        mixerWindow->setMinimized(false);
-        mixerWindow->setVisible(true);
-        mixerWindow->setBounds(mixerPanelBounds);
-        layoutMixerHandles();
-        mixerWindow->toFront(false);
-        mixerMoveHandle.toFront(false);
-        mixerResizeHandle.toFront(false);
-        saveMixerPanelBounds();
-        status.setText(expanded ? "Mixer expanded inside Orbit." : "Mixer restored to compact view.",
-                       juce::dontSendNotification);
-    }
-
-    juce::Array<te::AudioTrack*> getGeneratorTracks() const
-    {
-        juce::Array<te::AudioTrack*> result;
-        if (edit == nullptr) return result;
-        for (auto* track : te::getAudioTracks(*edit))
-            if (static_cast<int>(track->state.getProperty(juce::Identifier("orbitFxReturnBus"), -1)) < 0
-                && static_cast<int>(track->state.getProperty(juce::Identifier("orbitMixerBus"), -1)) < 0)
-                result.add(track);
-        return result;
-    }
-
-    juce::Array<te::AudioTrack*> getMixerTracks() const
-    {
-        auto result = getGeneratorTracks();
-        for (int bus = 0; bus < 8; ++bus)
-            if (auto* returnTrack = getFxReturnTrack(bus))
-                result.add(returnTrack);
-        for (int bus = 0; bus < 8; ++bus)
-            if (auto* outputBus = getOutputBusTrack(bus))
-                result.add(outputBus);
-        return result;
-    }
-
-    te::AudioTrack* getOutputBusTrack(int bus) const
-    {
-        if (edit == nullptr || !juce::isPositiveAndBelow(bus, 8)) return nullptr;
-        for (auto* track : te::getAudioTracks(*edit))
-            if (static_cast<int>(track->state.getProperty(juce::Identifier("orbitMixerBus"), -1)) == bus)
-                return track;
-        return nullptr;
-    }
-
-    te::AudioTrack* ensureOutputBusTrack(int bus)
-    {
-        if (edit == nullptr || !juce::isPositiveAndBelow(bus, 8)) return nullptr;
-        if (auto* existing = getOutputBusTrack(bus)) return existing;
-        auto busTrack = edit->insertNewAudioTrack(te::TrackInsertPoint::getEndOfTracks(*edit), nullptr, true);
-        if (busTrack == nullptr) return nullptr;
-        busTrack->setName("Bus " + juce::String(bus + 1));
-        busTrack->state.setProperty(juce::Identifier("orbitMixerBus"), bus, &edit->getUndoManager());
-        busTrack->state.setProperty(juce::Identifier("orbitMixerChannelId"), juce::Uuid().toString(),
-                                     &edit->getUndoManager());
-        return busTrack.get();
-    }
-
-    te::AudioTrack* getFxReturnTrack(int bus) const
-    {
-        if (edit == nullptr || !juce::isPositiveAndBelow(bus, 8)) return nullptr;
-        for (auto* track : te::getAudioTracks(*edit))
-            if (static_cast<int>(track->state.getProperty(juce::Identifier("orbitFxReturnBus"), -1)) == bus)
-                return track;
-        return nullptr;
-    }
-
-    te::AudioTrack* ensureFxReturnTrack(int bus)
-    {
-        if (edit == nullptr || !juce::isPositiveAndBelow(bus, 8)) return nullptr;
-        if (auto* existing = getFxReturnTrack(bus)) return existing;
-
-        const auto busName = "FX " + juce::String(bus + 1);
-        edit->setAuxBusName(bus, busName);
-
-        // Remove legacy returns from the master chain before migrating to an
-        // isolated audio return track, so return effects never process the dry mix.
-        std::vector<juce::ValueTree> legacyReturns;
-        for (auto* plugin : edit->getMasterPluginList())
-            if (auto* auxReturn = dynamic_cast<te::AuxReturnPlugin*>(plugin))
-                if (static_cast<int>(auxReturn->busNumber) == bus)
-                    legacyReturns.push_back(auxReturn->state);
-        for (auto& state : legacyReturns)
-            if (state.getParent().isValid())
-                state.getParent().removeChild(state, &edit->getUndoManager());
-
-        auto returnTrack = edit->insertNewAudioTrack(te::TrackInsertPoint::getEndOfTracks(*edit), nullptr, true);
-        if (returnTrack == nullptr) return nullptr;
-        returnTrack->setName(busName + " Return");
-        returnTrack->state.setProperty(juce::Identifier("orbitFxReturnBus"), bus, &edit->getUndoManager());
-        returnTrack->state.setProperty(juce::Identifier("orbitMixerChannelId"), juce::Uuid().toString(),
-                                       &edit->getUndoManager());
-
-        auto returnPlugin = edit->getPluginCache().createNewPlugin(te::AuxReturnPlugin::xmlTypeName, {});
-        auto* auxReturn = dynamic_cast<te::AuxReturnPlugin*>(returnPlugin.get());
-        if (auxReturn == nullptr) return returnTrack.get();
-        auxReturn->busNumber = bus;
-        returnTrack->pluginList.insertPlugin(*auxReturn, 0, nullptr);
-
-        const std::array<juce::String, 8> effectTypes {
-            te::ReverbPlugin::xmlTypeName, te::DelayPlugin::xmlTypeName,
-            te::ChorusPlugin::xmlTypeName, te::PhaserPlugin::xmlTypeName,
-            te::ReverbPlugin::xmlTypeName, te::DelayPlugin::xmlTypeName,
-            te::ChorusPlugin::xmlTypeName, te::PhaserPlugin::xmlTypeName
-        };
-        const auto effectType = effectTypes[static_cast<size_t>(bus)];
-        auto effect = edit->getPluginCache().createNewPlugin(effectType, {});
-        if (effect != nullptr)
-            returnTrack->pluginList.insertPlugin(*effect, 1, nullptr);
-        return returnTrack.get();
-    }
-
-    void ensureExistingFxReturns()
-    {
-        if (edit == nullptr) return;
-        const auto generatorTracks = getGeneratorTracks();
-        for (int bus = 0; bus < 8; ++bus)
-        {
-            if (auto* existingReturn = getFxReturnTrack(bus))
-            {
-                syncTrackMixerState(existingReturn);
-                continue;
-            }
-            const bool hasActiveSend = std::any_of(generatorTracks.begin(), generatorTracks.end(), [bus](te::AudioTrack* track)
-            {
-                auto* send = track->getAuxSendPlugin(bus);
-                return send != nullptr && send->isEnabled() && send->getGainDb() > -59.9f;
-            });
-            if (hasActiveSend && ensureFxReturnTrack(bus) != nullptr)
-                isDirty = true;
-        }
-    }
-
-    te::Plugin::Ptr getFxReturnEffect(int bus) const
-    {
-        auto* track = getFxReturnTrack(bus);
-        if (track == nullptr) return {};
-        for (auto* plugin : track->pluginList)
-            if (dynamic_cast<te::AuxReturnPlugin*>(plugin) == nullptr
-                && dynamic_cast<te::VolumeAndPanPlugin*>(plugin) == nullptr
-                && dynamic_cast<te::LevelMeterPlugin*>(plugin) == nullptr)
-                return plugin;
-        return {};
-    }
-
-    void openFxReturnEditor(int bus)
-    {
-        if (mixerWindow == nullptr) return;
-        auto effect = getFxReturnEffect(bus);
-        if (effect == nullptr)
-        {
-            status.setText("Raise the FX " + juce::String(bus + 1) + " send to create its return effect.", juce::dontSendNotification);
-            return;
-        }
-        mixerWindow->showEffectEditor(effect, [this, bus]
-        {
-            isDirty = true;
-            status.setText("FX " + juce::String(bus + 1) + " return effect changed. Save to keep the change.", juce::dontSendNotification);
-        });
-    }
-
-    double getTrackGainDb(int index) const
-    {
-        if (edit == nullptr) return 0.0;
-        const auto tracks = getMixerTracks();
-        if (!juce::isPositiveAndBelow(index, tracks.size())) return 0.0;
-        const auto* plugin = tracks.getUnchecked(index)->getVolumePlugin();
-        return plugin != nullptr ? plugin->getVolumeDb() : 0.0;
-    }
-
-    double getTrackPan(int index) const
-    {
-        if (edit == nullptr) return 0.0;
-        const auto tracks = getMixerTracks();
-        if (!juce::isPositiveAndBelow(index, tracks.size())) return 0.0;
-        const auto* plugin = tracks.getUnchecked(index)->getVolumePlugin();
-        return plugin != nullptr ? plugin->pan.get() : 0.0;
-    }
-
-    bool getTrackMute(int index) const
-    {
-        const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-        return juce::isPositiveAndBelow(index, tracks.size()) && tracks.getUnchecked(index)->isMuted(false);
-    }
-
-    bool getTrackSolo(int index) const
-    {
-        const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-        return juce::isPositiveAndBelow(index, tracks.size()) && tracks.getUnchecked(index)->isSolo(false);
-    }
-
-    void syncTrackMixerState(te::AudioTrack* track)
-    {
-        if (track == nullptr || edit == nullptr) return;
-        const auto generators = getGeneratorTracks();
-        const auto projectIndex = generators.indexOf(track);
-        auto* volume = track->getVolumePlugin();
-        if (!juce::isPositiveAndBelow(projectIndex, project.getTrackCount()))
-        {
-            const auto bus = static_cast<int>(track->state.getProperty(juce::Identifier("orbitFxReturnBus"), -1));
-            if (!juce::isPositiveAndBelow(bus, 8)) return;
-
-            auto channelId = track->state.getProperty(juce::Identifier("orbitMixerChannelId")).toString();
-            if (channelId.isEmpty())
-            {
-                channelId = juce::Uuid().toString();
-                track->state.setProperty(juce::Identifier("orbitMixerChannelId"), channelId, &edit->getUndoManager());
-                isDirty = true;
-            }
-
-            if (project.setFxReturnMixerState(bus, channelId, track->getName(),
-                                              volume != nullptr ? volume->getVolumeDb() : 0.0,
-                                              volume != nullptr ? volume->pan.get() : 0.0,
-                                              track->isMuted(false), track->isSolo(false)))
-                isDirty = true;
-            return;
-        }
-
-        project.setTrackMixerState(projectIndex,
-                                   volume != nullptr ? volume->getVolumeDb() : 0.0,
-                                   volume != nullptr ? volume->pan.get() : 0.0,
-                                   track->isMuted(false), track->isSolo(false));
-        for (int bus = 0; bus < 8; ++bus)
-        {
-            auto* send = track->getAuxSendPlugin(bus);
-            project.setTrackSendGain(projectIndex, bus, send != nullptr ? send->getGainDb() : -60.0);
-        }
-    }
-
-    void syncMasterMixerState()
-    {
-        if (edit == nullptr || edit->getMasterVolumePlugin() == nullptr) return;
-        project.setMasterMixerState(getMasterGainDb(), edit->getMasterVolumePlugin()->getPan(), isMasterMuted());
-    }
-
-    void setTrackGainDb(int index, double value)
-    {
-        if (edit == nullptr) return;
-        const auto tracks = getMixerTracks();
-        if (!juce::isPositiveAndBelow(index, tracks.size())) return;
-        if (auto* plugin = tracks.getUnchecked(index)->getVolumePlugin())
-        {
-            plugin->setVolumeDb(static_cast<float>(value));
-            syncTrackMixerState(tracks.getUnchecked(index));
-            isDirty = true;
-            status.setText("Mixer level changed. Save to keep the change.", juce::dontSendNotification);
-        }
-    }
-
-    void setTrackPan(int index, double value)
-    {
-        if (edit == nullptr) return;
-        const auto tracks = getMixerTracks();
-        if (!juce::isPositiveAndBelow(index, tracks.size())) return;
-        if (auto* plugin = tracks.getUnchecked(index)->getVolumePlugin())
-        {
-            plugin->setPan(static_cast<float>(value));
-            syncTrackMixerState(tracks.getUnchecked(index));
-            isDirty = true;
-            status.setText("Mixer pan changed. Save to keep the change.", juce::dontSendNotification);
-        }
-    }
-
-    void setTrackMute(int index, bool value)
-    {
-        const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-        if (!juce::isPositiveAndBelow(index, tracks.size())) return;
-        tracks.getUnchecked(index)->setMute(value);
-        syncTrackMixerState(tracks.getUnchecked(index));
-        isDirty = true;
-        if (mixerWindow != nullptr) mixerWindow->refresh(tracks.indexOf(instrumentTrack));
-        if (playlistWindow != nullptr) playlistWindow->refresh();
-        status.setText(value ? "Track muted. Save to keep the change." : "Track unmuted. Save to keep the change.",
-                       juce::dontSendNotification);
-    }
-
-    void setTrackSolo(int index, bool value)
-    {
-        const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-        if (!juce::isPositiveAndBelow(index, tracks.size())) return;
-        tracks.getUnchecked(index)->setSolo(value);
-        syncTrackMixerState(tracks.getUnchecked(index));
-        isDirty = true;
-        if (mixerWindow != nullptr) mixerWindow->refresh(tracks.indexOf(instrumentTrack));
-        if (playlistWindow != nullptr) playlistWindow->refresh();
-        status.setText(value ? "Generator solo enabled. Save to keep the change." : "Generator solo disabled. Save to keep the change.",
-                       juce::dontSendNotification);
-    }
-
-    te::EqualiserPlugin* getTrackEqualiser(int index) const
-    {
-        const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-        if (edit != nullptr && index == tracks.size())
-            for (auto* plugin : edit->getMasterPluginList())
-                if (auto* eq = dynamic_cast<te::EqualiserPlugin*>(plugin)) return eq;
-        return juce::isPositiveAndBelow(index, tracks.size()) ? tracks.getUnchecked(index)->getEqualiserPlugin() : nullptr;
-    }
-
-    te::EqualiserPlugin* ensureTrackEqualiser(int index)
-    {
-        if (edit == nullptr) return nullptr;
-        auto tracks = getMixerTracks();
-        if (index == tracks.size())
-        {
-            for (auto* plugin : edit->getMasterPluginList())
-                if (auto* eq = dynamic_cast<te::EqualiserPlugin*>(plugin)) return eq;
-            auto plugin = edit->getPluginCache().createNewPlugin(te::EqualiserPlugin::xmlTypeName, {});
-            if (plugin == nullptr) return nullptr;
-            auto& masterPlugins = edit->getMasterPluginList();
-            const auto* volume = edit->getMasterVolumePlugin().get();
-            auto insertIndex = volume != nullptr ? masterPlugins.indexOf(volume) : masterPlugins.size();
-            if (insertIndex < 0) insertIndex = masterPlugins.size();
-            masterPlugins.insertPlugin(*plugin, insertIndex, nullptr);
-            isDirty = true;
-            return dynamic_cast<te::EqualiserPlugin*>(plugin.get());
-        }
-        if (!juce::isPositiveAndBelow(index, tracks.size())) return nullptr;
-        auto* track = tracks.getUnchecked(index);
-        if (auto* existing = track->getEqualiserPlugin()) return existing;
-        auto plugin = edit->getPluginCache().createNewPlugin(te::EqualiserPlugin::xmlTypeName, {});
-        if (plugin == nullptr) return nullptr;
-        const auto* volume = track->getVolumePlugin();
-        const auto insertIndex = volume != nullptr ? track->pluginList.indexOf(volume) : track->pluginList.size();
-        track->pluginList.insertPlugin(*plugin, insertIndex, nullptr);
-        isDirty = true;
-        return track->getEqualiserPlugin();
-    }
-
-    float getTrackEqParameter(int index, int parameter) const
-    {
-        if (!juce::isPositiveAndBelow(parameter, 12)) return 0.0f;
-        auto* eq = getTrackEqualiser(index);
-        const auto band = parameter / 3;
-        const auto kind = parameter % 3;
-        if (eq == nullptr)
-        {
-            static constexpr std::array<float, 4> defaultFrequencies { 80.0f, 3000.0f, 5000.0f, 17000.0f };
-            if (kind == 0) return defaultFrequencies[static_cast<size_t>(band)];
-            if (kind == 2) return 0.5f;
-            return 0.0f;
-        }
-        if (band == 0) return kind == 0 ? eq->loFreqValue.get() : kind == 1 ? eq->loGainValue.get() : eq->loQValue.get();
-        if (band == 1) return kind == 0 ? eq->midFreqValue1.get() : kind == 1 ? eq->midGainValue1.get() : eq->midQValue1.get();
-        if (band == 2) return kind == 0 ? eq->midFreqValue2.get() : kind == 1 ? eq->midGainValue2.get() : eq->midQValue2.get();
-        return kind == 0 ? eq->hiFreqValue.get() : kind == 1 ? eq->hiGainValue.get() : eq->hiQValue.get();
-    }
-
-    float getTrackEqResponse(int index, float frequency) const
-    {
-        auto* eq = getTrackEqualiser(index);
-        return eq != nullptr ? eq->getDBGainAtFrequency(frequency) : 0.0f;
-    }
-
-    void setTrackEqEnabled(int index, bool enabled)
-    {
-        auto* eq = enabled ? ensureTrackEqualiser(index) : getTrackEqualiser(index);
-        if (eq == nullptr) return;
-        if (eq->isEnabled() != enabled)
-        {
-            eq->setEnabled(enabled);
-            isDirty = true;
-        }
-        if (mixerWindow != nullptr)
-            mixerWindow->refresh(getMixerTracks().indexOf(instrumentTrack));
-        status.setText(enabled ? "Equaliser enabled. Save to keep the change."
-                               : "Equaliser bypassed. Save to keep the change.",
-                       juce::dontSendNotification);
-    }
-
-    void setTrackEqParameter(int index, int parameter, float value)
-    {
-        auto* eq = ensureTrackEqualiser(index);
-        if (eq == nullptr || !juce::isPositiveAndBelow(parameter, 12)) return;
-        const auto band = parameter / 3;
-        const auto kind = parameter % 3;
-        if (band == 0) { if (kind == 0) eq->setLowFreq(value); else if (kind == 1) eq->setLowGain(value); else eq->setLowQ(value); }
-        else if (band == 1) { if (kind == 0) eq->setMidFreq1(value); else if (kind == 1) eq->setMidGain1(value); else eq->setMidQ1(value); }
-        else if (band == 2) { if (kind == 0) eq->setMidFreq2(value); else if (kind == 1) eq->setMidGain2(value); else eq->setMidQ2(value); }
-        else { if (kind == 0) eq->setHighFreq(value); else if (kind == 1) eq->setHighGain(value); else eq->setHighQ(value); }
-        isDirty = true;
-        if (mixerWindow != nullptr)
-        {
-            mixerWindow->refreshEqControls();
-            mixerWindow->repaintEqGraphs();
-        }
-        status.setText("Equaliser changed. Save to keep the change.", juce::dontSendNotification);
-    }
-
-    void setTrackEqBand(int index, int band, float frequency, float gain)
-    {
-        auto* eq = ensureTrackEqualiser(index);
-        if (eq == nullptr || !juce::isPositiveAndBelow(band, 4)) return;
-        const auto safeFrequency = juce::jlimit(20.0f, 20000.0f, frequency);
-        const auto safeGain = juce::jlimit(-20.0f, 20.0f, gain);
-        if (band == 0) { eq->setLowFreq(safeFrequency); eq->setLowGain(safeGain); }
-        else if (band == 1) { eq->setMidFreq1(safeFrequency); eq->setMidGain1(safeGain); }
-        else if (band == 2) { eq->setMidFreq2(safeFrequency); eq->setMidGain2(safeGain); }
-        else { eq->setHighFreq(safeFrequency); eq->setHighGain(safeGain); }
-        isDirty = true;
-        if (mixerWindow != nullptr)
-        {
-            mixerWindow->refreshEqControls();
-            mixerWindow->repaintEqGraphs();
-        }
-        if (equaliserWindow != nullptr) equaliserWindow->refreshParameterValues(index);
-        status.setText("Equaliser band changed. Save to keep the change.", juce::dontSendNotification);
-    }
-
-    void openTrackEqualiser(int index)
-    {
-        if (ensureTrackEqualiser(index) == nullptr || equaliserWindow == nullptr) return;
-        if (mixerWindow != nullptr) mixerWindow->refresh(getMixerTracks().indexOf(instrumentTrack));
-        equaliserWindow->openForTrack(index);
-    }
-
-    juce::Array<te::Plugin*> getInsertPlugins(int index) const
-    {
-        juce::Array<te::Plugin*> result;
-        const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-        if (edit == nullptr || (index != tracks.size() && !juce::isPositiveAndBelow(index, tracks.size()))) return result;
-        const auto& pluginList = index == tracks.size() ? edit->getMasterPluginList() : tracks.getUnchecked(index)->pluginList;
-        for (auto* plugin : pluginList)
-            if (dynamic_cast<te::FourOscPlugin*>(plugin) == nullptr
-                && dynamic_cast<te::VolumeAndPanPlugin*>(plugin) == nullptr
-                && dynamic_cast<te::LevelMeterPlugin*>(plugin) == nullptr
-                && dynamic_cast<te::EqualiserPlugin*>(plugin) == nullptr
-                && dynamic_cast<te::SamplerPlugin*>(plugin) == nullptr
-                && dynamic_cast<te::AuxReturnPlugin*>(plugin) == nullptr
-                && dynamic_cast<te::AuxSendPlugin*>(plugin) == nullptr)
-                result.add(plugin);
-        return result;
-    }
-
-    juce::StringArray getInsertNames(int index) const
-    {
-        juce::StringArray names;
-        for (auto* plugin : getInsertPlugins(index)) names.add(plugin->getName());
-        return names;
-    }
-
-    bool getInsertEnabled(int index, int slot) const
-    {
-        const auto plugins = getInsertPlugins(index);
-        return juce::isPositiveAndBelow(slot, plugins.size()) && plugins.getUnchecked(slot)->isEnabled();
-    }
-
-    void toggleInsert(int index, int slot)
-    {
-        const auto plugins = getInsertPlugins(index);
-        if (!juce::isPositiveAndBelow(slot, plugins.size())) return;
-        auto* plugin = plugins.getUnchecked(slot);
-        plugin->setEnabled(!plugin->isEnabled());
-        isDirty = true;
-        if (mixerWindow != nullptr) mixerWindow->refresh(getMixerTracks().indexOf(instrumentTrack));
-        status.setText(plugin->getName() + (plugin->isEnabled() ? " enabled." : " bypassed."), juce::dontSendNotification);
-    }
-
-    void openInsertEditor(int index, int slot)
-    {
-        if (mixerWindow == nullptr || edit == nullptr) return;
-        const auto plugins = getInsertPlugins(index);
-        if (!juce::isPositiveAndBelow(slot, plugins.size())) return;
-        te::Plugin::Ptr pluginRef = plugins.getUnchecked(slot);
-        mixerWindow->showEffectEditor(pluginRef, [this]
-        {
-            isDirty = true;
-            status.setText("Effect parameter changed. Save to keep the change.", juce::dontSendNotification);
-        });
-    }
-
-    void removeInsert(int index, int slot)
-    {
-        const auto plugins = getInsertPlugins(index);
-        if (!juce::isPositiveAndBelow(slot, plugins.size()) || edit == nullptr) return;
-        const auto insertName = plugins.getUnchecked(slot)->getName();
-        const auto state = plugins.getUnchecked(slot)->state;
-        if (state.getParent().isValid())
-            state.getParent().removeChild(state, &edit->getUndoManager());
-        isDirty = true;
-        if (mixerWindow != nullptr) mixerWindow->refresh(getMixerTracks().indexOf(instrumentTrack));
-        status.setText("Removed " + insertName + ". Save to keep the change.", juce::dontSendNotification);
-    }
-
-    void addInsert(int index, int kind)
-    {
-        if (edit == nullptr) return;
-        auto tracks = getMixerTracks();
-        const bool isMaster = index == tracks.size();
-        if (!isMaster && !juce::isPositiveAndBelow(index, tracks.size())) return;
-        if (getInsertPlugins(index).size() >= 3)
-        {
-            status.setText("This mixer strip has three insert slots. Remove one before adding another.", juce::dontSendNotification);
-            return;
-        }
-        const char* pluginType = nullptr;
-        if (kind == 1) pluginType = te::CompressorPlugin::xmlTypeName;
-        else if (kind == 2) pluginType = te::ReverbPlugin::xmlTypeName;
-        else if (kind == 3) pluginType = te::DelayPlugin::xmlTypeName;
-        else if (kind == 4) pluginType = te::ChorusPlugin::xmlTypeName;
-        else if (kind == 5) pluginType = te::PhaserPlugin::xmlTypeName;
-        else if (kind == 6) pluginType = te::LowPassPlugin::xmlTypeName;
-        if (pluginType == nullptr) return;
-
-        auto* track = isMaster ? nullptr : tracks.getUnchecked(index);
-        auto plugin = edit->getPluginCache().createNewPlugin(pluginType, {});
-        if (plugin == nullptr) return;
-        auto& pluginList = isMaster ? edit->getMasterPluginList() : track->pluginList;
-        const auto* volume = isMaster ? edit->getMasterVolumePlugin().get() : track->getVolumePlugin();
-        auto insertIndex = volume != nullptr ? pluginList.indexOf(volume) : pluginList.size();
-        if (insertIndex < 0) insertIndex = pluginList.size();
-        pluginList.insertPlugin(*plugin, insertIndex, nullptr);
-        isDirty = true;
-        if (mixerWindow != nullptr) mixerWindow->refresh(tracks.indexOf(instrumentTrack));
-        const auto insertCount = getInsertPlugins(index).size();
-        status.setText("Added " + plugin->getName() + " to " + (isMaster ? juce::String("Master") : track->getName())
-                           + " (" + juce::String(insertCount) + " insert" + (insertCount == 1 ? ")" : "s)")
-                           + ". Save to keep the change.",
-                       juce::dontSendNotification);
-    }
-
-    double getTrackSendGainDb(int index, int bus) const
-    {
-        const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-        if (!juce::isPositiveAndBelow(index, tracks.size()) || !juce::isPositiveAndBelow(bus, 8)) return -60.0;
-        if (auto* send = tracks.getUnchecked(index)->getAuxSendPlugin(bus))
-            return send->getGainDb();
-        return -60.0;
-    }
-
-    int getTrackOutputBus(int index) const
-    {
-        const auto tracks = edit != nullptr ? getMixerTracks() : juce::Array<te::AudioTrack*>{};
-        const auto generatorCount = getGeneratorTracks().size();
-        if (!juce::isPositiveAndBelow(index, generatorCount)
-            || !juce::isPositiveAndBelow(index, tracks.size())) return -1;
-        auto* destination = tracks.getUnchecked(index)->getOutput().getDestinationTrack();
-        return destination != nullptr
-            ? static_cast<int>(destination->state.getProperty(juce::Identifier("orbitMixerBus"), -1))
-            : -1;
-    }
-
-    void setTrackOutputBus(int index, int bus)
-    {
-        auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-        if (edit == nullptr || !juce::isPositiveAndBelow(index, tracks.size())
-            || bus < -1 || bus >= 8) return;
-        auto* track = tracks.getUnchecked(index);
-        if (bus < 0)
-            track->getOutput().setOutputToDefaultDevice(false);
-        else
-        {
-            auto* destination = ensureOutputBusTrack(bus);
-            if (destination == nullptr) return;
-            track->getOutput().setOutputToTrack(destination);
-        }
-        isDirty = true;
-        if (mixerWindow != nullptr) mixerWindow->refresh(getGeneratorTracks().indexOf(instrumentTrack));
-        status.setText(bus < 0 ? "Channel routed to Master." : "Channel routed to Bus " + juce::String(bus + 1) + ".",
-                       juce::dontSendNotification);
-    }
-
-    void setTrackSendGainDb(int index, int bus, double value)
-    {
-        if (edit == nullptr || !juce::isPositiveAndBelow(bus, 8)) return;
-        auto tracks = getGeneratorTracks();
-        if (!juce::isPositiveAndBelow(index, tracks.size())) return;
-        auto* track = tracks.getUnchecked(index);
-        auto* send = track->getAuxSendPlugin(bus);
-        const bool fxReturnWasMissing = getFxReturnTrack(bus) == nullptr;
-        if (send != nullptr && fxReturnWasMissing && ensureFxReturnTrack(bus) == nullptr)
-            return;
-
-        if (send == nullptr && value > -59.9)
-        {
-            const auto busName = "FX " + juce::String(bus + 1);
-            if (ensureFxReturnTrack(bus) == nullptr) return;
-
-            auto sendPlugin = edit->getPluginCache().createNewPlugin(te::AuxSendPlugin::xmlTypeName, {});
-            if (auto* auxSend = dynamic_cast<te::AuxSendPlugin*>(sendPlugin.get()))
-            {
-                auxSend->busNumber = bus;
-                auxSend->setGainDb(static_cast<float>(value));
-                const auto* meter = track->getLevelMeterPlugin();
-                auto insertIndex = meter != nullptr ? track->pluginList.indexOf(meter) : track->pluginList.size();
-                if (insertIndex < 0) insertIndex = track->pluginList.size();
-                track->pluginList.insertPlugin(*auxSend, insertIndex, nullptr);
-                send = auxSend;
-            }
-        }
-        else if (send != nullptr)
-        {
-            send->setGainDb(static_cast<float>(value));
-        }
-
-        if (send != nullptr)
-        {
-            syncTrackMixerState(track);
-            isDirty = true;
-            if (fxReturnWasMissing && mixerWindow != nullptr)
-                mixerWindow->refresh(getGeneratorTracks().indexOf(instrumentTrack));
-            static const std::array<const char*, 4> fxNames { "reverb", "delay", "chorus", "phaser" };
-            status.setText("FX " + juce::String(bus + 1) + " send routed to its shared "
-                           + fxNames[static_cast<size_t>(bus % 4)] + " return. Save to keep the change.", juce::dontSendNotification);
-        }
-    }
-
-    static const juce::Identifier& masterMuteProperty()
-    {
-        static const juce::Identifier property("orbitMasterMuted");
-        return property;
-    }
-
-    static const juce::Identifier& masterPreMuteGainProperty()
-    {
-        static const juce::Identifier property("orbitMasterPreMuteGainDb");
-        return property;
-    }
-
-    bool isMasterMuted() const
-    {
-        return edit != nullptr && static_cast<bool>(edit->state.getProperty(masterMuteProperty(), false));
-    }
-
-    double getMasterGainDb() const
-    {
-        if (edit == nullptr || edit->getMasterVolumePlugin() == nullptr) return 0.0;
-        if (isMasterMuted())
-            return static_cast<double>(edit->state.getProperty(masterPreMuteGainProperty(), 0.0));
-        return edit->getMasterVolumePlugin()->getVolumeDb();
-    }
-
-    void setMasterMuted(bool shouldMute)
-    {
-        if (edit == nullptr || edit->getMasterVolumePlugin() == nullptr || isMasterMuted() == shouldMute) return;
-        auto* volume = edit->getMasterVolumePlugin().get();
-        if (shouldMute)
-        {
-            edit->state.setProperty(masterPreMuteGainProperty(), volume->getVolumeDb(), &edit->getUndoManager());
-            volume->setVolumeDb(-100.0f);
-        }
-        else
-        {
-            const auto previousGain = static_cast<float>(edit->state.getProperty(masterPreMuteGainProperty(), 0.0));
-            volume->setVolumeDb(previousGain);
-        }
-        edit->state.setProperty(masterMuteProperty(), shouldMute, &edit->getUndoManager());
-        syncMasterMixerState();
-        isDirty = true;
-        if (mixerWindow != nullptr) mixerWindow->refresh(getMixerTracks().size());
-        status.setText(shouldMute ? "Master output muted. Save to keep the change." : "Master output unmuted. Save to keep the change.",
-                       juce::dontSendNotification);
-    }
-
-    void setMasterPan(double value)
-    {
-        if (edit == nullptr || edit->getMasterVolumePlugin() == nullptr) return;
-        edit->getMasterVolumePlugin()->setPan(static_cast<float>(value));
-        syncMasterMixerState();
-        isDirty = true;
-        status.setText("Master pan changed. Save to keep the change.", juce::dontSendNotification);
-    }
-
-    void setMasterGainDb(double value)
-    {
-        if (edit == nullptr || edit->getMasterVolumePlugin() == nullptr) return;
-        if (isMasterMuted())
-        {
-            edit->state.setProperty(masterPreMuteGainProperty(), value, &edit->getUndoManager());
-            edit->getMasterVolumePlugin()->setVolumeDb(-100.0f);
-        }
-        else
-        {
-            edit->getMasterVolumePlugin()->setVolumeDb(static_cast<float>(value));
-        }
-        syncMasterMixerState();
-        isDirty = true;
-        status.setText("Master level changed. Save to keep the change.", juce::dontSendNotification);
-    }
-
-    void selectTrackByIndex(int index)
-    {
-        if (edit == nullptr) return;
-        trackSelector.setSelectedId(index + 1, juce::dontSendNotification);
-        selectInstrumentTrack();
-    }
-
-    juce::String getPlaylistClipLabel(int trackIndex, int bar) const
-    {
-        const auto trackId = project.getTrackId(trackIndex);
-        const auto patternId = project.getPlaylistPatternId(trackId, bar);
-        const auto patternIndex = project.getPatternIndexForId(trackId, patternId);
-        return patternIndex >= 0 ? project.getPatternName(trackId, patternIndex) : juce::String{};
-    }
-
-    std::vector<juce::Point<int>> getPlaylistPreviewNotes(int trackIndex, int bar) const
-    {
-        std::vector<juce::Point<int>> notes;
-        if (!juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
-            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return notes;
-        const auto trackId = project.getTrackId(trackIndex);
-        const auto patternIndex = project.getPatternIndexForId(trackId, project.getPlaylistPatternId(trackId, bar));
-        if (patternIndex < 0) return notes;
-        const auto length = project.getPatternLengthSteps(trackId, patternIndex);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < length; ++step)
-                if (project.getPatternNote(trackId, patternIndex, pitch, step))
-                    notes.emplace_back(step * 64 / juce::jmax(1, length), pitch - minimumPitch);
-        return notes;
-    }
-
-    bool getTrackRecordArm(int trackIndex) const
-    {
-        const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-        if (edit == nullptr || !juce::isPositiveAndBelow(trackIndex, tracks.size())) return false;
-        for (auto* input : edit->getAllInputDevices())
-            if (input != nullptr && input->isRecordingEnabled(tracks.getUnchecked(trackIndex)->itemID)) return true;
-        return false;
-    }
-
-    void setTrackRecordArm(int trackIndex, bool armed)
-    {
-        const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-        if (edit == nullptr || !juce::isPositiveAndBelow(trackIndex, tracks.size())) return;
-        const auto devices = edit->getAllInputDevices();
-        if (devices.isEmpty())
-        {
-            status.setText("No MIDI input is available to arm for recording.", juce::dontSendNotification);
-            if (playlistWindow != nullptr) playlistWindow->refresh();
-            return;
-        }
-        for (auto* input : devices)
-            if (input != nullptr) input->setRecordingEnabled(tracks.getUnchecked(trackIndex)->itemID, armed);
-        isDirty = true;
-        status.setText(armed ? "Generator armed for recording." : "Generator disarmed.", juce::dontSendNotification);
-        if (playlistWindow != nullptr) playlistWindow->refresh();
-    }
-
-    void paintPlaylistClip(int trackIndex, int bar)
-    {
-        if (!hasProject || edit == nullptr || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
-            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return;
-        const auto trackId = project.getTrackId(trackIndex);
-        // Use the current A1-H8 slot as the drawing tool on the clicked lane;
-        // each destination generator retains its own note data for that slot.
-        const auto patternIndex = selectedPatternIndex();
-        const bool createdPattern = !project.isPatternCreated(trackId, patternIndex);
-        const auto patternId = project.getPatternId(trackId, patternIndex);
-        const auto currentPatternId = project.getPlaylistPatternId(trackId, bar);
-        if (!createdPattern && currentPatternId == patternId)
-            return;
-
-        if (!playlistPaintGestureActive)
-        {
-            rememberUndo("Draw playlist pattern");
-            playlistPaintGestureActive = true;
-        }
-        if (createdPattern)
-            project.setPatternCreated(trackId, patternIndex, true);
-        project.setPlaylistClip(trackId, patternId, bar, 1, true);
-        rebuildPatternClip();
-        isDirty = true;
-        if (createdPattern) readPatternSteps();
-        status.setText("Drew " + project.getPatternName(trackId, patternIndex)
-            + " in Playlist bar " + juce::String(bar + 1) + ".", juce::dontSendNotification);
-    }
-
-    void togglePlaylistClip(int trackIndex, int bar)
-    {
-        if (!hasProject || edit == nullptr || trackIndex < 0 || trackIndex >= project.getTrackCount()) return;
-        if (!juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return;
-        const auto trackId = project.getTrackId(trackIndex);
-        const auto current = project.getPlaylistPatternId(trackId, bar);
-        if (current.isNotEmpty())
-        {
-            const auto patternIndex = project.getPatternIndexForId(trackId, current);
-            if (patternIndex >= 0)
-            {
-                trackSelector.setSelectedId(trackIndex + 1, juce::sendNotificationSync);
-                selectPatternBank(patternIndex / ProjectDocument::patternsPerBank);
-                selectPatternSlot(patternIndex % ProjectDocument::patternsPerBank);
-                status.setText("Selected " + project.getPatternName(trackId, patternIndex)
-                                   + ". Scroll over the clip to cycle patterns, or double-click for the available patterns.",
-                               juce::dontSendNotification);
-            }
-            return;
-        }
-        status.setText("Move mode selected. Switch to Draw to place the selected pattern.",
-                       juce::dontSendNotification);
-    }
-
-    void deletePlaylistClip(int trackIndex, int bar)
-    {
-        if (!hasProject || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
-            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return;
-        const auto trackId = project.getTrackId(trackIndex);
-        const auto patternId = project.getPlaylistPatternId(trackId, bar);
-        if (patternId.isEmpty()) return;
-        rememberUndo("Delete Playlist clip");
-        project.setPlaylistClip(trackId, {}, bar, 1, false);
-        refreshEnginePlaylist();
-        isDirty = true;
-        if (playlistWindow != nullptr) playlistWindow->refresh();
-        status.setText("Deleted the Playlist clip at bar " + juce::String(bar + 1) + ". Save to keep the change.",
-                       juce::dontSendNotification);
-    }
-
-    void setPlaylistPattern(int trackIndex, int bar, int patternIndex)
-    {
-        if (!hasProject || edit == nullptr || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
-            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)
-            || !juce::isPositiveAndBelow(patternIndex, ProjectDocument::patternSlotCount)) return;
-        const auto trackId = project.getTrackId(trackIndex);
-        if (!project.isPatternCreated(trackId, patternIndex)) return;
-        const auto currentId = project.getPlaylistPatternId(trackId, bar);
-        const auto patternId = project.getPatternId(trackId, patternIndex);
-        if (currentId == patternId) return;
-
-        rememberUndo("Choose Playlist pattern");
-        project.setPlaylistClip(trackId, patternId, bar, 1, true);
-        trackSelector.setSelectedId(trackIndex + 1, juce::sendNotificationSync);
-        selectPatternBank(patternIndex / ProjectDocument::patternsPerBank);
-        selectPatternSlot(patternIndex % ProjectDocument::patternsPerBank);
-        rebuildPatternClip();
-        isDirty = true;
-        if (playlistWindow != nullptr) playlistWindow->refresh();
-        status.setText("Selected " + project.getPatternName(trackId, patternIndex)
-                           + " for Playlist bar " + juce::String(bar + 1) + ".", juce::dontSendNotification);
-    }
-
-    void showPlaylistPatternMenu(int trackIndex, int bar, juce::Component* target)
-    {
-        if (!juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
-            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return;
-        const auto trackId = project.getTrackId(trackIndex);
-        const auto currentIndex = project.getPatternIndexForId(trackId, project.getPlaylistPatternId(trackId, bar));
-        juce::PopupMenu patterns;
-        int available = 0;
-        for (int index = 0; index < ProjectDocument::patternSlotCount; ++index)
-        {
-            if (!project.isPatternCreated(trackId, index)) continue;
-            const auto bank = juce::String::charToString(static_cast<juce::juce_wchar>('A' + index / 8));
-            patterns.addItem(index + 1, bank + juce::String(index % 8 + 1) + "  Â·  "
-                + project.getPatternName(trackId, index), true, index == currentIndex);
-            ++available;
-        }
-        if (available == 0)
-        {
-            status.setText("This generator has no created patterns yet. Draw its active pattern first.",
-                           juce::dontSendNotification);
-            return;
-        }
-        patterns.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(target != nullptr ? target : playlistWindow.get()),
-            [this, trackIndex, bar](int result)
-            {
-                if (result > 0) setPlaylistPattern(trackIndex, bar, result - 1);
-            });
-    }
-
-    void scrollPlaylistPattern(int trackIndex, int bar, int direction)
-    {
-        if (!juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
-            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return;
-        const auto trackId = project.getTrackId(trackIndex);
-        const auto currentIndex = project.getPatternIndexForId(trackId, project.getPlaylistPatternId(trackId, bar));
-        std::vector<int> available;
-        for (int index = 0; index < ProjectDocument::patternSlotCount; ++index)
-            if (project.isPatternCreated(trackId, index)) available.push_back(index);
-        if (available.size() < 2) return;
-        const auto current = std::find(available.begin(), available.end(), currentIndex);
-        auto position = current == available.end() ? 0 : static_cast<int>(current - available.begin());
-        const auto count = static_cast<int>(available.size());
-        position = (position + direction + count) % count;
-        setPlaylistPattern(trackIndex, bar, available[static_cast<size_t>(position)]);
-    }
-
-    void movePlaylistClip(int trackIndex, int sourceBar, int destinationTrackIndex, int destinationBar)
-    {
-        if (!hasProject || edit == nullptr || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
-            || !juce::isPositiveAndBelow(destinationTrackIndex, project.getTrackCount())
-            || !juce::isPositiveAndBelow(sourceBar, PlaylistGrid::barCount)
-            || !juce::isPositiveAndBelow(destinationBar, PlaylistGrid::barCount)
-            || (sourceBar == destinationBar && trackIndex == destinationTrackIndex))
-            return;
-
-        const auto trackId = project.getTrackId(trackIndex);
-        const auto patternId = project.getPlaylistPatternId(trackId, sourceBar);
-        if (patternId.isEmpty()) return;
-
-        auto destinationPatternId = patternId;
-        const int sourcePatternIndex = project.getPatternIndexForId(trackId, patternId);
-        if (sourcePatternIndex < 0) return;
-        const auto destinationTrackId = project.getTrackId(destinationTrackIndex);
-        int destinationPatternIndex = sourcePatternIndex;
-        if (destinationTrackIndex != trackIndex)
-        {
-            const auto occupied = project.getPlaylistPatternId(destinationTrackId, destinationBar);
-            if (occupied.isNotEmpty())
-            {
-                status.setText("Move canceled. The destination Playlist cell already contains a pattern.",
-                               juce::dontSendNotification);
-                return;
-            }
-            destinationPatternIndex = -1;
-            for (int candidate = 0; candidate < ProjectDocument::patternSlotCount; ++candidate)
-                if (!project.isPatternCreated(destinationTrackId, candidate))
-                {
-                    destinationPatternIndex = candidate;
-                    break;
-                }
-            if (destinationPatternIndex < 0)
-            {
-                status.setText("Move canceled. The destination generator has no empty pattern slot.",
-                               juce::dontSendNotification);
-                return;
-            }
-        }
-        else if (project.getPlaylistPatternId(destinationTrackId, destinationBar).isNotEmpty())
-        {
-            status.setText("Move canceled. The destination Playlist cell already contains a pattern.",
-                           juce::dontSendNotification);
-            return;
-        }
-
-        rememberUndo("Move playlist pattern");
-        if (destinationTrackIndex != trackIndex)
-        {
-            project.setPatternCreated(destinationTrackId, destinationPatternIndex, true);
-            project.setPatternLengthSteps(destinationTrackId, destinationPatternIndex,
-                project.getPatternLengthSteps(trackId, sourcePatternIndex));
-            for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                for (int step = 0; step < 64; ++step)
-                {
-                    const bool on = project.getPatternNote(trackId, sourcePatternIndex, pitch, step);
-                    project.setPatternNote(destinationTrackId, destinationPatternIndex, pitch, step, on);
-                    if (on)
-                    {
-                        project.setPatternNoteLength(destinationTrackId, destinationPatternIndex, pitch, step,
-                            project.getPatternNoteLength(trackId, sourcePatternIndex, pitch, step));
-                        project.setPatternNoteVelocity(destinationTrackId, destinationPatternIndex, pitch, step,
-                            project.getPatternNoteVelocity(trackId, sourcePatternIndex, pitch, step));
-                    }
-                }
-            destinationPatternId = project.getPatternId(destinationTrackId, destinationPatternIndex);
-        }
-        project.setPlaylistClip(trackId, {}, sourceBar, 1, false);
-        project.setPlaylistClip(destinationTrackId, destinationPatternId, destinationBar, 1, true);
-        rebuildPatternClip();
-        isDirty = true;
-        const auto destinationPattern = project.getPatternIndexForId(destinationTrackId, destinationPatternId);
-        const juce::String name = destinationPattern >= 0 ? project.getPatternName(destinationTrackId, destinationPattern) : juce::String("pattern");
-        refreshProjectView("Moved " + name + " to generator " + juce::String(destinationTrackIndex + 1)
-            + ", Playlist bar " + juce::String(destinationBar + 1) + ".");
-    }
-
-    void finishPlaylistPaintGesture()
-    {
-        if (playlistPaintGestureActive)
-        {
-            playlistPaintGestureActive = false;
-            refreshProjectView("Playlist pattern placement updated. Save to keep the change.");
-        }
-        else if (playlistWindow != nullptr)
-            playlistWindow->refresh();
-    }
-
-    void togglePlayback()
-    {
-        if (edit == nullptr) return;
-        auto* activeDevice = engine.getDeviceManager().deviceManager.getCurrentAudioDevice();
-        if (activeDevice == nullptr)
-            status.setText("No active audio output. Choose a device in Audio Settings.", juce::dontSendNotification);
-        auto& transport = edit->getTransport();
-        if (transport.isPlaying())
-        {
-            transport.stop(false, false);
-            playButton.setButtonText("Play");
-            return;
-        }
-        bool hasPlaylistContent = false;
-        for (int trackIndex = 0; trackIndex < project.getTrackCount() && !hasPlaylistContent; ++trackIndex)
-            for (int bar = 0; bar < PlaylistGrid::barCount; ++bar)
-                hasPlaylistContent |= project.getPlaylistPatternId(project.getTrackId(trackIndex), bar).isNotEmpty();
-        if (!hasPlaylistContent)
-        {
-            status.setText("Place a pattern clip in the Playlist before starting playback.", juce::dontSendNotification);
-            return;
-        }
-        updateLoopRange();
-        transport.looping = loopButton.getToggleState();
-        transport.playFromStart(false);
-        playButton.setButtonText("Stop");
-        if (activeDevice != nullptr)
-            status.setText("Playing through " + activeDevice->getName(), juce::dontSendNotification);
-    }
-
-    void showAudioSettings()
-    {
-        if (audioSettingsWindow == nullptr)
-            audioSettingsWindow = std::make_unique<AudioSettingsWindow>(engine.getDeviceManager().deviceManager);
-        audioSettingsWindow->setVisible(true);
-        audioSettingsWindow->toFront(true);
-    }
-
-    void updateAudioStatus()
-    {
-        auto* device = engine.getDeviceManager().deviceManager.getCurrentAudioDevice();
-        if (device == nullptr)
-        {
-            audioDetails.setText("Audio: No active output device", juce::dontSendNotification);
-            return;
-        }
-
-        const auto outputChannels = device->getActiveOutputChannels().countNumberOfSetBits();
-        audioDetails.setText("Audio: " + device->getName() + "  Â·  "
-                                 + juce::String(device->getCurrentSampleRate(), 0) + " Hz  Â·  "
-                                 + juce::String(outputChannels) + " output channels",
-                             juce::dontSendNotification);
-    }
-
-    void migratePlaylistState()
-    {
-        if (edit == nullptr) return;
-        const auto tracks = getGeneratorTracks();
-        for (int trackIndex = 0; trackIndex < tracks.size() && trackIndex < project.getTrackCount(); ++trackIndex)
-        {
-            auto* track = tracks.getUnchecked(trackIndex);
-            const auto trackId = project.getTrackId(trackIndex);
-            std::vector<te::MidiClip*> clips;
-            for (int item = 0; item < track->getNumTrackItems(); ++item)
-                if (auto* clip = dynamic_cast<te::MidiClip*>(track->getTrackItem(item)))
-                    clips.push_back(clip);
-            if (clips.empty()) continue;
-
-            auto* source = clips.front();
-            int matchedPattern = -1;
-            for (int candidate = 0; candidate < ProjectDocument::patternSlotCount && matchedPattern < 0; ++candidate)
-            {
-                if (!project.isPatternCreated(trackId, candidate)) continue;
-                bool matches = true;
-                for (int pitch = minimumPitch; pitch <= maximumPitch && matches; ++pitch)
-                    for (int step = 0; step < 16; ++step)
-                    {
-                        bool clipHasNote = false;
-                        for (int noteIndex = 0; noteIndex < source->getSequence().getNumNotes(); ++noteIndex)
-                            if (auto* note = source->getSequence().getNote(noteIndex))
-                                clipHasNote |= note->getNoteNumber() == pitch
-                                    && juce::jlimit(0, 15, static_cast<int>(std::round(note->getStartBeat().inBeats() * 4.0))) == step;
-                        if (clipHasNote != project.getPatternNote(trackId, candidate, pitch, step))
-                        {
-                            matches = false;
-                            break;
-                        }
-                    }
-                if (matches) matchedPattern = candidate;
-            }
-
-            if (matchedPattern < 0)
-            {
-                matchedPattern = 0;
-                for (int noteIndex = 0; noteIndex < source->getSequence().getNumNotes(); ++noteIndex)
-                    if (auto* note = source->getSequence().getNote(noteIndex))
-                    {
-                        const auto step = juce::jlimit(0, 15, static_cast<int>(std::round(note->getStartBeat().inBeats() * 4.0)));
-                        if (note->getNoteNumber() >= minimumPitch && note->getNoteNumber() <= maximumPitch)
-                            project.setPatternNote(trackId, matchedPattern, note->getNoteNumber(), step, true);
-                    }
-                project.setPatternCreated(trackId, matchedPattern, true);
-            }
-
-            const auto patternId = project.getPatternId(trackId, matchedPattern);
-            for (auto* clip : clips)
-            {
-                const auto bar = juce::roundToInt(clip->getEditTimeRange().getStart().inSeconds() / 2.0);
-                if (juce::isPositiveAndBelow(bar, 16) && project.getPlaylistPatternId(trackId, bar).isEmpty())
-                    project.setPlaylistClip(trackId, patternId, bar, 1, true);
-            }
-        }
-        refreshEnginePlaylist();
-    }
-
-    void findFirstInstrumentTrack()
-    {
-        instrumentTrack = nullptr;
-        patternClip = nullptr;
-        if (edit == nullptr) return;
-        for (auto* track : getGeneratorTracks())
-        {
-            if (instrumentTrack == nullptr) instrumentTrack = track;
-            for (int i = 0; i < track->getNumTrackItems(); ++i)
-                if (auto* clip = dynamic_cast<te::MidiClip*>(track->getTrackItem(i)))
-                {
-                    if (patternClip == nullptr)
-                    {
-                        instrumentTrack = track;
-                        patternClip = clip;
-                    }
-                }
-        }
-    }
-
-    void readPatternSteps()
-    {
-        allNotesSelected = false;
-        for (auto& pitchSteps : noteGrid) pitchSteps.fill(false);
-        const auto trackId = selectedProjectTrackId();
-        hasPattern = project.isPatternCreated(trackId, selectedPatternIndex());
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-                noteGrid[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(step)] =
-                    project.getPatternNote(trackId, selectedPatternIndex(), pitch, step);
-        pitchSelector.setEnabled(false);
-        pitchSelector.setVisible(false);
-        pianoRollButton.setEnabled(instrumentTrack != nullptr);
-        pianoRollButton.setVisible(instrumentTrack != nullptr);
-        generatorDragHandle.setVisible(instrumentTrack != nullptr);
-        generatorResizeHandle.setVisible(instrumentTrack != nullptr);
-        generatorCollapseButton.setVisible(instrumentTrack != nullptr);
-        patternTitle.setVisible(instrumentTrack != nullptr);
-        for (auto& step : steps)
-        {
-            step->setEnabled(false);
-            step->setVisible(false);
-        }
-        for (auto& button : patternBankButtons)
-        {
-            button->setEnabled(instrumentTrack != nullptr);
-            button->setVisible(instrumentTrack != nullptr);
-        }
-        generatorMuteButton.setVisible(instrumentTrack != nullptr);
-        generatorSoloButton.setVisible(instrumentTrack != nullptr);
-        generatorMuteButton.setEnabled(instrumentTrack != nullptr);
-        generatorSoloButton.setEnabled(instrumentTrack != nullptr);
-        generatorSettingsButton.setVisible(instrumentTrack != nullptr);
-        generatorSettingsButton.setEnabled(instrumentTrack != nullptr);
-        openPresetButton.setVisible(instrumentTrack != nullptr);
-        savePresetButton.setVisible(instrumentTrack != nullptr);
-        openPresetButton.setEnabled(instrumentTrack != nullptr);
-        savePresetButton.setEnabled(instrumentTrack != nullptr);
-        patternPresetSelector.setVisible(instrumentTrack != nullptr);
-        patternPresetSelector.setEnabled(instrumentTrack != nullptr);
-        patternLengthDisplay.setVisible(instrumentTrack != nullptr);
-        patternLengthDownButton.setVisible(instrumentTrack != nullptr);
-        patternLengthUpButton.setVisible(instrumentTrack != nullptr);
-        patternLengthDownButton.setEnabled(instrumentTrack != nullptr);
-        patternLengthUpButton.setEnabled(instrumentTrack != nullptr);
-        for (auto& button : patternSlotButtons)
-        {
-            button->setEnabled(instrumentTrack != nullptr);
-            button->setVisible(instrumentTrack != nullptr);
-        }
-        resized();
-        loadSelectedPitchSteps();
-    }
-
-    int selectedPatternIndex() const
-    {
-        return selectedBankIndex * ProjectDocument::patternsPerBank + selectedSlotIndex;
-    }
-
-    juce::String selectedProjectTrackId() const
-    {
-        if (instrumentTrack == nullptr || edit == nullptr)
-            return {};
-        const auto tracks = getGeneratorTracks();
-        const auto index = tracks.indexOf(instrumentTrack);
-        return project.getTrackId(index);
-    }
-
-    void selectPatternBank(int bankIndex)
-    {
-        selectedBankIndex = juce::jlimit(0, 7, bankIndex);
-        for (int i = 0; i < 8; ++i)
-            patternBankButtons[static_cast<size_t>(i)]->setToggleState(i == selectedBankIndex, juce::dontSendNotification);
-        loadPatternSelection();
-    }
-
-    void selectPatternSlot(int slotIndex)
-    {
-        selectedSlotIndex = juce::jlimit(0, 7, slotIndex);
-        for (int i = 0; i < 8; ++i)
-            patternSlotButtons[static_cast<size_t>(i)]->setToggleState(i == selectedSlotIndex, juce::dontSendNotification);
-        loadPatternSelection();
-    }
-
-    void loadPatternSelection()
-    {
-        if (instrumentTrack == nullptr || edit == nullptr) return;
-        readPatternSteps();
-        status.setText(hasPattern ? "Selected pattern. Click Playlist to place it, or edit its notes in Piano Roll."
-                                  : "Selected empty pattern slot. Click Playlist to place it or add notes in Piano Roll.",
-                       juce::dontSendNotification);
-    }
-
-    void resetPatternButtons()
-    {
-        hasPattern = false;
-        if (activeInstrumentEditor != nullptr)
-        {
-            removeChildComponent(activeInstrumentEditor.get());
-            activeInstrumentEditor.reset();
-        }
-        if (mixerWindow != nullptr) mixerWindow->detachMeters();
-        detachTrackMeter();
-        instrumentTrack = nullptr;
-        patternClip = nullptr;
-        refreshingTrackSelector = true;
-        trackSelector.clear(juce::dontSendNotification);
-        trackSelector.setEnabled(false);
-        refreshingTrackSelector = false;
-        levelSlider.setEnabled(false);
-        panSlider.setEnabled(false);
-        for (auto& pitchSteps : noteGrid) pitchSteps.fill(false);
-        pitchSelector.setEnabled(false);
-        pitchSelector.setVisible(false);
-        pianoRollButton.setEnabled(false);
-        pianoRollButton.setVisible(false);
-        generatorCollapseButton.setVisible(false);
-        generatorCollapsed = false;
-        allGeneratorsMinimized = false;
-        pianoRollMaximized = false;
-        pianoRollRestoreBounds = {};
-        pianoRollWasVisibleWhenCollapsed = false;
-        expandedGeneratorBounds = {};
-        if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
-        generatorMuteButton.setEnabled(false);
-        generatorMuteButton.setToggleState(false, juce::dontSendNotification);
-        generatorMuteButton.setVisible(false);
-        generatorSoloButton.setEnabled(false);
-        generatorSoloButton.setToggleState(false, juce::dontSendNotification);
-        generatorSoloButton.setVisible(false);
-        generatorSettingsButton.setEnabled(false);
-        generatorSettingsButton.setVisible(false);
-        openPresetButton.setEnabled(false);
-        openPresetButton.setVisible(false);
-        savePresetButton.setEnabled(false);
-        savePresetButton.setVisible(false);
-        patternPresetSelector.setEnabled(false);
-        patternPresetSelector.setVisible(false);
-        patternLengthDisplay.setVisible(false);
-        patternLengthDownButton.setVisible(false);
-        patternLengthUpButton.setVisible(false);
-        generatorDragHandle.setVisible(false);
-        generatorResizeHandle.setVisible(false);
-        patternTitle.setVisible(false);
-        for (auto& button : patternBankButtons) { button->setEnabled(false); button->setVisible(false); }
-        for (auto& button : patternSlotButtons) { button->setEnabled(false); button->setVisible(false); }
-        for (auto& step : steps)
-        {
-            step->setEnabled(false);
-            step->setVisible(false);
-            step->setToggleState(false, juce::dontSendNotification);
-        }
-        selectedBankIndex = 0;
-        selectedSlotIndex = 0;
-        resized();
-        for (int i = 0; i < 8; ++i)
-        {
-            patternBankButtons[static_cast<size_t>(i)]->setToggleState(i == 0, juce::dontSendNotification);
-            patternSlotButtons[static_cast<size_t>(i)]->setToggleState(i == 0, juce::dontSendNotification);
-        }
-        if (playlistWindow != nullptr) playlistWindow->refresh();
-        if (pianoRollWindow != nullptr) pianoRollWindow->refresh("A1");
-    }
-
-    void refreshMixerControls()
-    {
-        const auto* volumePan = instrumentTrack != nullptr ? instrumentTrack->getVolumePlugin() : nullptr;
-        const bool available = volumePan != nullptr;
-        levelSlider.setEnabled(available);
-        panSlider.setEnabled(available);
-        const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-        const auto selectedIndex = tracks.indexOf(instrumentTrack);
-        const bool trackAvailable = juce::isPositiveAndBelow(selectedIndex, tracks.size());
-        generatorMuteButton.setToggleState(trackAvailable && tracks.getUnchecked(selectedIndex)->isMuted(false), juce::dontSendNotification);
-        generatorSoloButton.setToggleState(trackAvailable && tracks.getUnchecked(selectedIndex)->isSolo(false), juce::dontSendNotification);
-        generatorMuteButton.setEnabled(trackAvailable);
-        generatorSoloButton.setEnabled(trackAvailable);
-        attachTrackMeter();
-        if (!available) return;
-        levelSlider.setValue(volumePan->getVolumeDb(), juce::dontSendNotification);
-        panSlider.setValue(volumePan->pan.get(), juce::dontSendNotification);
-        mixerTitle.setText("Mixer - " + instrumentTrack->getName(), juce::dontSendNotification);
-    }
-
-    void refreshTrackSelector()
-    {
-        refreshingTrackSelector = true;
-        trackSelector.clear(juce::dontSendNotification);
-        const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-        for (int i = 0; i < tracks.size(); ++i)
-            trackSelector.addItem(tracks.getUnchecked(i)->getName(), i + 1);
-        const auto selected = tracks.indexOf(instrumentTrack);
-        trackSelector.setSelectedId(selected >= 0 ? selected + 1 : 0, juce::dontSendNotification);
-        trackSelector.setEnabled(!tracks.isEmpty());
-        trackSelector.setVisible(!tracks.isEmpty());
-        for (auto& button : patternBankButtons) button->setEnabled(instrumentTrack != nullptr);
-        for (auto& button : patternSlotButtons) button->setEnabled(instrumentTrack != nullptr);
-        refreshingTrackSelector = false;
-        refreshGeneratorDock();
-        if (playlistWindow != nullptr) playlistWindow->refresh();
-    }
-
-    void refreshGeneratorDock()
-    {
-        for (auto& button : generatorDockButtons)
-            if (button != nullptr) generatorDockStrip.removeChildComponent(button.get());
-        generatorDockButtons.clear();
-        const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-        for (int index = 0; index < tracks.size(); ++index)
-        {
-            auto button = std::make_unique<juce::TextButton>(tracks.getUnchecked(index)->getName());
-            button->setTooltip("Select and restore " + tracks.getUnchecked(index)->getName());
-            button->setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(36, 53, 64));
-            button->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(46, 112, 139));
-            button->setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(206, 226, 236));
-            button->setClickingTogglesState(false);
-            button->setToggleState(index == tracks.indexOf(instrumentTrack), juce::dontSendNotification);
-            button->onClick = [this, index]
-            {
-                if (trackSelector.getSelectedId() != index + 1)
-                    trackSelector.setSelectedId(index + 1, juce::dontSendNotification);
-                selectInstrumentTrack();
-                allGeneratorsMinimized = false;
-                generatorCollapsed = false;
-                pianoRollMaximized = false;
-                if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
-                if (!pianoRollRestoreBounds.isEmpty()) generatorPanelBounds = pianoRollRestoreBounds;
-                pianoRollButton.setButtonText("PIANO ROLL");
-                if (generatorPanelBounds.isEmpty())
-                    generatorPanelBounds = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(50).reduced(14, 10)
-                        .withSizeKeepingCentre(juce::jmin(1040, getWidth() - 28), juce::jmin(560, getHeight() - 150));
-                resized();
-                bringGeneratorToFront();
-            };
-            generatorDockStrip.addAndMakeVisible(*button);
-            generatorDockButtons.push_back(std::move(button));
-        }
-        generatorDockViewport.setVisible(!generatorDockButtons.empty());
-        resized();
-    }
-
-    void bringGeneratorToFront()
-    {
-        if (activeInstrumentEditor != nullptr && activeInstrumentEditor->isVisible())
-            activeInstrumentEditor->toFront(false);
-        if (pianoRollWindow != nullptr && pianoRollWindow->isVisible())
-            pianoRollWindow->toFront(false);
-        for (auto& button : patternBankButtons) button->toFront(false);
-        for (auto& button : patternSlotButtons) button->toFront(false);
-        for (auto* control : std::array<juce::Component*, 14> {
-                 &pianoRollButton, &generatorMuteButton, &generatorSoloButton, &generatorSettingsButton,
-                 &patternPresetSelector, &openPresetButton, &savePresetButton, &patternLengthDownButton,
-                 &patternLengthDisplay, &patternLengthUpButton, &trackSelector,
-                 &generatorCollapseButton, &generatorDragHandle, &generatorResizeHandle })
-            control->toFront(false);
-    }
-
-    void updateGeneratorDockSelection()
-    {
-        const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
-        const auto selected = tracks.indexOf(instrumentTrack);
-        for (int i = 0; i < static_cast<int>(generatorDockButtons.size()); ++i)
-            generatorDockButtons[static_cast<size_t>(i)]->setToggleState(i == selected, juce::dontSendNotification);
-    }
-
-    void selectInstrumentTrack()
-    {
-        if (refreshingTrackSelector || edit == nullptr) return;
-        const auto tracks = getGeneratorTracks();
-        const auto index = trackSelector.getSelectedId() - 1;
-        if (index < 0 || index >= tracks.size()) return;
-        instrumentTrack = tracks.getUnchecked(index);
-        allGeneratorsMinimized = false;
-        if (generatorCollapsed)
-        {
-            generatorCollapsed = false;
-            if (!expandedGeneratorBounds.isEmpty()) generatorPanelBounds = expandedGeneratorBounds;
-            generatorCollapseButton.setButtonText("âˆ’");
-        }
-        if (generatorPanelBounds.isEmpty())
-            generatorPanelBounds = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(50).reduced(14, 10)
-                .withSizeKeepingCentre(juce::jmin(1040, getWidth() - 28), juce::jmin(560, getHeight() - 150));
-        patternClip = nullptr;
-        for (int i = 0; i < instrumentTrack->getNumTrackItems(); ++i)
-            if (auto* clip = dynamic_cast<te::MidiClip*>(instrumentTrack->getTrackItem(i)))
-            {
-                patternClip = clip;
-                break;
-            }
-        updateActiveInstrumentEditor();
-        readPatternSteps();
-        trackSelector.setVisible(true);
-        refreshMixerControls();
-        if (playlistWindow != nullptr) playlistWindow->refresh();
-        updateGeneratorDockSelection();
-        bringGeneratorToFront();
-        status.setText("Selected " + instrumentTrack->getName() + ". Pattern bank A-H x 1-8 is ready.", juce::dontSendNotification);
-    }
-
-    void updateActiveInstrumentEditor()
-    {
-        if (activeInstrumentEditor != nullptr)
-        {
-            removeChildComponent(activeInstrumentEditor.get());
-            activeInstrumentEditor.reset();
-        }
-        if (instrumentTrack == nullptr) return;
-
-        for (auto* plugin : instrumentTrack->pluginList)
-        {
-            if (auto* external = dynamic_cast<te::ExternalPlugin*>(plugin))
-            {
-                activeInstrumentEditor = std::make_unique<OrbitPluginEditorContent>(*external);
-                addAndMakeVisible(*activeInstrumentEditor);
-                activeInstrumentEditor->addMouseListener(this, true);
-                resized();
-                if (pianoRollWindow != nullptr && pianoRollWindow->isVisible())
-                    pianoRollWindow->toFront(false);
-                return;
-            }
-        }
-        resized();
-    }
-
-    void detachTrackMeter()
-    {
-        if (trackMeter != nullptr)
-            trackMeter->measurer.removeClient(trackMeterClient);
-        trackMeter = nullptr;
-        trackMeterClient.reset();
-    }
-
-    void attachTrackMeter()
-    {
-        auto* nextMeter = instrumentTrack != nullptr ? instrumentTrack->getLevelMeterPlugin() : nullptr;
-        if (nextMeter == trackMeter) return;
-        detachTrackMeter();
-        trackMeter = nextMeter;
-        if (trackMeter != nullptr)
-            trackMeter->measurer.addClient(trackMeterClient);
-    }
-
-    void updateMeterStatus()
-    {
-        if (trackMeter == nullptr)
-        {
-            displayedMeterPeakDb = -100.0f;
-            meterStatus.setText("Track output: no instrument meter", juce::dontSendNotification);
-            return;
-        }
-
-        const auto leftDb = trackMeterClient.getAndClearAudioLevel(0).dB;
-        const auto rightDb = trackMeterClient.getAndClearAudioLevel(1).dB;
-        const auto peakDb = juce::jmax(leftDb, rightDb);
-        auto* settings = applicationProperties.getUserSettings();
-        const auto decay = settings != nullptr ? juce::jlimit(1, 100, settings->getIntValue("vuDecay", 75)) : 75;
-        const auto updateRate = settings != nullptr ? juce::jlimit(2, 60, settings->getIntValue("updateRateHz", 30)) : 30;
-        displayedMeterPeakDb = juce::jmax(peakDb, displayedMeterPeakDb - 60.0f * (decay / 100.0f) / updateRate);
-        if (displayedMeterPeakDb > -90.0f)
-            meterStatus.setText("Track output: audio signal detected Â· peak " + juce::String(displayedMeterPeakDb, 1) + " dBFS",
-                                juce::dontSendNotification);
-        else
-            meterStatus.setText("Track output: no recent audio activity", juce::dontSendNotification);
-    }
-
-    void refreshProjectView(const juce::String& message)
-    {
-        status.setText(message, juce::dontSendNotification);
-        const bool ready = hasProject && edit != nullptr;
-        saveButton.setEnabled(ready);
-        midiExportButton.setEnabled(ready && hasPattern && patternClip != nullptr);
-        addTrackButton.setEnabled(ready);
-        patternButton.setEnabled(ready);
-        playlistButton.setEnabled(ready);
-        mixerButton.setEnabled(ready);
-        masterButton.setEnabled(ready);
-        tempoLabel.setEnabled(ready);
-        tempoSlider.setEnabled(ready);
-        stopButton.setEnabled(ready);
-        loopButton.setEnabled(ready);
-        loopStartSlider.setEnabled(ready);
-        loopLengthSlider.setEnabled(ready);
-        metronomeButton.setEnabled(ready);
-        if (ready)
-        {
-            tempoSlider.setValue(project.getInitialTempoBpm(), juce::dontSendNotification);
-            metronomeButton.setToggleState(edit->clickTrackEnabled.get(), juce::dontSendNotification);
-            const auto meter = project.getInitialTimeSignature();
-            timeSignatureLabel.setText(juce::String(meter.numerator) + "/" + juce::String(meter.denominator),
-                                       juce::dontSendNotification);
-            updateLoopRange();
-            if (mixerWindow != nullptr)
-            {
-                const auto tracks = getGeneratorTracks();
-                mixerWindow->refresh(tracks.indexOf(instrumentTrack));
-            }
-        }
-        playButton.setEnabled(ready && instrumentTrack != nullptr);
-        if (!ready)
-        {
-            projectDetails.setText({}, juce::dontSendNotification);
-            musicalDetails.setText({}, juce::dontSendNotification);
-            return;
-        }
-        const auto meter = project.getInitialTimeSignature();
-        projectDetails.setText("Project: " + project.getName() + "   Â·   ID: " + project.getProjectId()
-                                   + (isDirty ? "   Â·   Unsaved" : ""), juce::dontSendNotification);
-        musicalDetails.setText("Tracks: " + juce::String(project.getTrackCount()) + "   Â·   "
-                                   + juce::String(project.getInitialTempoBpm(), 1) + " BPM   Â·   "
-                                   + juce::String(meter.numerator) + "/" + juce::String(meter.denominator)
-                                   + "   Â·   Built-in 4OSC   Â·   64 pattern slots per instrument (A1-H8)",
-                               juce::dontSendNotification);
-        resized();
-    }
-
-    void showError(const juce::String& titleText, const juce::String& message)
-    {
-        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, titleText, message);
-    }
-
-    te::Engine engine;
-    juce::ApplicationProperties applicationProperties;
-    std::unique_ptr<juce::TooltipWindow> tooltipWindow;
-    juce::uint32 lastAutoSaveMs = 0;
-    float displayedMeterPeakDb = -100.0f;
-    std::unique_ptr<te::Edit> edit;
-    te::AudioTrack* instrumentTrack = nullptr;
-    te::MidiClip* patternClip = nullptr;
-    te::LevelMeterPlugin* trackMeter = nullptr;
-    te::LevelMeasurer::Client trackMeterClient;
-    ProjectDocument project;
-    bool hasProject = false;
-    bool isDirty = false;
-    bool hasPattern = false;
-    bool refreshingTrackSelector = false;
-    bool allNotesSelected = false;
-    bool generatorCollapsed = false;
-    bool allGeneratorsMinimized = false;
-    bool pianoRollWasVisibleWhenCollapsed = false;
-    bool pianoRollMaximized = false;
-    juce::Rectangle<int> pianoRollRestoreBounds;
-    juce::Rectangle<int> expandedGeneratorBounds;
-    static constexpr int minimumPitch = 48; // C3
-    static constexpr int maximumPitch = 84; // C6
-    std::array<std::array<bool, 64>, maximumPitch - minimumPitch + 1> noteGrid{};
-    std::array<std::unique_ptr<juce::TextButton>, 16> steps;
-    std::array<std::unique_ptr<juce::TextButton>, 8> patternBankButtons, patternSlotButtons;
-    std::vector<UndoEntry> undoHistory, redoHistory;
-    PatternClipboard patternClipboard;
-    int randomDensityPercent = 25;
-    int randomPitchLow = 48;
-    int randomPitchHigh = 84;
-    int selectedBankIndex = 0;
-    int selectedSlotIndex = 0;
-    juce::ComboBox pitchSelector;
-    PianoRollButton pianoRollButton;
-    juce::ComboBox patternPresetSelector;
-    juce::Label patternLengthDisplay;
-    juce::TextButton patternLengthDownButton, patternLengthUpButton;
-    juce::ComboBox trackSelector;
-    juce::Slider levelSlider, panSlider;
-    juce::Slider tempoSlider;
-    juce::Slider loopStartSlider, loopLengthSlider;
-    juce::Label title, status, projectDetails, musicalDetails, audioDetails, patternTitle,
-                arrangementTitle, mixerTitle, levelLabel, panLabel, meterStatus, buildLabel, tempoLabel,
-                loopStartLabel, loopLengthLabel, timeSignatureLabel;
-    GeneratorDragLabel generatorDragHandle;
-    GeneratorResizeHandle generatorResizeHandle;
-    MixerMoveHandle mixerMoveHandle;
-    GeneratorResizeHandle mixerResizeHandle { "Resize mixer" };
-    juce::TextButton generatorCollapseButton;
-    juce::Viewport generatorDockViewport;
-    juce::Component generatorDockStrip;
-    std::vector<std::unique_ptr<juce::TextButton>> generatorDockButtons;
-    juce::TextButton newProjectButton, openButton, saveButton, midiExportButton, audioSettingsButton, addTrackButton,
-                     patternButton, fileMenuButton, editMenuButton, viewMenuButton, insertMenuButton, optionsMenuButton,
-                     windowMenuButton, helpMenuButton, loopButton, metronomeButton;
-    ToolbarButton playlistButton{ToolbarButton::Symbol::playlist}, playButton{ToolbarButton::Symbol::play},
-                  stopButton{ToolbarButton::Symbol::stop}, mixerButton{ToolbarButton::Symbol::mixer},
-                  masterButton{ToolbarButton::Symbol::master}, recordButton{ToolbarButton::Symbol::record},
-                  rewindButton{ToolbarButton::Symbol::rewind}, previousButton{ToolbarButton::Symbol::previous},
-                  nextButton{ToolbarButton::Symbol::next}, generatorMuteButton, generatorSoloButton,
-                  generatorSettingsButton{ToolbarButton::Symbol::settings}, openPresetButton{ToolbarButton::Symbol::open},
-                  savePresetButton{ToolbarButton::Symbol::save};
-    OutputMeterDisplay outputMeter;
-    std::unique_ptr<juce::FileChooser> fileChooser;
-    std::unique_ptr<AudioSettingsWindow> audioSettingsWindow;
-    std::unique_ptr<SearchPathsWindow> samplePathsWindow, vstPathsWindow;
-    std::unique_ptr<Vst3InstrumentBrowser> vst3InstrumentBrowser;
-    juce::Array<juce::PluginDescription> vst3MenuDescriptions;
-    std::unique_ptr<PlaylistWindow> playlistWindow;
-    std::unique_ptr<MixerWindow> mixerWindow;
-    std::unique_ptr<PianoRollWindow> pianoRollWindow;
-    std::unique_ptr<te::Plugin::EditorComponent> activeInstrumentEditor;
-    std::unique_ptr<EqualiserWindow> equaliserWindow;
-    juce::Rectangle<int> generatorPanelBounds, generatorInstrumentBounds, generatorResizeStart;
-    juce::Point<int> generatorDragOffset, generatorDragStart, generatorDragStartPosition;
-    juce::Rectangle<int> mixerPanelBounds, mixerResizeStartBounds;
-    juce::Point<int> mixerDragOffset, mixerResizeStart;
-    bool draggingGenerator = false, resizingGenerator = false, playlistPaintGestureActive = false;
-    bool mixerBoundsInitialised = false, draggingMixer = false, resizingMixer = false;
-    bool showHints = true;
-};
-
-class MainWindow final : public juce::DocumentWindow
-{
-public:
-    explicit MainWindow(juce::JUCEApplication& application)
-        : DocumentWindow("Orbit", juce::Colour::fromRGB(20, 29, 38), juce::DocumentWindow::allButtons), app(application)
-    {
-        setUsingNativeTitleBar(true);
-        setContentOwned(new ProjectView(), true);
-        setResizable(true, true);
-        centreWithSize(1220, 760);
-        setVisible(true);
-    }
-    void closeButtonPressed() override { app.systemRequestedQuit(); }
-private:
-    juce::JUCEApplication& app;
-};
-
-class OrbitApplication final : public juce::JUCEApplication
-{
-public:
-    const juce::String getApplicationName() override { return "Orbit"; }
-    const juce::String getApplicationVersion() override { return "0.3.45"; }
-    void initialise(const juce::String&) override
-    {
-        installOrbitCrashReportHandler();
-        mainWindow = std::make_unique<MainWindow>(*this);
-    }
-    void shutdown() override { mainWindow.reset(); }
-private:
-    std::unique_ptr<MainWindow> mainWindow;
-};
-}
-
-START_JUCE_APPLICATION(OrbitApplication)
+YªçŠx³¬uç%j·Â+ar‰ì¶ë•ë_¢ºÞjË"‚v›•ëÚ®&›•ëÚ[˜ÛYHXÙRXY\‹š‚ˆÚ[˜ÛYH˜XÚÝ[Û—Ù[™Ú[™KÝ˜XÚÝ[Û—Ù[™Ú[™Kš‚ˆÚ[˜ÛYHÛX]‚ˆÚ[˜ÛYHÜÝ[Ï‚ˆÚ[˜ÛYHÜÝš[™Ï‚ˆÚ[˜ÛYHX\‚ˆÚ[˜ÛYHÙ]‚‚ˆÚYˆ•PÑWÓPPÈ•PÑWÓS•VˆÚ[˜ÛYHÜÚYÛ˜[‚ˆÚ[˜ÛYH˜Ûš‚ˆÚ[˜ÛYH[Z]Ëš‚ˆÚ[˜ÛYH[š\Ýš‚ˆÙ[™Y‚‚ˆÚ[˜ÛYH”›Ú™XÝÔ›Ú™XÝØÝ[Y[š‚‚›˜[Y\ÜXÙHHH˜XÚÝ[ÛŽŽ™[™Ú[™NÂ‚›˜[Y\ÜXÙBžÂˆÚYˆ•PÑWÓPPÈ•PÑWÓS•V˜Ú\ˆÜ˜\Ú™\Ü]ÔUÓPVHHßNÂ˜Ú\ˆÜ˜\Ú™\ÜXY\–ÍLL—HH“Ü˜š]Ü˜\ÚYÚ[H[›š[™ËˆŽÂ˜Ú\ˆÝ\œ™[œÝÔØØ[•\™Ù]ÔUÓPVHHŠ›È”ÕÈYÚ[ˆØØ[ˆØ\ÈXÝ]™JHŽÂ‚›ÚYÜš]TÚYÛ˜[ØY™J[™ÛÛœÝÚ\Šˆ^Ú^™WÝ[™Ý
+BžÂˆÚ[H
+[™Ýˆ
+BˆÂˆÛÛœÝ]]ÈÜš][ˆHŽÜš]J™^[™Ý
+NÂˆYˆ
+Üš][ˆH
+H™]\›ŽÂˆ^
+ÏHÜš][ŽÂˆ[™ÝOHÝ]X×ØØ\ÝÚ^™WÝŠÜš][ŠNÂˆBŸB‚›ÚYÜ˜š]˜][ÚYÛ˜[[™\Š[ÚYÛ˜[[X™\ŠBžÂˆYˆ
+Ü˜\Ú™\Ü]ÌHOH	×	ÊBˆÂˆÛÛœÝ[™HŽ›Ü[ŠÜ˜\Ú™\Ü]×ÐÔ‘PU×ÕÔ“Ó“H×Õ•SËŒ
+NÂˆYˆ
+™H
+BˆÂˆÚ^™WÝXY\“[™ÝHÂˆÚ[H
+XY\“[™ÝÚ^™[ÙŠÜ˜\Ú™\ÜXY\ŠH	‰ˆÜ˜\Ú™\ÜXY\–ÚXY\“[™ÝHOH	×	ÊBˆ
+ÊÚXY\“[™ÝÂˆÜš]TÚYÛ˜[ØY™J™Ü˜\Ú™\ÜXY\‹XY\“[™Ý
+NÂˆÜš]TÚYÛ˜[ØY™J™—‘˜][ÚYÛ˜[ˆ‹MJNÂˆÛÛœÝÚ\ŠˆÚYÛ˜[˜[YHH•S’Ó“ÕÓˆŽÂˆYˆ
+ÚYÛ˜[[X™\ˆOHÒQÐP”•
+HÚYÛ˜[˜[YHH”ÒQÐP”•ŽÂˆ[ÙHYˆ
+ÚYÛ˜[[X™\ˆOHÒQÐ•TÊHÚYÛ˜[˜[YHH”ÒQÐ•TÈŽÂˆ[ÙHYˆ
+ÚYÛ˜[[X™\ˆOHÒQÑ”JHÚYÛ˜[˜[YHH”ÒQÑ”HŽÂˆ[ÙHYˆ
+ÚYÛ˜[[X™\ˆOHÒQÒS
+HÚYÛ˜[˜[YHH”ÒQÒSŽÂˆ[ÙHYˆ
+ÚYÛ˜[[X™\ˆOHÒQÔÑQÕŠHÚYÛ˜[˜[YHH”ÒQÔÑQÕˆŽÂˆ[ÙHYˆ
+ÚYÛ˜[[X™\ˆOHÒQÕT
+HÚYÛ˜[˜[YHH”ÒQÕTŽÂˆÚ^™WÝÚYÛ˜[˜[YS[™ÝHÂˆÚ[H
+ÚYÛ˜[˜[YVÜÚYÛ˜[˜[YS[™ÝHOH	×	ÊH
+ÊÜÚYÛ˜[˜[YS[™ÝÂˆÜš]TÚYÛ˜[ØY™J™ÚYÛ˜[˜[YKÚYÛ˜[˜[YS[™Ý
+NÂˆÜš]TÚYÛ˜[ØY™J™ˆ
+‹ŠNÂˆÚ\ˆYÚ]ÖÌM—NÂˆÚ^™WÝÛÝ[HÂˆ[œÚYÛ™Y[[X™\ˆHÝ]X×ØØ\Ý[œÚYÛ™Y[ŠÚYÛ˜[[X™\ŠNÂˆÈÈYÚ]ÖØÛÝ[
+Ê×HHÝ]X×ØØ\ÝÚ\Š	Ì	È
+È[X™\ˆ	HL
+NÈ[X™\ˆÏHLÈHÚ[H
+[X™\ˆˆ
+NÂˆÚ[H
+ÛÝ[ˆ
+HÜš]TÚYÛ˜[ØY™J™	™YÚ]ÖËKXÛÝ[KJNÂˆÜš]TÚYÛ˜[ØY™J™ŠH‹JNÂˆÜš]TÚYÛ˜[ØY™J™—”YÚ[ˆ™Z[™ÈØØ[›™Yˆ‹
+NÂˆÚ^™WÝ\™Ù][™ÝHÂˆÚ[H
+\™Ù][™ÝÚ^™[ÙŠÝ\œ™[œÝÔØØ[•\™Ù]
+H	‰ˆÝ\œ™[œÝÔØØ[•\™Ù]Ý\™Ù][™ÝHOH	×	ÊBˆ
+ÊÝ\™Ù][™ÝÂˆÜš]TÚYÛ˜[ØY™J™Ý\œ™[œÝÔØØ[•\™Ù]\™Ù][™Ý
+NÂˆÝ]XÈÛÛœÝ^ˆÚ\ˆ›ÛÝ\–×HH——•HÜ\˜][™ÈÞ\Ý[HX^H[ÛÈ]™HÜ™X]YH]Z[YÜ˜\Ú™\Ü[ˆ]ÈXYÛ›ÜÝXÔ™\ÜÈ›Û\‹—ˆŽÂˆÜš]TÚYÛ˜[ØY™J™›ÛÝ\‹Ú^™[ÙŠ›ÛÝ\ŠHHJNÂˆŽ™œÞ[˜Ê™
+NÂˆŽ˜ÛÜÙJ™
+NÂˆBˆB‚ˆŽœÚYÛ˜[
+ÚYÛ˜[[X™\‹ÒQ×Ñ“
+NÂˆŽœ˜Z\ÙJÚYÛ˜[[X™\ŠNÂˆŽ—Ù^]
+LŽ
+ÈÚYÛ˜[[X™\ŠNÂŸB‚›ÚY[œÝ[Ü˜š]Ü˜\Ú™\Ü[™\Š
+BžÂˆÛÛœÝ]]È\ÚÝÜHXÙNŽ‘š[NŽ™Ù]ÜXÚX[ØØ][ÛŠXÙNŽ‘š[NŽ\Ù\‘\ÚÝÜ\™XÝÜžJNÂˆÛÛœÝ]]ÈÝ[\HXÙNŽ•[YNŽ™Ù]Ý\œ™[[YJ
+K™›Ü›X]Y
+‰VI[IYIR	SITÈŠNÂˆÛÛœÝ]]È]H\ÚÝÜ™Ù]Ú[š[J“Ü˜š]PÜ˜\ÚT™\ÜHˆ
+ÈÝ[\
+È‹›ÙÈŠK™Ù][]˜[YJ
+NÂˆÝŽœÛœš[ŠÜ˜\Ú™\Ü]Ú^™[ÙŠÜ˜\Ú™\Ü]
+K‰\È‹]Ô˜]ÕUŽ
+
+JNÂˆÝŽœÛœš[ŠÜ˜\Ú™\ÜXY\‹Ú^™[ÙŠÜ˜\Ú™\ÜXY\ŠKˆ“Ü˜š]Z[	\ÈÜ˜\ÚY—•[YNˆ	\×ˆ‹›Ú™XÝ[™›ÎŽ™\œÚ[Û”Ýš[™ËÝ[\Ô˜]ÕUŽ
+
+JNÂ‚ˆ›Üˆ
+ÛÛœÝ[ÚYÛ˜[[X™\ˆˆÈÒQÐP”•ÒQÐ•TËÒQÑ”KÒQÒSÒQÔÑQÕ‹ÒQÕTJBˆÝŽœÚYÛ˜[
+ÚYÛ˜[[X™\‹Ü˜š]˜][ÚYÛ˜[[™\ŠNÂŸB‚›ÚYÙ]Ý\œ™[œÝÔØØ[•\™Ù]
+ÛÛœÝXÙNŽ”Ýš[™Éˆ]
+BžÂˆÛÛœÝ]]È]ŽH]Ô˜]ÕUŽ
+
+NÂˆÝŽœÛœš[ŠÝ\œ™[œÝÔØØ[•\™Ù]Ú^™[ÙŠÝ\œ™[œÝÔØØ[•\™Ù]
+K‰\È‹]Ž
+NÂŸBˆÙ[ÙB›ÚY[œÝ[Ü˜š]Ü˜\Ú™\Ü[™\Š
+HßB›ÚYÙ]Ý\œ™[œÝÔØØ[•\™Ù]
+ÛÛœÝXÙNŽ”Ýš[™ÉŠHßBˆÙ[™Y‚‚˜Û\ÜÈÛÛ˜\]Ûˆš[˜[ˆX›XÈXÙNŽ•^]Û‚žÂœX›XÎ‚ˆ[[HÛ\ÜÈÞ[X›ÛÈ›Û™K^KÝÜ™]Ú[™™]š[Ý\Ë™^™XÛÜ™^[\ÝZ^\‹X\Ý\‹Ù][™ÜËØ]™KÜ[ˆNÂ‚ˆ^XÚ]ÛÛ˜\]ÛŠÞ[X›Û]Û”Þ[X›ÛHÞ[X›ÛŽ››Û™JHˆÞ[X›Û
+]Û”Þ[X›Û
+BˆÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌKÍÊJNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍËLL‹MÊJNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒ‹ŒÌ‹ŒÍÊJNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆB‚ˆ›ÚYÙ]^š\ÚX›J›ÛÛÚÝ[ÚÝÊHÈÚÝÕ^HÚÝ[ÚÝÎÈ™\Z[
+
+NÈB‚ˆ›ÚYZ[]ÛŠXÙNŽ‘Ü˜\XÜÉˆË›ÛÛYÚYÚY›ÛÛÝÛŠHÝ™\œšYBˆÂˆ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+Kœ™YXÙY
+YŠNÂˆ]]Èš[Hš[™ÛÛÝ\ŠÙ]ÙÙÛTÝ]J
+HÈXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YˆˆXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’Y
+NÂˆYˆ
+ÝÛŠHš[Hš[˜œšYÚ\ŠŒMŠNÂˆ[ÙHYˆ
+YÚYÚY
+Hš[Hš[˜œšYÚ\ŠŒŠNÂˆYˆ
+Z\Ñ[˜X›Y
+
+JHš[Hš[Ú][JMYŠNÂˆËœÙ]ÛÛÝ\Šš[
+NÂˆË™š[›Ý[™Y™XÝ[™ÛJ›Ý[™ËŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠL‹LŒ‹LÍÊJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJ›Ý[™ËŒ‹KŒŠNÂ‚ˆÛÛœÝ]]ÈXÛÛÛÛÝ\ˆH\Ñ[˜X›Y
+
+HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNKŒŒÎ
+BˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKMKMLÊNÂˆÛÛœÝ›ÛÛ\ÒXÛÛˆHÞ[X›ÛOHÞ[X›ÛŽ››Û™NÂˆÛÛœÝ›Ø]XÛÛ”Ú^™HH\ÒXÛÛˆÈ
+ÚÝÕ^ÈMŒˆˆXÙNŽš›Z[ŠNŒ‹Ý]X×ØØ\Ý›Ø]ŠÙ]ZYÚ
+
+JH
+ˆŒ™ŠJHˆŒŽÂˆÛÛœÝ›Ø]XÛÛ–HZ\ÒXÛÛˆÈ›Ý[™Ë™Ù]
+
+H
+ÈKŒ‚ˆˆÚÝÕ^È›Ý[™Ë™Ù]
+
+H
+ÈËŒ‚ˆˆ›Ý[™Ë™Ù]Ù[™V
+
+HHXÛÛ”Ú^™H
+ˆYŽÂˆÛÛœÝ›Ø]XÛÛ–HH›Ý[™Ë™Ù]Ù[™VJ
+HHXÛÛ”Ú^™H
+ˆYŽÂˆËœÙ]ÛÛÝ\ŠÞ[X›ÛOHÞ[X›ÛŽœ™XÛÜ™ÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒKÍÊHˆXÛÛÛÛÝ\ŠNÂˆÛÛœÝ]]ÈšX[™ÛHHÝ\Ë	™ËXÛÛ–XÛÛ–KXÛÛ”Ú^™WJ›ÛÛÚ[ÔšYÚ›ÛÛÝX›P\œ›ÝÊBˆÂˆXÙNŽ”]]ÂˆYˆ
+ÝX›P\œ›ÝÊBˆÂˆÛÛœÝ›Ø]Ù™œÙ]HXÛÛ”Ú^™H
+ˆŽÂˆ]˜YšX[™ÛJXÛÛ–
+È
+Ú[ÔšYÚÈKŒˆˆXÛÛ”Ú^™H
+ˆL™ŠKXÛÛ–H
+ÈKŒ‹ˆXÛÛ–
+È
+Ú[ÔšYÚÈXÛÛ”Ú^™H
+ˆˆˆXÛÛ”Ú^™HHKŒŠKXÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆY‹ˆXÛÛ–
+È
+Ú[ÔšYÚÈKŒˆˆXÛÛ”Ú^™H
+ˆL™ŠKXÛÛ–H
+ÈXÛÛ”Ú^™HHKŒŠNÂˆYˆ
+Ú[ÔšYÚ
+Bˆ]˜YšX[™ÛJXÛÛ–
+ÈÙ™œÙ]XÛÛ–H
+ÈKŒ‹XÛÛ–
+ÈXÛÛ”Ú^™HHKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆY‹ˆXÛÛ–
+ÈÙ™œÙ]XÛÛ–H
+ÈXÛÛ”Ú^™HHKŒŠNÂˆ[ÙBˆ]˜YšX[™ÛJXÛÛ–
+ÈKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆY‹XÛÛ–
+ÈXÛÛ”Ú^™HHÙ™œÙ]XÛÛ–H
+ÈKŒ‹ˆXÛÛ–
+ÈXÛÛ”Ú^™HHÙ™œÙ]XÛÛ–H
+ÈXÛÛ”Ú^™HHKŒŠNÂˆBˆ[ÙHYˆ
+Ú[ÔšYÚ
+Bˆ]˜YšX[™ÛJXÛÛ–
+ÈKŒ‹XÛÛ–H
+ÈKŒ‹XÛÛ–
+ÈXÛÛ”Ú^™HHKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆY‹ˆXÛÛ–
+ÈKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™HHKŒŠNÂˆ[ÙBˆ]˜YšX[™ÛJXÛÛ–
+ÈXÛÛ”Ú^™HHKŒ‹XÛÛ–H
+ÈKŒ‹XÛÛ–
+ÈKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆY‹ˆXÛÛ–
+ÈXÛÛ”Ú^™HHKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™HHKŒŠNÂˆË™š[]
+]
+NÂˆNÂ‚ˆÝÚ]Ú
+Þ[X›Û
+BˆÂˆØ\ÙHÞ[X›ÛŽœ^NˆšX[™ÛJYK˜[ÙJNÈœ™XZÎÂˆØ\ÙHÞ[X›ÛŽœ™]š[Ý\Î‚ˆË™š[™XÝ
+XÛÛ–
+ÈXÛÛ”Ú^™HH‹Œ‹XÛÛ–H
+ÈKŒ‹‹Œ‹XÛÛ”Ú^™HH‹ŒŠNÂˆšX[™ÛJ˜[ÙK˜[ÙJNÂˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽ›™^‚ˆË™š[™XÝ
+XÛÛ–XÛÛ–H
+ÈKŒ‹‹Œ‹XÛÛ”Ú^™HH‹ŒŠNÂˆšX[™ÛJYK˜[ÙJNÂˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽœ™]Ú[™‚ˆË™š[™XÝ
+XÛÛ–XÛÛ–H
+ÈKŒ‹‹Œ‹XÛÛ”Ú^™HH‹ŒŠNÂˆšX[™ÛJ˜[ÙK˜[ÙJNÂˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽœÝÜ‚ˆË™š[›Ý[™Y™XÝ[™ÛJXÛÛ–
+È‹Œ‹XÛÛ–H
+È‹Œ‹XÛÛ”Ú^™HHŒ‹XÛÛ”Ú^™HHŒ‹KYŠNÂˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽœ™XÛÜ™‚ˆË™š[[\ÙJXÛÛ–
+È‹Œ‹XÛÛ–H
+È‹Œ‹XÛÛ”Ú^™HHŒ‹XÛÛ”Ú^™HHŒŠNÂˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽœ^[\Ý‚ˆ›Üˆ
+[›ÝÈHÈ›ÝÈÎÈ
+ÊÜ›ÝÊBˆÂˆÛÛœÝ›Ø]HHXÛÛ–H
+È‹Œˆ
+È›ÝÈ
+ˆŒ™ŽÂˆË™š[›Ý[™Y™XÝ[™ÛJXÛÛ–KŒ‹ËŒ‹ÙŠNÂˆË™š[™XÝ
+XÛÛ–
+È‹Œ‹H
+ÈY‹XÛÛ”Ú^™HHËŒ‹KŒ™ŠNÂˆBˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽ›Z^\Ž‚ˆ›Üˆ
+[ÛÛHÈÛÛÎÈ
+ÊØÛÛ
+BˆÂˆÛÛœÝ›Ø]HXÛÛ–
+ÈËŒˆ
+ÈÛÛ
+ˆÙŽÂˆË™˜]Ó[™JXÛÛ–H
+ÈKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™HHKŒ‹KŒ™ŠNÂˆË™š[›Ý[™Y™XÝ[™ÛJH‹Œ‹XÛÛ–H
+È
+ÛÛOHHÈŒˆˆKŒŠKŒ‹ËŒ‹ŽŠNÂˆBˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽ›X\Ý\Ž‚ˆ›Üˆ
+[ÛÛHÈÛÛÈ
+ÊØÛÛ
+BˆÂˆÛÛœÝ›Ø]HŒˆ
+ÈÝ]X×ØØ\Ý›Ø]Š
+ÛÛ
+ˆÊH	HL
+NÂˆË™š[›Ý[™Y™XÝ[™ÛJXÛÛ–
+ÈKŒˆ
+ÈÛÛ
+ˆËŒÙ‹XÛÛ–H
+ÈXÛÛ”Ú^™HHˆ‹Œ™‹ÙŠNÂˆBˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽœÙ][™ÜÎ‚ˆË™˜]Ñ[\ÙJXÛÛ–
+ÈËY‹XÛÛ–H
+ÈËY‹XÛÛ”Ú^™HHËŒ‹XÛÛ”Ú^™HHËŒ‹‹ŒŠNÂˆË™š[[\ÙJXÛÛ–
+ÈXÛÛ”Ú^™H
+ˆ™‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆ™‹XÛÛ”Ú^™H
+ˆŒM™‹XÛÛ”Ú^™H
+ˆŒM™ŠNÂˆ›Üˆ
+[ÜÚÙHHÈÜÚÙHÈ
+ÊÜÜÚÙJBˆÂˆÛÛœÝ]]È[™ÛHHXÙNŽ“X]ÛÛœÝ[Ï›Ø]ŽŽÛÔH
+ˆÜÚÙHÈŒŽÂˆÛÛœÝ]]ÈÙ[\ˆHXÙNŽ”Ú[›Ø]ŠXÛÛ–
+ÈXÛÛ”Ú^™H
+ˆY‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆYŠNÂˆË™˜]Ó[™JÙ[\‹ž
+ÈÝŽ˜ÛÜÊ[™ÛJH
+ˆKY‹Ù[\‹žH
+ÈÝŽœÚ[Š[™ÛJH
+ˆKY‹ˆÙ[\‹ž
+ÈÝŽ˜ÛÜÊ[™ÛJH
+ˆËY‹Ù[\‹žH
+ÈÝŽœÚ[Š[™ÛJH
+ˆËY‹‹ŒŠNÂˆBˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽœØ]™N‚ˆË™˜]Ô›Ý[™Y™XÝ[™ÛJXÛÛ–
+ÈKŒ‹XÛÛ–H
+ÈKŒ‹XÛÛ”Ú^™HH‹Œ‹XÛÛ”Ú^™HH‹Œ‹KY‹KŠNÂˆË™š[™XÝ
+XÛÛ–
+ÈŒ‹XÛÛ–H
+È‹Œ‹XÛÛ”Ú^™HHŒ‹ŒŠNÂˆË™˜]Ô™XÝ
+XÛÛ–
+ÈŒ‹XÛÛ–H
+ÈŒ‹XÛÛ”Ú^™HHŒ‹XÛÛ”Ú^™HHLŒ‹KŒ™ŠNÂˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽ›Ü[Ž‚ˆË™˜]Ó[™JXÛÛ–
+ÈKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆŒÍY‹XÛÛ–
+ÈKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆŒÍY‹KŽŠNÂˆË™˜]Ó[™JXÛÛ–
+ÈKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆŒÍY‹XÛÛ–
+ÈËŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆY‹KŽŠNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJXÛÛ–
+ÈKŒ‹XÛÛ–H
+ÈXÛÛ”Ú^™H
+ˆ™‹XÛÛ”Ú^™HH‹Œ‹ˆXÛÛ”Ú^™H
+ˆY‹KŒ™‹KYŠNÂˆœ™XZÎÂˆØ\ÙHÞ[X›ÛŽ››Û™Nˆœ™XZÎÂˆB‚ˆYˆ
+ÚÝÕ^
+BˆÂˆËœÙ]ÛÛÝ\Šš[™ÛÛÝ\ŠÙ]ÙÙÛTÝ]J
+HÈXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YˆˆXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’Y
+JNÂˆËœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLY‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆÛÛœÝ]]È^H\ÒXÛÛˆÈÝ]X×ØØ\Ý[ŠXÛÛ–
+ÈXÛÛ”Ú^™H
+È‹ŒŠHˆÎÂˆÛÛœÝ]]È^ÚYH\ÒXÛÛˆÈÙ]ÚY
+
+HH^HˆÙ]ÚY
+
+HHŽÂˆË™˜]Ñš]Y^
+Ù]]Û•^
+
+KXÙNŽ”™XÝ[™ÛO[Š^^ÚYÙ]ZYÚ
+
+JKˆXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YYJNÂˆBˆB‚œš]˜]N‚ˆÞ[X›ÛÞ[X›ÛÂˆ›ÛÛÚÝÕ^HYNÂŸNÂ‚˜Û\ÜÈ[ÙTÙ[XÝÜ]Ûˆš[˜[ˆX›XÈXÙNŽ•^]Û‚žÂœX›XÎ‚ˆ[ÙTÙ[XÝÜ]ÛŠ
+BˆÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌKÍÊJNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍËLL‹MÊJNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÌNLNNJJNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆB‚ˆ›ÚYZ[]ÛŠXÙNŽ‘Ü˜\XÜÉˆË›ÛÛYÚYÚY›ÛÛÝÛŠHÝ™\œšYBˆÂˆ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+Kœ™YXÙY
+YŠNÂˆ]]Èš[Hš[™ÛÛÝ\ŠÙ]ÙÙÛTÝ]J
+HÈXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YˆˆXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’Y
+NÂˆYˆ
+ÝÛŠHš[Hš[˜œšYÚ\ŠŒL™ŠNÂˆ[ÙHYˆ
+YÚYÚY
+Hš[Hš[˜œšYÚ\ŠŒÙŠNÂˆËœÙ]ÛÛÝ\Šš[
+NÂˆË™š[›Ý[™Y™XÝ[™ÛJ›Ý[™Ë‹ŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠL‹LŒ‹LÍÊJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJ›Ý[™Ë‹Œ‹ŽŠNÂˆËœÙ]ÛÛÝ\Šš[™ÛÛÝ\ŠÙ]ÙÙÛTÝ]J
+HÈXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YˆˆXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’Y
+JNÂˆËœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊKY‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆË™˜]Õ^
+Ù]]Û•^
+
+KÙ]ØØ[›Ý[™Ê
+KXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y˜[ÙJNÂˆBŸNÂ‚˜Û\ÜÈX[›Ô›Û]Ûˆš[˜[ˆX›XÈXÙNŽ•^]Û‚žÂœX›XÎ‚ˆ\Ú[™ÈXÙNŽ•^]ÛŽŽ•^]ÛŽÂ‚ˆ›ÚYZ[]ÛŠXÙNŽ‘Ü˜\XÜÉˆË›ÛÛYÚYÚY›ÛÛÝÛŠHÝ™\œšYBˆÂˆXÙNŽ•^]ÛŽŽœZ[]ÛŠËYÚYÚYÝÛŠNÂˆÛÛœÝ]]ÈHËŒŽÂˆÛÛœÝ]]ÈHHÝ]X×ØØ\Ý›Ø]ŠÙ]ZYÚ
+
+JH
+ˆYˆHËŒŽÂˆÛÛœÝ]]ÈÚ]HH\Ñ[˜X›Y
+
+HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNLŒŒÎ
+BˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKMKMLÊNÂˆËœÙ]ÛÛÝ\ŠÚ]JNÂˆË™š[›Ý[™Y™XÝ[™ÛJKŒŒ‹MŒ‹KYŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍLKLJJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJKŒŒ‹MŒ‹KY‹KŒŠNÂˆ›Üˆ
+[Ù^HHNÈÙ^HÎÈ
+ÊÚÙ^JBˆË™˜]Õ™\XØ[[™JÝ]X×ØØ\Ý[Š
+ÈÝ]X×ØØ\Ý›Ø]ŠÙ^JH
+ˆŒŒˆÈËŒŠKH
+ÈËŒ‹H
+ÈLËŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎKJJNÂˆ›Üˆ
+ÛÛœÝ]]ÈÙ^HˆÈK‹KˆJBˆÂˆÛÛœÝ]]ÈÙ^VH
+ÈÝ]X×ØØ\Ý›Ø]ŠÙ^JH
+ˆŒŒˆÈËŒˆHKŒ™ŽÂˆË™š[›Ý[™Y™XÝ[™ÛJÙ^VK‹Y‹ËY‹ŽŠNÂˆBˆBŸNÂ‚˜Û\ÜÈÝ]]Y]\‘\Ü^Hš[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNKÌ
+JNÂˆË™š[›Ý[™Y™XÝ[™ÛJ\™XKŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKLL‹LŠJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJ\™XKŒ‹KŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÍËŒŒL
+JNÂˆËœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊKŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆË™˜]Õ^
+“ÕU‹Ù]ØØ[›Ý[™Ê
+Kœ™[[Ý™Qœ›ÛSY
+ÊKXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆ]]ÈY]\œÈHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYY
+Ž
+Kœ™YXÙY
+‹JNÂˆÛÛœÝ[Ø\HÎÂˆÛÛœÝ[Ú[›™[ÚYH
+Y]\œË™Ù]ÚY
+
+HHØ\
+HÈŽÂˆ›Üˆ
+[Ú[›™[HÈÚ[›™[ŽÈ
+ÊØÚ[›™[
+BˆÂˆ]]ÈHY]\œË™Ù]
+
+H
+ÈÚ[›™[
+ˆ
+Ú[›™[ÚY
+ÈØ\
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMKNJJNÂˆË™š[›Ý[™Y™XÝ[™ÛJÝ]X×ØØ\Ý›Ø]Š
+KÝ]X×ØØ\Ý›Ø]ŠY]\œË™Ù]J
+JKˆÝ]X×ØØ\Ý›Ø]ŠÚ[›™[ÚY
+KÝ]X×ØØ\Ý›Ø]ŠY]\œË™Ù]ZYÚ
+
+JKKYŠNÂˆÛÛœÝ^ˆ[ÙYÛY[ÈHMÂˆÛÛœÝ^ˆ[ÙYÛY[Ø\HŽÂˆÛÛœÝ]]ÈÙYÛY[ZYÚHXÙNŽš›X^
+K
+Y]\œË™Ù]ZYÚ
+
+HH
+ÙYÛY[ÈHJH
+ˆÙYÛY[Ø\
+HÈÙYÛY[ÊNÂˆ›Üˆ
+[ÙYÛY[HÈÙYÛY[ÙYÛY[ÎÈ
+ÊÜÙYÛY[
+BˆÂˆÛÛœÝ]]ÈHHY]\œË™Ù]›ÝÛJ
+HHÙYÛY[ZYÚHÙYÛY[
+ˆ
+ÙYÛY[ZYÚ
+ÈÙYÛY[Ø\
+NÂˆÛÛœÝ]]ÈÛÛÝ\ˆHÙYÛY[HLˆÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNÍ‹ŒŠBˆˆÙYÛY[HLÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒËMŠBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLÎKMN
+NÂˆËœÙ]ÛÛÝ\ŠÛÛÝ\‹Ú][JŠJNÂˆË™š[›Ý[™Y™XÝ[™ÛJÝ]X×ØØ\Ý›Ø]Š
+ÈŠKÝ]X×ØØ\Ý›Ø]ŠJKˆÝ]X×ØØ\Ý›Ø]ŠÚ[›™[ÚYH
+KÝ]X×ØØ\Ý›Ø]ŠÙYÛY[ZYÚ
+KŽŠNÂˆBˆBˆBŸNÂ‚˜Û\ÜÈ]Y[ÔÙ][™ÜÕÚ[™ÝÈš[˜[ˆX›XÈXÙNŽ‘ØÝ[Y[Ú[™ÝÂžÂœX›XÎ‚ˆ^XÚ]]Y[ÔÙ][™ÜÕÚ[™ÝÊXÙNŽ]Y[Ñ]šXÙSX[˜YÙ\‰ˆX[˜YÙ\ŠBˆˆØÝ[Y[Ú[™ÝÊ“Ü˜š]]Y[È	ˆRQHÙ][™ÜÈ‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŽKÎ
+KXÙNŽ‘ØÝ[Y[Ú[™ÝÎŽ˜ÛÜÙP]ÛŠBˆÂˆÙ]\Ú[™Ó˜]]™U]P˜\ŠYJNÂˆÙ]ÛÛ[ÝÛ™Y
+™]ÈXÙNŽ]Y[Ñ]šXÙTÙ[XÝÜÛÛ\Û™[
+X[˜YÙ\‹K‹YKYKYKYJKYJNÂˆÙ]™\Ú^˜X›JYKYJNÂˆÙ[™UÚ]Ú^™JLŒŒ
+NÂˆB‚ˆ›ÚYÛÜÙP]Û”™\ÜÙY
+
+HÝ™\œšYHÈÙ]š\ÚX›J˜[ÙJNÈBŸNÂ‚˜Û\ÜÈÙX\˜Ú]Y]Üˆš[˜[ˆX›XÈXÙNŽÛÛ\Û™[š]˜]HXÙNŽ“\Ý›Þ[Ù[žÂœX›XÎ‚ˆÙX\˜Ú]Y]ÜŠXÙNŽ”Ýš[™Ð\œ˜^H[š]X[]ËˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ýš[™Ð\œ˜^JOˆØ]™KˆÝŽ™[˜Ý[Û›ÚY
+
+OˆØ[˜Ù[ˆ›ÛÛÚÝÕœÝÝ\\Ü[ÛˆH˜[ÙKˆ›ÛÛØØ[•œÝÐ]Ý\\[š]X[HH˜[ÙKˆÝŽ™[˜Ý[Û›ÚY
+›ÛÛ
+OˆØ]™UœÝÝ\\Ü[ÛˆHßJBˆˆ]ÊÝŽ›[Ý™J[š]X[]ÊJKÛ”Ø]™JÝŽ›[Ý™JØ]™JJKÛØ[˜Ù[
+ÝŽ›[Ý™JØ[˜Ù[
+JKˆ\ÕœÝÝ\\Ü[ÛŠÚÝÕœÝÝ\\Ü[ÛŠKÛ”Ø]™UœÝÝ\\Ü[ÛŠÝŽ›[Ý™JØ]™UœÝÝ\\Ü[ÛŠJBˆÂˆ]KœÙ]^
+ÚÝÕœÝÝ\\Ü[Û‚ˆÈ”Ý[™\™”ÕÈØØ][ÛœÈ\™H[˜ÛYY]]ÛX]XØ[KˆY^˜H›Û\œÈ™[ÝËˆ‚ˆˆ‘›Û\œÈÜ˜š]ÙX\˜Ú\È‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒŒÌÊJNÂˆY[™XZÙUš\ÚX›J]JNÂˆ›Û\“\ÝœÙ][Ù[
+\ÊNÂˆ›Û\“\ÝœÙ]›ÝÒZYÚ
+Ì
+NÂˆ›Û\“\ÝœÙ]][\TÙ[XÝ[Û‘[˜X›Y
+YJNÂˆY[™XZÙUš\ÚX›J›Û\“\Ý
+NÂ‚ˆØØ[•œÝÐ]Ý\\œÙ]]Û•^
+”ØØ[ˆ”ÕÈYÚ[œÈ]Ý\\ŠNÂˆØØ[•œÝÐ]Ý\\œÙ]ÙÙÛTÝ]JØØ[•œÝÐ]Ý\\[š]X[KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆØØ[•œÝÐ]Ý\\œÙ]š\ÚX›J\ÕœÝÝ\\Ü[ÛŠNÂˆYˆ
+\ÕœÝÝ\\Ü[ÛŠHY[™XZÙUš\ÚX›JØØ[•œÝÐ]Ý\\
+NÂ‚ˆY›Û\‹œÙ]]Û•^
+Y›Û\ˆŠNÂˆY›Û\‹›ÛÛXÚÈHÝ\×HÈÚÛÜÙQ›Û\Š
+NÈNÂˆY[™XZÙUš\ÚX›JY›Û\ŠNÂˆ™[[Ý™Q›Û\‹œÙ]]Û•^
+”™[[Ý™HŠNÂˆ™[[Ý™Q›Û\‹›ÛÛXÚÈHÝ\×HÈ™[[Ý™TÙ[XÝY›Û\œÊ
+NÈNÂˆY[™XZÙUš\ÚX›J™[[Ý™Q›Û\ŠNÂˆØ]™P]Û‹œÙ]]Û•^
+”Ø]™HŠNÂˆØ]™P]Û‹›ÛÛXÚÈHÝ\×BˆÂˆYˆ
+Û”Ø]™JHÛ”Ø]™J]ÊNÂˆYˆ
+\ÕœÝÝ\\Ü[Ûˆ	‰ˆÛ”Ø]™UœÝÝ\\Ü[ÛŠBˆÛ”Ø]™UœÝÝ\\Ü[ÛŠØØ[•œÝÐ]Ý\\™Ù]ÙÙÛTÝ]J
+JNÂˆYˆ
+ÛØ[˜Ù[
+HÛØ[˜Ù[
+
+NÂˆNÂˆY[™XZÙUš\ÚX›JØ]™P]ÛŠNÂˆØ[˜Ù[]Û‹œÙ]]Û•^
+Ø[˜Ù[ŠNÂˆØ[˜Ù[]Û‹›ÛÛXÚÈHÝ\×HÈYˆ
+ÛØ[˜Ù[
+HÛØ[˜Ù[
+
+NÈNÂˆY[™XZÙUš\ÚX›JØ[˜Ù[]ÛŠNÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆ]]È\™XHHÙ]ØØ[›Ý[™Ê
+Kœ™YXÙY
+LŠNÂˆ]KœÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛUÜ
+
+JNÂˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+ŠNÂˆ]]È›ÛÝ\ˆH\™XKœ™[[Ý™Qœ›ÛP›ÝÛJÍ
+NÂˆY›Û\‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛSY
+LLŠJNÂˆ›ÛÝ\‹œ™[[Ý™Qœ›ÛSY
+ŠNÂˆ™[[Ý™Q›Û\‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛSY
+ŠJNÂˆ]]ÈšYÚH›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+MÍŠNÂˆØ]™P]Û‹œÙ]›Ý[™ÊšYÚœ™[[Ý™Qœ›ÛTšYÚ
+LŠJNÂˆšYÚœ™[[Ý™Qœ›ÛTšYÚ
+ŠNÂˆØ[˜Ù[]Û‹œÙ]›Ý[™ÊšYÚœ™[[Ý™Qœ›ÛTšYÚ
+Î
+JNÂˆYˆ
+\ÕœÝÝ\\Ü[ÛŠBˆÂˆ\™XKœ™[[Ý™Qœ›ÛP›ÝÛJŠNÂˆØØ[•œÝÐ]Ý\\œÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛP›ÝÛJ
+JNÂˆBˆ›Û\“\ÝœÙ]›Ý[™Ê\™XJNÂˆB‚œš]˜]N‚ˆ[Ù][T›ÝÜÊ
+HÝ™\œšYHÈ™]\›ˆ]ËœÚ^™J
+NÈB‚ˆ›ÚYZ[\Ý›Þ][J[›ÝËXÙNŽ‘Ü˜\XÜÉˆË[ÚY[ZYÚ›ÛÛÙ[XÝY
+HÝ™\œšYBˆÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ›ÝË]ËœÚ^™J
+JJH™]\›ŽÂˆË™š[[
+Ù[XÝYÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMLKLÍÊBˆˆ
+›ÝÈ	HˆOHÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌKKMJBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍËL‹ŒŠJJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒŒÌKŒÍÊJNÂˆËœÙ]›Û
+LËŒŠNÂˆË™˜]Õ^
+]ÖÜ›Ý×KLÚYHŒZYÚXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YYYJNÂˆB‚ˆ›ÚYÚÛÜÙQ›Û\Š
+BˆÂˆY›Û\‹œÙ][˜X›Y
+˜[ÙJNÂˆÚÛÜÙ\ˆHÝŽ›XZÙWÝ[š\]YOXÙNŽ‘š[PÚÛÜÙ\ŠYHÙX\˜Ú›Û\ˆ‹ˆXÙNŽ‘š[NŽ™Ù]ÜXÚX[ØØ][ÛŠXÙNŽ‘š[NŽ\Ù\’ÛYQ\™XÝÜžJKŠˆŠNÂˆXÙNŽÛÛ\Û™[Ž”ØY™TÚ[\ÙX\˜Ú]Y]ÜˆØY™U\Ê\ÊNÂˆÚÛÜÙ\‹O›][˜Ú\Þ[˜ÊXÙNŽ‘š[Pœ›ÝÜÙ\ÛÛ\Û™[Ž›Ü[“[ÙBˆXÙNŽ‘š[Pœ›ÝÜÙ\ÛÛ\Û™[Ž˜Ø[”Ù[XÝ\™XÝÜšY\ËˆÜØY™U\×JÛÛœÝXÙNŽ‘š[PÚÛÜÙ\‰ˆš[PÚÛÜÙ\ŠBˆÂˆYˆ
+ØY™U\ÈOH[ŠH™]\›ŽÂˆÛÛœÝ]]È›Û\ˆHš[PÚÛÜÙ\‹™Ù]™\Ý[
+
+NÂˆYˆ
+›Û\‹š\Ñ\™XÝÜžJ
+JBˆÂˆÛÛœÝ]]È[]H›Û\‹™Ù][]˜[YJ
+NÂˆYˆ
+\ØY™U\ËOœ]Ë˜ÛÛZ[œÊ[]
+JHØY™U\ËOœ]Ë˜Y
+[]
+NÂˆØY™U\ËO™›Û\“\Ý\]PÛÛ[
+
+NÂˆØY™U\ËO™›Û\“\Ýœ™\Z[
+
+NÂˆBˆØY™U\ËO˜Y›Û\‹œÙ][˜X›Y
+YJNÂˆJNÂˆB‚ˆ›ÚY™[[Ý™TÙ[XÝY›Û\œÊ
+BˆÂˆ]]ÈÙ[XÝYH›Û\“\Ý™Ù]Ù[XÝY›ÝÜÊ
+NÂˆ›Üˆ
+[HHÙ[XÝYœÚ^™J
+NÈKZHHÊBˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊÙ[XÝYÚWK]ËœÚ^™J
+JJH]Ëœ™[[Ý™JÙ[XÝYÚWJNÂˆ›Û\“\Ý\]PÛÛ[
+
+NÂˆ›Û\“\Ýœ™\Z[
+
+NÂˆB‚ˆXÙNŽ”Ýš[™Ð\œ˜^H]ÎÂˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ýš[™Ð\œ˜^JOˆÛ”Ø]™NÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛØ[˜Ù[ÂˆXÙNŽ“X™[]NÂˆXÙNŽ“\Ý›Þ›Û\“\ÝÂˆXÙNŽ•ÙÙÛP]ÛˆØØ[•œÝÐ]Ý\\ÂˆXÙNŽ•^]ÛˆY›Û\‹™[[Ý™Q›Û\‹Ø]™P]Û‹Ø[˜Ù[]ÛŽÂˆÝŽ[š\]YWÜXÙNŽ‘š[PÚÛÜÙ\ˆÚÛÜÙ\ŽÂˆ›ÛÛ\ÕœÝÝ\\Ü[ÛˆH˜[ÙNÂˆÝŽ™[˜Ý[Û›ÚY
+›ÛÛ
+OˆÛ”Ø]™UœÝÝ\\Ü[ÛŽÂŸNÂ‚˜Û\ÜÈÙX\˜Ú]ÕÚ[™ÝÈš[˜[ˆX›XÈXÙNŽ‘ØÝ[Y[Ú[™ÝÂžÂœX›XÎ‚ˆÙX\˜Ú]ÕÚ[™ÝÊÛÛœÝXÙNŽ”Ýš[™ÉˆÚ[™ÝÕ]KXÙNŽ”Ýš[™Ð\œ˜^H]ËˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ýš[™Ð\œ˜^JOˆÛ”Ø]™Kˆ›ÛÛÚÝÕœÝÝ\\Ü[ÛˆH˜[ÙKˆ›ÛÛØØ[•œÝÐ]Ý\\[š]X[HH˜[ÙKˆÝŽ™[˜Ý[Û›ÚY
+›ÛÛ
+OˆØ]™UœÝÝ\\Ü[ÛˆHßJBˆˆØÝ[Y[Ú[™ÝÊÚ[™ÝÕ]KXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŽKÎ
+KXÙNŽ‘ØÝ[Y[Ú[™ÝÎŽ˜ÛÜÙP]ÛŠBˆÂˆÙ]\Ú[™Ó˜]]™U]P˜\ŠYJNÂˆÙ]ÛÛ[ÝÛ™Y
+™]ÈÙX\˜Ú]Y]ÜŠÝŽ›[Ý™J]ÊKÝŽ›[Ý™JÛ”Ø]™JKÝ\×HÈÙ]š\ÚX›J˜[ÙJNÈKˆÚÝÕœÝÝ\\Ü[Û‹ØØ[•œÝÐ]Ý\\[š]X[KˆÝŽ›[Ý™JØ]™UœÝÝ\\Ü[ÛŠJKYJNÂˆÙ]™\Ú^˜X›JYKYJNÂˆÙ[™UÚ]Ú^™JŒŒÎL
+NÂˆB‚ˆ›ÚYÛÜÙP]Û”™\ÜÙY
+
+HÝ™\œšYHÈÙ]š\ÚX›J˜[ÙJNÈBŸNÂ‚˜Û\ÜÈœÝÒ[œÝ[Y[œ›ÝÜÙ\ˆš[˜[ˆX›XÈXÙNŽ‘ØÝ[Y[Ú[™ÝËˆš]˜]HXÙNŽ“\Ý›Þ[Ù[ˆš]˜]HXÙNŽ•[Y\‚žÂœX›XÎ‚ˆœÝÒ[œÝ[Y[œ›ÝÜÙ\ŠXÙNŽ]Y[ÔYÚ[‘›Ü›X]X[˜YÙ\‰ˆ›Ü›X]ËXÙNŽ’Û›ÝÛ”YÚ[“\Ý	ˆÛ›ÝÛ”YÚ[œËˆÝŽ™[˜Ý[ÛXÙNŽ”Ýš[™Ð\œ˜^J
+OˆÙ]ÙX\˜Ú]ËˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÜ[”]Ù][™ÜËˆÝŽ™[˜Ý[Û›ÚY
+ÛÛœÝXÙNŽ”YÚ[‘\ØÜš\[Û‰ŠOˆÛ’[œÙ\
+BˆˆØÝ[Y[Ú[™ÝÊ’[œÙ\”ÕÈ[œÝ[Y[‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŽKÎ
+KˆXÙNŽ‘ØÝ[Y[Ú[™ÝÎŽ˜ÛÜÙP]ÛŠKˆYÚ[‘›Ü›X]Ê›Ü›X]ÊKYÚ[“\Ý
+Û›ÝÛ”YÚ[œÊK™XY]ÊÝŽ›[Ý™JÙ]ÙX\˜Ú]ÊJKˆÚÝÔ]Ù][™ÜÊÝŽ›[Ý™JÜ[”]Ù][™ÜÊJK[œÙ\YÚ[ŠÝŽ›[Ý™JÛ’[œÙ\
+JBˆÂˆÙ]\Ú[™Ó˜]]™U]P˜\ŠYJNÂˆ\ÝœÙ]ÛÛÝ\ŠXÙNŽ“\Ý›ÞŽ˜˜XÚÙÜ›Ý[™ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKÎ
+JNÂˆ\ÝœÙ][Ù[
+\ÊNÂˆ\ÝœÙ]›ÝÒZYÚ
+Í
+NÂˆ\ÝœÙ]][\TÙ[XÝ[Û‘[˜X›Y
+˜[ÙJNÂ‚ˆØØ[]Û‹›ÛÛXÚÈHÝ\×HÈ™YÚ[”ØØ[Š
+NÈNÂˆ]Ð]Û‹›ÛÛXÚÈHÝ\×HÈYˆ
+ÚÝÔ]Ù][™ÜÊHÚÝÔ]Ù][™ÜÊ
+NÈNÂˆ[œÙ\]Û‹›ÛÛXÚÈHÝ\×BˆÂˆÛÛœÝ[Ù[XÝYH\Ý™Ù]Ù[XÝY›ÝÊ
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÙ[XÝY[œÝ[Y[ËœÚ^™J
+JJH™]\›ŽÂˆYˆ
+[œÙ\YÚ[ŠH[œÙ\YÚ[Š[œÝ[Y[Ë™Ù]™Y™\™[˜ÙJÙ[XÝY
+JNÂˆÙ]š\ÚX›J˜[ÙJNÂˆNÂˆÛÜÙP]Û‹›ÛÛXÚÈHÝ\×HÈÙ]š\ÚX›J˜[ÙJNÈNÂˆY[™XZÙUš\ÚX›J	›\Ý
+NÂˆY[™XZÙUš\ÚX›J	œØØ[]ÛŠNÂˆY[™XZÙUš\ÚX›J	œ]Ð]ÛŠNÂˆY[™XZÙUš\ÚX›J	š[œÙ\]ÛŠNÂˆY[™XZÙUš\ÚX›J	˜ÛÜÙP]ÛŠNÂˆY[™XZÙUš\ÚX›J	š[™›Ü›X][ÛŠNÂˆÙ]™\Ú^˜X›JYKYJNÂˆÙ]Ú^™JÌ
+NÂˆ™Yœ™\Ú[œÝ[Y[\Ý
+
+NÂˆB‚ˆ•œÝÒ[œÝ[Y[œ›ÝÜÙ\Š
+HÝ™\œšYHÈÝÜ[Y\Š
+NÈBˆ›ÚYÛÜÙP]Û”™\ÜÙY
+
+HÝ™\œšYHÈÙ]š\ÚX›J˜[ÙJNÈBˆ›ÛÛ™YYÒ[š]X[ØØ[Š
+HÛÛœÝÈ™]\›ˆZ\ÔÝ\YØØ[ŽÈBˆ›ÚYØØ[“›ÝÊ
+HÈ™YÚ[”ØØ[Š
+NÈB‚œš]˜]N‚ˆ[Ù][T›ÝÜÊ
+HÝ™\œšYHÈ™]\›ˆ[œÝ[Y[ËœÚ^™J
+NÈBˆ›ÚYZ[\Ý›Þ][J[›ÝËXÙNŽ‘Ü˜\XÜÉˆË[ÚY[ZYÚ›ÛÛÙ[XÝY
+HÝ™\œšYBˆÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ›ÝË[œÝ[Y[ËœÚ^™J
+JJH™]\›ŽÂˆË™š[[
+Ù[XÝYÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎLLKMÊHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKÎ
+JNÂˆÛÛœÝ]]Éˆ\ØÜš\[ÛˆH[œÝ[Y[Ë™Ù]™Y™\™[˜ÙJ›ÝÊNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŽKŒÍËJJNÂˆËœÙ]›Û
+MŒŠNÂˆË™˜]Õ^
+\ØÜš\[Û‹›˜[YKL‹ÚYHŒZYÚÈ‹XÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMLKMÎNL
+JNÂˆËœÙ]›Û
+LKŒŠNÂˆË™˜]Õ^
+\ØÜš\[Û‹›X[Y˜XÝ\™\“˜[YH
+Èˆ0­È”ÕÈ‹LZYÚÈ‹ÚYHŒˆZYÚÈˆH‹XÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆØÝ[Y[Ú[™ÝÎŽœ™\Ú^™Y
+
+NÂˆ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+Kœ™YXÙY
+LŠNÂˆ]]È]ÛœÈH›Ý[™Ëœ™[[Ý™Qœ›ÛP›ÝÛJÍ
+NÂˆ[™›Ü›X][Û‹œÙ]›Ý[™Ê›Ý[™Ëœ™[[Ý™Qœ›ÛUÜ
+
+JNÂˆ\ÝœÙ]›Ý[™Ê›Ý[™ÊNÂˆØØ[]Û‹œÙ]›Ý[™Ê]ÛœËœ™[[Ý™Qœ›ÛSY
+L
+JNÂˆ]ÛœËœ™[[Ý™Qœ›ÛSY
+
+NÂˆ]Ð]Û‹œÙ]›Ý[™Ê]ÛœËœ™[[Ý™Qœ›ÛSY
+LÌŠJNÂˆ]ÛœËœ™[[Ý™Qœ›ÛSY
+
+NÂˆ[œÙ\]Û‹œÙ]›Ý[™Ê]ÛœËœ™[[Ý™Qœ›ÛTšYÚ
+L
+JNÂˆ]ÛœËœ™[[Ý™Qœ›ÛTšYÚ
+
+NÂˆÛÜÙP]Û‹œÙ]›Ý[™Ê]ÛœËœ™[[Ý™Qœ›ÛTšYÚ
+
+JNÂˆB‚ˆ›ÚY™YÚ[”ØØ[Š
+BˆÂˆÝÜ[Y\Š
+NÂˆØØ[›™\‹œ™\Ù]
+
+NÂˆ\ÔÝ\YØØ[ˆHYNÂˆ]]Êˆ›Ü›X]Hš[™œÝÑ›Ü›X]
+
+NÂˆYˆ
+›Ü›X]OH[ŠBˆÂˆ[™›Ü›X][Û‹œÙ]^
+•”ÕÈÜÝ[™È\È[˜]˜Z[X›H[ˆ\ÈZ[ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆB‚ˆ]]ÈÙX\˜Ú]H›Ü›X]O™Ù]Y˜][ØØ][ÛœÕÔÙX\˜Ú
+
+NÂˆÛÛœÝ]]ÈÛÛ™šYÝ\™Y]ÈH™XY]ÈÈ™XY]Ê
+HˆXÙNŽ”Ýš[™Ð\œ˜^^ßNÂˆ›Üˆ
+ÛÛœÝ]]Éˆ]ˆÛÛ™šYÝ\™Y]ÊBˆÂˆXÙNŽ‘š[H›Û\Š]
+NÂˆYˆ
+›Û\‹š\Ñ\™XÝÜžJ
+JBˆÙX\˜Ú]˜Y
+›Û\ŠNÂˆBˆYˆ
+ÙX\˜Ú]™Ù][T]Ê
+HOH
+BˆÂˆ[™›Ü›X][Û‹œÙ]^
+YÛ™HÜˆ[Ü™H”ÕÈ›Û\œË[ˆØØ[ˆYØZ[‹ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+ÚÝÔ]Ù][™ÜÊHÚÝÔ]Ù][™ÜÊ
+NÂˆ™]\›ŽÂˆB‚ˆÛÛœÝ]]ÈÝ[\HXÙNŽ•[YNŽ™Ù]Ý\œ™[[YJ
+K™›Ü›X]Y
+‰VI[IYIR	SITÈŠNÂˆØØ[“ÙÑš[HHXÙNŽ‘š[NŽ™Ù]ÜXÚX[ØØ][ÛŠXÙNŽ‘š[NŽ\Ù\‘\ÚÝÜ\™XÝÜžJBˆ™Ù]Ú[š[J“Ü˜š]U”ÕËTØØ[‹Hˆ
+ÈÝ[\
+È‹›ÙÈŠNÂˆØØ[“ÙÈHÝŽ›XZÙWÝ[š\]YOXÙNŽ‘š[SÝ]]Ý™X[OŠØØ[“ÙÑš[JNÂˆYˆ
+ØØ[“ÙÈOH[ˆ	‰ˆØØ[“ÙËO›Ü[™YÚÊ
+JBˆÂˆØØ[“ÙËOÜš]U^
+“Ü˜š]”ÕÈØØ[ˆÝ\Yˆˆ
+ÈXÙNŽ•[YNŽ™Ù]Ý\œ™[[YJ
+KÔÝš[™ÊYKYJBˆ
+È—”ÙX\˜Ú›Û\œÈ
+Ý[™\™\ÈÝ\ÝÛJN—ˆ‹˜[ÙK˜[ÙK[ŠNÂˆ›Üˆ
+[HHÈHÙX\˜Ú]™Ù][T]Ê
+NÈ
+ÊÚJBˆØØ[“ÙËOÜš]U^
+ˆˆ
+ÈÙX\˜Ú]ÚWK™Ù][]˜[YJ
+H
+È—ˆ‹˜[ÙK˜[ÙK[ŠNÂˆÛÛœÝ]]È›XÚÛ\ÝYš[\ÈHYÚ[“\Ý™Ù]›XÚÛ\ÝYš[\Ê
+NÂˆØØ[“ÙËOÜš]U^
+—”™]š[Ý\ÛH›XÚÛ\ÝYY\ˆHØØ[ˆÜ˜\Úˆ‚ˆ
+ÈXÙNŽ”Ýš[™Ê›XÚÛ\ÝYš[\ËœÚ^™J
+JH
+È—ˆ‹˜[ÙK˜[ÙK[ŠNÂˆ›Üˆ
+ÛÛœÝ]]Éˆ›XÚÛ\ÝYˆ›XÚÛ\ÝYš[\ÊBˆØØ[“ÙËOÜš]U^
+ˆˆ
+È›XÚÛ\ÝY
+È—ˆ‹˜[ÙK˜[ÙK[ŠNÂˆØØ[“ÙËO™›\Ú
+
+NÂˆB‚ˆ]]ÈXYX[œÔY[HXÙNŽ‘š[NŽ™Ù]ÜXÚX[ØØ][ÛŠXÙNŽ‘š[NŽ\Ù\\XØ][Û‘]Q\™XÝÜžJBˆ™Ù]Ú[š[J“Ü˜š]ŠK™Ù]Ú[š[JœÝË\ØØ[‹YXY[X[œË\Y[ŠNÂˆXYX[œÔY[™Ù]\™[\™XÝÜžJ
+K˜Ü™X]Q\™XÝÜžJ
+NÂˆØØ[›™\ˆHÝŽ›XZÙWÝ[š\]YOXÙNŽ”YÚ[‘\™XÝÜžTØØ[›™\ŠYÚ[“\Ý
+™›Ü›X]ÙX\˜Ú]YKˆXYX[œÔY[˜[ÙJNÂˆ[™›Ü›X][Û‹œÙ]^
+”ØØ[›š[™È”ÕÈ[œÝ[Y[Ë‹‹ˆˆ
+ÈXÙNŽ”Ýš[™ÊÙX\˜Ú]™Ù][T]Ê
+JBˆ
+ÈˆÙX\˜Ú›Û\ŠÊKˆØØ[ˆÙÎˆ\ÚÝÜÈˆ
+ÈØØ[“ÙÑš[K™Ù]š[S˜[YJ
+KˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆØØ[•Ý[Ø[™Y]\ÈH›Ü›X]OœÙX\˜Ú]Ñ›Ü”YÚ[œÊÙX\˜Ú]YK˜[ÙJKœÚ^™J
+NÂˆØØ[ÛÛ\]YØ[™Y]\ÈHÂˆYˆ
+ØØ[“ÙÈOH[ˆ	‰ˆØØ[“ÙËO›Ü[™YÚÊ
+JBˆÂˆØØ[“ÙËOÜš]U^
+—”YÚ[ˆ[™\È›Ý[™ÈÚXÚÎˆˆ
+ÈXÙNŽ”Ýš[™ÊØØ[•Ý[Ø[™Y]\ÊH
+È—ˆ‹ˆ˜[ÙK˜[ÙK[ŠNÂˆØØ[“ÙËO™›\Ú
+
+NÂˆBˆØØ[]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆÝ\[Y\’ŠMJNÂˆB‚ˆ›ÚY[Y\Ø[˜XÚÊ
+HÝ™\œšYBˆÂˆYˆ
+ØØ[›™\ˆOH[ŠHÈÝÜ[Y\Š
+NÈ™]\›ŽÈBˆÛÛœÝ]]ÈÝ\œ™[YÚ[ˆHØØ[›™\‹O™Ù]™^YÚ[‘š[U]Ú[™TØØ[›™Y
+
+NÂˆÙ]Ý\œ™[œÝÔØØ[•\™Ù]
+Ý\œ™[YÚ[ŠNÂˆYˆ
+Ý\œ™[YÚ[‹š\Ó›Ý[\J
+JBˆÂˆ
+ÊÜØØ[ÛÛ\]YØ[™Y]\ÎÂˆ[™›Ü›X][Û‹œÙ]^
+”ØØ[›š[™Èˆ
+ÈXÙNŽ‘š[JÝ\œ™[YÚ[ŠK™Ù]š[S˜[YJ
+Bˆ
+Èˆ
+ˆ
+ÈXÙNŽ”Ýš[™ÊØØ[ÛÛ\]YØ[™Y]\ÊH
+È‹È‚ˆ
+ÈXÙNŽ”Ýš[™ÊØØ[•Ý[Ø[™Y]\ÊH
+ÈŠH‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+ØØ[“ÙÈOH[ˆ	‰ˆØØ[“ÙËO›Ü[™YÚÊ
+JBˆÂˆØØ[“ÙËOÜš]U^
+ÚXÚÚ[™Îˆˆ
+ÈÝ\œ™[YÚ[ˆ
+È—ˆ‹˜[ÙK˜[ÙK[ŠNÂˆØØ[“ÙËO™›\Ú
+
+NÂˆBˆBˆXÙNŽ”Ýš[™ÈÝ\œ™[š[NÂˆÛÛœÝ›ÛÛ[Ü™UÔØØ[ˆHØØ[›™\‹OœØØ[“™^š[JYKÝ\œ™[š[JNÂˆYˆ
+[Ü™UÔØØ[ŠBˆÂˆÛÛœÝ]]È›ÙÜ™\ÜÈHXÙNŽœ›Ý[™Ò[
+ØØ[›™\‹O™Ù]›ÙÜ™\ÜÊ
+H
+ˆLŒŠNÂˆYˆ
+Ý\œ™[YÚ[‹š\Ó›Ý[\J
+H	‰ˆØØ[“ÙÈOH[ˆ	‰ˆØØ[“ÙËO›Ü[™YÚÊ
+JBˆÂˆØØ[“ÙËOÜš]U^
+ÚXÚÙYˆˆ
+ÈÝ\œ™[YÚ[ˆ
+È—ˆ‹˜[ÙK˜[ÙK[ŠNÂˆØØ[“ÙËO™›\Ú
+
+NÂˆBˆ[™›Ü›X][Û‹œÙ]^
+”ØØ[›š[™Èˆ
+ÈXÙNŽ‘š[JÝ\œ™[YÚ[ŠK™Ù]š[S˜[YJ
+Bˆ
+Èˆ
+ˆ
+ÈXÙNŽ”Ýš[™Ê›ÙÜ™\ÜÊH
+È‰HÛÛ\]JH‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆYˆ
+Ý\œ™[YÚ[‹š\Ó›Ý[\J
+H	‰ˆØØ[“ÙÈOH[ˆ	‰ˆØØ[“ÙËO›Ü[™YÚÊ
+JBˆØØ[“ÙËOÜš]U^
+ÚXÚÙYˆˆ
+ÈÝ\œ™[YÚ[ˆ
+È—ˆ‹˜[ÙK˜[ÙK[ŠNÂˆÛÛœÝ]]È˜Z[Yš[\ÈHØØ[›™\‹O™Ù]˜Z[Yš[\Ê
+NÂˆYˆ
+ØØ[“ÙÈOH[ˆ	‰ˆØØ[“ÙËO›Ü[™YÚÊ
+JBˆÂˆØØ[“ÙËOÜš]U^
+—‘˜Z[YYÚ[ˆ[™\Îˆˆ
+ÈXÙNŽ”Ýš[™Ê˜Z[Yš[\ËœÚ^™J
+JH
+È—ˆ‹ˆ˜[ÙK˜[ÙK[ŠNÂˆ›Üˆ
+ÛÛœÝ]]Éˆ˜Z[Yˆ˜Z[Yš[\ÊBˆØØ[“ÙËOÜš]U^
+ˆˆ
+È˜Z[Y
+È—ˆ‹˜[ÙK˜[ÙK[ŠNÂˆØØ[“ÙËOÜš]U^
+—•”ÕÈ[œÝ[Y[È]˜Z[X›HY\ˆØØ[Ž—ˆ‹˜[ÙK˜[ÙK[ŠNÂˆ›Üˆ
+ÛÛœÝ]]Éˆ[œÝ[Y[ˆ[œÝ[Y[ÊBˆØØ[“ÙËOÜš]U^
+ˆˆ
+È[œÝ[Y[›˜[YH
+Èˆ8 %ˆ
+È[œÝ[Y[›X[Y˜XÝ\™\“˜[YH
+È—ˆ‹ˆ˜[ÙK˜[ÙK[ŠNÂˆBˆØØ[›™\‹œ™\Ù]
+
+NÂˆÝÜ[Y\Š
+NÂˆØØ[]Û‹œÙ][˜X›Y
+YJNÂˆ™Yœ™\Ú[œÝ[Y[\Ý
+
+NÂˆ[\ØÛÝ™\™YœÝÕ\\ÈHÂˆ›Üˆ
+ÛÛœÝ]]Éˆ\ØÜš\[ÛˆˆYÚ[“\Ý™Ù]\\Ê
+JBˆYˆ
+\ØÜš\[Û‹œYÚ[‘›Ü›X]˜[YHOH•”ÕÈŠH
+ÊÙ\ØÛÝ™\™YœÝÕ\\ÎÂˆÛÛœÝ]]ÈÝ[[X\žHH—”ØØ[ˆÛÛ\]Kˆ”ÕÈYÚ[œÈ\ØÛÝ™\™Yˆˆ
+ÈXÙNŽ”Ýš[™Ê\ØÛÝ™\™YœÝÕ\\ÊBˆ
+ÈŽÈ[œÝ[Y[È]˜Z[X›Nˆˆ
+ÈXÙNŽ”Ýš[™Ê[œÝ[Y[ËœÚ^™J
+JBˆ
+ÈŽÈ[™\È]˜Z[Yˆˆ
+ÈXÙNŽ”Ýš[™Ê˜Z[Yš[\ËœÚ^™J
+JH
+È—“ÙÎˆˆ
+ÈØØ[“ÙÑš[K™Ù][]˜[YJ
+H
+È—ˆŽÂˆYˆ
+ØØ[“ÙÈOH[ˆ	‰ˆØØ[“ÙËO›Ü[™YÚÊ
+JBˆÂˆØØ[“ÙËOÜš]U^
+Ý[[X\žK˜[ÙK˜[ÙK[ŠNÂˆØØ[“ÙËO™›\Ú
+
+NÂˆØØ[“ÙËœ™\Ù]
+
+NÂˆBˆ[™›Ü›X][Û‹œÙ]^
+‘Û™Kˆˆ
+ÈXÙNŽ”Ýš[™Ê[œÝ[Y[ËœÚ^™J
+JH
+Èˆ”ÕÈ[œÝ[Y[
+ÊH™XYNÈ‚ˆ
+ÈXÙNŽ”Ýš[™Ê˜Z[Yš[\ËœÚ^™J
+JH
+Èˆ[™JÊH˜Z[YˆYÚ[ˆ˜[Y\È\™H[ˆH\ÚÝÜØØ[ˆÙËˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ]Ý\œ™[œÝÔØØ[•\™Ù]
+Š›È”ÕÈYÚ[ˆØØ[ˆØ\ÈXÝ]™JHŠNÂˆB‚ˆXÙNŽ]Y[ÔYÚ[‘›Ü›X]
+ˆš[™œÝÑ›Ü›X]
+
+HÛÛœÝˆÂˆ›Üˆ
+[HHÈHYÚ[‘›Ü›X]Ë™Ù][Q›Ü›X]Ê
+NÈ
+ÊÚJBˆYˆ
+]]Êˆ›Ü›X]HYÚ[‘›Ü›X]Ë™Ù]›Ü›X]
+JNÈ›Ü›X]OH[ˆ	‰ˆ›Ü›X]O™Ù]˜[YJ
+HOH•”ÕÈŠBˆ™]\›ˆ›Ü›X]Âˆ™]\›ˆ[ŽÂˆB‚ˆ›ÚY™Yœ™\Ú[œÝ[Y[\Ý
+
+BˆÂˆ[œÝ[Y[Ë˜ÛX\Š
+NÂˆ›Üˆ
+ÛÛœÝ]]Éˆ\ØÜš\[ÛˆˆYÚ[“\Ý™Ù]\\Ê
+JBˆYˆ
+\ØÜš\[Û‹œYÚ[‘›Ü›X]˜[YHOH•”ÕÈˆ	‰ˆ\ØÜš\[Û‹š\Ò[œÝ[Y[
+Bˆ[œÝ[Y[Ë˜Y
+\ØÜš\[ÛŠNÂˆÝŽœÛÜ
+[œÝ[Y[Ë˜™YÚ[Š
+K[œÝ[Y[Ë™[™
+
+K×JÛÛœÝ]]ÉˆKÛÛœÝ]]ÉˆŠBˆÂˆ™]\›ˆK›˜[YK˜ÛÛ\\™RYÛ›Ü™PØ\ÙJ‹›˜[YJHÂˆJNÂˆ\Ý\]PÛÛ[
+
+NÂˆ[œÙ\]Û‹œÙ][˜X›Y
+Z[œÝ[Y[Ëš\Ñ[\J
+JNÂˆB‚ˆXÙNŽ]Y[ÔYÚ[‘›Ü›X]X[˜YÙ\‰ˆYÚ[‘›Ü›X]ÎÂˆXÙNŽ’Û›ÝÛ”YÚ[“\Ý	ˆYÚ[“\ÝÂˆÝŽ™[˜Ý[ÛXÙNŽ”Ýš[™Ð\œ˜^J
+Oˆ™XY]ÎÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÚÝÔ]Ù][™ÜÎÂˆÝŽ™[˜Ý[Û›ÚY
+ÛÛœÝXÙNŽ”YÚ[‘\ØÜš\[Û‰ŠOˆ[œÙ\YÚ[ŽÂˆXÙNŽ“\Ý›Þ\ÝÈ•”ÕÈ[œÝ[Y[È‹\ßNÂˆXÙNŽ“X™[[™›Ü›X][ÛŽÂˆXÙNŽ•^]ÛˆØØ[]ÛžÈ”ØØ[ˆŸK]Ð]ÛžÈ•”Õ]Ë‹‹ˆŸK[œÙ\]ÛžÈ’[œÙ\ŸKÛÜÙP]ÛžÈÛÜÙHŸNÂˆXÙNŽ\œ˜^OXÙNŽ”YÚ[‘\ØÜš\[Ûˆ[œÝ[Y[ÎÂˆÝŽ[š\]YWÜXÙNŽ”YÚ[‘\™XÝÜžTØØ[›™\ˆØØ[›™\ŽÂˆXÙNŽ‘š[HØØ[“ÙÑš[NÂˆÝŽ[š\]YWÜXÙNŽ‘š[SÝ]]Ý™X[OˆØØ[“ÙÎÂˆ[ØØ[•Ý[Ø[™Y]\ÈHÂˆ[ØØ[ÛÛ\]YØ[™Y]\ÈHÂˆ›ÛÛ\ÔÝ\YØØ[ˆH˜[ÙNÂŸNÂ‚˜Û\ÜÈ^[\ÝÜšYš[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆÝ]XÈÛÛœÝ^ˆ[˜\ÛÝ[HLLŽÂˆ^[\ÝÜšY
+
+BˆÂˆ›ÛÛSÝ]œÙ]]Û•^
+’HŠNÂˆ›ÛÛSÝ]œÙ]ÛÛ\
+–›ÛÛHÝ][ˆH^[\ÝˆŠNÂˆ›ÛÛSÝ]›ÛÛXÚÈHÝ\×HÈÙ]Üš^›Û[›ÛÛJÜš^›Û[›ÛÛHHŒYŠNÈNÂˆY[™XZÙUš\ÚX›J›ÛÛSÝ]
+NÂˆ›ÛÛR[‹œÙ]]Û•^
+ŠÈŠNÂˆ›ÛÛR[‹œÙ]ÛÛ\
+–›ÛÛH[ˆ[ˆH^[\ÝˆŠNÂˆ›ÛÛR[‹›ÛÛXÚÈHÝ\×HÈÙ]Üš^›Û[›ÛÛJÜš^›Û[›ÛÛH
+ÈŒYŠNÈNÂˆY[™XZÙUš\ÚX›J›ÛÛR[ŠNÂˆ™\XØ[›ÛÛSÝ]œÙ]]Û•^
+•‹HŠNÂˆ™\XØ[›ÛÛSÝ]œÙ]ÛÛ\
+”™YXÙH^[\Ý˜XÚÈZYÚˆŠNÂˆ™\XØ[›ÛÛSÝ]›ÛÛXÚÈHÝ\×HÈÙ]™\XØ[›ÛÛJ™\XØ[›ÛÛHHŒYŠNÈNÂˆY[™XZÙUš\ÚX›J™\XØ[›ÛÛSÝ]
+NÂˆ™\XØ[›ÛÛR[‹œÙ]]Û•^
+•ŠÈŠNÂˆ™\XØ[›ÛÛR[‹œÙ]ÛÛ\
+’[˜Ü™X\ÙH^[\Ý˜XÚÈZYÚˆŠNÂˆ™\XØ[›ÛÛR[‹›ÛÛXÚÈHÝ\×HÈÙ]™\XØ[›ÛÛJ™\XØ[›ÛÛH
+ÈŒYŠNÈNÂˆY[™XZÙUš\ÚX›J™\XØ[›ÛÛR[ŠNÂˆ[˜Ú[ÛÛœÙ]]Û•^
+‘˜]ÈŠNÂˆ[˜Ú[ÛÛœÙ]ÛÛ\
+‘˜]ÈÛÛˆÛXÚÈÜˆ˜YÈÈXÙHHÙ[XÝY]\›‹™\XÚ[™ÈHÛ\Ú[ˆ™YYYˆŠNÂˆ[˜Ú[ÛÛœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆ[˜Ú[ÛÛœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LÌ‹MÍ
+JNÂˆY[™XZÙUš\ÚX›J[˜Ú[ÛÛ
+NÂˆÙ[XÝÛÛœÙ]]Û•^
+“[Ý™HŠNÂˆÙ[XÝÛÛœÙ]ÛÛ\
+”Ù[XÝ[ÛˆÛÛˆ˜YÈÛ\ÈÈ[Ý™H[KˆŠNÂˆÙ[XÝÛÛœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆY[™XZÙUš\ÚX›JÙ[XÝÛÛ
+NÂˆ[˜Ú[ÛÛœÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[˜Ú[ÛÛ›ÛÛXÚÈHÝ\×HÈ[˜Ú[ÛÛœÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÈÙ[XÝÛÛœÙ]ÙÙÛTÝ]J˜[ÙKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÈYˆ
+Û•ÛÛÚ[™ÙY
+HÛ•ÛÛÚ[™ÙY
+YJNÈNÂˆÙ[XÝÛÛ›ÛÛXÚÈHÝ\×HÈ[˜Ú[ÛÛœÙ]ÙÙÛTÝ]J˜[ÙKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÈÙ[XÝÛÛœÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÈYˆ
+Û•ÛÛÚ[™ÙY
+HÛ•ÛÛÚ[™ÙY
+˜[ÙJNÈNÂˆËÈHÛÛ›ÛÈ\™HÜÝY[ˆHš^Y^[\ÝÛÛ˜\ˆÛÈ^HÝ^BˆËÈ™XXÚX›HÚ[HH[Y[[™H]Ù[ˆ\ÈØÜ›ÛY‚ˆ›Üˆ
+]]ÊˆÛÛ›ÛˆÈ	ž›ÛÛSÝ]	ž›ÛÛR[‹	™\XØ[›ÛÛSÝ]	™\XØ[›ÛÛR[‹	œ[˜Ú[ÛÛ	œÙ[XÝÛÛJBˆÛÛ›ÛOœÙ]š\ÚX›J˜[ÙJNÂˆB‚ˆ[X™[ÚY
+
+HÛÛœÝÈ™]\›ˆNLÈBˆ[XY\’ZYÚ
+
+HÛÛœÝÈ™]\›ˆÍÈBˆ[›ÝÒZYÚ
+
+HÛÛœÝÈ™]\›ˆXÙNŽœ›Ý[™Ò[
+‹Œˆ
+ˆ™\XØ[›ÛÛJNÈBˆ[˜\•ÚY
+
+HÛÛœÝÈ™]\›ˆXÙNŽš›X^
+XÙNŽœ›Ý[™Ò[
+L‹Œˆ
+ˆÜš^›Û[›ÛÛJJNÈBˆ[ÛÛ[ÚY
+
+HÛÛœÝÈ™]\›ˆX™[ÚY
+
+H
+È˜\ÛÝ[
+ˆ˜\•ÚY
+
+NÈBˆ[ÛÛ[ZYÚ
+
+HÛÛœÝÈ™]\›ˆXY\’ZYÚ
+
+H
+ÈXÙNŽš›X^
+K˜XÚÐÛÝ[È˜XÚÐÛÝ[
+
+Hˆ
+H
+ˆ›ÝÒZYÚ
+
+NÈBˆ›Ø]Ý\œ™[Üš^›Û[›ÛÛJ
+HÛÛœÝÈ™]\›ˆÜš^›Û[›ÛÛNÈBˆ›Ø]Ý\œ™[™\XØ[›ÛÛJ
+HÛÛœÝÈ™]\›ˆ™\XØ[›ÛÛNÈBˆ›ÚYÙ]^ZXYÜÚ][ÛŠÝX›HÙXÛÛ™ËÝX›HœK›ÛÛXÝ]™JBˆÂˆ^ZXYš\ÚX›HHXÝ]™NÂˆ^ZXYHX™[ÚY
+
+H
+È
+ÙXÛÛ™ÈÈ
+ŒÈXÙNŽš›X^
+ŒŒœJJJH
+ˆ˜\•ÚY
+
+NÂˆ™\Z[
+
+NÂˆB‚ˆ›ÚYÙ]ÛÜ˜[™ÙJ[Ý\˜\‹[[™Ý˜\œË›ÛÛ[˜X›Y
+BˆÂˆÛÜÝ\˜\ˆHXÙNŽš›X^
+KÝ\˜\ŠNÂˆÛÜ[™Ý˜\œÈHXÙNŽš›X^
+K[™Ý˜\œÊNÂˆÛÜ˜[™ÙQ[˜X›YH[˜X›YÂˆ™\Z[
+
+NÂˆB‚ˆ›ÚYÙ]Üš^›Û[›ÛÛJ›Ø]™^›ÛÛJBˆÂˆÜš^›Û[›ÛÛHHXÙNŽš›[Z]
+ŒÍY‹KMY‹™^›ÛÛJNÂˆ™Yœ™\Ú^[Ý]
+
+NÂˆB‚ˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÙ]ÛÜ˜[™ÙQœ›ÛT[\ŽÂ‚ˆ›ÚYÙ]™\XØ[›ÛÛJ›Ø]™^›ÛÛJBˆÂˆ™\XØ[›ÛÛHHXÙNŽš›[Z]
+Y‹KY‹™^›ÛÛJNÂˆ™Yœ™\Ú^[Ý]
+
+NÂˆB‚ˆ›ÚYÙ]˜]Ó[ÙJ›ÛÛÚÝ[˜]ÊBˆÂˆ[˜Ú[ÛÛœÙ]ÙÙÛTÝ]JÚÝ[˜]ËXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[XÝÛÛœÙ]ÙÙÛTÝ]J\ÚÝ[˜]ËXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+Û•ÛÛÚ[™ÙY
+HÛ•ÛÛÚ[™ÙY
+ÚÝ[˜]ÊNÂˆB‚ˆ›ÚY™Yœ™\Ú^[Ý]
+
+BˆÂˆYˆ
+Û–›ÛÛPÚ[™ÙY
+HÛ–›ÛÛPÚ[™ÙY
+
+NÂˆBˆ›ÚYÙ]šY]ÜÜ\™XJXÙNŽ”™XÝ[™ÛO[ˆ\™XJBˆÂˆš\ÚX›P\™XHH\™XNÂˆ™Yœ™\ÚÙ[]ÛœÊ
+NÂˆBˆ›ÛÛ[˜Ú[XÝ]™J
+HÛÛœÝÈ™]\›ˆ[˜Ú[ÛÛ™Ù]ÙÙÛTÝ]J
+NÈBˆ›ÛÛ\Ð]]ÛX][Û“[ÙJ
+HÛÛœÝÈ™]\›ˆ]]ÛX][Û“[ÙNÈBˆ›ÚYÙ]]]ÛX][Û“[ÙJ›ÛÛ[˜X›Y
+HÈ]]ÛX][Û“[ÙHH[˜X›YÈ™\Z[
+
+NÈ™Yœ™\ÚÙ[]ÛœÊ
+NÈB‚ˆÝŽ™[˜Ý[Û›ÚY
+›ÛÛ
+OˆÛ•ÛÛÚ[™ÙYÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ”Z[š[š\ÚYÂˆÝŽ™[˜Ý[Û›ÛÛ
+
+Oˆ\Ô[˜Ú[ÛÛXÝ]™NÂˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ]˜XÚÓ]]NÂˆÝŽ™[˜Ý[Û›ÛÛ
+[
+OˆÙ]˜XÚÓ]]NÂˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ]˜XÚÔÛÛÎÂˆÝŽ™[˜Ý[Û›ÛÛ
+[
+OˆÙ]˜XÚÔÛÛÎÂˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ]˜XÚÔ™XÛÜ™\›NÂˆÝŽ™[˜Ý[Û›ÛÛ
+[
+OˆÙ]˜XÚÔ™XÛÜ™\›NÂ‚ˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ–›ÛÛPÚ[™ÙYÂˆÝŽ™[˜Ý[Û[
+
+Oˆ˜XÚÐÛÝ[ÂˆÝŽ™[˜Ý[ÛXÙNŽ”Ýš[™Ê[
+Oˆ˜XÚÓ˜[YNÂˆÝŽ™[˜Ý[ÛXÙNŽ”Ýš[™Ê[[
+OˆÛ\˜[YNÂˆÝŽ™[˜Ý[ÛÝŽ™XÝÜXÙNŽ”Ú[[Š[[
+OˆÛ\›Ý\ÎÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÙ[ÛXÚÙYÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÙ[Z[YÂˆÝŽ™[˜Ý[Û›ÚY
+[[[[
+OˆÛ\˜YÙÙYÂˆÝŽ™[˜Ý[Û›ÚY
+[[XÙNŽÛÛ\Û™[
+ŠOˆÚÝÔ]\›“Y[NÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÙ[[]YÂˆÝŽ™[˜Ý[Û›ÚY
+[[[
+OˆØÜ›Û]\›ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[XÙNŽÛÛ\Û™[
+ŠOˆ˜XÚÐÛÛ^Y[NÂˆÝŽ™[˜Ý[ÛXÙNŽÛÛÝ\Š[
+OˆÙ]˜XÚÐÛÛÝ\ŽÂˆÝŽ™[˜Ý[Û›Ø]
+[[
+OˆÙ]ÛÛ™Ð]]ÛX][Û•˜[YNÂˆÝŽ™[˜Ý[Û›ÚY
+[[›Ø]
+OˆÙ]ÛÛ™Ð]]ÛX][Û”Ú[Â‚œš]˜]N‚ˆ›Ø]Üš^›Û[›ÛÛHHKŒŽÂˆ›Ø]™\XØ[›ÛÛHHKŒŽÂˆXÙNŽ•^]Ûˆ›ÛÛSÝ]›ÛÛR[‹™\XØ[›ÛÛSÝ]™\XØ[›ÛÛR[‹[˜Ú[ÛÛÙ[XÝÛÛÂˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆÛÛœÝ]]ÈHXY\’ZYÚ
+
+NÂˆ[˜Ú[ÛÛœÙ]›Ý[™ÊKXÙNŽš›X^
+ŒH
+JNÂˆÙ[XÝÛÛœÙ]›Ý[™ÊËXÙNŽš›X^
+ŒH
+JNÂˆ›ÛÛSÝ]œÙ]]Û•^
+’HŠNÂˆ›ÛÛR[‹œÙ]]Û•^
+’
+ÈŠNÂˆ›ÛÛSÝ]œÙ]›Ý[™ÊX™[ÚY
+
+HHLL‹KXÙNŽš›X^
+ŒH
+JNÂˆ›ÛÛR[‹œÙ]›Ý[™ÊX™[ÚY
+
+HH‹KXÙNŽš›X^
+ŒH
+JNÂˆ›ÛÛSÝ]œÙ]]Û•^
+’HŠNÂˆ™\XØ[›ÛÛSÝ]œÙ]]Û•^
+•‹HŠNÂˆ™\XØ[›ÛÛSÝ]œÙ]›Ý[™ÊX™[ÚY
+
+HHNKŽKXÙNŽš›X^
+ŒH
+JNÂˆ™\XØ[›ÛÛR[‹œÙ]›Ý[™ÊX™[ÚY
+
+HHŽKKXÙNŽš›X^
+ŒH
+JNÂˆB‚œX›XÎ‚‚ˆÛ\ÜÈ^[\ÝÙ[]Ûˆš[˜[ˆX›XÈXÙNŽ•^]Û‚ˆÂˆX›XÎ‚ˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛXÝ]˜]NÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÛ‘˜YÕÐÙ[ÂˆÝŽ™[˜Ý[Û›ÚY
+[[XÙNŽÛÛ\Û™[
+ŠOˆÛ”]\›“Y[NÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÛ‘[]PÛ\ÂˆÝŽ™[˜Ý[Û›ÚY
+[[[
+OˆÛ”]\›”ØÜ›ÛÂˆÝŽ™[˜Ý[Û›ÛÛ
+
+Oˆ[˜Ú[[ÙNÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆZ[Ù[ÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆZ[š[š\ÚYÂˆÝŽ™[˜Ý[Û›ÛÛ
+
+OˆÛÝ\˜ÙR\ÐÛ\ÂˆÝŽ™[˜Ý[Û›ÛÛ
+
+Oˆ]]ÛX][Û“[ÙNÂˆÝŽ™[˜Ý[Û›Ø]
+[[
+OˆÙ]]]ÛX][Û•˜[YNÂˆÝŽ™[˜Ý[Û›ÚY
+[[›Ø]
+OˆÙ]]]ÛX][Û•˜[YNÂˆ[˜\•ÚY›Ü‘˜YÈHLŽÂˆ[›ÝÒZYÚ›Ü‘˜YÈHŽÂ‚ˆ^[\ÝÙ[]ÛŠ
+BˆÂˆÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\œÎŽ˜[œÜ\™[›XÚÊNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\œÎŽ˜[œÜ\™[›XÚÊNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\œÎŽ˜[œÜ\™[›XÚÊNÂˆÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YXÙNŽÛÛÝ\œÎŽ˜[œÜ\™[›XÚÊNÂˆÛÛXÚÈHÝ\×BˆÂˆYˆ
+]]ÛX][Û“[ÙH	‰ˆ]]ÛX][Û“[ÙJ
+JH™]\›ŽÂˆYˆ
+Y˜YÑÙ\Ý\™H	‰ˆ[˜Ú[[ÙH	‰ˆ[˜Ú[[ÙJ
+JBˆÂˆYˆ
+ÛÝ\˜ÙR\ÐÛ\	‰ˆÛÝ\˜ÙR\ÐÛ\
+
+JBˆÂˆYˆ
+ÛXÝ]˜]JHÛXÝ]˜]J
+NÂˆBˆ[ÙHYˆ
+Z[Ù[
+HZ[Ù[
+˜XÚÒ[™^˜\’[™^
+NÂˆBˆ[ÙHYˆ
+Y˜YÑÙ\Ý\™H	‰ˆÛXÝ]˜]JHÛXÝ]˜]J
+NÂˆNÂˆB‚ˆ›ÚYÛÛ™šYÝ\™J[˜XÚË[˜\‹ÛÛœÝXÙNŽ”Ýš[™Éˆ˜XÚÓX™[ˆÛÛœÝXÙNŽ”Ýš[™ÉˆÝ\œ™[Û\ˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆXÝ]˜]KˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆZ[ˆÝŽ™[˜Ý[Û›ÚY
+
+Oˆš[š\ÚZ[ˆÝŽ™[˜Ý[Û›ÛÛ
+
+Oˆ[˜Ú[ˆÝŽ™[˜Ý[Û›ÚY
+[[[[
+Oˆ˜YËˆ[ØØ[Y˜\•ÚY[ØØ[Y›ÝÒZYÚˆÝŽ™[˜Ý[Û›ÛÛ
+
+Oˆ]]ÛX][Û“[ÙQ›‹ˆÝŽ™[˜Ý[Û›Ø]
+[[
+OˆÙ]]]ÛX][Û‹ˆÝŽ™[˜Ý[Û›ÚY
+[[›Ø]
+OˆÙ]]]ÛX][ÛŠBˆÂˆ˜\’[™^H˜\ŽÂˆ˜XÚÒ[™^H˜XÚÎÂˆ˜\•ÚY›Ü‘˜YÈHØØ[Y˜\•ÚYÂˆ›ÝÒZYÚ›Ü‘˜YÈHØØ[Y›ÝÒZYÚÂˆ˜YÑÙ\Ý\™HH˜[ÙNÂˆÛXÝ]˜]HHØXÝ]˜]PØ[˜XÚÈHÝŽ›[Ý™JXÝ]˜]JK˜XÚË˜\—BˆÂˆYˆ
+XÝ]˜]PØ[˜XÚÊHXÝ]˜]PØ[˜XÚÊ˜XÚË˜\ŠNÂˆNÂˆÛ‘˜YÕÐÙ[HÙ˜YÐØ[˜XÚÈHÝŽ›[Ý™J˜YÊK˜XÚË˜\—J[\Ý[˜][Û•˜XÚË[\Ý[˜][Û˜\ŠBˆÂˆYˆ
+˜YÐØ[˜XÚÊH˜YÐØ[˜XÚÊ˜XÚË˜\‹\Ý[˜][Û•˜XÚË\Ý[˜][Û˜\ŠNÂˆNÂˆZ[Ù[HÝŽ›[Ý™JZ[
+NÂˆZ[š[š\ÚYHÝŽ›[Ý™Jš[š\ÚZ[
+NÂˆ[˜Ú[[ÙHHÝŽ›[Ý™J[˜Ú[
+NÂˆ]]ÛX][Û“[ÙHHÝŽ›[Ý™J]]ÛX][Û“[ÙQ›ŠNÂˆÙ]]]ÛX][Û•˜[YHHÝŽ›[Ý™JÙ]]]ÛX][ÛŠNÂˆÙ]]]ÛX][Û•˜[YHHÝŽ›[Ý™JÙ]]]ÛX][ÛŠNÂˆÛÝ\˜ÙR\ÐÛ\HØÝ\œ™[Û\HÈ™]\›ˆÝ\œ™[Û\š\Ó›Ý[\J
+NÈNÂˆÛÛœÝ]]È˜\“X™[H˜\ˆˆ
+ÈXÙNŽ”Ýš[™Ê˜\ˆ
+ÈJNÂˆÙ]]Û•^
+Ý\œ™[Û\š\Ó›Ý[\J
+HÈÝ\œ™[Û\ˆ˜\“X™[
+NÂˆÙ]]J˜XÚÓX™[
+È‹ˆ
+È˜\“X™[
+NÂˆÙ]\ØÜš\[ÛŠÝ\œ™[Û\š\Ó›Ý[\J
+BˆÈÛÛZ[œÈ]\›ˆˆ
+ÈÝ\œ™[Û\
+È‹ˆ˜YÈ]È[Ý™HHÛ\ˆ‚ˆˆ‘[\H^[\ÝÙ[ˆXÝ]˜]HÈXÙHHÙ[XÝY]\›ˆ\™KˆŠNÂˆÙ]ÛÛ\
+˜XÚÓX™[
+È‹ˆ
+È˜\“X™[
+È
+Ý\œ™[Û\š\Ó›Ý[\J
+BˆÈˆ8 %ˆ
+ÈÝ\œ™[Û\ˆˆ8 %[\NÈXÝ]˜]HÈXÙHHÙ[XÝY]\›ˆŠJNÂˆB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+Y]™[›[ÙËš\ÔšYÚ]Û‘ÝÛŠ
+H	‰ˆ]]ÛX][Û“[ÙH	‰ˆ]]ÛX][Û“[ÙJ
+JBˆÂˆ]]ÛX][Û‘Ù\Ý\™HHYNÂˆÜš]P]]ÛX][Û”Ú[
+]™[
+NÂˆ™]\›ŽÂˆBˆYˆ
+]™[›[ÙËš\ÔšYÚ]Û‘ÝÛŠ
+H]™[›[ÙËš\ÔÜ\Y[J
+JBˆÂˆYˆ
+ÛÝ\˜ÙR\ÐÛ\	‰ˆÛÝ\˜ÙR\ÐÛ\
+
+H	‰ˆÛ‘[]PÛ\
+BˆÛ‘[]PÛ\
+˜XÚÒ[™^˜\’[™^
+NÂˆšYÚ\˜\ÙQÙ\Ý\™HHYNÂˆšYÚÛXÚÒ[™YHYNÂˆ\Ý\˜\ÙY˜XÚÈH˜XÚÒ[™^Âˆ\Ý\˜\ÙY˜\ˆH˜\’[™^Âˆ™]\›ŽÂˆBˆ˜YÑÙ\Ý\™HH˜[ÙNÂˆ˜YÔÛÝ\˜ÙR\ÐÛ\HÛÝ\˜ÙR\ÐÛ\	‰ˆÛÝ\˜ÙR\ÐÛ\
+
+NÂˆXÙNŽ•^]ÛŽŽ›[Ý\ÙQÝÛŠ]™[
+NÂˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+]]ÛX][Û‘Ù\Ý\™JBˆÂˆÜš]P]]ÛX][Û”Ú[
+]™[
+NÂˆ™]\›ŽÂˆBˆYˆ
+šYÚ\˜\ÙQÙ\Ý\™JBˆÂˆYˆ
+]™[™Ù]\Ý[˜ÙQœ›ÛQ˜YÔÝ\
+
+HH	‰ˆÛ‘[]PÛ\
+BˆÂˆÛÛœÝ]]ÈÚ[[‘ÜšYH]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][ÛŽÂˆÛÛœÝ]]ÊˆÜšYH[˜[ZX×ØØ\ÝÛÛœÝ^[\ÝÜšY
+ŠÙ]\™[ÛÛ\Û™[
+
+JNÂˆÛÛœÝ[\Ý[˜][Û•˜XÚÈHÜšYOH[‚ˆÈÝ]X×ØØ\Ý[Š
+Ú[[‘ÜšYžHHÜšYOšXY\’ZYÚ
+
+JHÈ›ÝÒZYÚ›Ü‘˜YÊHˆLNÂˆÛÛœÝ[\Ý[˜][Û˜\ˆHÜšYOH[‚ˆÈÝ]X×ØØ\Ý[Š
+Ú[[‘ÜšYžHÜšYO›X™[ÚY
+
+JHÈ˜\•ÚY›Ü‘˜YÊHˆLNÂˆYˆ
+\Ý[˜][Û•˜XÚÈH	‰ˆ\Ý[˜][Û˜\ˆHˆ	‰ˆ
+\Ý[˜][Û•˜XÚÈOH\Ý\˜\ÙY˜XÚÈ\Ý[˜][Û˜\ˆOH\Ý\˜\ÙY˜\ŠJBˆÂˆÛ‘[]PÛ\
+\Ý[˜][Û•˜XÚË\Ý[˜][Û˜\ŠNÂˆ\Ý\˜\ÙY˜XÚÈH\Ý[˜][Û•˜XÚÎÂˆ\Ý\˜\ÙY˜\ˆH\Ý[˜][Û˜\ŽÂˆBˆBˆ™]\›ŽÂˆBˆYˆ
+]™[™Ù]\Ý[˜ÙQœ›ÛQ˜YÔÝ\
+
+HH
+BˆÂˆYˆ
+[˜Ú[[ÙH	‰ˆ[˜Ú[[ÙJ
+JBˆÂˆ˜YÑÙ\Ý\™HHYNÂˆYˆ
+Z[Ù[
+HZ[Ù[
+˜XÚÒ[™^˜\’[™^
+NÂˆÛÛœÝ]]ÈÚ[[‘ÜšYH]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][ÛŽÂˆÛÛœÝ]]ÊˆÜšYH[˜[ZX×ØØ\ÝÛÛœÝ^[\ÝÜšY
+ŠÙ]\™[ÛÛ\Û™[
+
+JNÂˆÛÛœÝ[\Ý[˜][Û•˜XÚÈHÜšYOH[‚ˆÈÝ]X×ØØ\Ý[Š
+Ú[[‘ÜšYžHHÜšYOšXY\’ZYÚ
+
+JHÈ›ÝÒZYÚ›Ü‘˜YÊHˆLNÂˆÛÛœÝ[\Ý[˜][Û˜\ˆHÜšYOH[‚ˆÈÝ]X×ØØ\Ý[Š
+Ú[[‘ÜšYžHÜšYO›X™[ÚY
+
+JHÈ˜\•ÚY›Ü‘˜YÊHˆLNÂˆYˆ
+\Ý[˜][Û•˜XÚÈH	‰ˆ\Ý[˜][Û˜\ˆH	‰ˆZ[Ù[
+BˆZ[Ù[
+\Ý[˜][Û•˜XÚË\Ý[˜][Û˜\ŠNÂˆBˆ[ÙHYˆ
+˜YÔÛÝ\˜ÙR\ÐÛ\
+H˜YÑÙ\Ý\™HHYNÂˆBˆXÙNŽ•^]ÛŽŽ›[Ý\ÙQ˜YÊ]™[
+NÂˆB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+]]ÛX][Û‘Ù\Ý\™JBˆÂˆ]]ÛX][Û‘Ù\Ý\™HH˜[ÙNÂˆYˆ
+Z[š[š\ÚY
+HZ[š[š\ÚY
+
+NÂˆ™]\›ŽÂˆBˆYˆ
+šYÚÛXÚÒ[™Y
+BˆÂˆšYÚÛXÚÒ[™YH˜[ÙNÂˆšYÚ\˜\ÙQÙ\Ý\™HH˜[ÙNÂˆ\Ý\˜\ÙY˜XÚÈH\Ý\˜\ÙY˜\ˆHLNÂˆ™]\›ŽÂˆBˆÛÛœÝ]]ÈÚ[[‘ÜšYH]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][ÛŽÂˆÛÛœÝ]]ÊˆÜšYH[˜[ZX×ØØ\ÝÛÛœÝ^[\ÝÜšY
+ŠÙ]\™[ÛÛ\Û™[
+
+JNÂˆÛÛœÝ[\Ý[˜][Û•˜XÚÈHÜšYOH[‚ˆÈÝ]X×ØØ\Ý[Š
+Ú[[‘ÜšYžHHÜšYOšXY\’ZYÚ
+
+JHÈ›ÝÒZYÚ›Ü‘˜YÊHˆLNÂˆÛÛœÝ[\Ý[˜][Û˜\ˆHÜšYOH[‚ˆÈÝ]X×ØØ\Ý[Š
+Ú[[‘ÜšYžHÜšYO›X™[ÚY
+
+JHÈ˜\•ÚY›Ü‘˜YÊHˆLNÂˆÛÛœÝ›ÛÛÚÝ[[Ý™HH˜YÑÙ\Ý\™H	‰ˆ˜YÔÛÝ\˜ÙR\ÐÛ\	‰ˆJ[˜Ú[[ÙH	‰ˆ[˜Ú[[ÙJ
+JBˆ	‰ˆ\Ý[˜][Û•˜XÚÈH	‰ˆ\Ý[˜][Û˜\ˆHÂˆXÙNŽ•^]ÛŽŽ›[Ý\ÙU\
+]™[
+NÂˆYˆ
+ÚÝ[[Ý™H	‰ˆÛ‘˜YÕÐÙ[
+BˆÛ‘˜YÕÐÙ[
+\Ý[˜][Û•˜XÚË\Ý[˜][Û˜\ŠNÂˆYˆ
+[˜Ú[[ÙH	‰ˆ[˜Ú[[ÙJ
+H	‰ˆZ[š[š\ÚY
+HZ[š[š\ÚY
+
+NÂˆ˜YÑÙ\Ý\™HH˜[ÙNÂˆ˜YÔÛÝ\˜ÙR\ÐÛ\H˜[ÙNÂˆB‚ˆ›ÚY[Ý\ÙQÝX›PÛXÚÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+ÛÝ\˜ÙR\ÐÛ\	‰ˆÛÝ\˜ÙR\ÐÛ\
+
+H	‰ˆÛ”]\›“Y[JBˆÛ”]\›“Y[J˜XÚÒ[™^˜\’[™^\ÊNÂˆXÙNŽ•^]ÛŽŽ›[Ý\ÙQÝX›PÛXÚÊ]™[
+NÂˆB‚ˆ›ÚY[Ý\ÙUÚY[[Ý™JÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[ÛÛœÝXÙNŽ“[Ý\ÙUÚY[]Z[ÉˆÚY[
+HÝ™\œšYBˆÂˆYˆ
+ÛÝ\˜ÙR\ÐÛ\	‰ˆÛÝ\˜ÙR\ÐÛ\
+
+H	‰ˆÛ”]\›”ØÜ›Û	‰ˆÝŽ˜XœÊÚY[™[VJHˆŒYŠBˆÛ”]\›”ØÜ›Û
+˜XÚÒ[™^˜\’[™^ÚY[™[VHˆŒˆÈLHˆJNÂˆ[ÙBˆXÙNŽ•^]ÛŽŽ›[Ý\ÙUÚY[[Ý™J]™[ÚY[
+NÂˆB‚ˆš]˜]N‚ˆ›ÚYÜš]P]]ÛX][Û”Ú[
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+BˆÂˆYˆ
+\Ù]]]ÛX][Û•˜[YJH™]\›ŽÂˆÛÛœÝ]]ÈÚ[H]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][Û‹Ò[
+
+NÂˆ]]ÊˆÜšYH[˜[ZX×ØØ\Ý^[\ÝÜšY
+ŠÙ]\™[ÛÛ\Û™[
+
+JNÂˆYˆ
+ÜšYOH[ŠH™]\›ŽÂˆÛÛœÝ]]È›ÝÈH
+Ú[žHHÜšYOšXY\’ZYÚ
+
+JHÈ›ÝÒZYÚ›Ü‘˜YÎÂˆÛÛœÝ]]È˜\ˆH
+Ú[žHÜšYO›X™[ÚY
+
+JHÈ˜\•ÚY›Ü‘˜YÎÂˆYˆ
+›ÝÈ˜\ˆ
+H™]\›ŽÂˆÛÛœÝ]]ÈÙ[H
+Ú[žHÜšYO›X™[ÚY
+
+JH	H˜\•ÚY›Ü‘˜YÎÂˆÛÛœÝ]]ÈÙ[HH
+Ú[žHHÜšYOšXY\’ZYÚ
+
+JH	H›ÝÒZYÚ›Ü‘˜YÎÂˆÛÛœÝ]]ÈÝXœÝ\HXÙNŽš›[Z]
+MKÙ[
+ˆMˆÈ˜\•ÚY›Ü‘˜YÊNÂˆÛÛœÝ]]È˜[YHHKŒˆHXÙNŽš›[Z]
+Œ‹KŒ‹ˆÝ]X×ØØ\Ý›Ø]ŠÙ[JHÈÝ]X×ØØ\Ý›Ø]ŠXÙNŽš›X^
+K›ÝÒZYÚ›Ü‘˜YÊJJNÂˆÙ]]]ÛX][Û•˜[YJ›ÝË˜\ˆ
+ˆMˆ
+ÈÝXœÝ\˜[YJNÂˆÜšYOœ™\Z[
+
+NÂˆB‚ˆ[˜\’[™^HLNÂˆ[˜XÚÒ[™^HLNÂˆ›ÛÛ˜YÑÙ\Ý\™HH˜[ÙNÂˆ›ÛÛ]]ÛX][Û‘Ù\Ý\™HH˜[ÙNÂˆ›ÛÛ˜YÔÛÝ\˜ÙR\ÐÛ\H˜[ÙNÂˆ›ÛÛšYÚÛXÚÒ[™YH˜[ÙNÂˆ›ÛÛšYÚ\˜\ÙQÙ\Ý\™HH˜[ÙNÂˆ[\Ý\˜\ÙY˜XÚÈHLNÂˆ[\Ý\˜\ÙY˜\ˆHLNÂˆNÂ‚ˆÛ\ÜÈ˜XÚÐÛÛ›ÛÈš[˜[ˆX›XÈXÙNŽÛÛ\Û™[ˆÂˆX›XÎ‚ˆXÙNŽ•^]Ûˆ]]HÈ“HˆKÛÛÈÈ”ÈˆK™XÛÜ™È”ˆˆNÂˆ˜XÚÐÛÛ›ÛÊ
+BˆÂˆ›Üˆ
+]]Êˆ]ÛˆˆÈ	›]]K	œÛÛË	œ™XÛÜ™JBˆÂˆ]Û‹OœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍKLKŒŠJNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÌ‹ŠJNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNMËŒMŒ
+JNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆY[™XZÙUš\ÚX›J
+˜]ÛŠNÂˆBˆBˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆ]]È\™XHHÙ]ØØ[›Ý[™Ê
+Kœ™YXÙY
+KJNÂˆ]]KœÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛSY
+JJNÈ\™XKœ™[[Ý™Qœ›ÛSY
+ŠNÂˆÛÛËœÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛSY
+JJNÈ\™XKœ™[[Ý™Qœ›ÛSY
+ŠNÂˆ™XÛÜ™œÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛSY
+JJNÂˆBˆNÂ‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆÛÛœÝ]]ÈX™[ÚYHX™[ÚY
+
+NÂˆÛÛœÝ]]ÈXY\’ZYÚHXY\’ZYÚ
+
+NÂˆÛÛœÝ]]È›ÝÒZYÚH›ÝÒZYÚ
+
+NÂˆÛÛœÝ]]È˜\•ÚYH˜\•ÚY
+
+NÂˆË™š[[
+XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŽKÎ
+JNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽKËMJJNÂˆË™š[™XÝ
+Ù]ÚY
+
+KXY\’ZYÚ
+NÂˆYˆ
+ÛÜ˜[™ÙQ[˜X›Y
+BˆÂˆÛÛœÝ]]È˜[™ÙVHX™[ÚY
+È
+ÛÜÝ\˜\ˆHJH
+ˆ˜\•ÚYÂˆÛÛœÝ]]È˜[™ÙUÚYHÛÜ[™Ý˜\œÈ
+ˆ˜\•ÚYÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMMLKNL
+KÚ][JŒŒ™ŠJNÂˆË™š[™XÝ
+˜[™ÙV˜[™ÙUÚYXY\’ZYÚ
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNŒŒ
+JNÂˆË™˜]Ô™XÝ
+˜[™ÙVK˜[™ÙUÚYXY\’ZYÚH‹ŠNÂˆBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÎNNŒLJJNÂˆËœÙ]›Û
+MŒŠNÂˆË™˜]Õ^
+‘ÑS‘TUÔˆ‹X™[ÚYHLL‹XY\’ZYÚXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆÛÛœÝ]]È[\“X™[[\˜[H˜\•ÚYÈMˆˆ˜\•ÚYŒÈˆYÚYÚ]™\žP˜\œÎÂˆÛÛœÝ]]ÈÛ\›Ý[™ÈHË™Ù]Û\›Ý[™Ê
+NÂˆÛÛœÝ]]Èš\œÝš\ÚX›P˜\ˆHXÙNŽš›[Z]
+˜\ÛÝ[ˆ
+Û\›Ý[™Ë™Ù]
+
+HHX™[ÚY
+HÈXÙNŽš›X^
+K˜\•ÚY
+JNÂˆÛÛœÝ]]È\Ýš\ÚX›P˜\ˆHXÙNŽš›[Z]
+š\œÝš\ÚX›P˜\‹˜\ÛÝ[ˆ
+Û\›Ý[™Ë™Ù]šYÚ
+
+HHX™[ÚY
+È˜\•ÚYHJHÈXÙNŽš›X^
+K˜\•ÚY
+JNÂˆ›Üˆ
+[˜\ˆHš\œÝš\ÚX›P˜\ŽÈ˜\ˆ\Ýš\ÚX›P˜\ŽÈ
+ÊØ˜\ŠBˆÂˆYˆ
+˜\ˆ	H[\“X™[[\˜[OH
+BˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÎNNŒLJJNÂˆÛÛœÝ]]ÈX™[H˜\•ÚYÌÈXÙNŽ”Ýš[™Ê˜\ˆ
+ÈJHˆ˜\ˆˆ
+ÈXÙNŽ”Ýš[™Ê˜\ˆ
+ÈJNÂˆË™˜]Õ^
+X™[X™[ÚY
+È˜\ˆ
+ˆ˜\•ÚY˜\•ÚYXY\’ZYÚˆXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆBˆB‚ˆÛÛœÝ]]ÈÛÝ[H˜XÚÐÛÝ[È˜XÚÐÛÝ[
+
+HˆÂˆÛÛœÝ]]Èš\œÝš\ÚX›T›ÝÈHXÙNŽš›[Z]
+ÛÝ[ˆ
+Û\›Ý[™Ë™Ù]J
+HHXY\’ZYÚ
+HÈXÙNŽš›X^
+K›ÝÒZYÚ
+JNÂˆÛÛœÝ]]È\Ýš\ÚX›T›ÝÈHXÙNŽš›[Z]
+š\œÝš\ÚX›T›ÝËÛÝ[ˆ
+Û\›Ý[™Ë™Ù]›ÝÛJ
+HHXY\’ZYÚ
+È›ÝÒZYÚHJHÈXÙNŽš›X^
+K›ÝÒZYÚ
+JNÂˆ›Üˆ
+[›ÝÈHš\œÝš\ÚX›T›ÝÎÈ›ÝÈ\Ýš\ÚX›T›ÝÎÈ
+ÊÜ›ÝÊBˆÂˆÛÛœÝ]]ÈHHXY\’ZYÚ
+È›ÝÈ
+ˆ›ÝÒZYÚÂˆÛÛœÝ]]È˜XÚÕ[HÙ]˜XÚÐÛÛÝ\ˆÈÙ]˜XÚÐÛÛÝ\Š›ÝÊHˆXÙNŽÛÛÝ\žßNÂˆÛÛœÝ]]È›ÝÐ˜\ÙHH›ÝÈ	HˆOHÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKÎJHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹ÌËÊNÂˆËœÙ]ÛÛÝ\Š˜XÚÕ[š\Õ˜[œÜ\™[
+
+HÈ›ÝÐ˜\ÙHˆ›ÝÐ˜\ÙK›Ý™\›ZYÚ]
+˜XÚÕ[Ú][JŒYŠJJNÂˆË™š[™XÝ
+KÙ]ÚY
+
+K›ÝÒZYÚ
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÎNNŒLJJNÂˆË™˜]Õ^
+XÙNŽ”Ýš[™Ê›ÝÈ
+ÈJH
+Èˆˆ
+È
+˜XÚÓ˜[YHÈ˜XÚÓ˜[YJ›ÝÊHˆXÙNŽ”Ýš[™ÞßJKˆKX™[ÚYHL›ÝÒZYÚXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆ›Üˆ
+[˜\ˆHš\œÝš\ÚX›P˜\ŽÈ˜\ˆ\Ýš\ÚX›P˜\ŽÈ
+ÊØ˜\ŠBˆÂˆÛÛœÝ]]ÈHX™[ÚY
+È˜\ˆ
+ˆ˜\•ÚYÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠËŒKÍ
+JNÂˆË™˜]Ô™XÝ
+K˜\•ÚY›ÝÒZYÚJNÂˆÛÛœÝ]]ÈX™[HÛ\˜[YHÈÛ\˜[YJ›ÝË˜\ŠHˆXÙNŽ”Ýš[™ÞßNÂˆYˆ
+ÚÝÔ]\›“X™[È	‰ˆX™[š\Ó›Ý[\J
+JBˆÂˆYˆ
+Û\›Ý\ÊBˆÂˆÛÛœÝ]]È›Ý\ÈHÛ\›Ý\Ê›ÝË˜\ŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎM‹NN
+KÚ][JŒÌŠJNÂˆ›Üˆ
+ÛÛœÝ]]È›ÝHˆ›Ý\ÊBˆÂˆÛÛœÝ]]È›ÝVH
+ÈÈ
+È›ÝKž
+ˆ
+˜\•ÚYH
+HÈÂˆÛÛœÝ]]È›ÝVHHH
+È›ÝÒZYÚHÈH›ÝKžH
+ˆ
+›ÝÒZYÚHN
+HÈÍŽÂˆË™š[›Ý[™Y™XÝ[™ÛJÝ]X×ØØ\Ý›Ø]Š›ÝV
+KÝ]X×ØØ\Ý›Ø]Š›ÝVJKˆXÙNŽš›X^
+‹Œ‹Ý]X×ØØ\Ý›Ø]Š˜\•ÚY
+HÈŒˆ
+ˆ‹ŒŠKˆ‹Œ‹KŒŠNÂˆBˆBˆÛÛœÝ]]ÈÛ\š[H˜XÚÕ[š\Õ˜[œÜ\™[
+
+BˆÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎKLKMJBˆˆ˜XÚÕ[š[\œÛ]YÚ]
+XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎKLKMJKŒÍYŠNÂˆËœÙ]ÛÛÝ\ŠÛ\š[Ú][JÌ™ŠJNÂˆË™š[›Ý[™Y™XÝ[™ÛJÝ]X×ØØ\Ý›Ø]Š
+ÈÊKÝ]X×ØØ\Ý›Ø]ŠH
+È
+KˆÝ]X×ØØ\Ý›Ø]Š˜\•ÚYHŠKÝ]X×ØØ\Ý›Ø]Š›ÝÒZYÚH
+KKŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\œÎŽÚ]JNÂˆË™˜]Õ^
+X™[
+ÈËH
+È˜\•ÚYH‹›ÝÒZYÚHXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆBˆBˆBˆYˆ
+^ZXYš\ÚX›JBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒÌ‹Ì‹Ž
+JNÂˆË™š[™XÝ
+XÙNŽœ›Ý[™Ò[
+^ZXY
+HHKXY\’ZYÚ‹ˆXÙNŽš›X^
+ÛÝ[
+ˆ›ÝÒZYÚ
+JNÂˆBˆYˆ
+]]ÛX][Û“[ÙH	‰ˆÙ]ÛÛ™Ð]]ÛX][Û•˜[YJBˆÂˆ›Üˆ
+[›ÝÈHš\œÝš\ÚX›T›ÝÎÈ›ÝÈ\Ýš\ÚX›T›ÝÎÈ
+ÊÜ›ÝÊBˆÂˆXÙNŽ”]Ý\™NÂˆÛÛœÝ]]ÈHHXY\’ZYÚ
+È›ÝÈ
+ˆ›ÝÒZYÚÂˆÛÛœÝ]]Èš\œÝÝ\HXÙNŽš›[Z]
+˜\ÛÝ[
+ˆM‹ˆ
+Û\›Ý[™Ë™Ù]
+
+HHX™[ÚY
+H
+ˆMˆÈXÙNŽš›X^
+K˜\•ÚY
+JNÂˆÛÛœÝ]]È\ÝÝ\HXÙNŽš›[Z]
+š\œÝÝ\˜\ÛÝ[
+ˆM‹ˆ
+
+Û\›Ý[™Ë™Ù]šYÚ
+
+HHX™[ÚY
+H
+ˆMˆ
+È˜\•ÚYHJHÈXÙNŽš›X^
+K˜\•ÚY
+JNÂˆ›Üˆ
+[Ý\Hš\œÝÝ\ÈÝ\\ÝÝ\È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È˜\ˆHÝ\ÈMŽÂˆÛÛœÝ]]ÈÝXœÝ\HÝ\	HMŽÂˆÛÛœÝ]]ÈHÝ]X×ØØ\Ý›Ø]ŠX™[ÚY
+È˜\ˆ
+ˆ˜\•ÚYˆ
+ÈÝXœÝ\
+ˆ˜\•ÚYÈMˆ
+È˜\•ÚYÈÌŠNÂˆÛÛœÝ]]È˜[YHHXÙNŽš›[Z]
+Œ‹KŒ‹Ù]ÛÛ™Ð]]ÛX][Û•˜[YJ›ÝËÝ\
+JNÂˆÛÛœÝ]]ÈÚ[HHÝ]X×ØØ\Ý›Ø]ŠH
+È›ÝÒZYÚHBˆH˜[YH
+ˆXÙNŽš›X^
+K›ÝÒZYÚHMŠJNÂˆYˆ
+Ý\OHš\œÝÝ\
+HÝ\™KœÝ\™]ÔÝX”]
+Ú[JNÈ[ÙHÝ\™K›[™UÊÚ[JNÂˆBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌËŒËŒÍÊKÚ][JŽYŠJNÂˆËœÝ›ÚÙT]
+Ý\™KXÙNŽ”]Ý›ÚÙU\J‹ŒŠJNÂˆBˆBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKMLLŠJNÂˆË™˜]Ô™XÝ
+Ù]ØØ[›Ý[™Ê
+KJNÂˆB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+]™[›[ÙËš\ÓY]Û‘ÝÛŠ
+H	‰ˆ]™[žHXY\’ZYÚ
+
+H	‰ˆ]™[žHX™[ÚY
+
+JBˆÂˆÛÜ˜YÐ[˜ÚÜ˜\ˆH˜\]
+]™[ž
+NÂˆ˜YÙÚ[™ÓÛÜ˜[™ÙHHYNÂˆ\]SÛÜœ›ÛT[\Š]™[ž
+NÂˆ™]\›ŽÂˆBˆÛÛœÝ]]È›ÝÈH
+]™[žHHXY\’ZYÚ
+
+JHÈ›ÝÒZYÚ
+
+NÂˆÛÛœÝ]]È˜\ˆH
+]™[žHX™[ÚY
+
+JHÈ˜\•ÚY
+
+NÂˆYˆ
+
+]™[›[ÙËš\ÔÜ\Y[J
+H]™[›[ÙËš\ÔšYÚ]Û‘ÝÛŠ
+JBˆ	‰ˆ]™[žX™[ÚY
+
+H	‰ˆ]™[žHHXY\’ZYÚ
+
+Bˆ	‰ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ›ÝË˜XÚÐÛÝ[È˜XÚÐÛÝ[
+
+Hˆ
+JBˆÂˆYˆ
+˜XÚÐÛÛ^Y[JH˜XÚÐÛÛ^Y[J›ÝË\ÊNÂˆ™]\›ŽÂˆBˆYˆ
+]™[žX™[ÚY
+
+H]™[žHXY\’ZYÚ
+
+H]˜XÚÐÛÝ[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ›ÝË˜XÚÐÛÝ[
+
+JHZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜\‹˜\ÛÝ[
+JBˆ™]\›ŽÂˆ˜YÔÛÝ\˜ÙT›ÝÈH›ÝÎÂˆ˜YÔÛÝ\˜ÙP˜\ˆH˜\ŽÂˆ˜YÔÛÝ\˜ÙR\ÐÛ\HÛ\˜[YH	‰ˆÛ\˜[YJ›ÝË˜\ŠKš\Ó›Ý[\J
+NÂˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆ\]SÛÜœ›ÛT[\Š]™[ž
+NÂˆB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+˜YÙÚ[™ÓÛÜ˜[™ÙJBˆÂˆ\]SÛÜœ›ÛT[\Š]™[ž
+NÂˆ˜YÙÚ[™ÓÛÜ˜[™ÙHH˜[ÙNÂˆ™]\›ŽÂˆBˆYˆ
+˜YÔÛÝ\˜ÙT›ÝÈ˜YÔÛÝ\˜ÙP˜\ˆ
+H™]\›ŽÂˆÛÛœÝ]]È\Ý[˜][Û”›ÝÈH
+]™[žHHXY\’ZYÚ
+
+JHÈ›ÝÒZYÚ
+
+NÂˆÛÛœÝ]]È\Ý[˜][Û˜\ˆH
+]™[žHX™[ÚY
+
+JHÈ˜\•ÚY
+
+NÂˆÛÛœÝ›ÛÛ[Ý™YH˜YÔÛÝ\˜ÙR\ÐÛ\	‰ˆ]™[™Ù]\Ý[˜ÙQœ›ÛQ˜YÔÝ\
+
+HHˆ	‰ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ý[˜][Û”›ÝË˜XÚÐÛÝ[È˜XÚÐÛÝ[
+
+Hˆ
+Bˆ	‰ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ý[˜][Û˜\‹˜\ÛÝ[
+NÂˆYˆ
+[Ý™Y
+BˆÂˆYˆ
+Û\˜YÙÙY	‰ˆ
+\Ý[˜][Û”›ÝÈOH˜YÔÛÝ\˜ÙT›ÝÈ\Ý[˜][Û˜\ˆOH˜YÔÛÝ\˜ÙP˜\ŠJBˆÛ\˜YÙÙY
+˜YÔÛÝ\˜ÙT›ÝË˜YÔÛÝ\˜ÙP˜\‹\Ý[˜][Û”›ÝË\Ý[˜][Û˜\ŠNÂˆBˆ[ÙHYˆ
+]™[™Ù]\Ý[˜ÙQœ›ÛQ˜YÔÝ\
+
+H	‰ˆÙ[ÛXÚÙY
+BˆÂˆÙ[ÛXÚÙY
+˜YÔÛÝ\˜ÙT›ÝË˜YÔÛÝ\˜ÙP˜\ŠNÂˆBˆ˜YÔÛÝ\˜ÙT›ÝÈH˜YÔÛÝ\˜ÙP˜\ˆHLNÂˆ˜YÔÛÝ\˜ÙR\ÐÛ\H˜[ÙNÂˆ™\Z[
+
+NÂˆB‚ˆ›ÚY™Yœ™\ÚÙ[]ÛœÊ
+BˆÂˆÛÛœÝ]]È›ÝÜÈH˜XÚÐÛÝ[ÈXÙNŽš›X^
+˜XÚÐÛÝ[
+
+JHˆÂˆÚ[H
+Ý]X×ØØ\Ý[Š˜XÚÐÛÛ›ÛËœÚ^™J
+JH›ÝÜÊBˆÂˆ]]ÈÛÛ›ÛÈHÝŽ›XZÙWÝ[š\]YO˜XÚÐÛÛ›ÛÏŠ
+NÂˆY[™XZÙUš\ÚX›J
+˜ÛÛ›ÛÊNÂˆ˜XÚÐÛÛ›ÛËœ\ÚØ˜XÚÊÝŽ›[Ý™JÛÛ›ÛÊJNÂˆBˆÚ[H
+Ý]X×ØØ\Ý[Š˜XÚÐÛÛ›ÛËœÚ^™J
+JHˆ›ÝÜÊBˆ˜XÚÐÛÛ›ÛËœÜØ˜XÚÊ
+NÂˆÛÛœÝ]]Èš\œÝ›ÝÈHXÙNŽš›[Z]
+›ÝÜËˆ
+š\ÚX›P\™XK™Ù]J
+HHXY\’ZYÚ
+
+JHÈXÙNŽš›X^
+K›ÝÒZYÚ
+
+JHHJNÂˆÛÛœÝ]]È\Ý›ÝÈHXÙNŽš›[Z]
+š\œÝ›ÝË›ÝÜËˆ
+š\ÚX›P\™XK™Ù]›ÝÛJ
+HHXY\’ZYÚ
+
+H
+È›ÝÒZYÚ
+
+HHJHÈXÙNŽš›X^
+K›ÝÒZYÚ
+
+JH
+ÈJNÂˆÛÛœÝ]]Èš\œÝ˜\ˆHXÙNŽš›[Z]
+˜\ÛÝ[ˆ
+š\ÚX›P\™XK™Ù]
+
+HHX™[ÚY
+
+JHÈXÙNŽš›X^
+K˜\•ÚY
+
+JHHJNÂˆÛÛœÝ]]È\Ý˜\ˆHXÙNŽš›[Z]
+š\œÝ˜\‹˜\ÛÝ[ˆ
+š\ÚX›P\™XK™Ù]šYÚ
+
+HHX™[ÚY
+
+H
+È˜\•ÚY
+
+HHJHÈXÙNŽš›X^
+K˜\•ÚY
+
+JH
+ÈJNÂ‚ˆÝŽœÙ]Ú^™WÝˆš\ÚX›RÙ^\ÎÂˆ›Üˆ
+[›ÝÈHš\œÝ›ÝÎÈ›ÝÈ\Ý›ÝÎÈ
+ÊÜ›ÝÊBˆ›Üˆ
+[˜\ˆHš\œÝ˜\ŽÈ˜\ˆ\Ý˜\ŽÈ
+ÊØ˜\ŠBˆš\ÚX›RÙ^\Ëš[œÙ\
+Ý]X×ØØ\ÝÚ^™WÝŠ›ÝÈ
+ˆ˜\ÛÝ[
+È˜\ŠJNÂˆ›Üˆ
+]]È]HÙ[]ÛœË˜™YÚ[Š
+NÈ]OHÙ[]ÛœË™[™
+
+NÊBˆYˆ
+]š\ÚX›RÙ^\Ë˜ÛÛZ[œÊ]O™š\œÝ
+JH]HÙ[]ÛœË™\˜\ÙJ]
+NÈ[ÙH
+ÊÚ]Â‚ˆ›Üˆ
+[›ÝÈHÈ›ÝÈ›ÝÜÎÈ
+ÊÜ›ÝÊBˆÂˆ]]ÉˆÛÛ›ÛÈH
+˜XÚÐÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ›ÝÊWNÂˆÛÛ›ÛËœÙ]›Ý[™ÊX™[ÚY
+
+HHLXY\’ZYÚ
+
+H
+È›ÝÈ
+ˆ›ÝÒZYÚ
+
+KÎ›ÝÒZYÚ
+
+JNÂˆÛÛ›ÛË›]]KœÙ]ÙÙÛTÝ]JÙ]˜XÚÓ]]H	‰ˆÙ]˜XÚÓ]]J›ÝÊKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÛ›ÛËœÛÛËœÙ]ÙÙÛTÝ]JÙ]˜XÚÔÛÛÈ	‰ˆÙ]˜XÚÔÛÛÊ›ÝÊKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÛ›ÛËœ™XÛÜ™œÙ]ÙÙÛTÝ]JÙ]˜XÚÔ™XÛÜ™\›H	‰ˆÙ]˜XÚÔ™XÛÜ™\›J›ÝÊKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]]ÊˆÛÛ›ÛˆH	˜ÛÛ›ÛÎÂˆÛÛ›ÛË›]]K›ÛÛXÚÈHÝ\Ë›ÝËÛÛ›Û—HÈYˆ
+Ù]˜XÚÓ]]JHÙ]˜XÚÓ]]J›ÝËÛÛ›Û‹O›]]K™Ù]ÙÙÛTÝ]J
+JNÈNÂˆÛÛ›ÛËœÛÛË›ÛÛXÚÈHÝ\Ë›ÝËÛÛ›Û—HÈYˆ
+Ù]˜XÚÔÛÛÊHÙ]˜XÚÔÛÛÊ›ÝËÛÛ›Û‹OœÛÛË™Ù]ÙÙÛTÝ]J
+JNÈNÂˆÛÛ›ÛËœ™XÛÜ™›ÛÛXÚÈHÝ\Ë›ÝËÛÛ›Û—HÈYˆ
+Ù]˜XÚÔ™XÛÜ™\›JHÙ]˜XÚÔ™XÛÜ™\›J›ÝËÛÛ›Û‹Oœ™XÛÜ™™Ù]ÙÙÛTÝ]J
+JNÈNÂˆÛÛ›ÛËœ™XÛÜ™œÙ]ÛÛ\
+\›H\ÈÙ[™\˜]Üˆ›ÜˆRQH™XÛÜ™[™ËˆŠNÂˆÛÛ›ÛË›]]KœÙ]ÛÛ\
+“]]H\ÈÙ[™\˜]Ü‹ˆŠNÂˆÛÛ›ÛËœÛÛËœÙ]ÛÛ\
+”ÛÛÈ\ÈÙ[™\˜]Ü‹ˆŠNÂˆB‚ˆ›Üˆ
+[›ÝÈHš\œÝ›ÝÎÈ›ÝÈ\Ý›ÝÎÈ
+ÊÜ›ÝÊBˆ›Üˆ
+[˜\ˆHš\œÝ˜\ŽÈ˜\ˆ\Ý˜\ŽÈ
+ÊØ˜\ŠBˆÂˆÛÛœÝ]]È[™^HÝ]X×ØØ\ÝÚ^™WÝŠ›ÝÈ
+ˆ˜\ÛÝ[
+È˜\ŠNÂˆ]]È›Ý[™HÙ[]ÛœË™š[™
+[™^
+NÂˆYˆ
+›Ý[™OHÙ[]ÛœË™[™
+
+JBˆÂˆ]]È]ÛˆHÝŽ›XZÙWÝ[š\]YO^[\ÝÙ[]ÛŠ
+NÂˆY[™XZÙUš\ÚX›J
+˜]ÛŠNÂˆ›Ý[™HÙ[]ÛœË™[\XÙJ[™^ÝŽ›[Ý™J]ÛŠJK™š\œÝÂˆBˆ]]Éˆ]ÛˆH
+™›Ý[™OœÙXÛÛ™ÂˆÛÛœÝ]]ÈÝ\œ™[Û\HÛ\˜[YHÈÛ\˜[YJ›ÝË˜\ŠHˆXÙNŽ”Ýš[™ÞßNÂˆ]Û‹˜ÛÛ™šYÝ\™J›ÝË˜\‹˜XÚÓ˜[YHÈ˜XÚÓ˜[YJ›ÝÊHˆXÙNŽ”Ýš[™Ê‘Ù[™\˜]ÜˆŠH
+ÈXÙNŽ”Ýš[™Ê›ÝÈ
+ÈJKˆÝ\œ™[Û\Ù[ÛXÚÙYÙ[Z[YÛ”Z[š[š\ÚY\Ô[˜Ú[ÛÛXÝ]™KˆÛ\˜YÙÙY˜\•ÚY
+
+K›ÝÒZYÚ
+
+KˆÝ\×HÈ™]\›ˆ]]ÛX][Û“[ÙNÈKÙ]ÛÛ™Ð]]ÛX][Û•˜[YKÙ]ÛÛ™Ð]]ÛX][Û”Ú[
+NÂˆ]Û‹›Û”]\›“Y[HHÚÝÔ]\›“Y[NÂˆ]Û‹›Û‘[]PÛ\HÙ[[]YÂˆ]Û‹›Û”]\›”ØÜ›ÛHØÜ›Û]\›ŽÂˆ]Û‹œÙ]›Ý[™ÊX™[ÚY
+
+H
+È˜\ˆ
+ˆ˜\•ÚY
+
+KXY\’ZYÚ
+
+H
+È›ÝÈ
+ˆ›ÝÒZYÚ
+
+K˜\•ÚY
+
+K›ÝÒZYÚ
+
+JNÂˆBˆB‚ˆ›ÚYÚÝÔÙ][™ÜÊ
+BˆÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ”^[\ÝÙ][™ÜÈ‹•[Y[[™HÙ[È\™H˜\‹\Û˜\Yˆ˜]ÈXÙ\ÈHÙ[XÝY]\›ŽÈ[Ý™H˜YÜÈ^\Ý[™ÈÛ\Ëˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜YÛÛX›Ð›Þ
+˜˜\’YÚYÚ‹È‘]™\žH˜\ˆ‹‘]™\žHˆ˜\œÈ‹‘]™\žH˜\œÈ‹‘]™\žH˜\œÈˆKˆ’YÚYÚ[\ˆ]™\žNˆŠNÂˆYˆ
+]]ÊˆÛÛX›ÈHX[ÙË™Ù]ÛÛX›Ð›ÞÛÛ\Û™[
+˜˜\’YÚYÚŠJBˆÛÛX›ËOœÙ]Ù[XÝYY
+YÚYÚ]™\žP˜\œÈOHHÈHˆYÚYÚ]™\žP˜\œÈOHˆÈˆˆYÚYÚ]™\žP˜\œÈOHÈˆËˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆX[ÙË˜YÛÛX›Ð›Þ
+œ]\›“X™[È‹È”ÚÝÈX™[È‹’YHX™[ÈˆK”]\›ˆX™[ÎˆŠNÂˆYˆ
+]]ÊˆÛÛX›ÈHX[ÙË™Ù]ÛÛX›Ð›ÞÛÛ\Û™[
+œ]\›“X™[ÈŠJBˆÛÛX›ËOœÙ]Ù[XÝYY
+ÚÝÔ]\›“X™[ÈÈHˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹KXÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽœ™]\›’Ù^K
+JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^K
+JNÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆYˆ
+]]ÊˆÛÛX›ÈHX[ÙË™Ù]ÛÛX›Ð›ÞÛÛ\Û™[
+˜˜\’YÚYÚŠJBˆYÚYÚ]™\žP˜\œÈHÛÛX›ËO™Ù]Ù[XÝYY
+
+HOHHÈHˆÛÛX›ËO™Ù]Ù[XÝYY
+
+HOHˆÈ‚ˆˆÛÛX›ËO™Ù]Ù[XÝYY
+
+HOHÈˆÂˆYˆ
+]]ÊˆÛÛX›ÈHX[ÙË™Ù]ÛÛX›Ð›ÞÛÛ\Û™[
+œ]\›“X™[ÈŠJBˆÚÝÔ]\›“X™[ÈHÛÛX›ËO™Ù]Ù[XÝYY
+
+HOHŽÂˆ™\Z[
+
+NÂˆB‚œš]˜]N‚ˆ[˜\]
+[
+HÛÛœÝˆÂˆ™]\›ˆXÙNŽš›[Z]
+K˜\ÛÝ[
+
+HX™[ÚY
+
+JHÈ˜\•ÚY
+
+JH
+ÈJNÂˆB‚ˆ›ÚY\]SÛÜœ›ÛT[\Š[
+BˆÂˆYˆ
+Y˜YÙÚ[™ÓÛÜ˜[™ÙH\Ù]ÛÜ˜[™ÙQœ›ÛT[\ŠH™]\›ŽÂˆÛÛœÝ]]È[™˜\ˆH˜\]
+
+NÂˆÛÛœÝ]]Èš\œÝHXÙNŽš›Z[ŠÛÜ˜YÐ[˜ÚÜ˜\‹[™˜\ŠNÂˆÛÛœÝ]]È\ÝHXÙNŽš›X^
+ÛÜ˜YÐ[˜ÚÜ˜\‹[™˜\ŠNÂˆÙ]ÛÜ˜[™ÙQœ›ÛT[\Šš\œÝ\ÝHš\œÝ
+ÈJNÂˆB‚ˆ[˜YÔÛÝ\˜ÙT›ÝÈHLNÂˆ[˜YÔÛÝ\˜ÙP˜\ˆHLNÂˆ›ÛÛ˜YÔÛÝ\˜ÙR\ÐÛ\H˜[ÙNÂˆ[YÚYÚ]™\žP˜\œÈHÂˆ›ÛÛÚÝÔ]\›“X™[ÈHYNÂˆ›ÛÛ]]ÛX][Û“[ÙHH˜[ÙNÂˆ›ÛÛ^ZXYš\ÚX›HH˜[ÙNÂˆÝX›H^ZXYHŒÂˆ[ÛÜÝ\˜\ˆHNÂˆ[ÛÜ[™Ý˜\œÈHÂˆ›ÛÛÛÜ˜[™ÙQ[˜X›YH˜[ÙNÂˆ›ÛÛ˜YÙÚ[™ÓÛÜ˜[™ÙHH˜[ÙNÂˆ[ÛÜ˜YÐ[˜ÚÜ˜\ˆHNÂˆXÙNŽ”™XÝ[™ÛO[ˆš\ÚX›P\™XHÈNNÂˆÝŽ›X\Ú^™WÝÝŽ[š\]YWÜ^[\ÝÙ[]ÛˆÙ[]ÛœÎÂˆÝŽ™XÝÜÝŽ[š\]YWÜ˜XÚÐÛÛ›ÛÏˆ˜XÚÐÛÛ›ÛÎÂŸNÂ‚˜Û\ÜÈ^[\ÝÝ\™˜XÙHš[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆ^XÚ]^[\ÝÝ\™˜XÙJ^[\ÝÜšY
+ˆ^[\ÝÜšY
+HˆÜšY
+^[\ÝÜšY
+BˆÂˆšY]ÜÜœÙ]ÜšY
+ÜšY
+NÂˆšY]ÜÜœÙ]šY]ÙYÛÛ\Û™[
+ÜšYYJNÂˆY[™XZÙUš\ÚX›JšY]ÜÜ
+NÂˆÛÛ™šYÝ\™J˜]Ð]Û‹‘˜]È‹‘˜]ÈHÙ[XÝY]\›ˆ[È^[\ÝÙ[Ëˆ‹Ý\×BˆÂˆÜšYOœÙ]˜]Ó[ÙJYJNÂˆ˜]Ð]Û‹œÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[Ý™P]Û‹œÙ]ÙÙÛTÝ]J˜[ÙKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆJNÂˆÛÛ™šYÝ\™J[Ý™P]Û‹“[Ý™H‹“[Ý™H^\Ý[™ÈÛ\ÈÚ]Ý]Z[[™È™]ÈÛ™\Ëˆ‹Ý\×BˆÂˆÜšYOœÙ]˜]Ó[ÙJ˜[ÙJNÂˆ˜]Ð]Û‹œÙ]ÙÙÛTÝ]J˜[ÙKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[Ý™P]Û‹œÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆJNÂˆ˜]Ð]Û‹œÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÛ™šYÝ\™JÜš^›Û[Ý]’H‹–›ÛÛHÝ]Üš^›Û[Kˆ‹Ý\×HÈÜšYOœÙ]Üš^›Û[›ÛÛJÜš^›Û[›ÛÛJ
+HHŒYŠNÈJNÂˆÛÛ™šYÝ\™JÜš^›Û[[‹’
+È‹–›ÛÛH[ˆÜš^›Û[Kˆ‹Ý\×HÈÜšYOœÙ]Üš^›Û[›ÛÛJÜš^›Û[›ÛÛJ
+H
+ÈŒYŠNÈJNÂˆÛÛ™šYÝ\™J™\XØ[Ý]•‹H‹”™YXÙH˜XÚÈZYÚˆ‹Ý\×HÈÜšYOœÙ]™\XØ[›ÛÛJ™\XØ[›ÛÛJ
+HHŒYŠNÈJNÂˆÛÛ™šYÝ\™J™\XØ[[‹•ŠÈ‹’[˜Ü™X\ÙH˜XÚÈZYÚˆ‹Ý\×HÈÜšYOœÙ]™\XØ[›ÛÛJ™\XØ[›ÛÛJ
+H
+ÈŒYŠNÈJNÂˆÛÛ™šYÝ\™JÙ][™ÜÐ]Û‹”Ù][™ÜË‹‹ˆ‹ÛÛ™šYÝ\™H^[\ÝÜšY[™Û\X™[Ëˆ‹Ý\×HÈÜšYOœÚÝÔÙ][™ÜÊ
+NÈJNÂˆÛÛ™šYÝ\™J]]ÛX][Û]Û‹]]ÛX][Ûˆ‹‘˜]ÈÛÛ™Ë[]™[\˜[Y]\ˆ]]ÛX][Ûˆ[ˆH^[\Ýˆ‹Ý\×BˆÂˆÛÛœÝ]]È[˜X›YHYÜšYOš\Ð]]ÛX][Û“[ÙJ
+NÂˆÜšYOœÙ]]]ÛX][Û“[ÙJ[˜X›Y
+NÂˆ]]ÛX][Û]Û‹œÙ]ÙÙÛTÝ]J[˜X›YXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+Û]]ÛX][Û“[ÙPÚ[™ÙY
+HÛ]]ÛX][Û“[ÙPÚ[™ÙY
+[˜X›Y
+NÂˆJNÂˆËÈÙY\ÛÛ›ÛÈ^XÚ][™TÐÒRK[Û›NˆH™]š[Ý\È[šXÛÙHÛ\ÂˆËÈÙ\™H™[™\™Y\Èœ›ÚÙ[ˆÚ\˜XÝ\œÈÛˆH\Ù\‰ÜÈXXÓÔÈZ[‚ˆ˜]Ð]Û‹œÙ]]Û•^
+‘˜]ÈŠNÂˆ[Ý™P]Û‹œÙ]]Û•^
+“[Ý™HŠNÂˆÜš^›Û[Ý]œÙ]]Û•^
+’HŠNÂˆÜš^›Û[[‹œÙ]]Û•^
+’
+ÈŠNÂˆ™\XØ[Ý]œÙ]]Û•^
+•‹HŠNÂˆ™\XØ[[‹œÙ]]Û•^
+•ŠÈŠNÂˆÙ][™ÜÐ]Û‹œÙ]]Û•^
+”Ù]ŠNÂˆ]]ÛX][Û]Û‹œÙ]]Û•^
+]]ÈŠNÂˆ]]ÛX][Û]Û‹œÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆ›Üˆ
+]]Êˆ]ÛˆˆÈ	™˜]Ð]Û‹	›[Ý™P]Û‹	˜]]ÛX][Û]Û‹	šÜš^›Û[Ý]	šÜš^›Û[[‹	™\XØ[Ý]	™\XØ[[‹	œÙ][™ÜÐ]ÛˆJBˆY[™XZÙUš\ÚX›J
+˜]ÛŠNÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆ]]È\™XHHÙ]ØØ[›Ý[™Ê
+NÂˆ]]È›ÛÝ\ˆH\™XKœ™[[Ý™Qœ›ÛP›ÝÛJÍ
+Kœ™YXÙY
+ÊNÂˆÙ][™ÜÐ]Û‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Í
+JNÈ›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+ÊNÂˆ]]ÛX][Û]Û‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Î
+JNÈ›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+ÊNÂˆ™\XØ[[‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Ì
+JNÈ›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+ÊNÂˆ™\XØ[Ý]œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Ì
+JNÈ›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+
+NÂˆÜš^›Û[[‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Ì
+JNÈ›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+ÊNÂˆÜš^›Û[Ý]œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Ì
+JNÈ›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+
+NÂˆ[Ý™P]Û‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+ŠJNÈ›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+ÊNÂˆ˜]Ð]Û‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+ŠJNÂˆšY]ÜÜœÙ]›Ý[™Ê\™XJNÂˆBˆ›ÚYÙ]]]ÛX][Û“[ÙJ›ÛÛ[˜X›Y
+BˆÂˆÜšYOœÙ]]]ÛX][Û“[ÙJ[˜X›Y
+NÂˆ]]ÛX][Û]Û‹œÙ]ÙÙÛTÝ]J[˜X›YXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚œš]˜]N‚ˆÝ]XÈ›ÚYÛÛ™šYÝ\™JXÙNŽ•^]Û‰ˆ]Û‹ÛÛœÝXÙNŽ”Ýš[™Éˆ^ˆÛÛœÝXÙNŽ”Ýš[™ÉˆÛÛ\ÝŽ™[˜Ý[Û›ÚY
+
+OˆXÝ[ÛŠBˆÂˆ]Û‹œÙ]]Û•^
+^
+NÂˆ]Û‹œÙ]]J^
+NÂˆ]Û‹œÙ]ÛÛ\
+ÛÛ\
+NÂˆ]Û‹œÙ]\ØÜš\[ÛŠÛÛ\
+NÂˆ]Û‹œÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆ]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍKLKŒŠJNÂˆ]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LÌ‹MÍ
+JNÂˆ]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNMËŒMŒ
+JNÂˆ]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆ]Û‹›ÛÛXÚÈHÝŽ›[Ý™JXÝ[ÛŠNÂˆB‚ˆ›Ø]Üš^›Û[›ÛÛJ
+HÛÛœÝÈ™]\›ˆÜšYO˜Ý\œ™[Üš^›Û[›ÛÛJ
+NÈBˆ›Ø]™\XØ[›ÛÛJ
+HÛÛœÝÈ™]\›ˆÜšYO˜Ý\œ™[™\XØ[›ÛÛJ
+NÈBˆÛ\ÜÈ^[\ÝšY]ÜÜš[˜[ˆX›XÈXÙNŽ•šY]ÜÜˆÂˆX›XÎ‚ˆ›ÚYÙ]ÜšY
+^[\ÝÜšY
+ˆ^[\ÝÜšY
+HÈÜšYH^[\ÝÜšYÈBˆ›ÚYš\ÚX›P\™XPÚ[™ÙY
+ÛÛœÝXÙNŽ”™XÝ[™ÛO[‰ˆ\™XJHÝ™\œšYBˆÂˆYˆ
+ÜšYOH[ŠHÜšYOœÙ]šY]ÜÜ\™XJ\™XJNÂˆBˆš]˜]N‚ˆ^[\ÝÜšY
+ˆÜšYH[ŽÂˆNÂˆ^[\ÝÜšY
+ˆÜšYH[ŽÂˆ^[\ÝšY]ÜÜšY]ÜÜÂˆXÙNŽ•^]Ûˆ˜]Ð]Û‹[Ý™P]Û‹]]ÛX][Û]Û‹Üš^›Û[Ý]Üš^›Û[[‹™\XØ[Ý]™\XØ[[‹Ù][™ÜÐ]ÛŽÂœX›XÎ‚ˆÝŽ™[˜Ý[Û›ÚY
+›ÛÛ
+OˆÛ]]ÛX][Û“[ÙPÚ[™ÙYÂŸNÂ‚˜Û\ÜÈ^[\ÝÚ[™ÝÈš[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆ^[\ÝÚ[™ÝÊÝŽ™[˜Ý[Û[
+
+OˆÙ]˜XÚÐÛÝ[ˆÝŽ™[˜Ý[ÛXÙNŽ”Ýš[™Ê[
+OˆÙ]˜XÚÓ˜[YKˆÝŽ™[˜Ý[ÛXÙNŽ”Ýš[™Ê[[
+OˆÙ]Û\˜[YKˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÛÙ[ÛXÚÙYˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÛÙ[Z[YˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ”Z[š[š\ÚYˆÝŽ™[˜Ý[Û›ÛÛ
+[
+OˆÙ]]]KˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ]]]KˆÝŽ™[˜Ý[Û›ÛÛ
+[
+OˆÙ]ÛÛËˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ]ÛÛËˆÝŽ™[˜Ý[Û›ÛÛ
+[
+OˆÙ]™XÛÜ™\›KˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ]™XÛÜ™\›KˆÝŽ™[˜Ý[Û›ÚY
+[[[[
+OˆÛÛ\˜YÙÙYˆÝŽ™[˜Ý[Û›ÚY
+[[XÙNŽÛÛ\Û™[
+ŠOˆÛ”]\›“Y[KˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÛÙ[[]YˆÝŽ™[˜Ý[Û›ÚY
+[[[
+OˆÛ”]\›”ØÜ›Û
+BˆÂˆÜšYH™]È^[\ÝÜšY
+
+NÂˆÜšYO˜XÚÐÛÝ[HÝŽ›[Ý™JÙ]˜XÚÐÛÝ[
+NÂˆÜšYO˜XÚÓ˜[YHHÝŽ›[Ý™JÙ]˜XÚÓ˜[YJNÂˆÜšYO˜Û\˜[YHHÝŽ›[Ý™JÙ]Û\˜[YJNÂˆÜšYO˜Ù[ÛXÚÙYHÝŽ›[Ý™JÛÙ[ÛXÚÙY
+NÂˆÜšYO˜Ù[Z[YHÝŽ›[Ý™JÛÙ[Z[Y
+NÂˆÜšYO›Û”Z[š[š\ÚYHÝŽ›[Ý™JÛ”Z[š[š\ÚY
+NÂˆÜšYO˜Û\˜YÙÙYHÝŽ›[Ý™JÛÛ\˜YÙÙY
+NÂˆÜšYOœÚÝÔ]\›“Y[HHÝŽ›[Ý™JÛ”]\›“Y[JNÂˆÜšYO˜Ù[[]YHÝŽ›[Ý™JÛÙ[[]Y
+NÂˆÜšYOœØÜ›Û]\›ˆHÝŽ›[Ý™JÛ”]\›”ØÜ›Û
+NÂˆÜšYO™Ù]˜XÚÓ]]HHÝŽ›[Ý™JÙ]]]JNÂˆÜšYOœÙ]˜XÚÓ]]HHÝŽ›[Ý™JÙ]]]JNÂˆÜšYO™Ù]˜XÚÔÛÛÈHÝŽ›[Ý™JÙ]ÛÛÊNÂˆÜšYOœÙ]˜XÚÔÛÛÈHÝŽ›[Ý™JÙ]ÛÛÊNÂˆÜšYO™Ù]˜XÚÔ™XÛÜ™\›HHÝŽ›[Ý™JÙ]™XÛÜ™\›JNÂˆÜšYOœÙ]˜XÚÔ™XÛÜ™\›HHÝŽ›[Ý™JÙ]™XÛÜ™\›JNÂˆÜšYOš\Ô[˜Ú[ÛÛXÝ]™HHÝ\×HÈ™]\›ˆÜšYOH[ˆ	‰ˆÜšYOœ[˜Ú[XÝ]™J
+NÈNÂˆÜšYO›Û•ÛÛÚ[™ÙYH×J›ÛÛ
+HßNÂˆÜšYO›Û–›ÛÛPÚ[™ÙYHÝ\×HÈ™Yœ™\Ú
+
+NÈNÂˆÝ\™˜XÙHHÝŽ›XZÙWÝ[š\]YO^[\ÝÝ\™˜XÙOŠÜšY
+NÂˆY[™XZÙUš\ÚX›J
+œÝ\™˜XÙJNÂˆÙ]š\ÚX›J˜[ÙJNÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYHÈYˆ
+Ý\™˜XÙHOH[ŠHÝ\™˜XÙKOœÙ]›Ý[™ÊÙ]ØØ[›Ý[™Ê
+JNÈB‚ˆ›ÚY™Yœ™\Ú
+
+BˆÂˆYˆ
+ÜšYOH[ŠH™]\›ŽÂˆÜšYOœÙ]Ú^™JÜšYO˜ÛÛ[ÚY
+
+KÜšYO˜ÛÛ[ZYÚ
+
+JNÂˆÜšYOœ™Yœ™\ÚÙ[]ÛœÊ
+NÂˆÜšYOœ™\Z[
+
+NÂˆB‚ˆ›ÚYÙ]^ZXYÜÚ][ÛŠÝX›HÙXÛÛ™ËÝX›HœK›ÛÛXÝ]™JBˆÂˆYˆ
+ÜšYOH[ŠHÜšYOœÙ]^ZXYÜÚ][ÛŠÙXÛÛ™ËœKXÝ]™JNÂˆBˆ›ÚYÙ]ÛÜ˜[™ÙJ[Ý\˜\‹[[™Ý˜\œË›ÛÛ[˜X›Y
+BˆÂˆYˆ
+ÜšYOH[ŠHÜšYOœÙ]ÛÜ˜[™ÙJÝ\˜\‹[™Ý˜\œË[˜X›Y
+NÂˆBˆ›ÚYÙ]ÛÜ˜[™ÙQœ›ÛT[\ŠÝŽ™[˜Ý[Û›ÚY
+[[
+OˆØ[˜XÚÊBˆÂˆYˆ
+ÜšYOH[ŠHÜšYOœÙ]ÛÜ˜[™ÙQœ›ÛT[\ˆHÝŽ›[Ý™JØ[˜XÚÊNÂˆBˆ›ÚYÚÝÔÙ][™ÜÊ
+HÈYˆ
+ÜšYOH[ŠHÜšYOœÚÝÔÙ][™ÜÊ
+NÈBˆ›ÚYÙ]Û\™]šY]ÊÝŽ™[˜Ý[ÛÝŽ™XÝÜXÙNŽ”Ú[[Š[[
+Oˆ›ÝšY\ŠBˆÂˆYˆ
+ÜšYOH[ŠHÜšYO˜Û\›Ý\ÈHÝŽ›[Ý™J›ÝšY\ŠNÂˆBˆ›ÚYÙ]ÛÛ™Ð]]ÛX][ÛØ[˜XÚÜÊÝŽ™[˜Ý[Û›Ø]
+[[
+OˆÙ]˜[YKˆÝŽ™[˜Ý[Û›ÚY
+[[›Ø]
+OˆÙ]Ú[
+BˆÂˆYˆ
+ÜšYOH[ŠBˆÂˆÜšYO™Ù]ÛÛ™Ð]]ÛX][Û•˜[YHHÝŽ›[Ý™JÙ]˜[YJNÂˆÜšYOœÙ]ÛÛ™Ð]]ÛX][Û”Ú[HÝŽ›[Ý™JÙ]Ú[
+NÂˆBˆBˆ›ÚYÙ]˜XÚÐÛÛ^Y[R[™\ŠÝŽ™[˜Ý[Û›ÚY
+[XÙNŽÛÛ\Û™[
+ŠOˆØ[˜XÚÊBˆÂˆYˆ
+ÜšYOH[ŠHÜšYO˜XÚÐÛÛ^Y[HHÝŽ›[Ý™JØ[˜XÚÊNÂˆBˆ›ÚYÙ]˜XÚÐÛÛÝ\”›ÝšY\ŠÝŽ™[˜Ý[ÛXÙNŽÛÛÝ\Š[
+Oˆ›ÝšY\ŠBˆÂˆYˆ
+ÜšYOH[ŠHÜšYO™Ù]˜XÚÐÛÛÝ\ˆHÝŽ›[Ý™J›ÝšY\ŠNÂˆBˆ›ÚYÙ]]]ÛX][Û“[ÙPÚ[™ÙY
+ÝŽ™[˜Ý[Û›ÚY
+›ÛÛ
+OˆØ[˜XÚÊBˆÂˆYˆ
+Ý\™˜XÙHOH[ŠHÝ\™˜XÙKO›Û]]ÛX][Û“[ÙPÚ[™ÙYHÝŽ›[Ý™JØ[˜XÚÊNÂˆBˆ›ÚYÙ]]]ÛX][Û“[ÙJ›ÛÛ[˜X›Y
+BˆÂˆYˆ
+Ý\™˜XÙHOH[ŠHÝ\™˜XÙKOœÙ]]]ÛX][Û“[ÙJ[˜X›Y
+NÂˆB‚œš]˜]N‚ˆ^[\ÝÜšY
+ˆÜšYH[ŽÂˆÝŽ[š\]YWÜ^[\ÝÝ\™˜XÙOˆÝ\™˜XÙNÂŸNÂ‚˜Û\ÜÈ\T™\ÜÛœÙQÜ˜\š[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆÝŽ™[˜Ý[Û›Ø]
+›Ø]
+Oˆ™\ÜÛœÙP]œ™\]Y[˜ÞNÂˆÝŽ™[˜Ý[Û›Ø]
+[
+Oˆ˜[™œ™\]Y[˜ÞNÂˆÝŽ™[˜Ý[Û›Ø]
+[
+Oˆ˜[™ØZ[ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[›Ø]›Ø]
+OˆÙ]˜[™ÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛÛXÚÎÂ‚ˆ\T™\ÜÛœÙQÜ˜\
+
+HÈÙ][Ý\ÙPÝ\œÛÜŠXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ”Ú[[™Ò[™Ý\œÛÜŠNÈB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆÙ[XÝY˜[™HLNÂˆY˜YÐ˜[™H˜[ÙNÂˆÛÛœÝ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+NÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+BˆÂˆÛÛœÝ]]Èœ™\]Y[˜ÞHH˜[™œ™\]Y[˜ÞHÈ˜[™œ™\]Y[˜ÞJ˜[™
+HˆŒŽÂˆYˆ
+œ™\]Y[˜ÞHŒŒŠHÛÛ[YNÂˆÛÛœÝ]]ÈØZ[ˆH˜[™ØZ[ˆÈ˜[™ØZ[Š˜[™
+HˆŒŽÂˆÛÛœÝXÙNŽ”Ú[›Ø]ˆÚ[
+œ™\]Y[˜ÞUÖ
+œ™\]Y[˜ÞK›Ý[™ÊKØZ[•ÖJØZ[‹›Ý[™ÊJNÂˆYˆ
+Ú[™Ù]\Ý[˜ÙQœ›ÛJ]™[œÜÚ][ÛŠHHL‹ŒŠBˆÂˆÙ[XÝY˜[™H˜[™Âˆœ™XZÎÂˆBˆBˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+Ù[XÝY˜[™\Ù]˜[™
+H™]\›ŽÂˆYˆ
+]™[™Ù]\Ý[˜ÙQœ›ÛQ˜YÔÝ\
+
+HˆŠHY˜YÐ˜[™HYNÂˆYˆ
+YY˜YÐ˜[™
+H™]\›ŽÂˆÛÛœÝ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+NÂˆYˆ
+›Ý[™Ë™Ù]ÚY
+
+HHŒˆ›Ý[™Ë™Ù]ZYÚ
+
+HHŒŠH™]\›ŽÂˆÛÛœÝ]]ÈHXÙNŽš›[Z]
+›Ý[™Ë™Ù]
+
+K›Ý[™Ë™Ù]šYÚ
+
+K]™[œÜÚ][Û‹ž
+NÂˆÛÛœÝ]]ÈHHXÙNŽš›[Z]
+›Ý[™Ë™Ù]J
+K›Ý[™Ë™Ù]›ÝÛJ
+K]™[œÜÚ][Û‹žJNÂˆÛÛœÝ]]Èœ™\]Y[˜ÞHHÑœ™\]Y[˜ÞJ›Ý[™ÊNÂˆÛÛœÝ]]ÈØZ[ˆHXÙNŽš›X\
+K›Ý[™Ë™Ù]›ÝÛJ
+K›Ý[™Ë™Ù]J
+KLNŒ‹NŒŠNÂˆÙ]˜[™
+Ù[XÝY˜[™œ™\]Y[˜ÞKØZ[ŠNÂˆ™\Z[
+
+NÂˆB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYBˆÂˆËÈHÚ[\HÛXÚÈÛÛ[Y\ÈÈÜ[ˆH[THY]ÜŽÈ˜YÙÚ[™ÈH›ÙBˆËÈ\™XÝHY]È]˜[™	ÜÈœ™\]Y[˜ÞH[™ØZ[ˆ[ˆH›Ú™XÝ‚ˆYˆ
+YY˜YÐ˜[™	‰ˆÛÛXÚÊHÛÛXÚÊ
+NÂˆÙ[XÝY˜[™HLNÂˆY˜YÐ˜[™H˜[ÙNÂˆB‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+NÂˆË™š[[
+XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹ÎKLŠJNÂˆYˆ
+›Ý[™Ë™Ù]ÚY
+
+HŒˆ›Ý[™Ë™Ù]ZYÚ
+
+HŒŠH™]\›ŽÂ‚ˆÛÛœÝ^ˆ›Ø]Z[‘ˆHLNŒŽÂˆÛÛœÝ^ˆ›Ø]X^ˆHNŒŽÂˆ›Üˆ
+[ˆHLNÈˆHNÈˆ
+ÏHŠBˆÂˆÛÛœÝ]]ÈHHXÙNŽš›X\
+Ý]X×ØØ\Ý›Ø]ŠŠKZ[‘‹X^‹›Ý[™Ë™Ù]›ÝÛJ
+K›Ý[™Ë™Ù]J
+JNÂˆËœÙ]ÛÛÝ\ŠˆOHÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠM‹LÌ‹MLJHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌ‹JJNÂˆË™˜]ÒÜš^›Û[[™JXÙNŽœ›Ý[™Ò[
+JK›Ý[™Ë™Ù]
+
+K›Ý[™Ë™Ù]šYÚ
+
+JNÂˆBˆ›Üˆ
+›Ø]œ™\]Y[˜ÞHˆÈŒŒ‹LŒ‹LŒ‹ŒŒ‹LŒ‹LŒ‹ŒŒ‹LŒ‹LŒ‹ŒŒˆJBˆÂˆÛÛœÝ]]ÈHœ™\]Y[˜ÞUÖ
+œ™\]Y[˜ÞK›Ý[™ÊNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹ÍÊJNÂˆË™˜]Õ™\XØ[[™JXÙNŽœ›Ý[™Ò[
+
+K›Ý[™Ë™Ù]J
+K›Ý[™Ë™Ù]›ÝÛJ
+JNÂˆB‚ˆXÙNŽ”]Ý\™NÂˆÛÛœÝ^ˆ[Ú[ÈHNÂˆ›Üˆ
+[HHÈHÚ[ÎÈ
+ÊÚJBˆÂˆÛÛœÝ]]È›ÜÜ[ÛˆHÝ]X×ØØ\Ý›Ø]ŠJHÈÝ]X×ØØ\Ý›Ø]ŠÚ[ÈHJNÂˆÛÛœÝ]]Èœ™\]Y[˜ÞHHŒŒˆ
+ˆÝŽœÝÊLŒ‹›ÜÜ[ÛŠNÂˆÛÛœÝ]]ÈˆHXÙNŽš›[Z]
+Z[‘‹X^‹™\ÜÛœÙP]œ™\]Y[˜ÞHÈ™\ÜÛœÙP]œ™\]Y[˜ÞJœ™\]Y[˜ÞJHˆŒŠNÂˆÛÛœÝ]]ÈH›Ý[™Ë™Ù]
+
+H
+È›ÜÜ[Ûˆ
+ˆ›Ý[™Ë™Ù]ÚY
+
+NÂˆÛÛœÝ]]ÈHHXÙNŽš›X\
+‹Z[‘‹X^‹›Ý[™Ë™Ù]›ÝÛJ
+K›Ý[™Ë™Ù]J
+JNÂˆYˆ
+HOH
+HÝ\™KœÝ\™]ÔÝX”]
+JNÈ[ÙHÝ\™K›[™UÊJNÂˆBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËŒLKJJNÂˆËœÝ›ÚÙT]
+Ý\™KXÙNŽ”]Ý›ÚÙU\JÙ]ZYÚ
+
+HLÈKYˆˆ‹YŠJNÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+BˆÂˆÛÛœÝ]]Èœ™\]Y[˜ÞHH˜[™œ™\]Y[˜ÞHÈ˜[™œ™\]Y[˜ÞJ˜[™
+HˆŒŽÂˆYˆ
+œ™\]Y[˜ÞHŒŒŠHÛÛ[YNÂˆÛÛœÝ]]ÈØZ[ˆH˜[™ØZ[ˆÈ˜[™ØZ[Š˜[™
+HˆŒŽÂˆÛÛœÝ]]ÈÚ[HXÙNŽ”Ú[›Ø]Šœ™\]Y[˜ÞUÖ
+œ™\]Y[˜ÞK›Ý[™ÊKØZ[•ÖJØZ[‹›Ý[™ÊJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNKLÊJNÂˆË™š[[\ÙJÚ[žHKŒ‹Ú[žHHKŒ‹LŒ‹LŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÍŒÎKMJJNÂˆË™š[[\ÙJÚ[žHËY‹Ú[žHHËY‹ËŒ‹ËŒŠNÂˆBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÍŒËŒ
+JNÂˆË™˜]Ô™XÝ
+Ù]ØØ[›Ý[™Ê
+KJNÂˆB‚œš]˜]N‚ˆ[Ù[XÝY˜[™HLNÂˆ›ÛÛY˜YÐ˜[™H˜[ÙNÂ‚ˆÝ]XÈ›Ø]ØZ[•ÖJ›Ø]ØZ[‹XÙNŽ”™XÝ[™ÛO›Ø]ˆ›Ý[™ÊBˆÂˆ™]\›ˆXÙNŽš›X\
+XÙNŽš›[Z]
+LNŒ‹NŒ‹ØZ[ŠKLNŒ‹NŒ‹›Ý[™Ë™Ù]›ÝÛJ
+K›Ý[™Ë™Ù]J
+JNÂˆB‚ˆÝ]XÈ›Ø]œ™\]Y[˜ÞUÖ
+›Ø]œ™\]Y[˜ÞKXÙNŽ”™XÝ[™ÛO›Ø]ˆ›Ý[™ÊBˆÂˆ™]\›ˆ›Ý[™Ë™Ù]
+
+H
+ÈÝŽ›ÙÊœ™\]Y[˜ÞHÈŒŒŠHÈÝŽ›ÙÊLŒŠH
+ˆ›Ý[™Ë™Ù]ÚY
+
+NÂˆB‚ˆÝ]XÈ›Ø]Ñœ™\]Y[˜ÞJ›Ø]XÙNŽ”™XÝ[™ÛO›Ø]ˆ›Ý[™ÊBˆÂˆÛÛœÝ]]È›ÜÜ[ÛˆHXÙNŽš›[Z]
+Œ‹KŒ‹
+H›Ý[™Ë™Ù]
+
+JHÈ›Ý[™Ë™Ù]ÚY
+
+JNÂˆ™]\›ˆŒŒˆ
+ˆÝŽœÝÊLŒ‹›ÜÜ[ÛŠNÂˆBŸNÂ‚˜Û\ÜÈ\]X[\Ù\•Ú[™ÝÈš[˜[ˆX›XÈXÙNŽ‘ØÝ[Y[Ú[™ÝÂžÂœX›XÎ‚ˆÝŽ™[˜Ý[Û›Ø]
+[[
+OˆÙ]\˜[Y]\ŽÂˆÝŽ™[˜Ý[Û›Ø]
+[›Ø]
+OˆÙ]™\ÜÛœÙNÂˆÝŽ™[˜Ý[Û›ÚY
+[[›Ø]
+OˆÙ]\˜[Y]\ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[[›Ø]›Ø]
+OˆÙ]˜[™˜[Y\ÎÂˆÝŽ™[˜Ý[ÛXÙNŽ”Ýš[™Ê[
+OˆÙ]˜XÚÓ˜[YNÂ‚ˆ\]X[\Ù\•Ú[™ÝÊ
+BˆˆØÝ[Y[Ú[™ÝÊ“Ü˜š]\]X[\Ù\ˆ‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒËKM
+KXÙNŽ‘ØÝ[Y[Ú[™ÝÎŽ˜[]ÛœÊBˆÂˆÙ]\Ú[™Ó˜]]™U]P˜\ŠYJNÂˆÙ]ÛÛ[›Û“ÝÛ™Y
+	˜ÛÛ[˜[ÙJNÂˆÛÛ[œÙ]Ü\]YJYJNÂˆÛÛ[˜Y[™XZÙUš\ÚX›J]JNÂˆ]KœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊNŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆ]KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒÎLŠJNÂˆÛÛ[˜Y[™XZÙUš\ÚX›JÜ˜\
+NÂ‚ˆÝ]XÈÛÛœÝÝŽ˜\œ˜^OÛÛœÝÚ\Š‹ˆ˜[™˜[Y\ÈÈ“ÕÈÒSˆ‹“ÕÈRQ‹’QÒRQ‹’QÒÒSˆˆNÂˆÝ]XÈÛÛœÝÝŽ˜\œ˜^OÛÛœÝÚ\Š‹Ïˆ\˜[Y]\“˜[Y\ÈÈ‘œ™\]Y[˜ÞH‹‘ØZ[ˆ‹”HˆNÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+BˆÂˆ˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKœÙ]^
+˜[™˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKœÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆ˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊL‹Œ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆ˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNËŒŒKŒÍÊJNÂˆÛÛ[˜Y[™XZÙUš\ÚX›J˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WJNÂˆ›Üˆ
+[\˜[Y]\ˆHÈ\˜[Y]\ˆÎÈ
+ÊÜ\˜[Y]\ŠBˆÂˆ]]ÉˆX™[H\˜[Y]\•]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWNÂˆX™[œÙ]^
+\˜[Y]\“˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆX™[œÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLYŠJNÂˆX™[œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒKŒŒËŒÌŠJNÂˆÛÛ[˜Y[™XZÙUš\ÚX›JX™[
+NÂ‚ˆ]]ÉˆÛY\ˆHÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWNÂˆÛY\‹œÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ“[™X\’Üš^›Û[
+NÂˆÛY\‹œÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ“›Õ^›Þ˜[ÙK
+NÂˆYˆ
+\˜[Y]\ˆOH
+BˆÂˆÛY\‹œÙ]˜[™ÙJŒŒŒŒKŒ
+NÂˆÛY\‹œÙ]ÚÙ]Ñ˜XÝÜ‘œ›ÛSZYÚ[
+LŒ
+NÂˆÛY\‹œÙ]^˜[YTÝY™š^
+ˆˆŠNÂˆBˆ[ÙHYˆ
+\˜[Y]\ˆOHJBˆÂˆÛY\‹œÙ]˜[™ÙJLŒŒŒŒŒJNÂˆÛY\‹œÙ]^˜[YTÝY™š^
+ˆˆŠNÂˆBˆ[ÙBˆÂˆÛY\‹œÙ]˜[™ÙJŒKŒŒJNÂˆBˆÛY\‹œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ[XÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLŽŒŒ‹
+JNÂˆÛY\‹œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ˜XÚÐÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽKLMLŠJNÂˆÛY\‹œÙ]Ü\\Ü^Q[˜X›Y
+YKYK	˜ÛÛ[
+NÂˆÛY\‹œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›Þ^ÛÛÝ\’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆÛY\‹œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›Þ˜XÚÙÜ›Ý[™ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌËMËÌÊJNÂˆÛY\‹›Û•˜[YPÚ[™ÙHHÝ\Ë˜[™\˜[Y]\—BˆÂˆYˆ
+˜XÚÒ[™^H	‰ˆÙ]\˜[Y]\ŠBˆÙ]\˜[Y]\Š˜XÚÒ[™^˜[™
+ˆÈ
+È\˜[Y]\‹Ý]X×ØØ\Ý›Ø]ŠÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWK™Ù]˜[YJ
+JJNÂˆÜ˜\œ™\Z[
+
+NÂˆNÂˆÛÛ[˜Y[™XZÙUš\ÚX›JÛY\ŠNÂˆBˆB‚ˆÜ˜\œ™\ÜÛœÙP]œ™\]Y[˜ÞHHÝ\×J›Ø]œ™\]Y[˜ÞJBˆÂˆ™]\›ˆ˜XÚÒ[™^H	‰ˆÙ]™\ÜÛœÙHÈÙ]™\ÜÛœÙJ˜XÚÒ[™^œ™\]Y[˜ÞJHˆŒŽÂˆNÂˆÜ˜\˜˜[™œ™\]Y[˜ÞHHÝ\×J[˜[™
+BˆÂˆ™]\›ˆ˜XÚÒ[™^H	‰ˆÙ]\˜[Y]\ˆÈÙ]\˜[Y]\Š˜XÚÒ[™^˜[™
+ˆÊHˆŒŽÂˆNÂˆÜ˜\˜˜[™ØZ[ˆHÝ\×J[˜[™
+BˆÂˆ™]\›ˆ˜XÚÒ[™^H	‰ˆÙ]\˜[Y]\ˆÈÙ]\˜[Y]\Š˜XÚÒ[™^˜[™
+ˆÈ
+ÈJHˆŒŽÂˆNÂˆÜ˜\œÙ]˜[™HÝ\×J[˜[™›Ø]œ™\]Y[˜ÞK›Ø]ØZ[ŠBˆÂˆYˆ
+˜XÚÒ[™^H	‰ˆÙ]˜[™˜[Y\ÊHÙ]˜[™˜[Y\Ê˜XÚÒ[™^˜[™œ™\]Y[˜ÞKØZ[ŠNÂˆNÂˆÙ]™\Ú^˜X›JYKYJNÂˆÙ[™UÚ]Ú^™JÍŒŒL
+NÂˆÙ]š\ÚX›J˜[ÙJNÂˆB‚ˆ›ÚYÜ[‘›Ü•˜XÚÊ[[™^
+BˆÂˆ˜XÚÒ[™^H[™^ÂˆÛÛœÝ]]È˜XÚÓ˜[YHHÙ]˜XÚÓ˜[YHÈÙ]˜XÚÓ˜[YJ[™^
+Hˆ‘Ù[™\˜]ÜˆŽÂˆ]KœÙ]^
+˜XÚÓ˜[YH
+ÈˆHP˜[™\]X[\Ù\ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™Yœ™\Ú\˜[Y]\•˜[Y\Ê[™^
+NÂˆÙ]š\ÚX›JYJNÂˆÑœ›Û
+YJNÂˆB‚ˆ›ÚY™Yœ™\Ú\˜[Y]\•˜[Y\Ê[[™^
+BˆÂˆYˆ
+˜XÚÒ[™^OH[™^
+H™]\›ŽÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+Bˆ›Üˆ
+[\˜[Y]\ˆHÈ\˜[Y]\ˆÎÈ
+ÊÜ\˜[Y]\ŠBˆYˆ
+Ù]\˜[Y]\ŠBˆÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]˜[YJˆÙ]\˜[Y]\Š[™^˜[™
+ˆÈ
+È\˜[Y]\ŠKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÜ˜\œ™\Z[
+
+NÂˆB‚ˆ›ÚYÛÜÙP]Û”™\ÜÙY
+
+HÝ™\œšYHÈÙ]š\ÚX›J˜[ÙJNÈB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆØÝ[Y[Ú[™ÝÎŽœ™\Ú^™Y
+
+NÂˆ]]È\™XHHÛÛ[™Ù]ØØ[›Ý[™Ê
+Kœ™YXÙY
+N
+NÂˆ]KœÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛUÜ
+Ž
+JNÂˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+
+NÂˆÜ˜\œÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛUÜ
+NL
+JNÂˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+L
+NÂˆÛÛœÝ[›ÝÒZYÚH\™XK™Ù]ZYÚ
+
+HÈÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+BˆÂˆ]]È›ÝÈH\™XKœ™[[Ý™Qœ›ÛUÜ
+›ÝÒZYÚ
+NÂˆ˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKœÙ]›Ý[™Ê›ÝËœ™[[Ý™Qœ›ÛUÜ
+NJJNÂˆÛÛœÝ[ÛÛ[[•ÚYH›ÝË™Ù]ÚY
+
+HÈÎÂˆ›Üˆ
+[\˜[Y]\ˆHÈ\˜[Y]\ˆÎÈ
+ÊÜ\˜[Y]\ŠBˆÂˆ]]ÈÛÛ[[ˆH›ÝËœ™[[Ý™Qœ›ÛSY
+ÛÛ[[•ÚY
+Kœ™YXÙY
+
+NÂˆ\˜[Y]\•]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]›Ý[™ÊÛÛ[[‹œ™[[Ý™Qœ›ÛUÜ
+MJJNÂˆÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]›Ý[™ÊÛÛ[[ŠNÂˆBˆBˆB‚œš]˜]N‚ˆXÙNŽÛÛ\Û™[ÛÛ[ÂˆXÙNŽ“X™[]NÂˆ\T™\ÜÛœÙQÜ˜\Ü˜\ÂˆÝŽ˜\œ˜^OXÙNŽ“X™[ˆ˜[™]\ÎÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^OXÙNŽ“X™[Ï‹ˆ\˜[Y]\•]\ÎÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^OXÙNŽ”ÛY\‹Ï‹ˆÛÛ›ÛÎÂˆ[˜XÚÒ[™^HLNÂŸNÂ‚˜Û\ÜÈYÚ[”\˜[Y]\•Ú[™ÝÈš[˜[ˆX›XÈXÙNŽ‘ØÝ[Y[Ú[™ÝÂžÂˆÛ\ÜÈ\˜[Y]\”›ÝÈš[˜[ˆX›XÈXÙNŽÛÛ\Û™[ˆÂˆX›XÎ‚ˆ\˜[Y]\”›ÝÊNŽ]]ÛX]X›T\˜[Y]\ŽŽ”ˆ\˜[Y]\‹ÝŽ™[˜Ý[Û›ÚY
+
+OˆÛÚ[™ÙY
+Bˆˆ\˜[Y]\”™YŠÝŽ›[Ý™J\˜[Y]\ŠJKÚ[™ÙY
+ÝŽ›[Ý™JÛÚ[™ÙY
+JBˆÂˆY[™XZÙUš\ÚX›JX™[
+NÂˆX™[œÙ]^
+\˜[Y]\”™Y‹O™Ù]\˜[Y]\“˜[YJ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆX™[œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŽK
+JNÂˆX™[œÙ]ÛÛ\
+\˜[Y]\”™Y‹O™Ù]Ý\œ™[˜[YP\ÔÝš[™ÕÚ]X™[
+
+JNÂˆY[™XZÙUš\ÚX›J˜[YJNÂˆ˜[YKœÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ“[™X\’Üš^›Û[
+NÂˆÛÛœÝ]]È\˜[Y]\”˜[™ÙHH\˜[Y]\”™Y‹O™Ù]˜[YT˜[™ÙJ
+NÂˆ˜[YKœÙ]˜[™ÙJ\˜[Y]\”˜[™ÙK™Ù]Ý\
+
+K\˜[Y]\”˜[™ÙK™Ù][™
+
+K\˜[Y]\”™Y‹O˜[YT˜[™ÙKš[\˜[
+NÂˆ˜[YKœÙ]˜[YJ\˜[Y]\”™Y‹O™Ù]Ý\œ™[˜[YJ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ˜[YKœÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ“›Õ^›Þ˜[ÙK
+NÂˆ˜[YKœÙ]^˜[YTÝY™š^
+\˜[Y]\”™Y‹O™Ù]X™[
+
+Kš\Ó›Ý[\J
+HÈˆˆ
+È\˜[Y]\”™Y‹O™Ù]X™[
+
+HˆXÙNŽ”Ýš[™ÞßJNÂˆ˜[YK^œ›ÛU˜[YQ[˜Ý[ÛˆHÜ\˜[Y]\’[™HH\˜[Y]\”™Y—JÝX›HŠHÈ™]\›ˆ\˜[Y]\’[™KO˜[YUÔÝš[™ÊÝ]X×ØØ\Ý›Ø]ŠŠJNÈNÂˆ˜[YK˜[YQœ›ÛU^[˜Ý[ÛˆHÜ\˜[Y]\’[™HH\˜[Y]\”™Y—JÛÛœÝXÙNŽ”Ýš[™ÉˆÊHÈ™]\›ˆÝ]X×ØØ\ÝÝX›OŠ\˜[Y]\’[™KOœÝš[™ÕÕ˜[YJÊJNÈNÂˆ˜[YKœÙ]Ü\\Ü^Q[˜X›Y
+YKYK\ÊNÂˆ˜[YK›Û‘˜YÔÝ\HÜ\˜[Y]\’[™HH\˜[Y]\”™Y—HÈ\˜[Y]\’[™KOœ\˜[Y]\Ú[™ÙQÙ\Ý\™P™YÚ[Š
+NÈNÂˆ˜[YK›Û‘˜YÑ[™HÜ\˜[Y]\’[™HH\˜[Y]\”™Y—HÈ\˜[Y]\’[™KOœ\˜[Y]\Ú[™ÙQÙ\Ý\™Q[™
+
+NÈNÂˆ˜[YK›Û•˜[YPÚ[™ÙHHÝ\×BˆÂˆ\˜[Y]\”™Y‹OœÙ]\˜[Y]\ŠÝ]X×ØØ\Ý›Ø]Š˜[YK™Ù]˜[YJ
+JKXÙNŽœÙ[™›ÝYšXØ][ÛŠNÂˆX™[œÙ]ÛÛ\
+\˜[Y]\”™Y‹O™Ù]Ý\œ™[˜[YP\ÔÝš[™ÕÚ]X™[
+
+JNÂˆYˆ
+Ú[™ÙY
+HÚ[™ÙY
+
+NÂˆNÂˆ˜[YKœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ[XÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠL‹ŒLŒÍŠJNÂˆ˜[YKœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ˜XÚÐÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎL
+JNÂˆ˜[YKœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›Þ^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹KLŠJNÂˆ˜[YKœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›Þ˜XÚÙÜ›Ý[™ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌËM‹ÌJJNÂˆ˜[YKœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›ÞÝ][™PÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMËM‹MÌ
+JNÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆ]]È\™XHHÙ]ØØ[›Ý[™Ê
+Kœ™YXÙY
+LÊNÂˆX™[œÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛSY
+NL
+JNÂˆ˜[YKœÙ]›Ý[™Ê\™XJNÂˆB‚ˆš]˜]N‚ˆNŽ]]ÛX]X›T\˜[Y]\ŽŽ”ˆ\˜[Y]\”™YŽÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÚ[™ÙYÂˆXÙNŽ“X™[X™[ÂˆXÙNŽ”ÛY\ˆ˜[YNÂˆNÂ‚ˆÛ\ÜÈ\˜[Y]\“\Ýš[˜[ˆX›XÈXÙNŽÛÛ\Û™[ˆÂˆX›XÎ‚ˆ›ÚYÙ]\˜[Y]\œÊNŽ”YÚ[ŽŽ”ˆYÚ[‹ÝŽ™[˜Ý[Û›ÚY
+
+OˆÚ[™ÙY
+BˆÂˆ›ÝÜË˜ÛX\Š
+NÂˆYÚ[”™YˆHÝŽ›[Ý™JYÚ[ŠNÂˆYˆ
+YÚ[”™YˆOH[ŠBˆ›Üˆ
+[HHÈHYÚ[”™Y‹O™Ù][P]]ÛX]X›T\˜[Y]\œÊ
+NÈ
+ÊÚJBˆÂˆ]]È›ÝÈHÝŽ›XZÙWÝ[š\]YO\˜[Y]\”›ÝÏŠYÚ[”™Y‹O™Ù]]]ÛX]X›T\˜[Y]\ŠJKÚ[™ÙY
+NÂˆY[™XZÙUš\ÚX›J
+œ›ÝÊNÂˆ›ÝÜËœ\ÚØ˜XÚÊÝŽ›[Ý™J›ÝÊJNÂˆBˆÙ]Ú^™JLXÙNŽš›X^
+Ý]X×ØØ\Ý[Š›ÝÜËœÚ^™J
+JH
+ˆˆ
+ÈMŠJNÂˆ™\Ú^™Y
+
+NÂˆB‚ˆ›ÚYÛX\”\˜[Y]\œÊ
+BˆÂˆ›ÝÜË˜ÛX\Š
+NÂˆYÚ[”™YˆH[ŽÂˆÙ]Ú^™JL
+NÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆ]]ÈHHÂˆ›Üˆ
+]]Éˆ›ÝÈˆ›ÝÜÊBˆÂˆ›ÝËOœÙ]›Ý[™ÊKÙ]ÚY
+
+KÎ
+NÂˆH
+ÏHŽÂˆBˆB‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYHÈË™š[[
+XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠËËMJJNÈB‚ˆš]˜]N‚ˆNŽ”YÚ[ŽŽ”ˆYÚ[”™YŽÂˆÝŽ™XÝÜÝŽ[š\]YWÜ\˜[Y]\”›ÝÏˆ›ÝÜÎÂˆNÂ‚œX›XÎ‚ˆYÚ[”\˜[Y]\•Ú[™ÝÊ
+BˆˆØÝ[Y[Ú[™ÝÊ“Ü˜š]Y™™XÝ‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKN
+KXÙNŽ‘ØÝ[Y[Ú[™ÝÎŽ˜[]ÛœÊBˆÂˆÙ]\Ú[™Ó˜]]™U]P˜\ŠYJNÂˆÙ]ÛÛ[›Û“ÝÛ™Y
+	šY]ÜÜ˜[ÙJNÂˆšY]ÜÜœÙ]šY]ÙYÛÛ\Û™[
+	œ\˜[Y]\œË˜[ÙJNÂˆÙ]™\Ú^˜X›JYKYJNÂˆÙ]š\ÚX›J˜[ÙJNÂˆB‚ˆ›ÚYÚÝÔYÚ[ŠNŽ”YÚ[ŽŽ”ˆYÚ[‹ÝŽ™[˜Ý[Û›ÚY
+
+OˆÛÚ[™ÙY
+BˆÂˆYˆ
+YÚ[ˆOH[ŠH™]\›ŽÂˆ\˜[Y]\œËœÙ]\˜[Y]\œÊYÚ[‹ÝŽ›[Ý™JÛÚ[™ÙY
+JNÂˆÙ]˜[YJYÚ[‹O™Ù]˜[YJ
+JNÂˆÙ]˜[YJ“Ü˜š]Hˆ
+ÈYÚ[‹O™Ù]˜[YJ
+JNÂˆšY]ÜÜœÙ]šY]ÔÜÚ][ÛŠ
+NÂˆÙ[™UÚ]Ú^™JŽLXÙNŽš›[Z]
+N\˜[Y]\œË™Ù]ZYÚ
+
+H
+È
+JNÂˆÙ]š\ÚX›JYJNÂˆÑœ›Û
+YJNÂˆB‚ˆ›ÚYÛX\”YÚ[Š
+BˆÂˆÙ]š\ÚX›J˜[ÙJNÂˆ\˜[Y]\œË˜ÛX\”\˜[Y]\œÊ
+NÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆØÝ[Y[Ú[™ÝÎŽœ™\Ú^™Y
+
+NÂˆšY]ÜÜœÙ]›Ý[™ÊÙ]ØØ[›Ý[™Ê
+Kœ™YXÙY
+
+JNÂˆB‚ˆ›ÚYÛÜÙP]Û”™\ÜÙY
+
+HÝ™\œšYHÈÛX\”YÚ[Š
+NÈB‚œš]˜]N‚ˆXÙNŽ•šY]ÜÜšY]ÜÜÂˆ\˜[Y]\“\Ý\˜[Y]\œÎÂŸNÂ‚˜Û\ÜÈZ^\•Ú[™ÝÈš[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆÝŽ™[˜Ý[Û[
+
+OˆÙ]˜XÚÐÛÝ[ÂˆÝŽ™[˜Ý[ÛXÙNŽ”Ýš[™Ê[
+OˆÙ]˜XÚÓ˜[YNÂˆÝŽ™[˜Ý[Û›ÚY
+[ÛÛœÝXÙNŽ”Ýš[™ÉŠOˆ™[˜[YU˜XÚÎÂˆÝŽ™[˜Ý[ÛÝX›J[
+OˆÙ]˜XÚÑØZ[ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[ÝX›JOˆÙ]˜XÚÑØZ[ŽÂˆÝŽ™[˜Ý[ÛÝX›J[
+OˆÙ]˜XÚÔ[ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[ÝX›JOˆÙ]˜XÚÔ[ŽÂˆÝŽ™[˜Ý[Û›ÛÛ
+[
+OˆÙ]˜XÚÓ]]YÂˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ]˜XÚÓ]]YÂˆÝŽ™[˜Ý[Û›ÛÛ
+[
+Oˆ\ÑÙ[™\˜]Ü•˜XÚÎÂˆÝŽ™[˜Ý[Û›ÛÛ
+[
+OˆÙ]˜XÚÔÛÛÎÂˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ]˜XÚÔÛÛÎÂˆÝŽ™[˜Ý[Û›Ø]
+[›Ø]
+OˆÙ]˜XÚÑ\T™\ÜÛœÙNÂˆÝŽ™[˜Ý[Û›Ø]
+[[
+OˆÙ]˜XÚÑ\T\˜[Y]\ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[[›Ø]
+OˆÙ]˜XÚÑ\T\˜[Y]\ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[[›Ø]›Ø]
+OˆÙ]˜XÚÑ\P˜[™ÂˆÝŽ™[˜Ý[Û›ÛÛ
+[
+OˆÙ]˜XÚÑ\Q[˜X›YÂˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ]˜XÚÑ\Q[˜X›YÂˆÝŽ™[˜Ý[Û›ÚY
+[
+OˆÛ“Ü[‘\NÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ‘›ØÝ\ÎÂˆÝŽ™[˜Ý[ÛXÙNŽ”Ýš[™Ð\œ˜^J[
+OˆÙ][œÙ\˜[Y\ÎÂˆÝŽ™[˜Ý[Û›ÛÛ
+[[
+OˆÙ][œÙ\[˜X›YÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÙÙÛR[œÙ\ÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆY][œÙ\ÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+Oˆ™[[Ý™R[œÙ\ÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆY[œÙ\ÂˆÝŽ™[˜Ý[ÛÝX›J[[
+OˆÙ]˜XÚÔÙ[™ØZ[ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[[ÝX›JOˆÙ]˜XÚÔÙ[™ØZ[ŽÂˆÝŽ™[˜Ý[Û[
+[
+OˆÙ]˜XÚÓÝ]]\ÎÂˆÝŽ™[˜Ý[Û›ÚY
+[[
+OˆÙ]˜XÚÓÝ]]\ÎÂˆÝŽ™[˜Ý[Û›ÛÛ
+[
+Oˆ\Ñž™]\›ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[
+OˆÛ“Ü[‘ž™]\›ŽÂˆÝŽ™[˜Ý[ÛNŽ“]™[Y]\”YÚ[ŠŠ[
+OˆÙ]˜XÚÓY]\ŽÂˆÝŽ™[˜Ý[ÛNŽ‘Y]^X˜XÚÐÛÛ^
+Š
+OˆÙ]X\Ý\“Y]\ÛÛ^ÂˆÝŽ™[˜Ý[ÛÝX›J
+OˆÙ]X\Ý\‘ØZ[ŽÂˆÝŽ™[˜Ý[Û›ÚY
+ÝX›JOˆÙ]X\Ý\‘ØZ[ŽÂˆÝŽ™[˜Ý[ÛÝX›J
+OˆÙ]X\Ý\”[ŽÂˆÝŽ™[˜Ý[Û›ÚY
+ÝX›JOˆÙ]X\Ý\”[ŽÂˆÝŽ™[˜Ý[Û›ÛÛ
+
+OˆÙ]X\Ý\“]]YÂˆÝŽ™[˜Ý[Û›ÚY
+›ÛÛ
+OˆÙ]X\Ý\“]]YÂˆZ^\•Ú[™ÝÊ
+BˆÂˆÛÛ[œÙ]Ü\]YJYJNÂˆZ[š[Z^™P]Û‹œÙ]]Û•^
+¸¢$ˆŠNÂˆÛÜÙP]Û‹œÙ]]Û•^
+°åÈŠNÂˆZ[š[Z^™P]Û‹œÙ]ÛÛ\
+“Z[š[Z^™HZ^\ˆŠNÂˆÛÜÙP]Û‹œÙ]ÛÛ\
+ÛÜÙHZ^\ˆŠNÂˆ›Üˆ
+]]Êˆ]ÛˆˆÈ	›Z[š[Z^™P]Û‹	˜ÛÜÙP]ÛˆJBˆÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍKN
+JNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒŒÍKÊJNÂˆY[™XZÙUš\ÚX›J]ÛŠNÂˆBˆ›ØÝ\Ó\Ý[™\‹›Û“[Ý\ÙQÝÛˆHÝ\×HÈYˆ
+Û‘›ØÝ\ÊHÛ‘›ØÝ\Ê
+NÈNÂˆZ[š[Z^™P]Û‹›ÛÛXÚÈHÝ\×BˆÂˆZ[š[Z^™YH[Z[š[Z^™YÂˆ\]SZ[š[Z^™P]ÛŠ
+NÂˆYˆ
+Û“Z[š[Z^™PÚ[™ÙY
+HÛ“Z[š[Z^™PÚ[™ÙY
+Z[š[Z^™Y
+NÂˆ™\Ú^™Y
+
+NÂˆNÂˆÛÜÙP]Û‹›ÛÛXÚÈHÝ\×HÈYˆ
+ÛÛÜÙJHÛÛÜÙJ
+NÈNÂˆY[™XZÙUš\ÚX›JÛÛ[
+NÂˆÛÛ[˜Y[™XZÙUš\ÚX›JšY]ÜÜ
+NÂˆËÈÙY\Ú[›™[Ýš\È›\ÚÚ]Hš]Y[™[ÚYˆ™\XØ[ˆËÈ˜]šYØ][Ûˆ™[XZ[œÈ]˜Z[X›Hœ›ÛHHÚY[Ú]Ý]™\Ù\š[™ÈBˆËÈ\›X[™[ØÜ›Û˜\ˆÝ]\ŽÈÜš^›Û[ØÜ›Û[™È\X\œÈÛ›HÚ[‚ˆËÈ[Ýš\ÈØ[››Ýš][ˆH]˜Z[X›HÛÜšÜÜXÙK‚ˆšY]ÜÜœÙ]ØÜ›Û˜\œÔÚÝÛŠ˜[ÙKYKYK˜[ÙJNÂˆšY]ÜÜœÙ]šY]ÙYÛÛ\Û™[
+	œÝš\Ë˜[ÙJNÂˆÝš\ËœÙ]Ü\]YJ˜[ÙJNÂˆÝš\Ë˜Y[™XZÙUš\ÚX›JX\Ý\”Ýš\
+NÂˆX\Ý\”Ýš\˜Y[Ý\ÙS\Ý[™\Š	™›ØÝ\Ó\Ý[™\‹YJNÂˆÝš\ËœÙ]Ú^™JJNÂˆY™™XÝÚ[™ÝÈHÝŽ›XZÙWÝ[š\]YOYÚ[”\˜[Y]\•Ú[™ÝÏŠ
+NÂˆB‚ˆÝŽ™[˜Ý[Û›ÚY
+›ÛÛ
+OˆÛ“Z[š[Z^™PÚ[™ÙYÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛÛÜÙNÂˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[ŠOˆÛ‘˜YÙÙYÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ‘˜YÑ[™YÂˆ›ÛÛ\ÓZ[š[Z^™Y
+
+HÛÛœÝÈ™]\›ˆZ[š[Z^™YÈBˆ›ÚYÙ]X\Ý\”ÙXÝ[Û“[ÙJ›ÛÛ[˜X›Y
+HÈX\Ý\”ÙXÝ[Û“[ÙHH[˜X›YÈBˆ›ÛÛ\ÓX\Ý\”ÙXÝ[Û“[ÙJ
+HÛÛœÝÈ™]\›ˆX\Ý\”ÙXÝ[Û“[ÙNÈBˆ[Ù]š\ÚX›U˜XÚÐÛÝ[
+
+HÛÛœÝÈ™]\›ˆš\ÚX›U˜XÚÒ[™XÙ\ËœÚ^™J
+NÈBˆ›ÚYÙ]Z[š[Z^™Y
+›ÛÛÚÝ[Z[š[Z^™JBˆÂˆZ[š[Z^™YHÚÝ[Z[š[Z^™NÂˆ\]SZ[š[Z^™P]ÛŠ
+NÂˆ™\Ú^™Y
+
+NÂˆB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+Û‘›ØÝ\ÊHÛ‘›ØÝ\Ê
+NÂˆYˆ
+]™[™]™[ÛÛ\Û™[OH\È	‰ˆ]™[žH]P˜\’ZYÚ
+H˜YÓÜšYÚ[ˆHÙ]ÜÚ][ÛŠ
+NÂˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+]™[™]™[ÛÛ\Û™[OH\È	‰ˆ]™[™Ù][Ý\ÙQÝÛ–J
+H]P˜\’ZYÚ	‰ˆÛ‘˜YÙÙY
+BˆÛ‘˜YÙÙY
+˜YÓÜšYÚ[ˆ
+È]™[™Ù]Ù™œÙ]œ›ÛQ˜YÔÝ\
+
+JNÂˆB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+]™[™]™[ÛÛ\Û™[OH\È	‰ˆ]™[™Ù][Ý\ÙQÝÛ–J
+H]P˜\’ZYÚ	‰ˆÛ‘˜YÑ[™Y
+HÛ‘˜YÑ[™Y
+
+NÂˆB‚ˆ›ÚY™Yœ™\Ú
+[Ù[XÝY˜XÚÊBˆÂˆÛÛœÝ]]ÈÛÝ[HÙ]˜XÚÐÛÝ[ÈÙ]˜XÚÐÛÝ[
+
+HˆÂˆš\ÚX›U˜XÚÒ[™XÙ\Ë˜ÛX\Š
+NÂˆ›Üˆ
+[HHÈHÛÝ[È
+ÊÚJBˆYˆ
+\ÑÙ[™\˜]Ü•˜XÚÈ	‰ˆ\ÑÙ[™\˜]Ü•˜XÚÊJHOHX\Ý\”ÙXÝ[Û“[ÙJBˆš\ÚX›U˜XÚÒ[™XÙ\Ë˜Y
+JNÂˆÛÛœÝ]]Èš\ÚX›PÛÝ[Hš\ÚX›U˜XÚÒ[™XÙ\ËœÚ^™J
+NÂˆÚ[H
+Ú[›™[Ýš\ËœÚ^™J
+Hš\ÚX›PÛÝ[
+BˆÂˆ]]ÊˆÝš\H™]ÈÚ[›™[Ýš\
+
+NÂˆÝš\O˜Y[Ý\ÙS\Ý[™\Š	™›ØÝ\Ó\Ý[™\‹YJNÂˆÚ[›™[Ýš\Ë˜Y
+Ýš\
+NÂˆBˆÚ[H
+Ú[›™[Ýš\ËœÚ^™J
+Hˆš\ÚX›PÛÝ[
+HÚ[›™[Ýš\Ëœ™[[Ý™S\Ý
+
+NÂˆX\Ý\”Ýš\œÙ]š\ÚX›JX\Ý\”ÙXÝ[Û“[ÙJNÂˆ›Üˆ
+[Ýš\[™^HÈÝš\[™^š\ÚX›PÛÝ[È
+ÊÜÝš\[™^
+BˆÂˆÛÛœÝ]]ÈHHš\ÚX›U˜XÚÒ[™XÙ\Ë™Ù][˜ÚXÚÙY
+Ýš\[™^
+NÂˆ]]ÊˆÝš\HÚ[›™[Ýš\ÖÜÝš\[™^NÂˆYˆ
+Ýš\O™Ù]\™[ÛÛ\Û™[
+
+HOH	œÝš\ÊHÝš\Ë˜Y[™XZÙUš\ÚX›JÝš\
+NÂˆËÈHÙ[XÝY]˜XÚÈÛÛ›Û[™›ÛÝ\ˆ[™XYHY[YžHBˆËÈÚ[›™[ˆHZ^\ˆÝš\]Ù[ˆÝ\ÈÚ]HÙ[™ÙXÝ[Û‹‚ˆÝš\OœÙ]›ÛÝ\•^
+Ù]˜XÚÓ˜[YHÈÙ]˜XÚÓ˜[YJJHˆÚ[›™[ˆ
+ÈXÙNŽ”Ýš[™ÊH
+ÈJJNÂˆÝš\OœÙ]Ù[XÝY
+HOHÙ[XÝY˜XÚÊNÂˆÝš\OœÙ]Y]\”YÚ[ŠÙ]˜XÚÓY]\ˆÈÙ]˜XÚÓY]\ŠJHˆ[ŠNÂˆÝš\OœÙ]ØZ[•˜[YJÙ]˜XÚÑØZ[ˆÈÙ]˜XÚÑØZ[ŠJHˆŒ
+NÂˆÝš\OœÙ][•˜[YJÙ]˜XÚÔ[ˆÈÙ]˜XÚÔ[ŠJHˆŒ
+NÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÝš\OœÙ]Ù[™˜[YJ\ËÙ]˜XÚÔÙ[™ØZ[ˆÈÙ]˜XÚÔÙ[™ØZ[ŠK\ÊHˆMŒŒ
+NÂˆÝš\OœÙ]Ý]]\ÊÙ]˜XÚÓÝ]]\ÈÈÙ]˜XÚÓÝ]]\ÊJHˆLJNÂˆÝš\OœÙ]]]TÝ]JÙ]˜XÚÓ]]Y	‰ˆÙ]˜XÚÓ]]Y
+JJNÂˆÝš\OœÙ]ÛÛÔÝ]JÙ]˜XÚÔÛÛÈ	‰ˆÙ]˜XÚÔÛÛÊJJNÂˆÝš\OœÙ]\T™\ÜÛœÙJÝ\ËWJ›Ø]œ™\]Y[˜ÞJBˆÂˆ™]\›ˆÙ]˜XÚÑ\T™\ÜÛœÙHÈÙ]˜XÚÑ\T™\ÜÛœÙJKœ™\]Y[˜ÞJHˆŒŽÂˆJNÂˆÝš\OœÙ]\Q[˜X›Y
+Ù]˜XÚÑ\Q[˜X›Y	‰ˆÙ]˜XÚÑ\Q[˜X›Y
+JJNÂˆÝš\OœÙ]\P˜[™Ø[˜XÚÜÊˆÝ\ËWJ[˜[™
+HÈ™]\›ˆÙ]˜XÚÑ\T\˜[Y]\ˆÈÙ]˜XÚÑ\T\˜[Y]\ŠK˜[™
+ˆÊHˆŒŽÈKˆÝ\ËWJ[˜[™
+HÈ™]\›ˆÙ]˜XÚÑ\T\˜[Y]\ˆÈÙ]˜XÚÑ\T\˜[Y]\ŠK˜[™
+ˆÈ
+ÈJHˆŒŽÈKˆÝ\ËWJ[˜[™›Ø]œ™\]Y[˜ÞK›Ø]ØZ[ŠBˆÂˆYˆ
+Ù]˜XÚÑ\P˜[™
+HÙ]˜XÚÑ\P˜[™
+K˜[™œ™\]Y[˜ÞKØZ[ŠNÂˆJNÂˆÝš\O™Ù]\T\˜[Y]\ˆHÝ\ËWJ[\˜[Y]\ŠBˆÂˆ™]\›ˆÙ]˜XÚÑ\T\˜[Y]\ˆÈÙ]˜XÚÑ\T\˜[Y]\ŠK\˜[Y]\ŠHˆŒŽÂˆNÂˆÝš\Oœ™Yœ™\Ú\T\˜[Y]\•˜[Y\Ê
+NÂˆÝš\O›Û‘\T\˜[Y]\ˆHÝ\ËWJ[\˜[Y]\‹›Ø]˜[YJBˆÂˆYˆ
+Ù]˜XÚÑ\T\˜[Y]\ŠHÙ]˜XÚÑ\T\˜[Y]\ŠK\˜[Y]\‹˜[YJNÂˆNÂˆÝš\O›Û•ÙÙÛQ\HHÝ\ËWJ›ÛÛ[˜X›Y
+BˆÂˆYˆ
+Ù]˜XÚÑ\Q[˜X›Y
+HÙ]˜XÚÑ\Q[˜X›Y
+K[˜X›Y
+NÂˆNÂˆÝš\OœÙ]Z^ÛÛ›ÛÕš\ÚX›JYJNÂˆËÈÙ]Z^ÛÛ›ÛÕš\ÚX›H[˜X›\ÈHÚ[›™[	ÜÈÙ[™ÛÛ›ÛÈÛË‚ˆËÈ\H˜XÚËZÚ[™š\ÚXš[]HY\ˆ]ÛÈ–™]\›ˆÝš\ÈÈ›ÝˆËÈ^ÜÙHXYÙ[™Û›ØœÈ]Û›HXØÙ\Ù[™\˜]Ü‹]˜XÚÈ[™XÙ\Ë‚ˆÝš\OœÙ]Ù[™Õš\ÚX›JZ\ÑÙ[™\˜]Ü•˜XÚÈ\ÑÙ[™\˜]Ü•˜XÚÊJJNÂˆËÈÝ]]›Ý][™È\È\ÙY[›Üˆ]™\žHZ^\ˆÚ[›™[[˜ÛY[™ÂˆËÈÜ™[˜\žH]Y[È˜XÚÜÈ[™–™]\›œËÛÈÙY\HX\Ý\‹Ð\ÂˆËÈÙ[XÝÜˆ˜[šÈ]˜Z[X›HXÜ›ÜÜÈ[Ýš\Ë‚ˆÝš\OœÙ]Ý]]›Ý]\Õš\ÚX›JYJNÂˆÛÛœÝ]]È[œÙ\˜[Y\ÈHÙ][œÙ\˜[Y\ÈÈÙ][œÙ\˜[Y\ÊJHˆXÙNŽ”Ýš[™Ð\œ˜^^ßNÂˆ›Üˆ
+[ÛÝHÈÛÝÈ
+ÊÜÛÝ
+BˆÂˆÛÛœÝ]]È˜[YHHÛÝ[œÙ\˜[Y\ËœÚ^™J
+HÈ[œÙ\˜[Y\ÖÜÛÝHˆXÙNŽ”Ýš[™ÞßNÂˆÝš\OœÙ][œÙ\›ÝÊÛÝ˜[YK˜[YKš\Ó›Ý[\J
+H	‰ˆÙ][œÙ\[˜X›Y	‰ˆÙ][œÙ\[˜X›Y
+KÛÝ
+JNÂˆBˆËÈ[œÙ\ÛÝÈØ[ˆ™XÛÛYHš\ÚX›HÚ]Ý]Ú[™Ú[™ÈHÝš\Ú^™K‚ˆËÈ™K\[ˆ^[Ý]ÛÈZ\ˆ]ÛœÈ™XÙZ]™H›Ý[™È[[YYX][K‚ˆÝš\Oœ™\Ú^™Y
+
+NÂˆÝš\O›Û‘ØZ[ˆHÝ\ËWJÝX›H˜[YJHÈYˆ
+Ù]˜XÚÑØZ[ŠHÙ]˜XÚÑØZ[ŠK˜[YJNÈNÂˆÝš\O›Û”[ˆHÝ\ËWJÝX›H˜[YJHÈYˆ
+Ù]˜XÚÔ[ŠHÙ]˜XÚÔ[ŠK˜[YJNÈNÂˆÝš\O›Û”Ù[™HÝ\ËWJ[\ËÝX›H˜[YJBˆÂˆYˆ
+Ù]˜XÚÔÙ[™ØZ[ŠHÙ]˜XÚÔÙ[™ØZ[ŠK\Ë˜[YJNÂˆNÂˆÝš\O›Û“Ý]]\ÈHÝ\ËWJ[\ÊBˆÂˆYˆ
+Ù]˜XÚÓÝ]]\ÊHÙ]˜XÚÓÝ]]\ÊK\ÊNÂˆNÂˆÝš\O›Û“]]HHÝ\ËWJ›ÛÛ˜[YJHÈYˆ
+Ù]˜XÚÓ]]Y
+HÙ]˜XÚÓ]]Y
+K˜[YJNÈNÂˆÝš\O›Û”ÛÛÈHÝ\ËWJ›ÛÛ˜[YJHÈYˆ
+Ù]˜XÚÔÛÛÊHÙ]˜XÚÔÛÛÊK˜[YJNÈNÂˆÝš\O›Û”™[˜[YHHÝ\ËWJÛÛœÝXÙNŽ”Ýš[™Éˆ˜[YJBˆÂˆYˆ
+™[˜[YU˜XÚÊH™[˜[YU˜XÚÊK˜[YJNÂˆNÂˆÝš\O›Û“Ü[‘\HHÝ\ËWHÈYˆ
+Û“Ü[‘\JHÛ“Ü[‘\JJNÈNÂˆÝš\O›Û•ÙÙÛR[œÙ\HÝ\ËWJ[ÛÝ
+HÈYˆ
+ÙÙÛR[œÙ\
+HÙÙÛR[œÙ\
+KÛÝ
+NÈNÂˆÝš\O›Û‘Y][œÙ\HÝ\ËWJ[ÛÝ
+HÈYˆ
+Y][œÙ\
+HY][œÙ\
+KÛÝ
+NÈNÂˆÝš\O›Û”™[[Ý™R[œÙ\HÝ\ËWJ[ÛÝ
+HÈYˆ
+™[[Ý™R[œÙ\
+H™[[Ý™R[œÙ\
+KÛÝ
+NÈNÂˆÝš\O›ÛY[œÙ\HÝ\ËWBˆÂˆÚÝÒ[œÙ\ÚÛÜÙ\ŠÝ\ËWJ[Ú[™
+BˆÂˆYˆ
+Y[œÙ\
+HY[œÙ\
+KÚ[™
+NÂˆJNÂˆNÂˆBˆX\Ý\”Ýš\œÙ]›ÛÝ\•^
+“PTÕTˆŠNÂˆX\Ý\”Ýš\œÙ]X\Ý\“Y]\ÛÛ^Ý\Y\ŠÙ]X\Ý\“Y]\ÛÛ^
+NÂˆX\Ý\”Ýš\œÙ]ØZ[•˜[YJÙ]X\Ý\‘ØZ[ˆÈÙ]X\Ý\‘ØZ[Š
+HˆŒ
+NÂˆX\Ý\”Ýš\œÙ][•˜[YJÙ]X\Ý\”[ˆÈÙ]X\Ý\”[Š
+HˆŒ
+NÂˆX\Ý\”Ýš\œÙ]]]TÝ]JÙ]X\Ý\“]]Y	‰ˆÙ]X\Ý\“]]Y
+
+JNÂˆX\Ý\”Ýš\œÙ]Z^ÛÛ›ÛÕš\ÚX›J˜[ÙJNÂˆX\Ý\”Ýš\œÙ]X\Ý\ÛÛ›ÛÕš\ÚX›JYJNÂˆX\Ý\”Ýš\œÙ]Ù[™Õš\ÚX›J˜[ÙJNÂˆX\Ý\”Ýš\œÙ]\T™\ÜÛœÙJÝ\ËÛÝ[J›Ø]œ™\]Y[˜ÞJBˆÂˆ™]\›ˆÙ]˜XÚÑ\T™\ÜÛœÙHÈÙ]˜XÚÑ\T™\ÜÛœÙJÛÝ[œ™\]Y[˜ÞJHˆŒŽÂˆJNÂˆX\Ý\”Ýš\œÙ]\Q[˜X›Y
+Ù]˜XÚÑ\Q[˜X›Y	‰ˆÙ]˜XÚÑ\Q[˜X›Y
+ÛÝ[
+JNÂˆX\Ý\”Ýš\œÙ]\P˜[™Ø[˜XÚÜÊˆÝ\ËÛÝ[J[˜[™
+HÈ™]\›ˆÙ]˜XÚÑ\T\˜[Y]\ˆÈÙ]˜XÚÑ\T\˜[Y]\ŠÛÝ[˜[™
+ˆÊHˆŒŽÈKˆÝ\ËÛÝ[J[˜[™
+HÈ™]\›ˆÙ]˜XÚÑ\T\˜[Y]\ˆÈÙ]˜XÚÑ\T\˜[Y]\ŠÛÝ[˜[™
+ˆÈ
+ÈJHˆŒŽÈKˆÝ\ËÛÝ[J[˜[™›Ø]œ™\]Y[˜ÞK›Ø]ØZ[ŠBˆÂˆYˆ
+Ù]˜XÚÑ\P˜[™
+HÙ]˜XÚÑ\P˜[™
+ÛÝ[˜[™œ™\]Y[˜ÞKØZ[ŠNÂˆJNÂˆX\Ý\”Ýš\™Ù]\T\˜[Y]\ˆHÝ\ËÛÝ[J[\˜[Y]\ŠBˆÂˆ™]\›ˆÙ]˜XÚÑ\T\˜[Y]\ˆÈÙ]˜XÚÑ\T\˜[Y]\ŠÛÝ[\˜[Y]\ŠHˆŒŽÂˆNÂˆX\Ý\”Ýš\œ™Yœ™\Ú\T\˜[Y]\•˜[Y\Ê
+NÂˆX\Ý\”Ýš\›Û‘\T\˜[Y]\ˆHÝ\ËÛÝ[J[\˜[Y]\‹›Ø]˜[YJBˆÂˆYˆ
+Ù]˜XÚÑ\T\˜[Y]\ŠHÙ]˜XÚÑ\T\˜[Y]\ŠÛÝ[\˜[Y]\‹˜[YJNÂˆNÂˆX\Ý\”Ýš\›Û•ÙÙÛQ\HHÝ\ËÛÝ[J›ÛÛ[˜X›Y
+BˆÂˆYˆ
+Ù]˜XÚÑ\Q[˜X›Y
+HÙ]˜XÚÑ\Q[˜X›Y
+ÛÝ[[˜X›Y
+NÂˆNÂˆX\Ý\”Ýš\›Û“Ü[‘\HHÝ\ËÛÝ[HÈYˆ
+Û“Ü[‘\JHÛ“Ü[‘\JÛÝ[
+NÈNÂˆÛÛœÝ]]ÈX\Ý\’[œÙ\ÈHÙ][œÙ\˜[Y\ÈÈÙ][œÙ\˜[Y\ÊÛÝ[
+HˆXÙNŽ”Ýš[™Ð\œ˜^^ßNÂˆ›Üˆ
+[ÛÝHÈÛÝÈ
+ÊÜÛÝ
+BˆÂˆÛÛœÝ]]È[œÙ\˜[YHHÛÝX\Ý\’[œÙ\ËœÚ^™J
+HÈX\Ý\’[œÙ\ÖÜÛÝHˆXÙNŽ”Ýš[™ÞßNÂˆX\Ý\”Ýš\œÙ][œÙ\›ÝÊÛÝ[œÙ\˜[YK[œÙ\˜[YKš\Ó›Ý[\J
+Bˆ	‰ˆÙ][œÙ\[˜X›Y	‰ˆÙ][œÙ\[˜X›Y
+ÛÝ[ÛÝ
+JNÂˆBˆX\Ý\”Ýš\œ™\Ú^™Y
+
+NÂˆX\Ý\”Ýš\›Û•ÙÙÛR[œÙ\HÝ\ËÛÝ[J[ÛÝ
+HÈYˆ
+ÙÙÛR[œÙ\
+HÙÙÛR[œÙ\
+ÛÝ[ÛÝ
+NÈNÂˆX\Ý\”Ýš\›Û‘Y][œÙ\HÝ\ËÛÝ[J[ÛÝ
+HÈYˆ
+Y][œÙ\
+HY][œÙ\
+ÛÝ[ÛÝ
+NÈNÂˆX\Ý\”Ýš\›Û”™[[Ý™R[œÙ\HÝ\ËÛÝ[J[ÛÝ
+HÈYˆ
+™[[Ý™R[œÙ\
+H™[[Ý™R[œÙ\
+ÛÝ[ÛÝ
+NÈNÂˆX\Ý\”Ýš\›ÛY[œÙ\HÝ\ËÛÝ[BˆÂˆÚÝÒ[œÙ\ÚÛÜÙ\ŠÝ\ËÛÝ[J[Ú[™
+BˆÂˆYˆ
+Y[œÙ\
+HY[œÙ\
+ÛÝ[Ú[™
+NÂˆJNÂˆNÂˆX\Ý\”Ýš\›Û‘ØZ[ˆHÝ\×JÝX›H˜[YJHÈYˆ
+Ù]X\Ý\‘ØZ[ŠHÙ]X\Ý\‘ØZ[Š˜[YJNÈNÂˆX\Ý\”Ýš\›Û”[ˆHÝ\×JÝX›H˜[YJHÈYˆ
+Ù]X\Ý\”[ŠHÙ]X\Ý\”[Š˜[YJNÈNÂˆX\Ý\”Ýš\›Û“]]HHÝ\×J›ÛÛ˜[YJHÈYˆ
+Ù]X\Ý\“]]Y
+HÙ]X\Ý\“]]Y
+˜[YJNÈNÂˆ^[Ý]Ýš\Ê
+NÂˆÛÛ[œ™\Z[
+
+NÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆÛÛ[œÙ]›Ý[™ÊÙ]ØØ[›Ý[™Ê
+Kœ™YXÙY
+JKÚ]š[[YYÜ
+]P˜\’ZYÚHJJNÂˆZ[š[Z^™P]Û‹œÙ]›Ý[™ÊÙ]ÚY
+
+HHM‹‹]P˜\’ZYÚH
+NÂˆÛÜÙP]Û‹œÙ]›Ý[™ÊÙ]ÚY
+
+HHŽK‹]P˜\’ZYÚH
+NÂˆšY]ÜÜœÙ]›Ý[™ÊÛÛ[™Ù]ØØ[›Ý[™Ê
+JNÂˆšY]ÜÜœÙ]š\ÚX›J[Z[š[Z^™Y
+NÂˆ^[Ý]Ýš\Ê
+NÂˆB‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠK‹Œ
+JNÂˆË™š[™XÝ
+Ù]ØØ[›Ý[™Ê
+JNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌ‹‹LŠJNÂˆË™š[™XÝ
+Ù]ÚY
+
+K]P˜\’ZYÚ
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒ‹ŒÍKŠJNÂˆËœÙ]›Û
+XÙNŽ‘›Û
+LËŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆË™˜]Õ^
+X\Ý\”ÙXÝ[Û“[ÙHÈ“X\Ý\ˆÙXÝ[Ûˆˆˆ“Z^[™È\ÚÈ‹KXÙNŽš›X^
+Ù]ÚY
+
+HHÌ
+K]P˜\’ZYÚˆXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMLKNMŒMŠJNÂˆË™˜]Ô™XÝ
+Ù]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+Kœ™YXÙY
+YŠKKŒŠNÂˆB‚ˆ›ÚY›ØÝ\ÓX\Ý\Š
+HÈX\Ý\”Ýš\™ØZ[‹™Ü˜X’Ù^X›Ø\™›ØÝ\Ê
+NÈBˆ›ÚY™\Z[\QÜ˜\Ê
+BˆÂˆ›Üˆ
+]]ÊˆÝš\ˆÚ[›™[Ýš\ÊHÝš\Oœ™\Z[\QÜ˜\
+
+NÂˆX\Ý\”Ýš\œ™\Z[\QÜ˜\
+
+NÂˆBˆ›ÚY™Yœ™\Ú\PÛÛ›ÛÊ
+BˆÂˆ›Üˆ
+]]ÊˆÝš\ˆÚ[›™[Ýš\ÊHÝš\Oœ™Yœ™\Ú\T\˜[Y]\•˜[Y\Ê
+NÂˆX\Ý\”Ýš\œ™Yœ™\Ú\T\˜[Y]\•˜[Y\Ê
+NÂˆBˆ›ÚYÚÝÑY™™XÝY]ÜŠNŽ”YÚ[ŽŽ”ˆYÚ[‹ÝŽ™[˜Ý[Û›ÚY
+
+OˆÛÚ[™ÙY
+BˆÂˆYˆ
+Y™™XÝÚ[™ÝÈOH[ŠHY™™XÝÚ[™ÝËOœÚÝÔYÚ[ŠÝŽ›[Ý™JYÚ[ŠKÝŽ›[Ý™JÛÚ[™ÙY
+JNÂˆBˆ›ÚYÚÝÒ[œÙ\ÚÛÜÙ\ŠÝŽ™[˜Ý[Û›ÚY
+[
+OˆÛ”Ù[XÝY
+BˆÂˆ]]ÊˆX[ÙÈH™]ÈXÙNŽ[\Ú[™ÝÊY[œÙ\‹ÚÛÜÙH[ˆY™™XÝ›Üˆ\ÈZ^\ˆÝš\ˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛ‹\ÊNÂˆX[ÙËO˜Y]ÛŠÛÛ\™\ÜÛÜˆ‹JNÂˆX[ÙËO˜Y]ÛŠ”™]™\˜ˆ‹ŠNÂˆX[ÙËO˜Y]ÛŠ‘[^H‹ÊNÂˆX[ÙËO˜Y]ÛŠÚÜ\È‹
+NÂˆX[ÙËO˜Y]ÛŠ”\Ù\ˆ‹JNÂˆX[ÙËO˜Y]ÛŠ“ÝË\\ÜÈš[\ˆ‹ŠNÂˆX[ÙËO˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^JJNÂˆX[ÙËO˜Ù[™P\›Ý[™ÛÛ\Û™[
+\ËŒÌ
+NÂˆX[ÙËO™[\“[Ù[Ý]JYKXÙNŽ“[Ù[Ø[˜XÚÑ[˜Ý[ÛŽŽ˜Ü™X]JˆÜÙ[XÝ[ÛØ[˜XÚÈHÝŽ›[Ý™JÛ”Ù[XÝY
+WJ[™\Ý[
+BˆÂˆYˆ
+™\Ý[ˆ	‰ˆÙ[XÝ[ÛØ[˜XÚÊHÙ[XÝ[ÛØ[˜XÚÊ™\Ý[
+NÂˆJKYJNÂˆB‚ˆ›ÚY]XÚY]\œÊ
+BˆÂˆYˆ
+Y™™XÝÚ[™ÝÈOH[ŠHY™™XÝÚ[™ÝËO˜ÛX\”YÚ[Š
+NÂˆ›Üˆ
+]]ÊˆÝš\ˆÚ[›™[Ýš\ÊHÝš\O™]XÚY]\Š
+NÂˆX\Ý\”Ýš\™]XÚY]\Š
+NÂˆX\Ý\”Ýš\œÙ]X\Ý\“Y]\ÛÛ^Ý\Y\ŠßJNÂˆB‚œš]˜]N‚ˆÛ\ÜÈ›ØÝ\Ó\Ý[™\ˆš[˜[ˆX›XÈXÙNŽ“[Ý\ÙS\Ý[™\‚ˆÂˆX›XÎ‚ˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ“[Ý\ÙQÝÛŽÂˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYBˆÂˆYˆ
+Û“[Ý\ÙQÝÛŠHÛ“[Ý\ÙQÝÛŠ
+NÂˆBˆH›ØÝ\Ó\Ý[™\ŽÂˆÝ]XÈÛÛœÝ^ˆ[]P˜\’ZYÚHŽÂˆXÙNŽ•^]ÛˆZ[š[Z^™P]Û‹ÛÜÙP]ÛŽÂˆXÙNŽ”Ú[[ˆ˜YÓÜšYÚ[ŽÂˆ›ÛÛZ[š[Z^™YH˜[ÙNÂˆ›ÛÛX\Ý\”ÙXÝ[Û“[ÙHH˜[ÙNÂˆXÙNŽ\œ˜^O[ˆš\ÚX›U˜XÚÒ[™XÙ\ÎÂ‚ˆ›ÚY\]SZ[š[Z^™P]ÛŠ
+BˆÂˆZ[š[Z^™P]Û‹œÙ]]Û•^
+Z[š[Z^™YÈŠÈˆˆ¸¢$ˆŠNÂˆZ[š[Z^™P]Û‹œÙ]ÛÛ\
+Z[š[Z^™YÈ”™\ÝÜ™HZ^\ˆˆˆ“Z[š[Z^™HZ^\ˆŠNÂˆB‚ˆ›ÚY^[Ý]Ýš\Ê
+BˆÂˆËÈ\ÙHHÛÛœÚ\Ý[˜\œ›ÝÈÝš\ÚYÛÈHÛÛœÛÛHÝ^\ÈÛÛ\XÝ‚ˆËÈHšY]ÜÜYÈÜš^›Û[ØÜ›Û[™ÈÚ[ˆHXÝ]™H˜[šÈÜ›ÝÜË‚ˆÛÛœÝ[ÛÝ[HÚ[›™[Ýš\ËœÚ^™J
+NÂˆÛÛœÝ[ÛÛ[[œÈHÛÝ[
+È
+X\Ý\”ÙXÝ[Û“[ÙHÈHˆ
+NÂˆÛÛœÝ^ˆ[ÛÛ[[”Ý\HLMŽÂˆÛÛœÝ^ˆ[ÛÛ[[•ÚYHLLÂˆËÈÙY\XXÚÝš\[œÚYHHš\ÚX›HZ^\ˆšY]ÜÜˆH[\ˆš^YˆËÈZ[š[][H\ÚYHÝ]]\›Ý][™È]ÛœÈ™[ÝÈHÚ[™ÝÈYÙK‚ˆÛÛœÝ[Ýš\ZYÚHXÙNŽš›X^
+KšY]ÜÜ™Ù]ZYÚ
+
+JNÂ‚ˆ›Üˆ
+[HHÈHÛÝ[È
+ÊÚJBˆÚ[›™[Ýš\ÖÚWKOœÙ]›Ý[™ÊH
+ˆÛÛ[[”Ý\ÛÛ[[•ÚYÝš\ZYÚ
+NÂˆYˆ
+X\Ý\”ÙXÝ[Û“[ÙJHX\Ý\”Ýš\œÙ]›Ý[™ÊÛÝ[
+ˆÛÛ[[”Ý\ÛÛ[[•ÚYÝš\ZYÚ
+NÂˆÝš\ËœÙ]Ú^™JXÙNŽš›X^
+KÛÛ[[œÊH
+ˆÛÛ[[”Ý\Ýš\ZYÚ
+NÂˆB‚ˆÛ\ÜÈÛX[XÝ[Û]Ûˆš[˜[ˆX›XÈXÙNŽ•^]Û‚ˆÂˆX›XÎ‚ˆ›ÚYÙ]˜]ÜÐž\\ÜÒ[™XØ]ÜŠ›ÛÛÚÝ[˜]Ðž\\ÜÊHÈ˜]ÜÐž\\ÜÈHÚÝ[˜]Ðž\\ÜÎÈ™\Z[
+
+NÈBˆ›ÚYÙ]XÝ]™J›ÛÛXÝ]™JHÈ\ÐXÝ]™HHXÝ]™NÈ™\Z[
+
+NÈB‚ˆ›ÝXÝY‚ˆ›ÚYZ[]ÛŠXÙNŽ‘Ü˜\XÜÉˆË›ÛÛYÚYÚY›ÛÛÝÛŠHÝ™\œšYBˆÂˆ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+Kœ™YXÙY
+KŒŠNÂˆ]]È˜XÚÙÜ›Ý[™Hš[™ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’Y
+NÂˆYˆ
+YÚYÚY
+H˜XÚÙÜ›Ý[™H˜XÚÙÜ›Ý[™˜œšYÚ\ŠŒM™ŠNÂˆYˆ
+ÝÛŠH˜XÚÙÜ›Ý[™H˜XÚÙÜ›Ý[™™\šÙ\ŠŒL™ŠNÂˆËœÙ]ÛÛÝ\Š˜XÚÙÜ›Ý[™
+NÂˆË™š[›Ý[™Y™XÝ[™ÛJ›Ý[™ËËŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLM‹MMËMÎ
+JNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJ›Ý[™ËËŒ‹KŒŠNÂ‚ˆÛÛœÝ]]ÈÙ[™HH›Ý[™Ë™Ù]Ù[™J
+NÂˆYˆ
+˜]ÜÐž\\ÜÊBˆÂˆÛÛœÝ]]È˜Y]\ÈHXÙNŽš›Z[ŠËŽ‹›Ý[™Ë™Ù]ZYÚ
+
+H
+ˆŒŒ™ŠNÂˆËœÙ]ÛÛÝ\Š\ÐXÝ]™HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌ‹ŒËŒŽJBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍËMŠJNÂˆË™š[[\ÙJÙ[™KžH˜Y]\ËÙ[™KžHH˜Y]\Ë˜Y]\È
+ˆ‹Œ‹˜Y]\È
+ˆ‹ŒŠNÂˆYˆ
+\ÐXÝ]™JBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNË‹L
+KÚ][JÌ™ŠJNÂˆË™˜]Ñ[\ÙJÙ[™KžH˜Y]\ËÙ[™KžHH˜Y]\Ë˜Y]\È
+ˆ‹Œ‹˜Y]\È
+ˆ‹Œ‹ŽŠNÂˆBˆBˆ[ÙBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒÌ‹JJNÂˆË™˜]Ó[™JÙ[™KžHËŒ‹Ù[™KžHHËŒ‹ˆÙ[™Kž
+ÈËŒ‹Ù[™KžH
+ÈËŒ‹KŒ™ŠNÂˆË™˜]Ó[™JÙ[™Kž
+ÈËŒ‹Ù[™KžHHËŒ‹ˆÙ[™KžHËŒ‹Ù[™KžH
+ÈËŒ‹KŒ™ŠNÂˆBˆB‚ˆš]˜]N‚ˆ›ÛÛ˜]ÜÐž\\ÜÈH˜[ÙNÂˆ›ÛÛ\ÐXÝ]™HH˜[ÙNÂˆNÂ‚ˆÛ\ÜÈ\RXY\]Ûˆš[˜[ˆX›XÈXÙNŽ•^]Û‚ˆÂˆX›XÎ‚ˆ›ÚYÙ][˜X›Y[™XØ]ÜŠ›ÛÛ[˜X›Y
+HÈ\Ñ[˜X›YH[˜X›YÈ™\Z[
+
+NÈB‚ˆ›ÝXÝY‚ˆ›ÚYZ[]ÛŠXÙNŽ‘Ü˜\XÜÉˆË›ÛÛYÚYÚY›ÛÛÝÛŠHÝ™\œšYBˆÂˆXÙNŽ•^]ÛŽŽœZ[]ÛŠËYÚYÚYÝÛŠNÂˆÛÛœÝ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+Kœ™YXÙY
+KŒŠNÂˆÛÛœÝ]]ÈÙ[™VHH›Ý[™Ë™Ù]Ù[™VJ
+NÂˆÛÛœÝ]]È˜Y]\ÈHXÙNŽš›Z[ŠËY‹›Ý[™Ë™Ù]ZYÚ
+
+H
+ˆŒNŠNÂˆËœÙ]ÛÛÝ\Š\Ñ[˜X›YÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌ‹ŒËŒŽJBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍËMŠJNÂˆË™š[[\ÙJ›Ý[™Ë™Ù]
+
+H
+ÈËŒ‹Ù[™VHH˜Y]\Ë˜Y]\È
+ˆ‹Œ‹˜Y]\È
+ˆ‹ŒŠNÂˆYˆ
+\Ñ[˜X›Y
+BˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNË‹L
+KÚ][JÌ™ŠJNÂˆË™˜]Ñ[\ÙJ›Ý[™Ë™Ù]
+
+H
+ÈËŒ‹Ù[™VHH˜Y]\Ë˜Y]\È
+ˆ‹Œ‹˜Y]\È
+ˆ‹Œ‹ŽŠNÂˆBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒK
+JNÂˆË™˜]Ó[™J›Ý[™Ë™Ù]šYÚ
+
+HHLKŒ‹Ù[™VHH‹Œ‹ˆ›Ý[™Ë™Ù]šYÚ
+
+HHŒ‹Ù[™VH
+ÈKŒ‹KŒYŠNÂˆË™˜]Ó[™J›Ý[™Ë™Ù]šYÚ
+
+HHŒ‹Ù[™VH
+ÈKŒ‹ˆ›Ý[™Ë™Ù]šYÚ
+
+HHKŒ‹Ù[™VHH‹Œ‹KŒYŠNÂˆB‚ˆš]˜]N‚ˆ›ÛÛ\Ñ[˜X›YH˜[ÙNÂˆNÂ‚ˆÛ\ÜÈÚ[›™[Ýš\š[˜[ˆX›XÈXÙNŽÛÛ\Û™[š]˜]HXÙNŽ•[Y\‚ˆÂˆX›XÎ‚ˆÛ\ÜÈÙ[™Û›Øˆš[˜[ˆX›XÈXÙNŽ”ÛY\‚ˆÂˆX›XÎ‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆÛÛœÝ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+Kœ™YXÙY
+ËŒŠNÂˆÛÛœÝ]]ÈÙ[™HH›Ý[™Ë™Ù]Ù[™J
+NÂˆÛÛœÝ]]È˜Y]\ÈHXÙNŽš›Z[Š›Ý[™Ë™Ù]ÚY
+
+K›Ý[™Ë™Ù]ZYÚ
+
+JH
+ˆÙŽÂˆÛÛœÝ^ˆ›Ø]Ý\[™ÛHHXÙNŽ“X]ÛÛœÝ[Ï›Ø]ŽŽœH
+ˆÍYŽÂˆÛÛœÝ^ˆ›Ø][™[™ÛHHXÙNŽ“X]ÛÛœÝ[Ï›Ø]ŽŽœH
+ˆ‹ŒYŽÂˆXÙNŽ”]\˜ÎÂˆ\˜Ë˜YÙ[™Y\˜ÊÙ[™KžÙ[™KžK˜Y]\Ë˜Y]\ËŒ‹ˆÝ\[™ÛK[™[™ÛKYJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽKLËÊJNÂˆËœÝ›ÚÙT]
+\˜ËXÙNŽ”]Ý›ÚÙU\JŒ‹XÙNŽ”]Ý›ÚÙU\NŽ˜Ý\™YˆXÙNŽ”]Ý›ÚÙU\NŽœ›Ý[™Y
+JNÂ‚ˆÛÛœÝ]]È›ÜÜ[ÛˆHÝ]X×ØØ\Ý›Ø]Š˜[YUÔ›ÜÜ[Û“Ù“[™Ý
+Ù]˜[YJ
+JJNÂˆYˆ
+›ÜÜ[ÛˆˆŒŠBˆÂˆXÙNŽ”]XÝ]™P\˜ÎÂˆXÝ]™P\˜Ë˜YÙ[™Y\˜ÊÙ[™KžÙ[™KžK˜Y]\Ë˜Y]\ËŒ‹ˆÝ\[™ÛKÝ\[™ÛH
+È
+[™[™ÛHHÝ\[™ÛJH
+ˆ›ÜÜ[Û‹YJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹NŒMJJNÂˆËœÝ›ÚÙT]
+XÝ]™P\˜ËXÙNŽ”]Ý›ÚÙU\JŒ‹XÙNŽ”]Ý›ÚÙU\NŽ˜Ý\™YˆXÙNŽ”]Ý›ÚÙU\NŽœ›Ý[™Y
+JNÂˆB‚ˆÛÛœÝ]]È[™ÛHHÝ\[™ÛH
+È
+[™[™ÛHHÝ\[™ÛJH
+ˆ›ÜÜ[ÛŽÂˆÛÛœÝ]]È[™XØ]ÜˆHXÙNŽ”Ú[›Ø]ŠÙ[™Kž
+ÈÝŽ˜ÛÜÊ[™ÛJH
+ˆ˜Y]\ËˆÙ[™KžH
+ÈÝŽœÚ[Š[™ÛJH
+ˆ˜Y]\ÊNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒË‹LÊJNÂˆË™š[[\ÙJÙ[™KžH˜Y]\È
+ˆ‹Ù[™KžHH˜Y]\È
+ˆ‹ˆ˜Y]\È
+ˆKŒŽ‹˜Y]\È
+ˆKŒŽŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNM‹ŒŽKJJNÂˆË™š[[\ÙJ[™XØ]Ü‹žHËŒÙ‹[™XØ]Ü‹žHHËŒÙ‹‹™‹‹™ŠNÂˆBˆNÂ‚ˆÛ\ÜÈ[œÙ\ÛÝ]Ûˆš[˜[ˆX›XÈXÙNŽ•^]Û‚ˆÂˆX›XÎ‚ˆ›ÚYÙ][œÙ\XÝ]™J›ÛÛXÝ]™JHÈ[œÙ\XÝ]™HHXÝ]™NÈ™\Z[
+
+NÈBˆ›ÝXÝY‚ˆ›ÚYZ[]ÛŠXÙNŽ‘Ü˜\XÜÉˆË›ÛÛYÚYÚY›ÛÛÝÛŠHÝ™\œšYBˆÂˆXÙNŽ•^]ÛŽŽœZ[]ÛŠËYÚYÚYÝÛŠNÂˆÛÛœÝ]]ÈÙ[™VHHÝ]X×ØØ\Ý›Ø]ŠÙ]ZYÚ
+
+JH
+ˆYŽÂˆÛÛœÝ]]ÈÛÛÝ\ˆH[œÙ\XÝ]™HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽŒKŒÊBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒËÍKÊNÂˆËœÙ]ÛÛÝ\ŠÛÛÝ\ŠNÂˆË™š[[\ÙJKŒ‹Ù[™VHHËŒÙ‹‹™‹‹™ŠNÂˆËœÙ]ÛÛÝ\Š[œÙ\XÝ]™HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNKËL
+KÚ][JÍYŠBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËLÌKM
+JNÂˆË™˜]Ñ[\ÙJKŒ‹Ù[™VHHËŒÙ‹‹™‹‹™‹ŽŠNÂˆBˆš]˜]N‚ˆ›ÛÛ[œÙ\XÝ]™HH˜[ÙNÂˆNÂ‚ˆÚ[›™[Ýš\
+
+BˆÂˆÝ\[Y\’ŠŒ
+NÂˆY[™XZÙUš\ÚX›J›ÛÝ\ŠNÂˆ›ÛÝ\‹œÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆ›ÛÝ\‹œÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLY‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆ›ÛÝ\‹œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹KLŠJNÂˆ›ÛÝ\‹œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž˜˜XÚÙÜ›Ý[™ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽKŽKM
+JNÂˆ›ÛÝ\‹œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž›Ý][™PÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠL‹MNLÊJNÂˆY[™XZÙUš\ÚX›J]]JNÂˆY[™XZÙUš\ÚX›JÛÛÊNÂˆY[™XZÙUš\ÚX›J\P]ÛŠNÂˆY[™XZÙUš\ÚX›J\QÜ˜\
+NÂˆ\QÜ˜\›ÛÛXÚÈHÝ\×HÈYˆ
+Û“Ü[‘\JHÛ“Ü[‘\J
+NÈNÂˆY[™XZÙUš\ÚX›J[œÙ\Õ]JNÂˆ[œÙ\Õ]KœÙ]^
+’S”ÑT•È‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[œÙ\Õ]KœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLY‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆ[œÙ\Õ]KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒK
+JNÂˆ[œÙ\Õ]KœÙ]›Ü™\”Ú^™JXÙNŽ›Ü™\”Ú^™O[ŠM
+JNÂˆY[™XZÙUš\ÚX›JÙ[™Õ]JNÂˆÙ[™Õ]KœÙ]^
+”ÑS‘È‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[™Õ]KœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLY‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆÙ[™Õ]KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒK
+JNÂˆÙ[™Õ]KœÙ]›Ü™\”Ú^™JXÙNŽ›Ü™\”Ú^™O[ŠM
+JNÂˆ\P]Û‹œÙ]]Û•^
+‘THŠNÂˆ\P]Û‹œÙ]]J•ÙÙÛH\]X[\Ù\ˆŠNÂˆ\P]Û‹œÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆ\P]Û‹œÙ]ÛÛ\
+‘[˜X›HÜˆž\\ÜÈH˜XÚÝ[Ûˆ\]X[\Ù\‹ˆÛXÚÈHÜ˜\ÈÜ[ˆ]È[ÛÛ›ÛËˆŠNÂˆ\P]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËLËLÌ
+JNÂˆ\P]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠËLNMJJNÂˆ\P]Û‹›ÛÛXÚÈHÝ\×HÈYˆ
+Û•ÙÙÛQ\JHÛ•ÙÙÛQ\J\P]Û‹™Ù]ÙÙÛTÝ]J
+JNÈNÂˆÝ]XÈÛÛœÝÝŽ˜\œ˜^OÛÛœÝÚ\Š‹ˆ˜[™˜[Y\ÈÈ’HÚ[ˆ‹’YÚZY‹“ÝÈZY‹“ÝÈÚ[ˆˆNÂˆÝ]XÈÛÛœÝÝŽ˜\œ˜^OÛÛœÝÚ\Š‹Ïˆ\˜[Y]\“˜[Y\ÈÈ‘ØZ[ˆ‹‘œ™\]Y[˜ÞH‹”HˆNÂˆÝ]XÈÛÛœÝÝŽ˜\œ˜^OÛÛœÝÚ\Š‹ÏˆÛÛ\XÝ\˜[Y]\“˜[Y\ÈÈ‘ØZ[ˆ‹‘œ™\H‹”HˆNÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+BˆÂˆ]]Éˆ˜[™]HH\P˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WNÂˆ˜[™]KœÙ]^
+˜[™˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ˜[™]KœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊKŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆ˜[™]KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒK
+JNÂˆ˜[™]KœÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆY[™XZÙUš\ÚX›J˜[™]JNÂˆ›Üˆ
+[\˜[Y]\ˆHÈ\˜[Y]\ˆÎÈ
+ÊÜ\˜[Y]\ŠBˆÂˆ]]ÉˆÛÛ›ÛH\PÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWNÂˆY[™XZÙUš\ÚX›JÛÛ›Û
+NÂˆÛÛ›ÛœÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ”›Ý\žRÜš^›Û[™\XØ[˜YÊNÂˆÛÛ›ÛœÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ“›Õ^›Þ˜[ÙK
+NÂˆÛÛ›ÛœÙ]Ü\\Ü^Q[˜X›Y
+YKYK\ÊNÂˆÛÛ›ÛœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ[XÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠN‹ŒKŠJNÂˆÛÛ›ÛœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽœ›Ý\žTÛY\‘š[ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹MŽKŒJJNÂˆÛÛ›ÛœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽœ›Ý\žTÛY\“Ý][™PÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍNÍ
+JNÂˆYˆ
+\˜[Y]\ˆOH
+BˆÂˆÛÛ›ÛœÙ]˜[™ÙJLŒŒŒŒŒJNÂˆÛÛ›ÛœÙ]^˜[YTÝY™š^
+ˆˆŠNÂˆBˆ[ÙHYˆ
+\˜[Y]\ˆOHJBˆÂˆÛÛ›ÛœÙ]˜[™ÙJŒŒŒŒKŒ
+NÂˆÛÛ›ÛœÙ]ÚÙ]Ñ˜XÝÜ‘œ›ÛSZYÚ[
+LŒ
+NÂˆÛÛ›ÛœÙ]^˜[YTÝY™š^
+ˆˆŠNÂˆBˆ[ÙBˆÂˆÛÛ›ÛœÙ]˜[™ÙJŒKŒŒJNÂˆBˆÛÛ›ÛœÙ]ÛÛ\
+XÙNŽ”Ýš[™Ê˜[™˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WJH
+Èˆ‚ˆ
+È\˜[Y]\“˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWBˆ
+Èˆ8 %˜YÈÈY\ÝÈH˜[YH\X\œÈÚ[H[ÝH[Ý™HHÛ›ØˆŠNÂˆÛÛœÝ›ÛÛ\˜[Y]\•\ÙYH\˜[Y]\ˆˆ˜[™OHNÂˆÛÛ›ÛœÙ]š\ÚX›J\˜[Y]\•\ÙY
+NÂˆÛÛ›Û›Û•˜[YPÚ[™ÙHHÝ\Ë˜[™\˜[Y]\—BˆÂˆYˆ
+Û‘\T\˜[Y]\ŠBˆÂˆËÈHÛÛ\XÝÝš\ÚÝÜÈØZ[‹œ™\]Y[˜ÞKHÚ[BˆËÈ˜XÚÝ[ÛˆÝÜ™\ÈXXÚ˜[™	ÜÈ˜[Y\È\Èœ™\]Y[˜ÞKˆËÈØZ[‹Kˆ˜[œÛ]HHRHÜ™\ˆÈH[™Ú[™HÜ™\‹‚ˆÛÛœÝ]]È[™Ú[™RÚ[™H\˜[Y]\ˆOHÈHˆ\˜[Y]\ˆOHHÈˆŽÂˆÛ‘\T\˜[Y]\Š
+ÈH˜[™
+H
+ˆÈ
+È[™Ú[™RÚ[™ˆÝ]X×ØØ\Ý›Ø]Š\PÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWK™Ù]˜[YJ
+JJNÂˆBˆNÂ‚ˆ]]ÉˆÛÛ›ÛX™[H\PÛÛ›ÛX™[ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWNÂˆÛÛ›ÛX™[œÙ]^
+ÛÛ\XÝ\˜[Y]\“˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÛ›ÛX™[œÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊYŠJNÂˆÛÛ›ÛX™[œÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆÛÛ›ÛX™[œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒKŒËŒÍÊJNÂˆY[™XZÙUš\ÚX›JÛÛ›ÛX™[
+NÂˆÛÛ›ÛX™[œÙ]š\ÚX›J\˜[Y]\•\ÙY
+NÂˆBˆBˆ›Üˆ
+[ÛÝHÈÛÝÈ
+ÊÜÛÝ
+BˆÂˆ]]Éˆ[œÙ\H[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WNÂˆ]]ÉˆY]HY][œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WNÂˆ]]Éˆž\\ÜÈHž\\ÜÒ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WNÂˆ]]Éˆ™[[Ý™HH™[[Ý™R[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WNÂˆY[™XZÙUš\ÚX›J[œÙ\
+NÂˆY[™XZÙUš\ÚX›JY]
+NÂˆY[™XZÙUš\ÚX›Jž\\ÜÊNÂˆY[™XZÙUš\ÚX›J™[[Ý™JNÂˆž\\ÜËœÙ]˜]ÜÐž\\ÜÒ[™XØ]ÜŠYJNÂˆ[œÙ\œÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆ[œÙ\œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠËLKLMÊJNÂˆ™[[Ý™KœÙ]]Û•^
+žŠNÂˆ™[[Ý™KœÙ]]J”™[[Ý™H[œÙ\ŠNÂˆ™[[Ý™KœÙ]ÛÛ\
+”™[[Ý™H\ÈY™™XÝ[œÙ\ŠNÂˆ™[[Ý™KœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒË‹LJJNÂˆ[œÙ\›ÛÛXÚÈHÝ\ËÛÝBˆÂˆYˆ
+[œÙ\ÛÝ\ÑY™™XÝÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WJBˆÂˆYˆ
+Û‘Y][œÙ\
+HÛ‘Y][œÙ\
+ÛÝ
+NÂˆBˆ[ÙHYˆ
+ÛY[œÙ\
+BˆÛY[œÙ\
+
+NÂˆNÂˆY]œÙ]]Û•^
+‘HŠNÂˆY]œÙ]ÛÛ\
+“Ü[ˆY™™XÝÛÛ›ÛÈŠNÂˆY]œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLJJNÂˆY]›ÛÛXÚÈHÝ\ËÛÝHÈYˆ
+Û‘Y][œÙ\
+HÛ‘Y][œÙ\
+ÛÝ
+NÈNÂˆž\\ÜËœÙ]]Û•^
+ˆŠNÂˆž\\ÜËœÙ]]Jž\\ÜÈ[œÙ\ŠNÂˆž\\ÜËœÙ]ÛÛ\
+ž\\ÜÈÜˆ[˜X›H\È[œÙ\ŠNÂˆž\\ÜËœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLJJNÂˆž\\ÜË›ÛÛXÚÈHÝ\ËÛÝHÈYˆ
+Û•ÙÙÛR[œÙ\
+HÛ•ÙÙÛR[œÙ\
+ÛÝ
+NÈNÂˆ™[[Ý™K›ÛÛXÚÈHÝ\ËÛÝHÈYˆ
+Û”™[[Ý™R[œÙ\
+HÛ”™[[Ý™R[œÙ\
+ÛÝ
+NÈNÂˆ[œÙ\œÙ]š\ÚX›J˜[ÙJNÂˆY]œÙ]š\ÚX›J˜[ÙJNÂˆž\\ÜËœÙ]š\ÚX›J˜[ÙJNÂˆ™[[Ý™KœÙ]š\ÚX›J˜[ÙJNÂˆBˆY[™XZÙUš\ÚX›JY[œÙ\]ÛŠNÂˆY[œÙ\]Û‹œÙ]]Û•^
+ŠÈ[œÙ\ŠNÂˆY[œÙ\]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLJJNÂˆY[œÙ\]Û‹›ÛÛXÚÈHÝ\×HÈYˆ
+ÛY[œÙ\
+HÛY[œÙ\
+
+NÈNÂˆ]]KœÙ]]Û•^
+“HŠNÂˆÛÛËœÙ]]Û•^
+”ÈŠNÂˆ]]KœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆÛÛËœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆ]]KœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNËËÌJJNÂˆÛÛËœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNLËMLËÌJJNÂˆ]]K›ÛÛXÚÈHÝ\×HÈYˆ
+Û“]]JHÛ“]]J]]K™Ù]ÙÙÛTÝ]J
+JNÈNÂˆÛÛË›ÛÛXÚÈHÝ\×HÈYˆ
+Û”ÛÛÊHÛ”ÛÛÊÛÛË™Ù]ÙÙÛTÝ]J
+JNÈNÂˆY[™XZÙUš\ÚX›J[ŠNÂˆ›Üˆ
+]]ÊˆX™[ˆÈ	œ[“Y	œ[•]K	œ[”šYÚJBˆÂˆY[™XZÙUš\ÚX›J
+›X™[
+NÂˆX™[OœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊKŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆX™[OœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒMKŒÍÊJNÂˆX™[OœÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆBˆ[“YœÙ]^
+“‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[•]KœÙ]^
+”[ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[”šYÚœÙ]^
+”ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[‹œÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ”›Ý\žRÜš^›Û[™\XØ[˜YÊNÂˆ[‹œÙ]˜[™ÙJLKŒKŒŒJNÂˆ[‹œÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ“›Õ^›Þ˜[ÙK
+NÂˆ[‹œÙ]^˜[YTÝY™š^
+ˆ[ˆŠNÂˆ[‹œÙ]Ü\\Ü^Q[˜X›Y
+YKYK\ÊNÂˆ[‹›Û•˜[YPÚ[™ÙHHÝ\×HÈYˆ
+Û”[ŠHÛ”[Š[‹™Ù]˜[YJ
+JNÈNÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÂˆ]]ÉˆX™[HÙ[™˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWNÂˆ]]ÉˆÙ[™HÙ[™ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWNÂˆY[™XZÙUš\ÚX›JX™[
+NÂˆX™[œÙ]^
+XÙNŽ”Ýš[™Ê\È
+ÈJKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆX™[œÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YšYÚ
+NÂˆX™[œÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLY‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆX™[œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒK
+JNÂˆY[™XZÙUš\ÚX›JÙ[™
+NÂˆÙ[™œÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ”›Ý\žRÜš^›Û[™\XØ[˜YÊNÂˆÙ[™œÙ]˜[™ÙJMŒŒ‹ŒŒJNÂˆÙ[™œÙ]˜[YJMŒŒXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[™œÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ“›Õ^›Þ˜[ÙK
+NÂˆÙ[™œÙ]^˜[YTÝY™š^
+ˆˆŠNÂˆÙ[™œÙ]Ü\\Ü^Q[˜X›Y
+YKYK\ÊNÂˆÙ[™œÙ]ÛÛ\
+‘–ˆ
+ÈXÙNŽ”Ýš[™Ê\È
+ÈJH
+ÈˆÜÝY˜Y\ˆÙ[™]™[ŠNÂˆÙ[™›Û•˜[YPÚ[™ÙHHÝ\Ë\×HÈYˆ
+Û”Ù[™
+HÛ”Ù[™
+\ËÙ[™ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWK™Ù]˜[YJ
+JNÈNÂˆÙ[™œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ[XÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠN‹ŒKŠJNÂˆÙ[™œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽœ›Ý\žTÛY\‘š[ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹MŽKŒJJNÂˆÙ[™œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽœ›Ý\žTÛY\“Ý][™PÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍNÍ
+JNÂˆÙ[™œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›Þ^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹KLŠJNÂˆÙ[™œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›Þ˜XÚÙÜ›Ý[™ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠËÌËM
+JNÂˆÙ[™œÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›ÞÝ][™PÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKMŽKNLÊJNÂˆBˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÂˆ]]Éˆ›Ý]HHÝ]]\Ð]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWNÂˆY[™XZÙUš\ÚX›J›Ý]JNÂˆ›Ý]KœÙ]]Û•^
+XÙNŽ”Ýš[™Ê\È
+ÈJJNÂˆ›Ý]KœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆ›Ý]KœÙ]ÛÛ\
+”›Ý]H\ÈÚ[›™[È\Èˆ
+ÈXÙNŽ”Ýš[™Ê\È
+ÈJJNÂˆ›Ý]K›ÛÛXÚÈHÝ\Ë\×HÈYˆ
+Û“Ý]]\ÊHÛ“Ý]]\Ê\ÊNÈNÂˆ›Ý]KœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍKNÌŠJNÂˆ›Ý]KœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LÌ‹MÍ
+JNÂˆ›Ý]KœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒÌKÊJNÂˆ›Ý]KœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆBˆY[™XZÙUš\ÚX›JÝ]]X\Ý\]ÛŠNÂˆÝ]]X\Ý\]Û‹œÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆÝ]]X\Ý\]Û‹œÙ]ÛÛ\
+”›Ý]H\ÈÚ[›™[ÈHX\Ý\ˆÝ]]ŠNÂˆÝ]]X\Ý\]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍKNÌŠJNÂˆÝ]]X\Ý\]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LÌ‹MÍ
+JNÂˆÝ]]X\Ý\]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒÌKÊJNÂˆÝ]]X\Ý\]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆÝ]]X\Ý\]Û‹›ÛÛXÚÈHÝ\×HÈYˆ
+Û“Ý]]\ÊHÛ“Ý]]\ÊLJNÈNÂˆY[™XZÙUš\ÚX›JØZ[ŠNÂˆØZ[‹œÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ“[™X\•™\XØ[
+NÂˆØZ[‹œÙ]˜[™ÙJMŒŒ‹ŒŒJNÂˆØZ[‹œÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ“›Õ^›Þ˜[ÙK
+NÂˆØZ[‹œÙ]^˜[YTÝY™š^
+ˆˆŠNÂˆØZ[‹œÙ]Ü\\Ü^Q[˜X›Y
+YKYK\ÊNÂˆØZ[‹›Û•˜[YPÚ[™ÙHHÝ\×HÈYˆ
+Û‘ØZ[ŠHÛ‘ØZ[ŠØZ[‹™Ù]˜[YJ
+JNÈNÂˆ›Üˆ
+]]ÊˆÛY\ˆˆÈ	™ØZ[‹	œ[ˆJBˆÂˆÛY\‹OœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ[XÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠN‹ŒKŠJNÂˆÛY\‹OœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ˜XÚÐÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎL
+JNÂˆÛY\‹OœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›Þ^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹KLŠJNÂˆÛY\‹OœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›Þ˜XÚÙÜ›Ý[™ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠËÌËM
+JNÂˆÛY\‹OœÙ]ÛÛÝ\ŠXÙNŽ”ÛY\ŽŽ^›ÞÝ][™PÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKMŽKNLÊJNÂˆBˆB‚ˆÚ[›™[Ýš\
+
+HÝ™\œšYBˆÂˆÝÜ[Y\Š
+NÂˆ]XÚY]\Š
+NÂˆB‚ˆÝŽ™[˜Ý[Û›ÚY
+ÝX›JOˆÛ‘ØZ[‹Û”[ŽÂˆÝŽ™[˜Ý[Û›ÚY
+ÛÛœÝXÙNŽ”Ýš[™ÉŠOˆÛ”™[˜[YNÂˆÝŽ™[˜Ý[Û›ÚY
+[ÝX›JOˆÛ”Ù[™ÂˆÝŽ™[˜Ý[Û›ÚY
+[
+OˆÛ“Ý]]\ÎÂˆÝŽ™[˜Ý[Û›ÚY
+›ÛÛ
+OˆÛ“]]KÛ”ÛÛËÛ•ÙÙÛQ\NÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ“Ü[‘\NÂˆÝŽ™[˜Ý[Û›ÚY
+[›Ø]
+OˆÛ‘\T\˜[Y]\ŽÂˆÝŽ™[˜Ý[Û›Ø]
+[
+OˆÙ]\T\˜[Y]\ŽÂˆÝŽ™[˜Ý[Û›ÚY
+[
+OˆÛ‘Y][œÙ\ÂˆÝŽ™[˜Ý[Û›ÚY
+[
+OˆÛ•ÙÙÛR[œÙ\Û”™[[Ý™R[œÙ\ÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛY[œÙ\ÂˆXÙNŽ”ÛY\ˆØZ[ŽÂˆXÙNŽ“X™[›ÛÝ\ŽÂˆXÙNŽ“X™[[œÙ\Õ]NÂˆXÙNŽ“X™[Ù[™Õ]NÂˆÝŽ˜\œ˜^OXÙNŽ“X™[ˆ\P˜[™]\ÎÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^OXÙNŽ”ÛY\‹Ï‹ˆ\PÛÛ›ÛÎÂˆÝŽ˜\œ˜^OXÙNŽ“X™[ˆÙ[™˜[Y\ÎÂˆÝŽ˜\œ˜^OÙ[™Û›Ø‹ˆÙ[™ÎÂˆÝŽ˜\œ˜^OXÙNŽ•^]Û‹ˆÝ]]\Ð]ÛœÎÂˆXÙNŽ•^]ÛˆÝ]]X\Ý\]ÛˆÈ“X\Ý\ˆˆNÂˆ›ÚYÙ]›ÛÝ\•^
+ÛÛœÝXÙNŽ”Ýš[™Éˆ^
+HÈ›ÛÝ\‹œÙ]^
+^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÈBˆ›ÚYÙ]ØZ[•˜[YJÝX›H˜[YJHÈØZ[‹œÙ]˜[YJ˜[YKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÈBˆ›ÚYÙ][•˜[YJÝX›H˜[YJHÈ[‹œÙ]˜[YJ˜[YKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÈBˆ›ÚY™Yœ™\Ú\T\˜[Y]\•˜[Y\Ê
+BˆÂˆYˆ
+YÙ]\T\˜[Y]\ŠH™]\›ŽÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+Bˆ›Üˆ
+[\˜[Y]\ˆHÈ\˜[Y]\ˆÎÈ
+ÊÜ\˜[Y]\ŠBˆ\PÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]˜[YJˆÙ]\T\˜[Y]\Š
+ÈH˜[™
+H
+ˆÈ
+È
+\˜[Y]\ˆOHÈHˆ\˜[Y]\ˆOHHÈˆŠJKˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ›ÚYÙ]Ù[™˜[YJ[\ËÝX›H˜[YJBˆÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ë
+JBˆÙ[™ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]˜[YJ˜[YKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ›ÚYÙ]Ý]]\Ê[\ÊBˆÂˆ›Üˆ
+[HHÈHÈ
+ÊÚJBˆÝ]]\Ð]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKœÙ]ÙÙÛTÝ]JHOH\ËXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÝ]]X\Ý\]Û‹œÙ]ÙÙÛTÝ]J\ÈXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ›ÚYÙ]]]TÝ]J›ÛÛ˜[YJHÈ]]KœÙ]ÙÙÛTÝ]J˜[YKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÈBˆ›ÚYÙ]ÛÛÔÝ]J›ÛÛ˜[YJHÈÛÛËœÙ]ÙÙÛTÝ]J˜[YKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÈBˆ›ÚYÙ]\Q[˜X›Y
+›ÛÛ˜[YJBˆÂˆ\P]Û‹œÙ]ÙÙÛTÝ]J˜[YKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ\P]Û‹œÙ][˜X›Y[™XØ]ÜŠ˜[YJNÂˆ\P]Û‹œÙ]ÛÛ\
+˜[YBˆÈ‘\]X[\Ù\ˆ[˜X›Y8 %ÛXÚÈÈž\\ÜÎÈÛXÚÈHÜ˜\ÈÜ[ˆ[ÛÛ›ÛËˆ‚ˆˆ‘\]X[\Ù\ˆž\\ÜÙY8 %ÛXÚÈÈ[˜X›NÈÛXÚÈHÜ˜\ÈÜ[ˆ[ÛÛ›ÛËˆŠNÂˆBˆ›ÚYÙ][•š\ÚX›J›ÛÛÚÝ[ÚÝÊHÈ[‹œÙ]š\ÚX›JÚÝ[ÚÝÊNÈBˆ›ÚYÙ]Z^ÛÛ›ÛÕš\ÚX›J›ÛÛÚÝ[ÚÝÊBˆÂˆ]]KœÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆÛÛËœÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆÙ[™Õ]KœÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÂˆÙ[™˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ\È
+NÂˆÙ[™ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ\È
+NÂˆBˆÝ]]X\Ý\]Û‹œÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ[X\Ý\‘\UšY]ÊNÂˆ›Üˆ
+]]Éˆ›Ý]HˆÝ]]\Ð]ÛœÊH›Ý]KœÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ[X\Ý\‘\UšY]ÊNÂˆ\P]Û‹œÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆ\QÜ˜\œÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+BˆÂˆ\P˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKœÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆ›Üˆ
+[\˜[Y]\ˆHÈ\˜[Y]\ˆÎÈ
+ÊÜ\˜[Y]\ŠBˆÂˆÛÛœÝ›ÛÛ\˜[Y]\•\ÙYH\˜[Y]\ˆˆ˜[™OHNÂˆ\PÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ\˜[Y]\•\ÙY
+NÂˆ\PÛÛ›ÛX™[ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ\˜[Y]\•\ÙY
+NÂˆBˆBˆ[œÙ\Õ]KœÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆY[œÙ\]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆYˆ
+\ÚÝ[ÚÝÊBˆ›Üˆ
+[ÛÝHÈÛÝÈ
+ÊÜÛÝ
+BˆÂˆ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]š\ÚX›J˜[ÙJNÂˆY][œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]š\ÚX›J˜[ÙJNÂˆž\\ÜÒ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]š\ÚX›J˜[ÙJNÂˆ™[[Ý™R[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]š\ÚX›J˜[ÙJNÂˆBˆBˆ›ÚYÙ]X\Ý\ÛÛ›ÛÕš\ÚX›J›ÛÛÚÝ[ÚÝÊBˆÂˆX\Ý\‘\UšY]ÈHÚÝ[ÚÝÎÂˆÙ[™Õ]KœÙ]š\ÚX›J˜[ÙJNÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÂˆÙ[™˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]š\ÚX›J˜[ÙJNÂˆÙ[™ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]š\ÚX›J˜[ÙJNÂˆÝ]]\Ð]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]š\ÚX›J˜[ÙJNÂˆBˆÝ]]X\Ý\]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆ]]KœÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆ]]KœÙ][˜X›Y
+ÚÝ[ÚÝÊNÂˆÛÛËœÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆÛÛËœÙ][˜X›Y
+˜[ÙJNÂˆÛÛËœÙ]ÛÛ\
+•HX\Ý\ˆÝ]]Ø[››Ý™HÛÛÙYŠNÂˆ\P]Û‹œÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆ\QÜ˜\œÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+BˆÂˆ\P˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKœÙ]š\ÚX›J˜[ÙJNÂˆ›Üˆ
+[\˜[Y]\ˆHÈ\˜[Y]\ˆÎÈ
+ÊÜ\˜[Y]\ŠBˆÂˆ\PÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]š\ÚX›J˜[ÙJNÂˆ\PÛÛ›ÛX™[ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]š\ÚX›J˜[ÙJNÂˆBˆBˆ[œÙ\Õ]KœÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆY[œÙ\]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆ™\Ú^™Y
+
+NÂˆBˆ›ÚYÙ]Ù[™Õš\ÚX›J›ÛÛÚÝ[ÚÝÊBˆÂˆÙ[™Õ]KœÙ]š\ÚX›JÚÝ[ÚÝÊNÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÂˆÙ[™˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ\È
+NÂˆÙ[™ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ\È
+NÂˆBˆBˆ›ÚYÙ]Ý]]›Ý]\Õš\ÚX›J›ÛÛÚÝ[ÚÝÊBˆÂˆÝ]]X\Ý\]Û‹œÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ[X\Ý\‘\UšY]ÊNÂˆ›Üˆ
+]]Éˆ›Ý]HˆÝ]]\Ð]ÛœÊH›Ý]KœÙ]š\ÚX›JÚÝ[ÚÝÈ	‰ˆ[X\Ý\‘\UšY]ÊNÂˆBˆ›ÚYÙ]\T™\ÜÛœÙJÝŽ™[˜Ý[Û›Ø]
+›Ø]
+OˆØ[˜XÚÊBˆÂˆ\QÜ˜\œ™\ÜÛœÙP]œ™\]Y[˜ÞHHÝŽ›[Ý™JØ[˜XÚÊNÂˆ\QÜ˜\œ™\Z[
+
+NÂˆBˆ›ÚYÙ]\P˜[™Ø[˜XÚÜÊÝŽ™[˜Ý[Û›Ø]
+[
+Oˆœ™\]Y[˜ÞKˆÝŽ™[˜Ý[Û›Ø]
+[
+OˆØZ[•˜[YKˆÝŽ™[˜Ý[Û›ÚY
+[›Ø]›Ø]
+OˆÙ]˜[™
+BˆÂˆ\QÜ˜\˜˜[™œ™\]Y[˜ÞHHÝŽ›[Ý™Jœ™\]Y[˜ÞJNÂˆ\QÜ˜\˜˜[™ØZ[ˆHÝŽ›[Ý™JØZ[•˜[YJNÂˆ\QÜ˜\œÙ]˜[™HÝŽ›[Ý™JÙ]˜[™
+NÂˆ\QÜ˜\œ™\Z[
+
+NÂˆBˆ›ÚY™\Z[\QÜ˜\
+
+HÈ\QÜ˜\œ™\Z[
+
+NÈBˆ›ÚYÙ]Y]\”YÚ[ŠNŽ“]™[Y]\”YÚ[ŠˆYÚ[ŠBˆÂˆYˆ
+Y]\”YÚ[ˆOHYÚ[ŠH™]\›ŽÂˆ]XÚY]\Š
+NÂˆYˆ
+YÚ[ˆOH[ŠH™]\›ŽÂˆY]\”YÚ[”™YˆHYÚ[ŽÂˆY]\”YÚ[ˆHYÚ[ŽÂˆY]\”YÚ[‹O›YX\Ý\™\‹˜YÛY[
+Y]\ÛY[
+NÂˆY]\•š\ÚX›HHYNÂˆBˆ›ÚYÙ]X\Ý\“Y]\ÛÛ^Ý\Y\ŠÝŽ™[˜Ý[ÛNŽ‘Y]^X˜XÚÐÛÛ^
+Š
+OˆÝ\Y\ŠBˆÂˆX\Ý\“Y]\ÛÛ^Ý\Y\ˆHÝŽ›[Ý™JÝ\Y\ŠNÂˆ\ÓX\Ý\“Y]\ˆHÝ]X×ØØ\Ý›ÛÛŠX\Ý\“Y]\ÛÛ^Ý\Y\ŠNÂˆBˆ›ÚY]XÚY]\Š
+BˆÂˆYˆ
+Y]\”YÚ[ˆOH[ŠBˆY]\”YÚ[‹O›YX\Ý\™\‹œ™[[Ý™PÛY[
+Y]\ÛY[
+NÂˆY]\”YÚ[ˆH[ŽÂˆY]\”YÚ[”™YˆH[ŽÂˆYˆ
+]]ÊˆÛÛ^HX\Ý\“Y]\ÛÛ^™Ù]
+
+JBˆÛÛ^O›X\Ý\“]™[Ëœ™[[Ý™PÛY[
+Y]\ÛY[
+NÂˆX\Ý\“Y]\ÛÛ^HßNÂˆYXZÑˆHšYÚXZÑˆHLLŒŽÂˆYXZÒÛˆHšYÚXZÒÛˆHLLŒŽÂˆYXZÒÛXÚÜÈHšYÚXZÒÛXÚÜÈHÂˆÛ\[H˜[ÙNÂˆY]\•š\ÚX›HH˜[ÙNÂˆBˆ›ÚYÙ][œÙ\›ÝÊ[ÛÝÛÛœÝXÙNŽ”Ýš[™Éˆ[œÙ\˜[YK›ÛÛ[˜X›Y
+BˆÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÛÝ
+JH™]\›ŽÂˆ]]Éˆ[œÙ\H[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WNÂˆ]]ÉˆY]HY][œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WNÂˆ]]Éˆž\\ÜÈHž\\ÜÒ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WNÂˆ]]Éˆ™[[Ý™HH™[[Ý™R[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WNÂˆÛÛœÝ›ÛÛš\ÚX›HHÛÝÎÂˆÛÛœÝ›ÛÛÜ[]YHš\ÚX›H	‰ˆ[œÙ\˜[YKš\Ó›Ý[\J
+NÂˆ[œÙ\ÛÝ\ÑY™™XÝÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WHHÜ[]YÂˆ[œÙ\œÙ]š\ÚX›Jš\ÚX›JNÂˆ™[[Ý™KœÙ]š\ÚX›JÜ[]Y
+NÂˆËÈHY™™XÝ[˜[YH]Ûˆ[™XYHÜ[œÈ]ÈY]Ü‹ˆY[™ÈBˆËÈ\XØ]HHÛÛ›ÛÚ]™\ÈH˜[YH[›ÝYÚ›ÛÛHÈ™XY]BˆËÈ™Y™\™[˜ÙHZ^\¸ &\È˜\œ›ÝÈÚ[›™[ÚY‚ˆY]œÙ]š\ÚX›J˜[ÙJNÂˆž\\ÜËœÙ]š\ÚX›JÜ[]Y
+NÂˆ[œÙ\œÙ]]Û•^
+Ü[]YÈˆˆ
+È[œÙ\˜[YHˆXÙNŽ”Ýš[™ÞßJNÂˆ[œÙ\œÙ][œÙ\XÝ]™JÜ[]Y	‰ˆ[˜X›Y
+NÂˆ[œÙ\œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’Yˆ\Ü[]YÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎMJBˆˆ[˜X›YÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠËLKLMÊHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMKŽKÎ
+JNÂˆ[œÙ\œÙ]ÛÛ\
+Ü[]YÈ“Ü[ˆˆ
+È[œÙ\˜[YH
+ÈˆÛÛ›ÛÈˆˆY[ˆY™™XÝÈ\È[œÙ\ÛÝŠNÂˆž\\ÜËœÙ]]Û•^
+ˆŠNÂˆž\\ÜËœÙ]ÛÛ\
+[˜X›YÈž\\ÜÈ\ÈY™™XÝˆˆ‘[˜X›H\ÈY™™XÝŠNÂˆž\\ÜËœÙ]XÝ]™J[˜X›Y
+NÂˆž\\ÜËœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’Yˆ[˜X›YÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLJHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMKŽKÎ
+JNÂˆBˆ›ÚYÙ]Ù[XÝY
+›ÛÛÙ[XÝY
+HÈ\ÔÙ[XÝYHÙ[XÝYÈ™\Z[
+
+NÈB‚ˆ›ÚY[Ý\ÙS[Ý™JÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆÙ][Ý\ÙPÝ\œÛÜŠY]\•š\ÚX›H	‰ˆY]\›Ý[™Ë˜ÛÛZ[œÊ]™[™Ù]ÜÚ][ÛŠ
+JBˆÈXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ”Ú[[™Ò[™Ý\œÛÜ‚ˆˆXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ“›Ü›X[Ý\œÛÜŠNÂˆB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+[Y]\•š\ÚX›H[Y]\›Ý[™Ë˜ÛÛZ[œÊ]™[™Ù]ÜÚ][ÛŠ
+JJBˆ™]\›ŽÂ‚ˆYXZÒÛˆHšYÚXZÒÛˆHLLŒŽÂˆYXZÒÛXÚÜÈHšYÚXZÒÛXÚÜÈHÂˆÛ\[H˜[ÙNÂˆ™\Z[
+Y]\›Ý[™Ë™^[™Y
+ŠJNÂˆB‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆ]]È›ÞHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+Kœ™YXÙY
+KŒŠNÂˆÛÛœÝ]]È˜\ÙHH\ÔÙ[XÝYÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKMËMÌJHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌKLMËMŠNÂˆËœÙ]Ü˜YY[š[
+XÙNŽÛÛÝ\‘Ü˜YY[
+˜\ÙK˜œšYÚ\ŠŒL™ŠKŒ‹Œ‹ˆ˜\ÙK™\šÙ\ŠŒM™ŠKŒ‹Ù]ZYÚ
+
+K˜[ÙJJNÂˆË™š[›Ý[™Y™XÝ[™ÛJ›ÞKŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMŒKNMËŒMŠJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJ›ÞKŒ‹KŒŠNÂˆYˆ
+Ù[™Õ]Kš\Õš\ÚX›J
+JBˆÂˆÛÛœÝ]]ÈÙ[™VHHÙ[™Õ]K™Ù]›Ý[™Ê
+KÑ›Ø]
+
+K™Ù]Ù[™VJ
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌ‹ŒLKŒÍJJNÂˆË™š[[\ÙJÝ]X×ØØ\Ý›Ø]ŠÙ[™Õ]K™Ù]
+
+HHLŠKÙ[™VHHËŒ‹‹Œ‹‹ŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNLKLŠKÚ][JÍYŠJNÂˆË™˜]Ñ[\ÙJÝ]X×ØØ\Ý›Ø]ŠÙ[™Õ]K™Ù]
+
+HHLŠKÙ[™VHHËŒ‹‹Œ‹‹Œ‹ŽŠNÂˆBˆYˆ
+[œÙ\Õ]Kš\Õš\ÚX›J
+JBˆÂˆÛÛœÝ]]ÈÙ[™VHH[œÙ\Õ]K™Ù]›Ý[™Ê
+KÑ›Ø]
+
+K™Ù]Ù[™VJ
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒÍŒ‹LŠJNÂˆË™š[[\ÙJÝ]X×ØØ\Ý›Ø]Š[œÙ\Õ]K™Ù]
+
+HHLŠKÙ[™VHHËŒ‹‹Œ‹‹ŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMKNËMŠKÚ][JÍYŠJNÂˆË™˜]Ñ[\ÙJÝ]X×ØØ\Ý›Ø]Š[œÙ\Õ]K™Ù]
+
+HHLŠKÙ[™VHHËŒ‹‹Œ‹‹Œ‹ŽŠNÂˆBˆZ[Y]\ŠÊNÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆ]]È\™XHHÙ]ØØ[›Ý[™Ê
+Kœ™YXÙY
+‹ŠNÂˆ›ÛÝ\‹œÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛP›ÝÛJŒ
+JNÂˆ\™XKœ™[[Ý™Qœ›ÛP›ÝÛJ
+NÂˆYˆ
+Ù[™ÖÌKš\Õš\ÚX›J
+JBˆÂˆËÈ›Ý\ˆ]^[X\žHÙ[™Û›ØœÈ\œ˜[™ÙYZÙHHÜš[Ûˆ™Y™\™[˜ÙK‚ˆÙ[™Õ]KœÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛUÜ
+LJKÚ]š[[YYY
+MŠJNÂˆ]]ÈÙ[™\™XHH\™XKœ™[[Ý™Qœ›ÛUÜ
+
+NÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÂˆÛÛœÝ]]È›ÝÈH\ÈÈŽÂˆÛÛœÝ]]ÈÛÛ[[ˆH\È	HŽÂˆÛÛœÝ]]ÈÙ[H\™XK™Ù]
+
+H
+ÈÛÛ[[ˆ
+ˆ
+\™XK™Ù]ÚY
+
+HÈŠNÂˆ]]ÈÙ[HXÙNŽ”™XÝ[™ÛO[ŠÙ[Ù[™\™XK™Ù]J
+H
+È›ÝÈ
+ˆÌ‹ˆ\™XK™Ù]ÚY
+
+HÈ‹ÌŠKœ™YXÙY
+K
+NÂˆ]]ÈÙ[™˜[YP\™XHHÙ[œ™[[Ý™Qœ›ÛUÜ
+
+Kœ™[[Ý™Qœ›ÛTšYÚ
+N
+NÂˆÙ[™˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]›Ý[™ÊÙ[™˜[YP\™XJNÂˆÛÛœÝ]]ÈÛ›Ø”Ú^™HHXÙNŽš›Z[ŠŽKÙ[™Ù]ÚY
+
+HH‹Ù[™Ù]ZYÚ
+
+HHJNÂˆÙ[™ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]›Ý[™ÊÙ[Ú]Ú^™RÙY\[™ÐÙ[™JÛ›Ø”Ú^™KÛ›Ø”Ú^™JJNÂˆBˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+ŠNÂˆBˆYˆ
+\P]Û‹š\Õš\ÚX›J
+JBˆÂˆ[œÙ\Õ]KœÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛUÜ
+MŠKÚ]š[[YYY
+MŠJNÂˆ›Üˆ
+[ÛÝHÈÛÝÈ
+ÊÜÛÝ
+BˆÂˆYˆ
+ÛÝHÊBˆÂˆ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™ÊßJNÂˆY][œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™ÊßJNÂˆž\\ÜÒ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™ÊßJNÂˆ™[[Ý™R[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™ÊßJNÂˆÛÛ[YNÂˆBˆ]]È›ÝÈH\™XKœ™[[Ý™Qœ›ÛUÜ
+ŒÊNÂˆYˆ
+[œÙ\ÛÝ\ÑY™™XÝÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WJBˆÂˆ]]È™[[Ý™P\™XHH›ÝËœ™[[Ý™Qœ›ÛTšYÚ
+MÊNÂˆ]]Èž\\ÜÐ\™XHH›ÝËœ™[[Ý™Qœ›ÛTšYÚ
+MÊNÂˆ›ÝËœ™[[Ý™Qœ›ÛTšYÚ
+ŠNÂˆ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™Ê›ÝÊNÂˆž\\ÜÒ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™Êž\\ÜÐ\™XJNÂˆ™[[Ý™R[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™Ê™[[Ý™P\™XJNÂˆBˆ[ÙBˆÂˆ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™Ê›ÝÊNÂˆž\\ÜÒ[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™ÊßJNÂˆ™[[Ý™R[œÙ\]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠÛÝ
+WKœÙ]›Ý[™ÊßJNÂˆBˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+JNÂˆBˆY[œÙ\]Û‹œÙ]›Ý[™ÊßJNÂˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+ŠNÂˆ\P]Û‹œÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛUÜ
+ŒŠJNÂˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+ŠNÂˆYˆ
+X\Ý\‘\UšY]ÊBˆÂˆËÈH™Y™\™[˜ÙHX\Ý\ˆÝš\Ú]™\È]ÈTH™\ÜÛœÙHÜ˜\ˆËÈHYXØ]Y\Ü^H\™XH[œÝXYÙˆ™\X][™ÈH›Ý\‚ˆËÈÛÛ\XÝÚ[›™[THÛÛ›Û›ÝÜË‚ˆÛÛœÝ]]ÈÜ˜\ZYÚHXÙNŽš›Z[ŠŒLXÙNŽš›X^
+LL\™XK™Ù]ZYÚ
+
+HÈÊJNÂˆ\QÜ˜\œÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛUÜ
+Ü˜\ZYÚ
+JNÂˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+ÊNÂˆBˆ[ÙBˆÂˆ\QÜ˜\œÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛUÜ
+ÌŠJNÂˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+ÊNÂˆ›Üˆ
+[˜[™HÈ˜[™È
+ÊØ˜[™
+BˆÂˆ\P˜[™]\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WKœÙ]›Ý[™Ê\™XKœ™[[Ý™Qœ›ÛUÜ
+L
+JNÂˆËÈÙY\Ú[›™[THÛÛ›ÛÈÛÛ\XÝ[›ÝYÚ]BˆËÈÝ]]›Ý][™È˜[šÈ™[XZ[œÈš\ÚX›H[ˆHZ^\‹‚ˆ]]ÈÛÛ›ÛÈH\™XKœ™[[Ý™Qœ›ÛUÜ
+ŒŠNÂˆÛÛœÝ[\˜[Y]\ÛÝ[H˜[™OHHÈÈˆŽÂˆÛÛœÝÝŽ˜\œ˜^O›Ø]ÏˆÛÒÛ›Ø”ÜÚ][ÛœÈÈŒÌ‹Ì‹ŒˆNÂˆÛÛœÝÝŽ˜\œ˜^O›Ø]Ïˆ™YRÛ›Ø”ÜÚ][ÛœÈÈŒN‹L‹Ž™ˆNÂˆ›Üˆ
+[\˜[Y]\ˆHÈ\˜[Y]\ˆ\˜[Y]\ÛÝ[È
+ÊÜ\˜[Y]\ŠBˆÂˆÛÛœÝ]]ÈÜÚ][ÛˆH\˜[Y]\ÛÝ[OHÂˆÈ™YRÛ›Ø”ÜÚ][ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWBˆˆÛÒÛ›Ø”ÜÚ][ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWNÂˆÛÛœÝ[Û›Ø”Ú^™HHXÙNŽš›Z[ŠŒ‹ÛÛ›ÛË™Ù]ZYÚ
+
+JNÂˆÛÛœÝ[XYÛÛ˜[Ù™œÙ]H\˜[Y]\ÛÝ[OHÂˆÈ
+\˜[Y]\ˆOHHÈˆÊBˆˆ
+\˜[Y]\ˆOHÈÈˆ
+NÂˆÛÛœÝ[HÛÛ›ÛË™Ù]
+
+H
+ÈXÙNŽœ›Ý[™Ò[
+ˆÜÚ][Ûˆ
+ˆÝ]X×ØØ\Ý›Ø]ŠÛÛ›ÛË™Ù]ÚY
+
+JJHHÛ›Ø”Ú^™HÈŽÂˆ\PÛÛ›ÛÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]›Ý[™ÊˆXÙNŽ”™XÝ[™ÛO[ŠÛÛ›ÛË™Ù]J
+H
+ÈXYÛÛ˜[Ù™œÙ]Û›Ø”Ú^™KÛ›Ø”Ú^™JBˆ˜ÛÛœÝ˜Z[™YÚ][ŠÛÛ›ÛÊJNÂˆBˆ]]ÈX™[ÈH\™XKœ™[[Ý™Qœ›ÛUÜ
+
+NÂˆ›Üˆ
+[\˜[Y]\ˆHÈ\˜[Y]\ˆ\˜[Y]\ÛÝ[È
+ÊÜ\˜[Y]\ŠBˆÂˆÛÛœÝ]]ÈÜÚ][ÛˆH\˜[Y]\ÛÝ[OHÂˆÈ™YRÛ›Ø”ÜÚ][ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWBˆˆÛÒÛ›Ø”ÜÚ][ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWNÂˆÛÛœÝ[X™[ÚYH\˜[Y]\ÛÝ[OHÈÈÍˆÂˆÛÛœÝ[HÛÛ›ÛË™Ù]
+
+H
+ÈXÙNŽœ›Ý[™Ò[
+ˆÜÚ][Ûˆ
+ˆÝ]X×ØØ\Ý›Ø]ŠÛÛ›ÛË™Ù]ÚY
+
+JJHHX™[ÚYÈŽÂˆ\PÛÛ›ÛX™[ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ\˜[Y]\ŠWKœÙ]›Ý[™ÊˆXÙNŽ”™XÝ[™ÛO[ŠX™[Ë™Ù]J
+KX™[ÚYX™[Ë™Ù]ZYÚ
+
+JBˆ˜ÛÛœÝ˜Z[™YÚ][ŠX™[ÊJNÂˆBˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+
+NÂˆBˆBˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+ŠNÂˆBˆYˆ
+]]Kš\Õš\ÚX›J
+JBˆÂˆ]]È[ÙP]ÛœÈH\™XKœ™[[Ý™Qœ›ÛUÜ
+ŒŠNÂˆ]]KœÙ]›Ý[™Ê[ÙP]ÛœËœ™[[Ý™Qœ›ÛSY
+
+[ÙP]ÛœË™Ù]ÚY
+
+HH
+HÈŠJNÂˆ[ÙP]ÛœËœ™[[Ý™Qœ›ÛSY
+
+NÂˆÛÛËœÙ]›Ý[™Ê[ÙP]ÛœÊNÂˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+ŠNÂˆ]]È[\™XHH\™XKœ™[[Ý™Qœ›ÛUÜ
+L
+NÂˆ]]È[“X™[›ÝÈH[\™XKœ™[[Ý™Qœ›ÛUÜ
+L
+NÂˆ[“YœÙ]›Ý[™Ê[“X™[›ÝËœ™[[Ý™Qœ›ÛSY
+N
+JNÂˆ[”šYÚœÙ]›Ý[™Ê[“X™[›ÝËœ™[[Ý™Qœ›ÛTšYÚ
+N
+JNÂˆ[•]KœÙ]›Ý[™Ê[“X™[›ÝÊNÂˆÛÛœÝ[[•ÚYHXÙNŽš›Z[Š‹[\™XK™Ù]ÚY
+
+JNÂˆ[‹œÙ]›Ý[™Ê[\™XKÚ]Ú^™RÙY\[™ÐÙ[™J[•ÚY[\™XK™Ù]ZYÚ
+
+JJNÂˆ\™XKœ™[[Ý™Qœ›ÛUÜ
+
+NÂˆBˆYˆ
+[X\Ý\‘\UšY]ÊBˆÂˆÝ]]X\Ý\]Û‹œÙ]š\ÚX›JYJNÂˆ›Üˆ
+]]Éˆ›Ý]HˆÝ]]\Ð]ÛœÊH›Ý]KœÙ]š\ÚX›JYJNÂˆ]]È›Ý]P\™XHH\™XKœ™[[Ý™Qœ›ÛP›ÝÛJLŠNÂˆÝ]]X\Ý\]Û‹œÙ]›Ý[™Ê›Ý]P\™XKœ™[[Ý™Qœ›ÛUÜ
+MŠJNÂˆ›Ý]P\™XKœ™[[Ý™Qœ›ÛUÜ
+JNÂˆ›Üˆ
+[›ÝÒ[™^HÈ›ÝÒ[™^ŽÈ
+ÊÜ›ÝÒ[™^
+BˆÂˆ]]È›ÝÈH›Ý]P\™XKœ™[[Ý™Qœ›ÛUÜ
+MÊNÂˆ›Üˆ
+[ÛÛ[[ˆHÈÛÛ[[ˆÈ
+ÊØÛÛ[[ŠBˆÂˆÛÛœÝ[\ÈH›ÝÒ[™^
+ˆ
+ÈÛÛ[[ŽÂˆ]]ÈÙ[H›ÝËœ™[[Ý™Qœ›ÛSY
+›ÝË™Ù]ÚY
+
+HÈ
+HÛÛ[[ŠJNÂˆÝ]]\Ð]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWKœÙ]›Ý[™ÊÙ[œ™YXÙY
+K
+JNÂˆBˆBˆBˆ]]ÈY]\\™XHH\™XKœ™[[Ý™Qœ›ÛTšYÚ
+Í
+NÂˆ\™XKœ™[[Ý™Qœ›ÛTšYÚ
+ÊNÂˆØZ[‹œÙ]›Ý[™Ê\™XJNÂˆY]\›Ý[™ÈHY]\\™XKœ™YXÙY
+‹
+NÂˆB‚‚ˆš]˜]N‚ˆ›ÚY[Y\Ø[˜XÚÊ
+HÝ™\œšYBˆÂˆYˆ
+\ÓX\Ý\“Y]\ˆ	‰ˆX\Ý\“Y]\ÛÛ^Ý\Y\ŠBˆÂˆ]]ÊˆÝ\œ™[ÛÛ^HX\Ý\“Y]\ÛÛ^Ý\Y\Š
+NÂˆYˆ
+X\Ý\“Y]\ÛÛ^™Ù]
+
+HOHÝ\œ™[ÛÛ^
+BˆÂˆ]XÚY]\Š
+NÂˆYˆ
+Ý\œ™[ÛÛ^OH[ŠBˆÂˆX\Ý\“Y]\ÛÛ^HÝ\œ™[ÛÛ^ÂˆÝ\œ™[ÛÛ^O›X\Ý\“]™[Ë˜YÛY[
+Y]\ÛY[
+NÂˆY]\•š\ÚX›HHYNÂˆBˆBˆB‚ˆÛÛœÝ]]ÈYHY]\ÛY[™Ù][™ÛX\]Y[Ó]™[
+
+K™ŽÂˆÛÛœÝ]]ÈšYÚHY]\ÛY[™Ù][™ÛX\]Y[Ó]™[
+JK™ŽÂˆYXZÑˆHYˆLLŒˆÈXÙNŽš›X^
+YYXZÑˆHKŒYŠHˆXÙNŽš›X^
+LLŒ‹YXZÑˆHKŒYŠNÂˆšYÚXZÑˆHšYÚˆLLŒˆÈXÙNŽš›X^
+šYÚšYÚXZÑˆHKŒYŠHˆXÙNŽš›X^
+LLŒ‹šYÚXZÑˆHKŒYŠNÂˆ\]TXZÒÛ
+YYXZÒÛ‹YXZÒÛXÚÜÊNÂˆ\]TXZÒÛ
+šYÚšYÚXZÒÛ‹šYÚXZÒÛXÚÜÊNÂˆËÈH]™[YX\Ý\™\ˆ™\ÜÈXZÜÈ[ˆ‘”ËÚ\™H[ØØ[H\È‹‚ˆËÈ™X]HØ[\H]™XXÚ\È‘”È\ÈHÛ\\ÈÙ[\È[žHÝ™\œË‚ˆYˆ
+YHŒˆšYÚHŒŠBˆÛ\[HYNÂˆ™\Z[
+Y]\›Ý[™Ë™^[™Y
+ŠJNÂˆB‚ˆÝ]XÈ›ÚY\]TXZÒÛ
+›Ø][˜ÛÛZ[™Ñ‹›Ø]	ˆ[‹[	ˆÛXÚÜÊBˆÂˆYˆ
+[˜ÛÛZ[™Ñˆˆ[ŠBˆÂˆ[ˆH[˜ÛÛZ[™ÑŽÂˆÛXÚÜÈHÂˆBˆ[ÙHYˆ
+ÛXÚÜÈˆ
+BˆÂˆKZÛXÚÜÎÂˆBˆ[ÙBˆÂˆ[ˆHXÙNŽš›X^
+LLŒ‹[ˆHŒYŠNÂˆBˆB‚ˆ›ÚYZ[Y]\ŠXÙNŽ‘Ü˜\XÜÉˆÊBˆÂˆYˆ
+[Y]\•š\ÚX›HY]\›Ý[™Ëš\Ñ[\J
+JH™]\›ŽÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNKÌËÊJNÂˆË™š[›Ý[™Y™XÝ[™ÛJY]\›Ý[™ËÑ›Ø]
+
+K‹ŒŠNÂˆÛÛœÝ[Ø\HŽÂˆÛÛœÝ^ˆ[ØØ[UÚYHLŽÂˆÛÛœÝ[Ú[›™[ÚYH
+Y]\›Ý[™Ë™Ù]ÚY
+
+HHØØ[UÚYHØ\HŠHÈŽÂˆÝ]XÈÛÛœÝ^ˆÝŽ˜\œ˜^O[ÏˆØØ[U˜[Y\ÈÈM‹LL‹LNLLÍ‹MŒNÂˆÛÛœÝ]]ÈY]\•ÜHY]\›Ý[™Ë™Ù]J
+H
+ÈŽÂˆÛÛœÝ]]ÈY]\’ZYÚHY]\›Ý[™Ë™Ù]ZYÚ
+
+HHÂˆËœÙ]›Û
+ËYŠNÂˆ›Üˆ
+ÛÛœÝ]]ÈˆˆØØ[U˜[Y\ÊBˆÂˆÛÛœÝ]]È]™[HÝ]X×ØØ\Ý›Ø]Šˆ
+ÈŒ
+HÈŒŒŽÂˆÛÛœÝ]]ÈHHY]\•Ü
+ÈXÙNŽœ›Ý[™Ò[
+
+KŒˆH]™[
+H
+ˆÝ]X×ØØ\Ý›Ø]ŠY]\’ZYÚ
+JNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNMŒM‹ŒJJNÂˆË™˜]Ñš]Y^
+ˆOHÈŒˆˆXÙNŽ”Ýš[™ÊŠKˆY]\›Ý[™Ë™Ù]
+
+KHHØØ[UÚYH‹KˆXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YšYÚJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKMNMÌÊJNÂˆË™˜]ÒÜš^›Û[[™JKÝ]X×ØØ\Ý›Ø]ŠY]\›Ý[™Ë™Ù]
+
+H
+ÈØØ[UÚYHŠKˆÝ]X×ØØ\Ý›Ø]ŠY]\›Ý[™Ë™Ù]
+
+H
+ÈØØ[UÚY
+ÈŠJNÂˆBˆÛÛœÝ]]È˜]ÐÚ[›™[HÉ™Ë\ËÚ[›™[ÚYJ[›Ø]‹›Ø][ŠBˆÂˆÛÛœÝ]]ÈÚ[›™[HXÙNŽ”™XÝ[™ÛO[ŠY]\›Ý[™Ë™Ù]J
+H
+È‹ˆÚ[›™[ÚYY]\›Ý[™Ë™Ù]ZYÚ
+
+HH
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌKKŒ
+JNÂˆË™š[™XÝ
+Ú[›™[
+NÂˆÛÛœÝ^ˆ[ÙYÛY[ÛÝ[HÌÈËÈˆˆ\ˆQÝ™\ˆHMŒÈˆ˜[™ÙBˆÛÛœÝ^ˆ[ÙYÛY[Ø\HŽÂˆÛÛœÝ[ÙYÛY[ZYÚHXÙNŽš›X^
+‹ˆ
+Ú[›™[™Ù]ZYÚ
+
+HH
+ÙYÛY[ÛÝ[HJH
+ˆÙYÛY[Ø\
+HÈÙYÛY[ÛÝ[
+NÂˆ›Üˆ
+[ÙYÛY[HÈÙYÛY[ÙYÛY[ÛÝ[È
+ÊÜÙYÛY[
+BˆÂˆÛÛœÝ›Ø]™\ÚÛˆHMŒŒˆ
+È
+Ý]X×ØØ\Ý›Ø]ŠÙYÛY[
+H
+ÈKŒŠBˆ
+ˆ
+ŒŒˆÈÝ]X×ØØ\Ý›Ø]ŠÙYÛY[ÛÝ[
+JNÂˆYˆ
+ˆ™\ÚÛŠHÛÛ[YNÂ‚ˆYˆ
+™\ÚÛˆˆM‹ŒŠBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒËLKJJNÂˆ[ÙHYˆ
+™\ÚÛˆˆLNŒŠBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒÌKJJNÂˆ[ÙBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹ŒËŒÌJJNÂ‚ˆÛÛœÝ[HHÚ[›™[™Ù]›ÝÛJ
+HH
+ÙYÛY[
+ÈJH
+ˆ
+ÙYÛY[ZYÚ
+ÈÙYÛY[Ø\
+Bˆ
+ÈÙYÛY[Ø\ÂˆË™š[™XÝ
+KÚ[›™[ÚYÙYÛY[ZYÚ
+NÂˆB‚ˆYˆ
+[ˆˆMŒŒŠBˆÂˆÛÛœÝ]]È[]™[HXÙNŽš›[Z]
+Œ‹KŒ‹
+[ˆ
+ÈŒŒŠHÈŒŒŠNÂˆÛÛœÝ]]ÈX\šÙ\–HHÚ[›™[™Ù]›ÝÛJ
+BˆHXÙNŽœ›Ý[™Ò[
+[]™[
+ˆÝ]X×ØØ\Ý›Ø]ŠÚ[›™[™Ù]ZYÚ
+
+JJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒÌ‹ËLŠJNÂˆË™š[™XÝ
+XÙNŽš›[Z]
+Ú[›™[™Ù]J
+KÚ[›™[™Ù]›ÝÛJ
+HH‹X\šÙ\–HHJKˆÚ[›™[ÚYŠNÂˆBˆNÂˆ˜]ÐÚ[›™[
+Y]\›Ý[™Ë™Ù]
+
+H
+ÈØØ[UÚYYXZÑ‹YXZÒÛŠNÂˆ˜]ÐÚ[›™[
+Y]\›Ý[™Ë™Ù]
+
+H
+ÈØØ[UÚY
+ÈÚ[›™[ÚY
+ÈØ\šYÚXZÑ‹šYÚXZÒÛŠNÂˆYˆ
+Û\[
+BˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒÍKÍKŒJJNÂˆË™š[™XÝ
+Y]\›Ý[™Ë™Ù]
+
+H
+ÈØØ[UÚYY]\›Ý[™Ë™Ù]J
+H
+È‹ˆY]\›Ý[™Ë™Ù]ÚY
+
+HHØØ[UÚYH‹ÊNÂˆBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMËNKŒŠJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJY]\›Ý[™ËÑ›Ø]
+
+K‹Œ‹KŒŠNÂˆB‚ˆXÙNŽ”ÛY\ˆ[ŽÂˆXÙNŽ•^]Ûˆ]]KÛÛÎÂˆ\RXY\]Ûˆ\P]ÛŽÂˆ\T™\ÜÛœÙQÜ˜\\QÜ˜\ÂˆÝŽ˜\œ˜^O[œÙ\ÛÝ]Û‹ˆ[œÙ\]ÛœÎÂˆÝŽ˜\œ˜^OXÙNŽ•^]Û‹ˆY][œÙ\]ÛœÎÂˆÝŽ˜\œ˜^OÛX[XÝ[Û]Û‹ˆž\\ÜÒ[œÙ\]ÛœÎÂˆÝŽ˜\œ˜^OÛX[XÝ[Û]Û‹ˆ™[[Ý™R[œÙ\]ÛœÎÂˆXÙNŽ•^]ÛˆY[œÙ\]ÛŽÂˆÝŽ˜\œ˜^O›ÛÛˆ[œÙ\ÛÝ\ÑY™™XÝßNÂˆNŽ“]™[Y]\”YÚ[ŠˆY]\”YÚ[ˆH[ŽÂˆNŽ”YÚ[ŽŽ”ˆY]\”YÚ[”™YŽÂˆNŽ“]™[YX\Ý\™\ŽŽÛY[Y]\ÛY[ÂˆXÙNŽ•ÙXZÔ™Y™\™[˜ÙONŽ‘Y]^X˜XÚÐÛÛ^ˆX\Ý\“Y]\ÛÛ^ÂˆÝŽ™[˜Ý[ÛNŽ‘Y]^X˜XÚÐÛÛ^
+Š
+OˆX\Ý\“Y]\ÛÛ^Ý\Y\ŽÂˆXÙNŽ”™XÝ[™ÛO[ˆY]\›Ý[™ÎÂˆXÙNŽ“X™[[“Y[•]K[”šYÚÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^OXÙNŽ“X™[Ï‹ˆ\PÛÛ›ÛX™[ÎÂˆ›Ø]YXZÑˆHLLŒ‹šYÚXZÑˆHLLŒŽÂˆ›Ø]YXZÒÛˆHLLŒ‹šYÚXZÒÛˆHLLŒŽÂˆ[YXZÒÛXÚÜÈHšYÚXZÒÛXÚÜÈHÂˆ›ÛÛÛ\[H˜[ÙNÂˆ›ÛÛY]\•š\ÚX›HH˜[ÙK\ÓX\Ý\“Y]\ˆH˜[ÙNÂˆ›ÛÛX\Ý\‘\UšY]ÈH˜[ÙNÂˆ›ÛÛ\ÔÙ[XÝYH˜[ÙNÂˆNÂ‚ˆÛ\ÜÈZ^\”[™[š[˜[ˆX›XÈXÙNŽÛÛ\Û™[ˆÂˆX›XÎ‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYHÈË™š[[
+XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽLL‹LÎJJNÈBˆNÂ‚ˆZ^\”[™[ÛÛ[ÂˆXÙNŽ•šY]ÜÜšY]ÜÜÂˆXÙNŽÛÛ\Û™[Ýš\ÎÂˆXÙNŽ“ÝÛ™Y\œ˜^OÚ[›™[Ýš\ˆÚ[›™[Ýš\ÎÂˆÚ[›™[Ýš\X\Ý\”Ýš\ÂˆÝŽ[š\]YWÜYÚ[”\˜[Y]\•Ú[™ÝÏˆY™™XÝÚ[™ÝÎÂŸNÂ‚˜Û\ÜÈX[›Ô›ÛÜšYš[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆËÈÙY\HX^[Z^™YY]Ü‰ÜÈ[YH[\ˆœ›ØYZÙHÜš[Û‰ÜÈX[›È›Û‚ˆËÈH]\›ˆØ[ˆÝ[™HÚÜ\ŽÈH™Y›Ý[™\žHÚÝÜÈ]ÈÝ\œ™[[™‚ˆÝ]XÈÛÛœÝ^ˆ[˜\ÙUš\ÚX›TÝ\ÛÝ[HÂˆÝŽ™[˜Ý[Û[
+
+OˆÙ]XÝ]™TÝ\ÛÝ[ÂˆÝŽ™[˜Ý[Û›ÛÛ
+[[
+Oˆ›ÝR\ÓÛŽÂˆÝŽ™[˜Ý[Û›ÛÛ
+
+Oˆ\™P[›Ý\ÔÙ[XÝYÂˆÝŽ™[˜Ý[Û[
+[[
+OˆÙ]›ÝS[™ÝÂˆÝŽ™[˜Ý[Û›ÚY
+[[›ÛÛ
+Oˆ›ÝPÛXÚÙYÂˆÝŽ™[˜Ý[Û›ÚY
+[[[
+Oˆ›ÝS[™ÝÚ[™ÙYÂˆÝŽ™[˜Ý[Û›ÚY
+
+Oˆ›ÝQÙ\Ý\™TÝ\YÂˆÝŽ™[˜Ý[Û›ÚY
+
+Oˆ›ÝQÙ\Ý\™Q[™YÂˆÝŽ™[˜Ý[Û›ÚY
+[
+OˆZ[[™Ý\]YÂˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÙ^X›Ø\™›ÝPÚ[™ÙYÂˆÝŽ™[˜Ý[Û›Ø]
+[
+OˆÙ]]]ÛX][Û•˜[YNÂˆÝŽ™[˜Ý[Û›ÚY
+[›Ø]
+OˆÙ]]]ÛX][Û•˜[YNÂ‚ˆ›ÚYÙ]^ZXYÝ\
+ÝX›HÝ\›ÛÛXÝ]™JBˆÂˆ^ZXYÝ\HÝ\Âˆ^ZXYš\ÚX›HHXÝ]™NÂˆ™\Z[
+
+NÂˆB‚ˆ[XÝ]™TÝ\Ê
+HÛÛœÝÈ™]\›ˆXÙNŽš›[Z]
+KÙ]XÝ]™TÝ\ÛÝ[ÈÙ]XÝ]™TÝ\ÛÝ[
+
+HˆMŠNÈBˆ[š\ÚX›TÝ\Ê
+HÛÛœÝÈ™]\›ˆXÙNŽš›X^
+˜\ÙUš\ÚX›TÝ\ÛÝ[XÝ]™TÝ\Ê
+JNÈBˆ[X™[ÚY
+
+HÛÛœÝÈ™]\›ˆNÈBˆ[XY\’ZYÚ
+
+HÛÛœÝÈ™]\›ˆÌÈBˆ[›ÝÒZYÚ
+
+HÛÛœÝÈ™]\›ˆXÙNŽš›X^
+Œ‹
+Ù]ZYÚ
+
+HHXY\’ZYÚ
+
+HHH
+™[ØÚ]S[™Uš\ÚX›HÈLMˆˆ
+JHÈÍÊNÈBˆ[Ý\ÚY
+
+HÛÛœÝÈ™]\›ˆXÙNŽš›X^
+Œ‹
+Ù]ÚY
+
+HHX™[ÚY
+
+JHÈš\ÚX›TÝ\Ê
+JNÈBˆ›ÚYÙ]™[ØÚ]S[™Uš\ÚX›J›ÛÛš\ÚX›JHÈ™[ØÚ]S[™Uš\ÚX›HHš\ÚX›NÈ™\Z[
+
+NÈBˆ›ÚYÙ]]]ÛX][Û“[™Uš\ÚX›J›ÛÛš\ÚX›JHÈ]]ÛX][Û“[™Uš\ÚX›HHš\ÚX›NÈ™\Z[
+
+NÈBˆ›ÛÛ\Õ™[ØÚ]S[™Uš\ÚX›J
+HÛÛœÝÈ™]\›ˆ™[ØÚ]S[™Uš\ÚX›NÈBˆ›ÚYÙ]Ù^X›Ø\™Ü[ÛœÊ›ÛÛÛÛÝ\™Y›ÛÛX™[ÊBˆÂˆÛÛÝ\™YÙ^\ÈHÛÛÝ\™YÂˆÚÝÓ›ÝS˜[Y\ÈHX™[ÎÂˆ™\Z[
+
+NÂˆBˆ›ÚYÙ]ÜšYÜ[ÛœÊ[Ý\Ô\˜\‹[[\\Ú\ÊBˆÂˆÝX™]š\Ú[ÛœÔ\˜\ˆHXÙNŽš›[Z]
+Ý\Ô\˜\ŠNÂˆYÚYÚ]™\žSˆHXÙNŽš›[Z]
+KÝX™]š\Ú[ÛœÔ\˜\‹[\\Ú\ÊNÂˆ™\Z[
+
+NÂˆBˆ[Ù]ÝX™]š\Ú[ÛœÔ\˜\Š
+HÛÛœÝÈ™]\›ˆÝX™]š\Ú[ÛœÔ\˜\ŽÈBˆ[Ù]YÚYÚ]™\žSŠ
+HÛÛœÝÈ™]\›ˆYÚYÚ]™\žSŽÈBˆ›ÛÛ\ÐÛÛÝ\™YÙ^\Ê
+HÛÛœÝÈ™]\›ˆÛÛÝ\™YÙ^\ÎÈBˆ›ÛÛ\Ó›ÝS˜[Y\Ê
+HÛÛœÝÈ™]\›ˆÚÝÓ›ÝS˜[Y\ÎÈB‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆÛÛœÝ^ˆ[™[ØÚ]RZYÚHLMŽÂˆÛÛœÝ]]ÈX™[ÚYHX™[ÚY
+
+NÂˆÛÛœÝ]]ÈXY\’ZYÚHXY\’ZYÚ
+
+NÂˆÛÛœÝ]]È›ÝÒZYÚH›ÝÒZYÚ
+
+NÂˆÛÛœÝ]]ÈÝ\ÚYHÝ\ÚY
+
+NÂˆË™š[[
+XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŽKÎ
+JNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽKËMJJNÂˆË™š[™XÝ
+Ù]ÚY
+
+KXY\’ZYÚ
+NÂˆËœÙ]›Û
+L‹ŒŠNÂˆÛÛœÝ]]ÈXÝ]™TÝ\ÛÝ[HXÝ]™TÝ\Ê
+NÂˆÛÛœÝ]]Èš\ÚX›TÝ\ÛÝ[Hš\ÚX›TÝ\Ê
+NÂˆ›Üˆ
+[Ý\HÈÝ\š\ÚX›TÝ\ÛÝ[È
+ÊÜÝ\
+BˆÂˆËœÙ]ÛÛÝ\ŠÝ\XÝ]™TÝ\ÛÝ[ÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÎNNŒLJBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLLLKL
+JNÂˆË™˜]Õ^
+XÙNŽ”Ýš[™ÊÝ\
+ÈJKX™[ÚY
+ÈÝ\
+ˆÝ\ÚYÝ\ÚYXY\’ZYÚˆXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆB‚ˆ›Üˆ
+[]ÚHÈ]ÚHÈK\]Ú
+BˆÂˆÛÛœÝ]]È›ÝÈHH]ÚÂˆÛÛœÝ]]ÈHHXY\’ZYÚ
+È›ÝÈ
+ˆ›ÝÒZYÚÂˆÛÛœÝ›ÛÛ›XÚÒÙ^HH
+
+]Ú	HLŠHOHH
+]Ú	HLŠHOHÈ
+]Ú	HLŠHOH‚ˆ
+]Ú	HLŠHOH
+]Ú	HLŠHOHL
+NÂˆÛÛœÝ]]ÈÙ^UÚYH›XÚÒÙ^HÈ
+X™[ÚY
+ˆÊHÈHˆX™[ÚYHŽÂˆËœÙ]ÛÛÝ\ŠÛÛÝ\™YÙ^\ÂˆÈ
+›XÚÒÙ^HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍÊHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒÌ‹ŒÍÊJBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNM‹ŒËŒMJJNÂˆË™š[™XÝ
+KÙ^UÚY›ÝÒZYÚ
+NÂˆËœÙ]ÛÛÝ\Š›XÚÒÙ^HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËŒKŽ
+HˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠL‹L‹LÎJJNÂˆË™˜]Ô™XÝ
+KÙ^UÚY›ÝÒZYÚJNÂˆËœÙ]ÛÛÝ\Š›XÚÒÙ^HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÎNNŒLJHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽËLÊJNÂˆYˆ
+ÚÝÓ›ÝS˜[Y\ÊBˆË™˜]Õ^
+]ÚX™[
+]Ú
+KKX™[ÚYH›ÝÒZYÚXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YšYÚ
+NÂ‚ˆ›Üˆ
+[Ý\HÈÝ\š\ÚX›TÝ\ÛÝ[È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]ÈHX™[ÚY
+ÈÝ\
+ˆÝ\ÚYÂˆÛÛœÝ›ÛÛ[”]\›ˆHÝ\XÝ]™TÝ\ÛÝ[ÂˆÛÛœÝ›ÛÛXÝ]™HH[”]\›ˆ	‰ˆ›ÝR\ÓÛˆ	‰ˆ›ÝR\ÓÛŠ]ÚÝ\
+NÂˆËœÙ]ÛÛÝ\Š[”]\›‚ˆÈ
+›XÚÒÙ^HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍÊHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌ‹‹N
+JBˆˆ
+›XÚÒÙ^HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNËÍJHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒËÍŠJJNÂˆË™š[™XÝ
+
+ÈKH
+ÈKÝ\ÚYH‹›ÝÒZYÚHŠNÂˆYˆ
+XÝ]™JBˆÂˆÛÛœÝ]]È›ÝS[™ÝHXÙNŽš›[Z]
+KXÝ]™TÝ\ÛÝ[HÝ\ˆÙ]›ÝS[™ÝÈÙ]›ÝS[™Ý
+]ÚÝ\
+HˆJNÂˆÛÛœÝ]]È›ÝUÚYHXÙNŽš›X^
+›ÝS[™Ý
+ˆÝ\ÚYHJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMNNNJJNÂˆË™š[›Ý[™Y™XÝ[™ÛJÝ]X×ØØ\Ý›Ø]Š
+ÈŠKÝ]X×ØØ\Ý›Ø]ŠH
+ÈÊKˆÝ]X×ØØ\Ý›Ø]Š›ÝUÚY
+KÝ]X×ØØ\Ý›Ø]Š›ÝÒZYÚHŠKËŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMM‹ŒÌ‹L
+JNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJÝ]X×ØØ\Ý›Ø]Š
+ÈŠKÝ]X×ØØ\Ý›Ø]ŠH
+ÈÊKˆÝ]X×ØØ\Ý›Ø]Š›ÝUÚY
+KÝ]X×ØØ\Ý›Ø]Š›ÝÒZYÚHŠKËŒ‹KŒŠNÂˆYˆ
+\™P[›Ý\ÔÙ[XÝY	‰ˆ\™P[›Ý\ÔÙ[XÝY
+
+JBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMKŒŒLJJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJÝ]X×ØØ\Ý›Ø]Š
+ÈJKÝ]X×ØØ\Ý›Ø]ŠH
+ÈŠKˆÝ]X×ØØ\Ý›Ø]Š›ÝUÚY
+ÈŠKÝ]X×ØØ\Ý›Ø]Š›ÝÒZYÚH
+KËŒ‹‹ŒŠNÂˆBˆBˆËœÙ]ÛÛÝ\ŠZ[”]\›ˆÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMKŠBˆˆÝ\	HÝX™]š\Ú[ÛœÔ\˜\ˆOHÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLLÍËMMJBˆˆÝ\	HYÚYÚ]™\žSˆOHÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹LLËLÌ
+BˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËÍKL
+JNÂˆË™˜]Ô™XÝ
+KÝ\ÚY›ÝÒZYÚJNÂˆBˆB‚ˆÛÛœÝ]]È™[ØÚ]UÜHXY\’ZYÚ
+ÈÍÈ
+ˆ›ÝÒZYÚ
+ÈÂˆYˆ
+™[ØÚ]S[™Uš\ÚX›H]]ÛX][Û“[™Uš\ÚX›JBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽKËMJJNÂˆË™š[™XÝ
+™[ØÚ]UÜÙ]ÚY
+
+K™[ØÚ]RZYÚ
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÎNNŒLJJNÂˆËœÙ]›Û
+LKŒŠNÂˆË™˜]Õ^
+]]ÛX][Û“[™Uš\ÚX›HÈ]]ÛX][Ûˆˆˆ•™[ØÚ]H‹™[ØÚ]UÜˆX™[ÚYHŒXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆYˆ
+]]ÛX][Û“[™Uš\ÚX›JBˆÂˆXÙNŽ”]Ý\™NÂˆ›ÛÛÝ\YH˜[ÙNÂˆ›Üˆ
+[Ý\HÈÝ\XÝ]™TÝ\ÛÝ[È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È˜[YHHXÙNŽš›[Z]
+Œ‹KŒ‹Ù]]]ÛX][Û•˜[YHÈÙ]]]ÛX][Û•˜[YJÝ\
+HˆYŠNÂˆÛÛœÝ]]ÈHÝ]X×ØØ\Ý›Ø]ŠX™[ÚY
+ÈÝ\
+ˆÝ\ÚY
+ÈÝ\ÚYÈŠNÂˆÛÛœÝ]]ÈHHÝ]X×ØØ\Ý›Ø]Š™[ØÚ]UÜ
+Èˆ
+È
+KŒˆH˜[YJH
+ˆ
+™[ØÚ]RZYÚHÎ
+JNÂˆYˆ
+\Ý\Y
+HÈÝ\™KœÝ\™]ÔÝX”]
+JNÈÝ\YHYNÈBˆ[ÙHÝ\™K›[™UÊJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMNNNJJNÂˆË™š[[\ÙJHŒ‹HHŒ‹Œ‹ŒŠNÂˆBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌËŒËŒÍÊJNÂˆËœÝ›ÚÙT]
+Ý\™KXÙNŽ”]Ý›ÚÙU\J‹ŒŠJNÂˆ›Üˆ
+[Ý\HÈÝ\š\ÚX›TÝ\ÛÝ[È
+ÊÜÝ\
+BˆËœÙ]ÛÛÝ\ŠÝ\XÝ]™TÝ\ÛÝ[ÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËÍKL
+BˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎL‹ŒŠJKˆË™˜]Õ™\XØ[[™JX™[ÚY
+ÈÝ\
+ˆÝ\ÚYˆÝ]X×ØØ\Ý›Ø]Š™[ØÚ]UÜ
+ÈŒŠKˆÝ]X×ØØ\Ý›Ø]Š™[ØÚ]UÜ
+È™[ØÚ]RZYÚ
+JNÂˆBˆ[ÙBˆ›Üˆ
+[Ý\HÈÝ\š\ÚX›TÝ\ÛÝ[È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]ÈHX™[ÚY
+ÈÝ\
+ˆÝ\ÚYÂˆÛÛœÝ›ÛÛ[”]\›ˆHÝ\XÝ]™TÝ\ÛÝ[ÂˆËœÙ]ÛÛÝ\Š[”]\›ˆÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËÍKL
+HˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎL‹ŒŠJNÂˆË™˜]Õ™\XØ[[™JÝ]X×ØØ\Ý›Ø]Š™[ØÚ]UÜ
+ÈŒŠKÝ]X×ØØ\Ý›Ø]Š™[ØÚ]UÜ
+È™[ØÚ]RZYÚ
+JNÂˆ›ÛÛXÝ]™HH˜[ÙNÂˆ›Üˆ
+[]ÚHÈ]ÚH	‰ˆ[”]\›ˆ	‰ˆXXÝ]™NÈ
+ÊÜ]Ú
+BˆXÝ]™HH›ÝR\ÓÛˆ	‰ˆ›ÝR\ÓÛŠ]ÚÝ\
+NÂˆYˆ
+XÝ]™JBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMNNNJJNÂˆË™š[™XÝ
+
+ÈÝ\ÚYÈˆHK™[ØÚ]UÜ
+ÈÌL™[ØÚ]RZYÚHÎ
+NÂˆBˆBˆBˆÛÛœÝ]]È›Ý[™\žVHX™[ÚY
+ÈXÝ]™TÝ\ÛÝ[
+ˆÝ\ÚYÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒÌËŽJJNÂˆÛÛœÝ]]ÈÜšY›ÝÛHH
+™[ØÚ]S[™Uš\ÚX›H]]ÛX][Û“[™Uš\ÚX›JHÈ™[ØÚ]UÜ
+È™[ØÚ]RZYÚˆ™[ØÚ]UÜÂˆË™š[™XÝ
+›Ý[™\žVHKXY\’ZYÚ‹ÜšY›ÝÛHHXY\’ZYÚ
+NÂˆYˆ
+^ZXYš\ÚX›JBˆÂˆÛÛœÝ]]ÈHX™[ÚY
+ÈXÙNŽœ›Ý[™Ò[
+^ZXYÝ\
+ˆÝ\ÚY
+NÂˆË™š[™XÝ
+HKXY\’ZYÚ‹ÜšY›ÝÛHHXY\’ZYÚ
+NÂˆBˆB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆÛÛœÝ]]È™[ØÚ]UÜHXY\’ZYÚ
+
+H
+ÈÍÈ
+ˆ›ÝÒZYÚ
+
+H
+ÈÂˆYˆ
+]]ÛX][Û“[™Uš\ÚX›H	‰ˆ]™[žHH™[ØÚ]UÜ	‰ˆ]™[žHX™[ÚY
+
+Bˆ	‰ˆÙ]]]ÛX][Û•˜[YJBˆÂˆ]]ÛX][Û‘˜YÐXÝ]™HHYNÂˆÙ]]]ÛX][Û”Ú[œ›ÛS[Ý\ÙJ]™[
+NÂˆ™]\›ŽÂˆBˆÛÛœÝ]]È]ÚHH
+]™[žHHXY\’ZYÚ
+
+JHÈ›ÝÒZYÚ
+
+NÂˆÛÛœÝ]]ÈÝ\H
+]™[žHX™[ÚY
+
+JHÈÝ\ÚY
+
+NÂˆYˆ
+]™[žHXY\’ZYÚ
+
+H]Ú]Úˆ
+Bˆ™]\›ŽÂˆËÈHX[›ÈÙ^\È\™H[ÛÈH]™H]Y][ÛˆÙ^X›Ø\™ˆÙY\HÜšY	ÜÂˆËÈ›ÝKY[žHÙ\Ý\™HÙ\\˜]HÛÈÛXÚÚ[™ÈHÙ^H™]™\ˆZ[ÈH›ÝK‚ˆYˆ
+]™[žX™[ÚY
+
+JBˆÂˆYˆ
+Y]™[›[ÙËš\ÔšYÚ]Û‘ÝÛŠ
+H	‰ˆÙ^X›Ø\™›ÝPÚ[™ÙY
+BˆÂˆÙ^X›Ø\™]ÚH]ÚÂˆÙ^X›Ø\™›ÝPÚ[™ÙY
+]ÚYJNÂˆBˆ™]\›ŽÂˆBˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÝ\XÝ]™TÝ\Ê
+JJH™]\›ŽÂˆÛÛœÝ]]È›ÝTÝ\Hš[™›ÝTÝ\
+]ÚÝ\
+NÂˆYˆ
+]™[›[ÙËš\ÔšYÚ]Û‘ÝÛŠ
+JBˆÂˆYˆ
+›ÝTÝ\H	‰ˆ›ÝPÛXÚÙY
+H›ÝPÛXÚÙY
+]Ú›ÝTÝ\YJNÂˆ™]\›ŽÂˆBˆ˜YÔ]ÚH]ÚÂˆ˜YÔÝ\Ý\H›ÝTÝ\HÈ›ÝTÝ\ˆÝ\Âˆ˜YÕØ\Ñ^\Ý[™ÈH›ÝTÝ\HÂˆ˜YÔ™\ÜÔÝ\HÝ\Âˆ˜YÒ[š]X[[™ÝH˜YÕØ\Ñ^\Ý[™È	‰ˆÙ]›ÝS[™ÝˆÈXÙNŽš›[Z]
+KXÝ]™TÝ\Ê
+HH˜YÔÝ\Ý\Ù]›ÝS[™Ý
+]Ú˜YÔÝ\Ý\
+JHˆNÂˆ˜YÐÚ[™ÙYH˜[ÙNÂˆ›ÝQÙ\Ý\™PXÝ]™HHYNÂˆYˆ
+›ÝQÙ\Ý\™TÝ\Y
+H›ÝQÙ\Ý\™TÝ\Y
+
+NÂˆYˆ
+Y˜YÕØ\Ñ^\Ý[™È	‰ˆ›ÝPÛXÚÙY
+BˆÂˆ›ÝPÛXÚÙY
+]ÚÝ\˜[ÙJNÂˆYˆ
+Z[[™ÝˆH	‰ˆ›ÝS[™ÝÚ[™ÙY
+Bˆ›ÝS[™ÝÚ[™ÙY
+]ÚÝ\XÙNŽš›Z[ŠZ[[™ÝXÝ]™TÝ\Ê
+HHÝ\
+JNÂˆ™\Z[
+
+NÂˆBˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+]]ÛX][Û‘˜YÐXÝ]™JBˆÂˆÙ]]]ÛX][Û”Ú[œ›ÛS[Ý\ÙJ]™[
+NÂˆ™]\›ŽÂˆBˆYˆ
+˜YÔ]Ú[›ÝS[™ÝÚ[™ÙY
+H™]\›ŽÂˆYˆ
+]™[™Ù]\Ý[˜ÙQœ›ÛQ˜YÔÝ\
+
+HJH™]\›ŽÂˆÛÛœÝ]]ÈÚ[\”Ý\HXÙNŽš›[Z]
+XÝ]™TÝ\Ê
+HHKˆ
+]™[žHX™[ÚY
+
+JHÈÝ\ÚY
+
+JNÂˆÛÛœÝ]]È[™ÝH˜YÕØ\Ñ^\Ý[™ÂˆÈXÙNŽš›[Z]
+KXÝ]™TÝ\Ê
+HH˜YÔÝ\Ý\ˆ˜YÒ[š]X[[™Ý
+ÈÚ[\”Ý\H˜YÔ™\ÜÔÝ\
+BˆˆXÙNŽš›[Z]
+KXÝ]™TÝ\Ê
+HH˜YÔÝ\Ý\Ú[\”Ý\H˜YÔÝ\Ý\
+ÈJNÂˆYˆ
+˜YÕØ\Ñ^\Ý[™È[™ÝˆJBˆÂˆ›ÝS[™ÝÚ[™ÙY
+˜YÔ]Ú˜YÔÝ\Ý\[™Ý
+NÂˆZ[[™ÝH[™ÝÂˆYˆ
+Z[[™Ý\]Y
+HZ[[™Ý\]Y
+Z[[™Ý
+NÂˆ˜YÐÚ[™ÙYHYNÂˆ™\Z[
+
+NÂˆBˆB‚ˆ›ÚYÙ]Z[[™Ý
+[[™Ý
+HÈZ[[™ÝHXÙNŽš›[Z]
+K[™Ý
+NÈBˆ[Ù]Z[[™Ý
+
+HÛÛœÝÈ™]\›ˆZ[[™ÝÈB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYBˆÂˆ]]ÛX][Û‘˜YÐXÝ]™HH˜[ÙNÂˆYˆ
+Ù^X›Ø\™]ÚH	‰ˆÙ^X›Ø\™›ÝPÚ[™ÙY
+BˆÙ^X›Ø\™›ÝPÚ[™ÙY
+Ù^X›Ø\™]Ú˜[ÙJNÂˆÙ^X›Ø\™]ÚHLNÂˆYˆ
+›ÝQÙ\Ý\™PXÝ]™H	‰ˆ›ÝQÙ\Ý\™Q[™Y
+H›ÝQÙ\Ý\™Q[™Y
+
+NÂˆ›ÝQÙ\Ý\™PXÝ]™HH˜[ÙNÂˆ˜YÔ]ÚHLNÂˆ˜YÔÝ\Ý\HLNÂˆ˜YÕØ\Ñ^\Ý[™ÈH˜[ÙNÂˆ˜YÐÚ[™ÙYH˜[ÙNÂˆB‚œš]˜]N‚ˆ›ÚYÙ]]]ÛX][Û”Ú[œ›ÛS[Ý\ÙJÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+BˆÂˆYˆ
+\Ù]]]ÛX][Û•˜[YJH™]\›ŽÂˆÛÛœÝ]]ÈÝ\HXÙNŽš›[Z]
+XÝ]™TÝ\Ê
+HHK
+]™[žHX™[ÚY
+
+JHÈÝ\ÚY
+
+JNÂˆÛÛœÝ]]È[™UÜHXY\’ZYÚ
+
+H
+ÈÍÈ
+ˆ›ÝÒZYÚ
+
+H
+ÈÂˆÛÛœÝ]]È˜[YHHKŒˆHXÙNŽš›[Z]
+Œ‹KŒ‹ˆÝ]X×ØØ\Ý›Ø]Š]™[žHH[™UÜHŠHÈÝ]X×ØØ\Ý›Ø]ŠXÙNŽš›X^
+KLMˆHÎ
+JJNÂˆÙ]]]ÛX][Û•˜[YJÝ\˜[YJNÂˆ™\Z[
+
+NÂˆB‚ˆ[š[™›ÝTÝ\
+[]Ú[Ý\
+HÛÛœÝˆÂˆYˆ
+[›ÝR\ÓÛŠH™]\›ˆLNÂˆ›Üˆ
+[Ý\HÝ\ÈÝ\HÈK\Ý\
+BˆÂˆYˆ
+[›ÝR\ÓÛŠ]ÚÝ\
+JHÛÛ[YNÂˆÛÛœÝ]]È[™ÝHXÙNŽš›[Z]
+KXÝ]™TÝ\Ê
+HHÝ\ˆÙ]›ÝS[™ÝÈÙ]›ÝS[™Ý
+]ÚÝ\
+HˆJNÂˆYˆ
+Ý\Ý\
+È[™Ý
+H™]\›ˆÝ\ÂˆBˆ™]\›ˆLNÂˆB‚ˆ[˜YÔ]ÚHLNÂˆ[˜YÔÝ\Ý\HLNÂˆ[˜YÔ™\ÜÔÝ\HLNÂˆ[˜YÒ[š]X[[™ÝHNÂˆ[Ù^X›Ø\™]ÚHLNÂˆ›ÛÛ˜YÕØ\Ñ^\Ý[™ÈH˜[ÙNÂˆ›ÛÛ˜YÐÚ[™ÙYH˜[ÙNÂˆ›ÛÛ›ÝQÙ\Ý\™PXÝ]™HH˜[ÙNÂˆ[Z[[™ÝHNÂˆÝX›H^ZXYÝ\HŒÂˆ›ÛÛ^ZXYš\ÚX›HH˜[ÙNÂˆ[ÝX™]š\Ú[ÛœÔ\˜\ˆHMŽÂˆ[YÚYÚ]™\žSˆHÂˆ›ÛÛ™[ØÚ]S[™Uš\ÚX›HHYNÂˆ›ÛÛ]]ÛX][Û“[™Uš\ÚX›HH˜[ÙNÂˆ›ÛÛ]]ÛX][Û‘˜YÐXÝ]™HH˜[ÙNÂˆ›ÛÛÛÛÝ\™YÙ^\ÈHYNÂˆ›ÛÛÚÝÓ›ÝS˜[Y\ÈHYNÂˆÝ]XÈXÙNŽ”Ýš[™È]ÚX™[
+[]Ú
+BˆÂˆÝ]XÈÛÛœÝÚ\Šˆ˜[Y\Ö×HHÈÈ‹ÈÈ‹‘‹‘È‹‘H‹‘ˆ‹‘ˆÈ‹‘È‹‘ÈÈ‹H‹HÈ‹ˆˆNÂˆ™]\›ˆXÙNŽ”Ýš[™Ê˜[Y\ÖÜ]Ú	HL—JH
+ÈXÙNŽ”Ýš[™Ê]ÚÈLˆHJNÂˆBŸNÂ‚˜Û\ÜÈX[›Ô›ÛXÛÛ]Ûˆš[˜[ˆX›XÈXÙNŽ]Û‚žÂœX›XÎ‚ˆ[[HÛ\ÜÈXÛÛˆÈ™[ØÚ]KÙ^X›Ø\™›ÝS˜[Y\ÈNÂˆX[›Ô›ÛXÛÛ]ÛŠÛÛœÝXÙNŽ”Ýš[™Éˆ˜[YKXÛÛˆXÛÛ•Ñ˜]ÊBˆˆXÙNŽ]ÛŠ˜[YJKXÛÛŠXÛÛ•Ñ˜]ÊBˆÂˆÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆB‚ˆ›ÚYZ[]ÛŠXÙNŽ‘Ü˜\XÜÉˆË›ÛÛYÚYÚY›ÛÛÝÛŠHÝ™\œšYBˆÂˆ]]È›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+Kœ™YXÙY
+KŒŠNÂˆÛÛœÝ]]È˜XÚÙÜ›Ý[™HÙ]ÙÙÛTÝ]J
+HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍKLÌMJBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌŒJNÂˆËœÙ]ÛÛÝ\ŠÝÛˆÈ˜XÚÙÜ›Ý[™˜œšYÚ\ŠŒNŠHˆYÚYÚYÈ˜XÚÙÜ›Ý[™˜œšYÚ\ŠŒLŠHˆ˜XÚÙÜ›Ý[™
+NÂˆË™š[›Ý[™Y™XÝ[™ÛJ›Ý[™ËŒŠNÂˆËœÙ]ÛÛÝ\ŠÙ]ÙÙÛTÝ]J
+HÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠN‹MJBˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMN‹NN
+JNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJ›Ý[™ËŒ‹KŒŠNÂˆ]]ÈXÛÛ\™XHH›Ý[™Ëœ™YXÙY
+KŒ‹ŒŠNÂˆYˆ
+XÛÛˆOHXÛÛŽŽ•™[ØÚ]JBˆÂˆ›Üˆ
+[HHÈHÈ
+ÊÚJBˆÂˆÛÛœÝ]]ÈHXÛÛ\™XK™Ù]
+
+H
+È‹Œˆ
+ÈÝ]X×ØØ\Ý›Ø]ŠJH
+ˆ
+XÛÛ\™XK™Ù]ÚY
+
+HHŒŠHÈËŒŽÂˆÛÛœÝ]]ÈZYÚHŒˆ
+ÈÝ]X×ØØ\Ý›Ø]Š
+H
+ˆÊH	HL
+NÂˆË™š[›Ý[™Y™XÝ[™ÛJXÛÛ\™XK™Ù]›ÝÛJ
+HHZYÚËŒ‹ZYÚKŒŠNÂˆBˆBˆ[ÙHYˆ
+XÛÛˆOHXÛÛŽŽ’Ù^X›Ø\™
+BˆÂˆ]]ÈÙ^\ÈHXÛÛ\™XKœ™YXÙY
+Œ‹‹ŒŠNÂˆË™š[›Ý[™Y™XÝ[™ÛJÙ^\ËKYŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌËLK
+JNÂˆ›Üˆ
+[HHNÈHNÈ
+ÊÚJBˆË™˜]Õ™\XØ[[™JXÙNŽœ›Ý[™Ò[
+Ù^\Ë™Ù]
+
+H
+ÈÙ^\Ë™Ù]ÚY
+
+H
+ˆHÈKŒŠKÙ^\Ë™Ù]J
+KÙ^\Ë™Ù]›ÝÛJ
+JNÂˆ›Üˆ
+[HˆÈK‹JBˆÂˆÛÛœÝ]]ÈHÙ^\Ë™Ù]
+
+H
+ÈÙ^\Ë™Ù]ÚY
+
+H
+ˆHÈKŒˆHKYŽÂˆË™š[™XÝ
+Ù^\Ë™Ù]J
+KËŒ‹Ù^\Ë™Ù]ZYÚ
+
+H
+ˆM™ŠNÂˆBˆBˆ[ÙBˆÂˆËœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLËŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆË™˜]Õ^
+XH‹›Ý[™ËÓ™X\™\Ý[
+
+KXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆBˆB‚œš]˜]N‚ˆXÛÛˆXÛÛŽÂŸNÂ‚˜Û\ÜÈX[›Ô›ÛÚ[™ÝÈš[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛÛÜÙNÂˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[‹›ÛÛ
+OˆÛ“X[š\[][Û”Ý\YÂˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”™XÝ[™ÛO[ŠOˆÛ›Ý[™ÐÚ[™ÙYÂˆX[›Ô›ÛÚ[™ÝÊÝŽ™[˜Ý[Û[
+
+OˆXÝ]™TÝ\ÛÝ[ˆÝŽ™[˜Ý[Û›ÛÛ
+[[
+Oˆ\Ó›ÝSÛ‹ˆÝŽ™[˜Ý[Û›ÛÛ
+
+Oˆ\™P[›Ý\ÔÙ[XÝYˆÝŽ™[˜Ý[Û[
+[[
+OˆÙ]›ÝS[™ÝˆÝŽ™[˜Ý[Û›ÚY
+[[›ÛÛ
+OˆÛ“›ÝPÛXÚÙYˆÝŽ™[˜Ý[Û›ÚY
+[[[
+OˆÛ“›ÝS[™ÝÚ[™ÙYˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ“›ÝQÙ\Ý\™TÝ\YˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ“›ÝQÙ\Ý\™Q[™YˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÛ’Ù^X›Ø\™›ÝPÚ[™ÙY
+BˆÂˆÙ]Ü\]YJYJNÂˆY[™XZÙUš\ÚX›J]JNÂˆ]KœÙ]^
+”PS“È“Ó‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]KœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLËŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆ]KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒNŒÍËŠJNÂˆËÈ]HY]Üˆ™XÙZ]™H]KX˜\ˆÚ[\ˆ]™[È\™XÝKˆHX™[ˆËÈ][\˜Ù\ÈHÙ\Ý\™H™]™[ÈH\™[˜YÈ[™\œÈœ›ÛBˆËÈÙYZ[™ÈHØ[YH[Ý\ÙKYÝÛ‹Ù˜YÈÙ\]Y[˜ÙHÛÛœÚ\Ý[K‚ˆ]KœÙ][\˜Ù\Ó[Ý\ÙPÛXÚÜÊYK˜[ÙJNÂˆ]K˜Y[Ý\ÙS\Ý[™\Š\Ë˜[ÙJNÂˆY[™XZÙUš\ÚX›JÛÜÙP]ÛŠNÂˆÛÜÙP]Û‹œÙ]]Û•^
+°åÈŠNÂˆÛÜÙP]Û‹›ÛÛXÚÈHÝ\×HÈYˆ
+ÛÛÜÙJHÛÛÜÙJ
+NÈ[ÙHÙ]š\ÚX›J˜[ÙJNÈNÂˆY[™XZÙUš\ÚX›J[™ÝÙ[XÝÜŠNÂˆ›Üˆ
+[[™ÝHNÈ[™ÝHÈ
+ÊÛ[™Ý
+Bˆ[™ÝÙ[XÝÜ‹˜Y][JXÙNŽ”Ýš[™Ê[™Ý
+H
+È
+[™ÝOHHÈˆÝ\ˆˆˆÝ\ÈŠK[™Ý
+NÂˆ[™ÝÙ[XÝÜ‹œÙ]Ù[XÝYY
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[™ÝÙ[XÝÜ‹œÙ]ÛÛ\
+‘Y˜][›ÝH[™Ý›Üˆ™]ÈX[›Ë\›Û›Ý\ÈŠNÂˆ[™ÝÙ[XÝÜ‹›ÛÚ[™ÙHHÝ\×BˆÂˆYˆ
+ÜšYOH[ŠHÜšYOœÙ]Z[[™Ý
+[™ÝÙ[XÝÜ‹™Ù]Ù[XÝYY
+
+JNÂˆNÂˆY[™XZÙUš\ÚX›J[™S[ÙTÙ[XÝÜŠNÂˆ[™S[ÙTÙ[XÝÜ‹˜Y][J•™[ØÚ]H‹JNÂˆ[™S[ÙTÙ[XÝÜ‹˜Y][J]]ÛX][Ûˆ‹ŠNÂˆ[™S[ÙTÙ[XÝÜ‹œÙ]Ù[XÝYY
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[™S[ÙTÙ[XÝÜ‹›ÛÚ[™ÙHHÝ\×BˆÂˆÛÛœÝ›ÛÛ]]ÛX][ÛˆH[™S[ÙTÙ[XÝÜ‹™Ù]Ù[XÝYY
+
+HOHŽÂˆYˆ
+ÜšYOH[ŠHÜšYOœÙ]]]ÛX][Û“[™Uš\ÚX›J]]ÛX][ÛŠNÂˆ[™ÝÙ[XÝÜ‹œÙ]š\ÚX›JX]]ÛX][ÛŠNÂˆ]]ÛX][Û•\™Ù]Ù[XÝÜ‹œÙ]š\ÚX›J]]ÛX][ÛŠNÂˆNÂˆ[™S[ÙTÙ[XÝÜ‹œÙ]ÛÛ\
+ÚÛÜÙHHX[›Ë\›ÛÝÙ\ˆ[™HŠNÂˆY[™XZÙUš\ÚX›J]]ÛX][Û•\™Ù]Ù[XÝÜŠNÂˆ]]ÛX][Û•\™Ù]Ù[XÝÜ‹œÙ]ÛÛ\
+]]ÛX]YYÚ[ˆ\˜[Y]\ˆŠNÂˆ]]ÛX][Û•\™Ù]Ù[XÝÜ‹›ÛÚ[™ÙHHÝ\×BˆÂˆYˆ
+Û]]ÛX][Û•\™Ù]Ú[™ÙY	‰ˆ]]ÛX][Û•\™Ù]Ù[XÝÜ‹™Ù]Ù[XÝYY
+
+Hˆ
+BˆÂˆÛÛœÝ]]È[™^H]]ÛX][Û•\™Ù]Ù[XÝÜ‹™Ù]Ù[XÝYY
+
+HHNÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^]]ÛX][Û•\™Ù]YËœÚ^™J
+JJBˆÛ]]ÛX][Û•\™Ù]Ú[™ÙY
+]]ÛX][Û•\™Ù]YÖÚ[™^JNÂˆBˆYˆ
+ÜšYOH[ŠHÜšYOœ™\Z[
+
+NÂˆNÂˆY[™XZÙUš\ÚX›JÙ][™ÜÐ]ÛŠNÂˆÙ][™ÜÐ]Û‹œÙ]]Û•^
+”Ù]ŠNÂˆÙ][™ÜÐ]Û‹œÙ]ÛÛ\
+”X[›È›ÛÜ[ÛœÈŠNÂˆÙ][™ÜÐ]Û‹›ÛÛXÚÈHÝ\×HÈÚÝÔÙ][™ÜÊ
+NÈNÂˆY[™XZÙUš\ÚX›J™[ØÚ]P]ÛŠNÂˆ™[ØÚ]P]Û‹œÙ]ÛÛ\
+”ÚÝÈÜˆYHH™[ØÚ]H[™HŠNÂˆ™[ØÚ]P]Û‹œÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™[ØÚ]P]Û‹›ÛÛXÚÈHÝ\×BˆÂˆYˆ
+ÜšYOH[ŠBˆÂˆÜšYOœÙ]™[ØÚ]S[™Uš\ÚX›J™[ØÚ]P]Û‹™Ù]ÙÙÛTÝ]J
+JNÂˆ™\Ú^™QÜšYÕšY]ÜÜ
+
+NÂˆBˆNÂˆY[™XZÙUš\ÚX›JÙ^X›Ø\™]ÛŠNÂˆÙ^X›Ø\™]Û‹œÙ]ÛÛ\
+ÛÛÝ\ˆHX[›ÈÙ^X›Ø\™Ù^\ÈŠNÂˆÙ^X›Ø\™]Û‹œÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ^X›Ø\™]Û‹›ÛÛXÚÈHÝ\×BˆÂˆYˆ
+ÜšYOH[ŠHÜšYOœÙ]Ù^X›Ø\™Ü[ÛœÊÙ^X›Ø\™]Û‹™Ù]ÙÙÛTÝ]J
+KÜšYOš\Ó›ÝS˜[Y\Ê
+JNÂˆNÂˆY[™XZÙUš\ÚX›J›ÝS˜[Y\Ð]ÛŠNÂˆ›ÝS˜[Y\Ð]Û‹œÙ]ÛÛ\
+”ÚÝÈ]Ú˜[Y\È™\ÚYHHÙ^X›Ø\™ŠNÂˆ›ÝS˜[Y\Ð]Û‹œÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ›ÝS˜[Y\Ð]Û‹›ÛÛXÚÈHÝ\×BˆÂˆYˆ
+ÜšYOH[ŠHÜšYOœÙ]Ù^X›Ø\™Ü[ÛœÊÜšYOš\ÐÛÛÝ\™YÙ^\Ê
+K›ÝS˜[Y\Ð]Û‹™Ù]ÙÙÛTÝ]J
+JNÂˆNÂˆÜšYH™]ÈX[›Ô›ÛÜšY
+
+NÂˆÜšYO™Ù]XÝ]™TÝ\ÛÝ[HÝŽ›[Ý™JXÝ]™TÝ\ÛÝ[
+NÂˆÜšYO››ÝR\ÓÛˆHÝŽ›[Ý™J\Ó›ÝSÛŠNÂˆÜšYO˜\™P[›Ý\ÔÙ[XÝYHÝŽ›[Ý™J\™P[›Ý\ÔÙ[XÝY
+NÂˆÜšYO™Ù]›ÝS[™ÝHÝŽ›[Ý™JÙ]›ÝS[™Ý
+NÂˆÜšYO››ÝPÛXÚÙYHÝŽ›[Ý™JÛ“›ÝPÛXÚÙY
+NÂˆÜšYO››ÝS[™ÝÚ[™ÙYHÝŽ›[Ý™JÛ“›ÝS[™ÝÚ[™ÙY
+NÂˆÜšYO››ÝQÙ\Ý\™TÝ\YHÝŽ›[Ý™JÛ“›ÝQÙ\Ý\™TÝ\Y
+NÂˆÜšYO››ÝQÙ\Ý\™Q[™YHÝŽ›[Ý™JÛ“›ÝQÙ\Ý\™Q[™Y
+NÂˆÜšYOšÙ^X›Ø\™›ÝPÚ[™ÙYHÝŽ›[Ý™JÛ’Ù^X›Ø\™›ÝPÚ[™ÙY
+NÂˆÜšYO™Ù]]]ÛX][Û•˜[YHHÝ\×J[Ý\
+HÈ™]\›ˆ]]ÛX][Û•˜[YHÈ]]ÛX][Û•˜[YJÝ\
+HˆYŽÈNÂˆÜšYOœÙ]]]ÛX][Û•˜[YHHÝ\×J[Ý\›Ø]˜[YJHÈYˆ
+]]ÛX][Û”Ú[Ú[™ÙY
+H]]ÛX][Û”Ú[Ú[™ÙY
+Ý\˜[YJNÈNÂˆÜšYOœZ[[™Ý\]YHÝ\×J[[™Ý
+BˆÂˆ[™ÝÙ[XÝÜ‹œÙ]Ù[XÝYY
+[™ÝXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆNÂˆÜšYOœÙ]Ú^™JN
+ÈÜšYOš\ÚX›TÝ\Ê
+H
+ˆNÌ
+ÈÍÈ
+ˆŒˆ
+È
+ÈLMŠNÂˆšY]ÜÜœÙ]šY]ÙYÛÛ\Û™[
+ÜšYYJNÂˆY[™XZÙUš\ÚX›JšY]ÜÜ
+NÂˆ™\Ú^™QÜš\œÙ][Ý\ÙPÝ\œÛÜŠXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ›ÝÛTšYÚÛÜ›™\”™\Ú^™PÝ\œÛÜŠNÂˆ™\Ú^™QÜš\œÙ]]J”™\Ú^™HX[›È›ÛŠNÂˆ™\Ú^™QÜš\›Û‘˜YÔÝ\YHÝ\×JXÙNŽ”Ú[[ˆÚ[
+BˆÂˆYˆ
+Û“X[š\[][Û”Ý\Y
+HÛ“X[š\[][Û”Ý\Y
+Ú[YJNÂˆ™\Ú^š[™ÈHYNÂˆ™\Ú^™TÝ\›Ý[™ÈHÙ]›Ý[™Ê
+NÂˆNÂˆ™\Ú^™QÜš\›Û‘˜YÙÙYHÝ\×JXÙNŽ”Ú[[ˆ[JBˆÂˆYˆ
+\™\Ú^š[™ÊH™]\›ŽÂˆ]]È›Ý[™ÈH™\Ú^™TÝ\›Ý[™ÎÂˆ›Ý[™ËœÙ]Ú^™JXÙNŽš›X^
+Œ›Ý[™Ë™Ù]ÚY
+
+H
+È[Kž
+KˆXÙNŽš›X^
+Œ›Ý[™Ë™Ù]ZYÚ
+
+H
+È[KžJJNÂˆYˆ
+]]Êˆ\™[HÙ]\™[ÛÛ\Û™[
+
+JBˆÂˆÛÛœÝ]]ÈÛÜšÜÜXÙHH\™[O™Ù]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJ
+Kœ™YXÙY
+ML
+NÂˆ›Ý[™ËœÙ]Ú^™JXÙNŽš›Z[Š›Ý[™Ë™Ù]ÚY
+
+KÛÜšÜÜXÙK™Ù]ÚY
+
+JKˆXÙNŽš›Z[Š›Ý[™Ë™Ù]ZYÚ
+
+KÛÜšÜÜXÙK™Ù]ZYÚ
+
+JJNÂˆ›Ý[™ËœÙ]ÜÚ][ÛŠXÙNŽš›[Z]
+ÛÜšÜÜXÙK™Ù]
+
+KXÙNŽš›X^
+ÛÜšÜÜXÙK™Ù]
+
+KÛÜšÜÜXÙK™Ù]šYÚ
+
+HH›Ý[™Ë™Ù]ÚY
+
+JK›Ý[™Ë™Ù]
+
+JKˆXÙNŽš›[Z]
+ÛÜšÜÜXÙK™Ù]J
+KXÙNŽš›X^
+ÛÜšÜÜXÙK™Ù]J
+KÛÜšÜÜXÙK™Ù]›ÝÛJ
+HH›Ý[™Ë™Ù]ZYÚ
+
+JK›Ý[™Ë™Ù]J
+JJNÂˆBˆÙ]›Ý[™Ê›Ý[™ÊNÂˆYˆ
+Û›Ý[™ÐÚ[™ÙY
+HÛ›Ý[™ÐÚ[™ÙY
+Ù]›Ý[™Ê
+JNÂˆNÂˆ™\Ú^™QÜš\›Û‘˜YÑ[™YHÝ\×HÈ™\Ú^š[™ÈH˜[ÙNÈNÂˆY[™XZÙUš\ÚX›J™\Ú^™QÜš\
+NÂˆÙ]š\ÚX›J˜[ÙJNÂˆB‚ˆ›ÚY™Yœ™\Ú
+ÛÛœÝXÙNŽ”Ýš[™Éˆ]\›“˜[YJBˆÂˆ]KœÙ]^
+”PS“È“Óˆ
+È]\›“˜[YKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+ÜšYOH[ŠH™]\›ŽÂˆ™\Ú^™Y
+
+NÂˆÜšYOœ™\Z[
+
+NÂˆB‚ˆÝŽ™[˜Ý[Û›Ø]
+[
+Oˆ]]ÛX][Û•˜[YNÂˆÝŽ™[˜Ý[Û›ÚY
+[›Ø]
+Oˆ]]ÛX][Û”Ú[Ú[™ÙYÂˆÝŽ™[˜Ý[Û›ÚY
+ÛÛœÝXÙNŽ”Ýš[™ÉŠOˆÛ]]ÛX][Û•\™Ù]Ú[™ÙYÂˆ›ÚYÙ]]]ÛX][Û•\™Ù]ÊÛÛœÝXÙNŽ”Ýš[™Ð\œ˜^IˆX™[ËÛÛœÝXÙNŽ”Ýš[™Ð\œ˜^IˆYË[Ù[XÝYYHJBˆÂˆ]]ÛX][Û•\™Ù]Ù[XÝÜ‹˜ÛX\ŠXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]]ÛX][Û•\™Ù]YÈHYÎÂˆ›Üˆ
+[HHÈHX™[ËœÚ^™J
+NÈ
+ÊÚJH]]ÛX][Û•\™Ù]Ù[XÝÜ‹˜Y][JX™[ÖÚWKH
+ÈJNÂˆYˆ
+X™[Ëš\Ñ[\J
+JH]]ÛX][Û•\™Ù]Ù[XÝÜ‹˜Y][J“›È]]ÛX]X›H\˜[Y]\œÈ‹JNÂˆ]]ÛX][Û•\™Ù]Ù[XÝÜ‹œÙ]Ù[XÝYY
+XÙNŽš›[Z]
+KXÙNŽš›X^
+KX™[ËœÚ^™J
+JKÙ[XÝYY
+KˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+Û]]ÛX][Û•\™Ù]Ú[™ÙY	‰ˆZYËš\Ñ[\J
+JHÛ]]ÛX][Û•\™Ù]Ú[™ÙY
+YÖÌJNÂˆB‚ˆ›ÚYÙ]^ZXYÝ\
+ÝX›HÝ\›ÛÛXÝ]™JBˆÂˆYˆ
+ÜšYOH[ŠHÜšYOœÙ]^ZXYÝ\
+Ý\XÝ]™JNÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆ]]È\™XHHÙ]ØØ[›Ý[™Ê
+Kœ™YXÙY
+ŠNÂˆ]]ÈXY\ˆH\™XKœ™[[Ý™Qœ›ÛUÜ
+Ž
+NÂˆ]KœÙ]›Ý[™ÊXY\ŠNÂˆÛÜÙP]Û‹œÙ]›Ý[™ÊXY\‹œ™[[Ý™Qœ›ÛTšYÚ
+Ž
+Kœ™YXÙY
+JJNÂˆ]]ÈÜš\›Ý[™ÈH\™XKœ™[[Ý™Qœ›ÛP›ÝÛJN
+Kœ™[[Ý™Qœ›ÛTšYÚ
+N
+NÂˆ™\Ú^™QÜš\œÙ]›Ý[™ÊÜš\›Ý[™ÊNÂˆ]]È›ÛÝ\ˆH\™XKœ™[[Ý™Qœ›ÛP›ÝÛJÊNÂˆÙ][™ÜÐ]Û‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Ž
+Kœ™YXÙY
+JJNÂˆ›ÝS˜[Y\Ð]Û‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Ž
+Kœ™YXÙY
+JJNÂˆÙ^X›Ø\™]Û‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Ž
+Kœ™YXÙY
+JJNÂˆ™[ØÚ]P]Û‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+Ž
+Kœ™YXÙY
+JJNÂˆ]]ÛX][Û•\™Ù]Ù[XÝÜ‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+L
+Kœ™YXÙY
+‹ŠJNÂˆ[™S[ÙTÙ[XÝÜ‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+LMŠKœ™YXÙY
+‹ŠJNÂˆ[™ÝÙ[XÝÜ‹œÙ]›Ý[™Ê›ÛÝ\‹œ™[[Ý™Qœ›ÛTšYÚ
+L
+Kœ™YXÙY
+‹ŠJNÂˆšY]ÜÜœÙ]›Ý[™Ê\™XJNÂˆ™\Ú^™QÜšYÕšY]ÜÜ
+
+NÂˆB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆÛÛœÝ]]ÈÚ[H]™[™Ù]]™[™[]]™UÊ\ÊK™Ù]ÜÚ][ÛŠ
+NÂˆYˆ
+Ú[žHŽ	‰ˆÚ[žÙ]ÚY
+
+HHÍ
+BˆÂˆÛÛœÝ]]È\™[Ú[H]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][Û‹Ò[
+
+NÂˆYˆ
+Û“X[š\[][Û”Ý\Y
+HÛ“X[š\[][Û”Ý\Y
+\™[Ú[˜[ÙJNÂˆ˜YÙÚ[™ÈHYNÂˆ˜YÔÝ\›Ý[™ÈHÙ]›Ý[™Ê
+NÂˆBˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+Y˜YÙÚ[™ÊH™]\›ŽÂˆ]]È›Ý[™ÈH˜YÔÝ\›Ý[™ÎÂˆ›Ý[™ËœÙ]ÜÚ][ÛŠ›Ý[™Ë™Ù]ÜÚ][ÛŠ
+H
+È]™[™Ù]Ù™œÙ]œ›ÛQ˜YÔÝ\
+
+JNÂˆYˆ
+]]Êˆ\™[HÙ]\™[ÛÛ\Û™[
+
+JBˆÂˆÛÛœÝ]]ÈÛÜšÜÜXÙHH\™[O™Ù]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJ
+Kœ™YXÙY
+ML
+NÂˆ›Ý[™ËœÙ]ÜÚ][ÛŠXÙNŽš›[Z]
+ÛÜšÜÜXÙK™Ù]
+
+KXÙNŽš›X^
+ÛÜšÜÜXÙK™Ù]
+
+KÛÜšÜÜXÙK™Ù]šYÚ
+
+HH›Ý[™Ë™Ù]ÚY
+
+JK›Ý[™Ë™Ù]
+
+JKˆXÙNŽš›[Z]
+ÛÜšÜÜXÙK™Ù]J
+KXÙNŽš›X^
+ÛÜšÜÜXÙK™Ù]J
+KÛÜšÜÜXÙK™Ù]›ÝÛJ
+HH›Ý[™Ë™Ù]ZYÚ
+
+JK›Ý[™Ë™Ù]J
+JJNÂˆBˆÙ]›Ý[™Ê›Ý[™ÊNÂˆYˆ
+Û›Ý[™ÐÚ[™ÙY
+HÛ›Ý[™ÐÚ[™ÙY
+Ù]›Ý[™Ê
+JNÂˆB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYHÈ˜YÙÚ[™ÈH˜[ÙNÈB‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆË™š[[
+XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹Ì‹ŠJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËLÎKMMÊJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+Kœ™YXÙY
+YŠKKŒ‹KŒŠNÂˆB‚œš]˜]N‚ˆÛ\ÜÈ™\Ú^™QÜš\š[˜[ˆX›XÈXÙNŽÛÛ\Û™[ˆÂˆX›XÎ‚ˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[ŠOˆÛ‘˜YÔÝ\YÂˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[ŠOˆÛ‘˜YÙÙYÂˆÝŽ™[˜Ý[Û›ÚY
+
+OˆÛ‘˜YÑ[™YÂˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆ]]ÊˆÚ[™ÝÈHÙ]\™[ÛÛ\Û™[
+
+NÂˆ]]ÊˆÛÜšÜÜXÙHHÚ[™ÝÈOH[ˆÈÚ[™ÝËO™Ù]\™[ÛÛ\Û™[
+
+Hˆ[ŽÂˆYˆ
+Û‘˜YÔÝ\Y	‰ˆÛÜšÜÜXÙHOH[ŠBˆÛ‘˜YÔÝ\Y
+]™[™Ù]]™[™[]]™UÊÛÜšÜÜXÙJKœÜÚ][Û‹Ò[
+
+JNÂˆBˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+Û‘˜YÙÙY
+HÛ‘˜YÙÙY
+]™[™Ù]Ù™œÙ]œ›ÛQ˜YÔÝ\
+
+JNÂˆBˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYHÈYˆ
+Û‘˜YÑ[™Y
+HÛ‘˜YÑ[™Y
+
+NÈBˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLL‹MÎKŒJJNÂˆ›Üˆ
+[[œÙ]HNÈ[œÙ]HLÎÈ[œÙ]
+ÏH
+BˆË™˜]Ó[™JÝ]X×ØØ\Ý›Ø]ŠÙ]ÚY
+
+HH[œÙ]
+KÝ]X×ØØ\Ý›Ø]ŠÙ]ZYÚ
+
+JKˆÝ]X×ØØ\Ý›Ø]ŠÙ]ÚY
+
+JKÝ]X×ØØ\Ý›Ø]ŠÙ]ZYÚ
+
+HH[œÙ]
+KKYŠNÂˆBˆNÂ‚ˆ›ÚYÚÝÔÙ][™ÜÊ
+BˆÂˆXÙNŽ”Ü\Y[HY[NÂˆXÙNŽ”Ü\Y[HÝX™]š\Ú[ÛœÎÂˆ›Üˆ
+ÛÛœÝ[ÛÝ[ˆÈM‹Ì‹JBˆÝX™]š\Ú[ÛœË˜Y][JL
+ÈÛÝ[XÙNŽ”Ýš[™ÊÛÝ[
+H
+ÈˆÝX™]š\Ú[ÛœÈ\ˆ˜\ˆ‹ˆYKÜšYOH[ˆ	‰ˆÜšYO™Ù]ÝX™]š\Ú[ÛœÔ\˜\Š
+HOHÛÝ[
+NÂˆY[K˜YÝX“Y[J‘ÜšYÝX™]š\Ú[ÛœÈ\ˆ˜\ˆ‹ÝX™]š\Ú[ÛœÊNÂˆXÙNŽ”Ü\Y[H[\\Ú\ÎÂˆ›Üˆ
+ÛÛœÝ[ÛÝ[ˆÈK‹MˆJBˆ[\\Ú\Ë˜Y][JŒ
+ÈÛÝ[’YÚYÚ]™\žHˆ
+ÈXÙNŽ”Ýš[™ÊÛÝ[
+H
+ÈˆÝ\È‹ˆYKÜšYOH[ˆ	‰ˆÜšYO™Ù]YÚYÚ]™\žSŠ
+HOHÛÝ[
+NÂˆY[K˜YÝX“Y[J’YÚYÚÜšY]™\žH‹[\\Ú\ÊNÂˆXÙNŽÛÛ\Û™[Ž”ØY™TÚ[\X[›Ô›ÛÚ[™ÝÏˆØY™U\Ê\ÊNÂˆY[KœÚÝÓY[P\Þ[˜ÊßKÜØY™U\×J[™\Ý[
+BˆÂˆYˆ
+ØY™U\ÈOH[ˆØY™U\ËO™ÜšYOH[ŠH™]\›ŽÂˆYˆ
+™\Ý[HL	‰ˆ™\Ý[HM
+BˆØY™U\ËO™ÜšYOœÙ]ÜšYÜ[ÛœÊ™\Ý[HLXÙNŽš›Z[ŠØY™U\ËO™ÜšYO™Ù]YÚYÚ]™\žSŠ
+K™\Ý[HL
+JNÂˆ[ÙHYˆ
+™\Ý[HŒH	‰ˆ™\Ý[HŒMŠBˆØY™U\ËO™ÜšYOœÙ]ÜšYÜ[ÛœÊØY™U\ËO™ÜšYO™Ù]ÝX™]š\Ú[ÛœÔ\˜\Š
+K™\Ý[HŒ
+NÂˆJNÂˆB‚ˆ›ÚY™\Ú^™QÜšYÕšY]ÜÜ
+
+BˆÂˆYˆ
+ÜšYOH[ŠH™]\›ŽÂˆÛÛœÝ^ˆ[X™[ÚYHNÂˆÛÛœÝ^ˆ[XY\’ZYÚHÌÂˆÛÛœÝ[™[ØÚ]P\™XHH
+È
+ÜšYOš\Õ™[ØÚ]S[™Uš\ÚX›J
+HÈLMˆˆ
+NÂˆÛÛœÝ]]ÈÛÛ[[œÈHÜšYOš\ÚX›TÝ\Ê
+NÂˆÛÛœÝ]]ÈÝ\ÚYHXÙNŽš›X^
+Œ‹
+šY]ÜÜ™Ù]ÚY
+
+HHX™[ÚY
+HÈÛÛ[[œÊNÂˆÛÛœÝ]]È›ÝÒZYÚHXÙNŽš›X^
+Œ‹
+šY]ÜÜ™Ù]ZYÚ
+
+HHXY\’ZYÚH™[ØÚ]P\™XJHÈÍÊNÂˆÜšYOœÙ]Ú^™JX™[ÚY
+ÈÛÛ[[œÈ
+ˆÝ\ÚYˆXY\’ZYÚ
+ÈÍÈ
+ˆ›ÝÒZYÚ
+È™[ØÚ]P\™XJNÂˆB‚ˆX[›Ô›ÛÜšY
+ˆÜšYH[ŽÂˆXÙNŽ•šY]ÜÜšY]ÜÜÂˆXÙNŽ“X™[]NÂˆXÙNŽ•^]ÛˆÛÜÙP]Û‹Ù][™ÜÐ]ÛŽÂˆ™\Ú^™QÜš\™\Ú^™QÜš\ÂˆX[›Ô›ÛXÛÛ]Ûˆ™[ØÚ]P]ÛˆÈ•™[ØÚ]H[™H‹X[›Ô›ÛXÛÛ]ÛŽŽ’XÛÛŽŽ•™[ØÚ]HNÂˆX[›Ô›ÛXÛÛ]ÛˆÙ^X›Ø\™]ÛˆÈÛÛÝ\ˆÙ^X›Ø\™‹X[›Ô›ÛXÛÛ]ÛŽŽ’XÛÛŽŽ’Ù^X›Ø\™NÂˆX[›Ô›ÛXÛÛ]Ûˆ›ÝS˜[Y\Ð]ÛˆÈ“›ÝH˜[Y\È‹X[›Ô›ÛXÛÛ]ÛŽŽ’XÛÛŽŽ“›ÝS˜[Y\ÈNÂˆXÙNŽÛÛX›Ð›Þ[™ÝÙ[XÝÜŽÂˆXÙNŽÛÛX›Ð›Þ[™S[ÙTÙ[XÝÜ‹]]ÛX][Û•\™Ù]Ù[XÝÜŽÂˆXÙNŽ”Ýš[™Ð\œ˜^H]]ÛX][Û•\™Ù]YÎÂˆXÙNŽ”™XÝ[™ÛO[ˆ˜YÔÝ\›Ý[™Ë™\Ú^™TÝ\›Ý[™ÎÂˆXÙNŽ”Ú[[ˆ˜YÔÝ\Ú[™\Ú^™TÝ\Ú[Âˆ›ÛÛ˜YÙÚ[™ÈH˜[ÙK™\Ú^š[™ÈH˜[ÙNÂŸNÂ‚‹ËÈHYXØ]Y˜YÈÛÝ\˜ÙHXZÙ\ÈHÙ[™\˜]Üˆ[Ý™HÙ\Ý\™H[™\[™[œ›ÛB‹ËÈ•PÑIÜÈ\™[]\Ý[™È[™[žHÛÛ›ÛÈ^Y\™YÝ™\ˆHÙ[™\˜]Ü‹‚˜Û\ÜÈÙ[™\˜]Ü‘˜YÓX™[š[˜[ˆX›XÈXÙNŽ“X™[žÂœX›XÎ‚ˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[ŠOˆ˜YÔÝ\YÂˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[ŠOˆ˜YÙÙYÂˆÝŽ™[˜Ý[Û›ÚY
+
+Oˆ˜YÑ[™YÂ‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+˜YÔÝ\Y
+Bˆ˜YÔÝ\Y
+]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][Û‹Ò[
+
+JNÂˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+˜YÙÙY
+Bˆ˜YÙÙY
+]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][Û‹Ò[
+
+JNÂˆB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYBˆÂˆYˆ
+˜YÑ[™Y
+H˜YÑ[™Y
+
+NÂˆBŸNÂ‚˜Û\ÜÈÙ[™\˜]Ü”™\Ú^™R[™Hš[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[ŠOˆ™\Ú^™TÝ\YÂˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[ŠOˆ™\Ú^™YžQ˜YÎÂˆÝŽ™[˜Ý[Û›ÚY
+
+Oˆ™\Ú^™Q[™YÂ‚ˆ^XÚ]Ù[™\˜]Ü”™\Ú^™R[™JXÙNŽ”Ýš[™È[™U]HH”™\Ú^™HÙ[™\˜]ÜˆŠBˆÂˆÙ][Ý\ÙPÝ\œÛÜŠXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ›ÝÛTšYÚÛÜ›™\”™\Ú^™PÝ\œÛÜŠNÂˆÙ]]J[™U]JNÂˆB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+™\Ú^™TÝ\Y
+Bˆ™\Ú^™TÝ\Y
+]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][Û‹Ò[
+
+JNÂˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+™\Ú^™YžQ˜YÊBˆ™\Ú^™YžQ˜YÊ]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][Û‹Ò[
+
+JNÂˆB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYBˆÂˆYˆ
+™\Ú^™Q[™Y
+H™\Ú^™Q[™Y
+
+NÂˆB‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉŠHÝ™\œšYBˆÂˆËÈÙY\HÛÜ›™\ˆ]\™Ù][š\ÚX›NˆH[X™YYYÚ[ˆY]Üˆ\ÂˆËÈ]ÈÝÛˆÛÛ›ÛË[™HÙXÛÛ™˜]Ûˆ™\Ú^™HÜš\ÛÚÙYZÙHHÙXÛÛ™ˆËÈ™\ÝYÚ[™ÝË‚ˆBŸNÂ‚˜Û\ÜÈÜ˜š]]Y][Û’Ù^X›Ø\™š[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆÝŽ™[˜Ý[Û›ÚY
+[›ÛÛ
+OˆÛ“›ÝNÂ‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆÛÛœÝ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÑ›Ø]
+
+NÂˆË™š[[
+XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹JJNÂˆYˆ
+\™XKš\Ñ[\J
+JH™]\›ŽÂˆÛÛœÝ^ˆ[Ú]PÛÝ[HMÂˆÛÛœÝ]]ÈÚ]UÚYH\™XK™Ù]ÚY
+
+HÈÝ]X×ØØ\Ý›Ø]ŠÚ]PÛÝ[
+NÂˆÛÛœÝ]]ÈÚ]S›ÝQ›Ü’[™^H×J[[™^
+BˆÂˆÛÛœÝ^ˆÝŽ˜\œ˜^O[ÏˆÙ[Z]Û™\ÈÈ‹KËKLHNÂˆ™]\›ˆŒ
+È
+[™^ÈÊH
+ˆLˆ
+ÈÙ[Z]Û™\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ[™^	HÊWNÂˆNÂˆ›Üˆ
+[HHÈHÚ]PÛÝ[È
+ÊÚJBˆÂˆ]]ÈÙ^HHXÙNŽ”™XÝ[™ÛO›Ø]ŠH
+ˆÚ]UÚYÚ]UÚY\™XK™Ù]ZYÚ
+
+JNÂˆËœÙ]ÛÛÝ\ŠXÝ]™T]ÚOHÚ]S›ÝQ›Ü’[™^
+JHÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKNLËŒN
+BˆˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹ŒÍŒÍÊJNÂˆË™š[™XÝ
+Ù^Kœ™YXÙY
+YŠJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKŒKÌŠJNÂˆË™˜]Ô™XÝ
+Ù^KKŒŠNÂˆBˆÛÛœÝ^ˆÝŽ˜\œ˜^O[Lˆ›XÚÐY\•Ú]HÈKËKËLLKLˆNÂˆÛÛœÝ]]È›XÚÕÚYHÚ]UÚY
+ˆNŽÂˆÛÛœÝ]]È›XÚÒZYÚH\™XK™Ù]ZYÚ
+
+H
+ˆŒ™ŽÂˆ›Üˆ
+[HHÈHÝ]X×ØØ\Ý[Š›XÚÐY\•Ú]KœÚ^™J
+JNÈ
+ÊÚJBˆÂˆÛÛœÝ]]ÈÚ]R[™^H›XÚÐY\•Ú]VÜÝ]X×ØØ\ÝÚ^™WÝŠJWNÂˆÛÛœÝ]]ÈØÝ]™HHÚ]R[™^ÈÎÂˆÛÛœÝ]]ÈÚ][ˆHÚ]R[™^	HÎÂˆÛÛœÝ^ˆÝŽ˜\œ˜^O[Ïˆ›XÚÔÙ[Z]Û™\ÈÈKËLK‹LLHNÂˆÛÛœÝ]]È]ÚHŒ
+ÈØÝ]™H
+ˆLˆ
+È›XÚÔÙ[Z]Û™\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠÚ][ŠWNÂˆ]]ÈÙ^HHXÙNŽ”™XÝ[™ÛO›Ø]Š
+Ú]R[™^
+ÈJH
+ˆÚ]UÚYH›XÚÕÚY
+ˆY‹›XÚÕÚY›XÚÒZYÚ
+NÂˆËœÙ]ÛÛÝ\ŠXÝ]™T]ÚOH]ÚÈXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKMNNLJHˆXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒËÍŠJNÂˆË™š[›Ý[™Y™XÝ[™ÛJÙ^K‹ŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹LL‹LŠJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJÙ^K‹Œ‹KŒŠNÂˆBˆB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYHÈ\]T]Ú
+]™[œÜÚ][Û‹žYJNÈBˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYHÈ\]T]Ú
+]™[œÜÚ][Û‹žYJNÈBˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYHÈ™[X\ÙT]Ú
+
+NÈB‚œš]˜]N‚ˆ[]Ú]
+›Ø]
+HÛÛœÝˆÂˆÛÛœÝ^ˆ[Ú]PÛÝ[HMÂˆÛÛœÝ]]ÈÚ]UÚYHÝ]X×ØØ\Ý›Ø]ŠÙ]ÚY
+
+JHÈÝ]X×ØØ\Ý›Ø]ŠÚ]PÛÝ[
+NÂˆYˆ
+Ú]UÚYHŒŠH™]\›ˆŒÂˆÛÛœÝ]]ÈÚ]R[™^HXÙNŽš›[Z]
+Ú]PÛÝ[HKÝ]X×ØØ\Ý[ŠÈÚ]UÚY
+JNÂˆÛÛœÝ^ˆÝŽ˜\œ˜^O[ÏˆÚ]TÙ[Z]Û™\ÈÈ‹KËKLHNÂˆÛÛœÝ^ˆÝŽ˜\œ˜^O[Ïˆ›XÚÔÙ[Z]Û™\ÈÈKËLK‹LLHNÂˆÛÛœÝ]]ÈÚ][ˆHÚ]R[™^	HÎÂˆÛÛœÝ]]È›Ý[™\žVH
+Ú]R[™^
+ÈJH
+ˆÚ]UÚYÂˆÛÛœÝ]]È›XÚÕÚYHÚ]UÚY
+ˆŒŽYŽÂˆYˆ
+›XÚÔÙ[Z]Û™\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠÚ][ŠWHH	‰ˆH›Ý[™\žVH›XÚÕÚY	‰ˆ›Ý[™\žV
+È›XÚÕÚY
+Bˆ™]\›ˆŒ
+È
+Ú]R[™^ÈÊH
+ˆLˆ
+È›XÚÔÙ[Z]Û™\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠÚ][ŠWNÂˆYˆ
+Ú]R[™^ˆ	‰ˆ›XÚÔÙ[Z]Û™\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ
+Ú]R[™^HJH	HÊWHHˆ	‰ˆÚ]R[™^
+ˆÚ]UÚY
+È›XÚÕÚY
+Bˆ™]\›ˆŒ
+È
+
+Ú]R[™^HJHÈÊH
+ˆLˆ
+È›XÚÔÙ[Z]Û™\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ
+Ú]R[™^HJH	HÊWNÂˆ™]\›ˆŒ
+È
+Ú]R[™^ÈÊH
+ˆLˆ
+ÈÚ]TÙ[Z]Û™\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠÚ][ŠWNÂˆB‚ˆ›ÚY\]T]Ú
+›Ø]›ÛÛÝÛŠBˆÂˆYˆ
+YÝÛŠH™]\›ŽÂˆÛÛœÝ]]È™^]ÚH]Ú]
+
+NÂˆYˆ
+™^]ÚOHXÝ]™T]Ú
+H™]\›ŽÂˆ™[X\ÙT]Ú
+
+NÂˆXÝ]™T]ÚH™^]ÚÂˆYˆ
+Û“›ÝJHÛ“›ÝJXÝ]™T]ÚYJNÂˆ™\Z[
+
+NÂˆB‚ˆ›ÚY™[X\ÙT]Ú
+
+BˆÂˆYˆ
+XÝ]™T]Ú
+H™]\›ŽÂˆYˆ
+Û“›ÝJHÛ“›ÝJXÝ]™T]Ú˜[ÙJNÂˆXÝ]™T]ÚHLNÂˆ™\Z[
+
+NÂˆB‚ˆ[XÝ]™T]ÚHLNÂŸNÂ‚˜Û\ÜÈZ^\“[Ý™R[™Hš[˜[ˆX›XÈXÙNŽÛÛ\Û™[žÂœX›XÎ‚ˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[ŠOˆ˜YÔÝ\YÂˆÝŽ™[˜Ý[Û›ÚY
+XÙNŽ”Ú[[ŠOˆ˜YÙÙYÂˆÝŽ™[˜Ý[Û›ÚY
+
+Oˆ˜YÑ[™YÂ‚ˆZ^\“[Ý™R[™J
+BˆÂˆÙ][Ý\ÙPÝ\œÛÜŠXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ‘˜YÙÚ[™Ò[™Ý\œÛÜŠNÂˆÙ]]J“[Ý™HZ^\ˆŠNÂˆB‚ˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+˜YÔÝ\Y
+H˜YÔÝ\Y
+]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][Û‹Ò[
+
+JNÂˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+˜YÙÙY
+H˜YÙÙY
+]™[™Ù]]™[™[]]™UÊÙ]\™[ÛÛ\Û™[
+
+JKœÜÚ][Û‹Ò[
+
+JNÂˆB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYBˆÂˆYˆ
+˜YÑ[™Y
+H˜YÑ[™Y
+
+NÂˆB‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNËŒNŒÌÊJNÂˆÛÛœÝ]]ÈÙ[™VHÙ]ÚY
+
+H
+ˆYŽÂˆÛÛœÝ]]ÈÙ[™VHHÙ]ZYÚ
+
+H
+ˆYŽÂˆ›Üˆ
+[›ÝÈHLNÈ›ÝÈHNÈ
+ÊÜ›ÝÊBˆ›Üˆ
+[ÛÛ[[ˆHLNÈÛÛ[[ˆHNÈ
+ÊØÛÛ[[ŠBˆË™š[[\ÙJÙ[™V
+ÈÛÛ[[ˆ
+ˆŒˆHKŒ™‹Ù[™VH
+È›ÝÈ
+ˆŒˆHKŒ™‹‹‹‹ŠNÂˆBŸNÂ‚˜Û\ÜÈÜ˜š]YÚ[‘Y]ÜÛÛ[š[˜[ˆX›XÈNŽ”YÚ[ŽŽ‘Y]ÜÛÛ\Û™[žÂœX›XÎ‚ˆ^XÚ]Ü˜š]YÚ[‘Y]ÜÛÛ[
+NŽ‘^\›˜[YÚ[‰ˆ^\›˜[
+BˆˆY]ÜŠ^\›˜[™Ù]]Y[ÔYÚ[’[œÝ[˜ÙJ
+HOH[‚ˆÈÝŽ[š\]YWÜXÙNŽ]Y[Ô›ØÙ\ÜÛÜ‘Y]ÜŠ^\›˜[™Ù]]Y[ÔYÚ[’[œÝ[˜ÙJ
+KO˜Ü™X]QY]Ü’Y“™YYY
+
+JBˆˆ[ŠBˆÂˆYˆ
+Y]ÜˆOH[ˆ	‰ˆ^\›˜[™Ù]]Y[ÔYÚ[’[œÝ[˜ÙJ
+HOH[ŠBˆY]ÜˆHÝŽ›XZÙWÝ[š\]YOXÙNŽ‘Ù[™\šXÐ]Y[Ô›ØÙ\ÜÛÜ‘Y]ÜŠ
+™^\›˜[™Ù]]Y[ÔYÚ[’[œÝ[˜ÙJ
+JNÂˆYˆ
+Y]ÜˆOH[ŠBˆÂˆY[™XZÙUš\ÚX›J
+™Y]ÜŠNÂˆÙ]Ú^™JXÙNŽš›X^
+ŒŒY]Ü‹O™Ù]ÚY
+
+JKXÙNŽš›X^
+LŒY]Ü‹O™Ù]ZYÚ
+
+JJNÂˆBˆ[ÙBˆÂˆÙ]Ú^™JÌŒLŒ
+NÂˆBˆB‚ˆ›ÛÛ[ÝÕÚ[™ÝÔ™\Ú^š[™Ê
+HÝ™\œšYHÈ™]\›ˆY]ÜˆOH[ˆ	‰ˆY]Ü‹Oš\Ô™\Ú^˜X›J
+NÈBˆXÙNŽÛÛ\Û™[›Ý[™ÐÛÛœÝ˜Z[™\ŠˆÙ]›Ý[™ÐÛÛœÝ˜Z[™\Š
+HÝ™\œšYBˆÂˆ™]\›ˆY]ÜˆOH[ˆÈY]Ü‹O™Ù]ÛÛœÝ˜Z[™\Š
+Hˆ[ŽÂˆBˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆYˆ
+Y]ÜˆOH[ŠHY]Ü‹OœÙ]›Ý[™ÊÙ]ØØ[›Ý[™Ê
+JNÂˆB‚œš]˜]N‚ˆÝŽ[š\]YWÜXÙNŽ]Y[Ô›ØÙ\ÜÛÜ‘Y]ÜˆY]ÜŽÂŸNÂ‚˜Û\ÜÈÜ˜š]YÚ[•Ú[™ÝÈš[˜[ˆX›XÈXÙNŽ‘ØÝ[Y[Ú[™ÝÂžÂœX›XÎ‚ˆ^XÚ]Ü˜š]YÚ[•Ú[™ÝÊNŽ”YÚ[ŽŽ•Ú[™ÝÔÝ]IˆÝ]JBˆˆØÝ[Y[Ú[™ÝÊÝ]KœYÚ[‹™Ù]˜[YJ
+KXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŽKÎ
+KÛÜÙP]ÛŠKˆYÚ[”Ý]JÝ]JKYÚ[ŠÝ]KœYÚ[ŠBˆÂˆÙ]\Ú[™Ó˜]]™U]P˜\ŠYJNÂˆYˆ
+]]Êˆ^\›˜[H[˜[ZX×ØØ\ÝNŽ‘^\›˜[YÚ[ŠŠ	œYÚ[ŠJBˆY]ÜˆHÝŽ›XZÙWÝ[š\]YOÜ˜š]YÚ[‘Y]ÜÛÛ[Š
+™^\›˜[
+NÂˆYˆ
+Y]ÜˆOH[ŠBˆÂˆÙ]ÛÛ[›Û“ÝÛ™Y
+Y]Ü‹™Ù]
+
+KYJNÂˆÙ]™\Ú^˜X›JY]Ü‹O˜[ÝÕÚ[™ÝÔ™\Ú^š[™Ê
+K˜[ÙJNÂˆYˆ
+Y]Ü‹O˜[ÝÕÚ[™ÝÔ™\Ú^š[™Ê
+JHÙ]ÛÛœÝ˜Z[™\ŠY]Ü‹O™Ù]›Ý[™ÐÛÛœÝ˜Z[™\Š
+JNÂˆÙ[™UÚ]Ú^™JXÙNŽš›X^
+ŒY]Ü‹O™Ù]ÚY
+
+JKXÙNŽš›X^
+MLY]Ü‹O™Ù]ZYÚ
+
+JJNÂˆBˆ[ÙBˆÂˆ]]ÊˆY\ÜØYÙHH™]ÈXÙNŽ“X™[
+ßK•\ÈYÚ[ˆÙ\È›Ý›ÝšYH[ˆY]Ü‹ˆŠNÂˆY\ÜØYÙKOœÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆÙ]ÛÛ[ÝÛ™Y
+Y\ÜØYÙKYJNÂˆÙ[™UÚ]Ú^™JÍŒLŒ
+NÂˆBˆÙ]š\ÚX›JYJNÂˆÑœ›Û
+˜[ÙJNÂˆB‚ˆ›ÚYÛÜÙP]Û”™\ÜÙY
+
+HÝ™\œšYHÈYÚ[”Ý]K˜ÛÜÙUÚ[™ÝÑ^XÚ]J
+NÈB‚œš]˜]N‚ˆNŽ”YÚ[ŽŽ•Ú[™ÝÔÝ]IˆYÚ[”Ý]NÂˆNŽ”YÚ[‰ˆYÚ[ŽÂˆÝŽ[š\]YWÜNŽ”YÚ[ŽŽ‘Y]ÜÛÛ\Û™[ˆY]ÜŽÂŸNÂ‚˜Û\ÜÈÜ˜š]RP™Z]š[Ý\ˆš[˜[ˆX›XÈNŽ•RP™Z]š[Ý\‚žÂœX›XÎ‚ˆÝŽ[š\]YWÜXÙNŽÛÛ\Û™[ˆÜ™X]TYÚ[•Ú[™ÝÊNŽ”YÚ[•Ú[™ÝÔÝ]IˆÝ]JHÝ™\œšYBˆÂˆYˆ
+]]ÊˆYÚ[”Ý]HH[˜[ZX×ØØ\ÝNŽ”YÚ[ŽŽ•Ú[™ÝÔÝ]JŠ	œÝ]JJBˆ™]\›ˆÝŽ›XZÙWÝ[š\]YOÜ˜š]YÚ[•Ú[™ÝÏŠ
+œYÚ[”Ý]JNÂˆ™]\›ˆßNÂˆBŸNÂ‚˜Û\ÜÈ›Ú™XÝšY]Èš[˜[ˆX›XÈXÙNŽÛÛ\Û™[š]˜]HXÙNŽ•[Y\‚žÂœX›XÎ‚ˆ[[HÛ\ÜÈ^X˜XÚÓ[ÙHÈ]\›‹ÛÛ™ÈNÂˆ›ÚY[Ý\ÙQÝÛŠÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYHÈœš[™ÑÙ[™\˜]Ü•Ñœ›Û
+
+NÈBˆ›Ú™XÝšY]Ê
+Hˆ[™Ú[™J“Ü˜š]‹ÝŽ›XZÙWÝ[š\]YOÜ˜š]RP™Z]š[Ý\Š
+K[ŠBˆÂˆXÙNŽ”›Ü\Y\Ñš[NŽ“Ü[ÛœÈÙ][™ÜÓÜ[ÛœÎÂˆÙ][™ÜÓÜ[ÛœË˜\XØ][Û“˜[YHH“Ü˜š]ŽÂˆÙ][™ÜÓÜ[ÛœË™š[[˜[YTÝY™š^HœÙ][™ÜÈŽÂˆÙ][™ÜÓÜ[ÛœË›ÜÞXœ˜\žTÝX‘›Û\ˆH\XØ][ÛˆÝ\ÜŽÂˆ\XØ][Û”›Ü\Y\ËœÙ]ÝÜ˜YÙT\˜[Y]\œÊÙ][™ÜÓÜ[ÛœÊNÂˆYˆ
+]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+JBˆÚÝÒ[ÈHÙ][™ÜËO™Ù]›ÛÛ˜[YJœÚÝÒ[È‹YJNÂˆÛÛ\Ú[™ÝÈHÝŽ›XZÙWÝ[š\]YOXÙNŽ•ÛÛ\Ú[™ÝÏŠ\ËÚÝÒ[ÈÈLˆŒMÍÍÊNÂ‚ˆ]KœÙ]^
+“Ü˜š]‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]KœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊÌŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆ]KœÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆY[™XZÙUš\ÚX›J]JNÂ‚ˆÛÛœÝÝŽ˜\œ˜^OÝŽœZ\XÙNŽ•^]ÛŠ‹XÙNŽ”Ýš[™Ï‹ÏˆY[QYš[š][ÛœÈÞÂˆÈ	™š[SY[P]Û‹‘š[HˆKÈ	™Y]Y[P]Û‹‘Y]ˆKÈ	šY]ÓY[P]Û‹•šY]ÈˆKˆÈ	š[œÙ\Y[P]Û‹’[œÙ\ˆKÈ	›Ü[ÛœÓY[P]Û‹“Ü[ÛœÈˆKˆÈ	Ú[™ÝÓY[P]Û‹•Ú[™ÝÈˆKÈ	š[Y[P]Û‹’[ˆBˆ_NÂˆ›Üˆ
+[HHÈHÝ]X×ØØ\Ý[ŠY[QYš[š][ÛœËœÚ^™J
+JNÈ
+ÊÚJBˆÂˆ]]Êˆ]ÛˆHY[QYš[š][ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWK™š\œÝÂˆ]Û‹OœÙ]]Û•^
+Y[QYš[š][ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKœÙXÛÛ™
+NÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹M
+JNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMËËÍJJNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŒÌKŒÍJJNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆ]Û‹O›ÛÛXÚÈHÝ\ËK]Û—HÈÚÝÓY[J
+˜]Û‹JNÈNÂˆY[™XZÙUš\ÚX›J
+˜]ÛŠNÂˆB‚ˆÛÛ™šYÝ\™P]ÛŠ™]Ô›Ú™XÝ]Û‹“™]È›Ú™XÝ‹Ý\×HÈÜ™X]T›Ú™XÝ
+
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠÜ[]Û‹“Ü[ˆ‹Ý\×HÈÜ[”›Ú™XÝ
+
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠØ]™P]Û‹”Ø]™H‹Ý\×HÈØ]™T›Ú™XÝ
+
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠZYQ^Ü]Û‹‘^ÜRQH‹Ý\×HÈ^ÜZYJ
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠ]Y[ÔÙ][™ÜÐ]Û‹]Y[ÈÙ][™ÜÈ‹Ý\×HÈÚÝÐ]Y[ÔÙ][™ÜÊ
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠY˜XÚÐ]Û‹Y[œÝ[Y[‹Ý\×HÈY[œÝ[Y[˜XÚÊ
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠ]\›]Û‹“™]È]\›ˆ‹Ý\×HÈY]\›Š
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠ^[\Ý]Û‹”^[\Ý‹Ý\×HÈÙÙÛT^[\ÝšY]Ê
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠ^P]Û‹”^H‹Ý\×HÈÙÙÛT^X˜XÚÊ
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠÝÜ]Û‹”ÝÜ‹Ý\×HÈÝÜ^X˜XÚÊ
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠ]\›“[ÙP]Û‹”]\›ˆ‹Ý\×HÈÙ]^X˜XÚÓ[ÙJ^X˜XÚÓ[ÙNŽœ]\›ŠNÈJNÂˆÛÛ™šYÝ\™P]ÛŠÛÛ™Ó[ÙP]Û‹”ÛÛ™È‹Ý\×HÈÙ]^X˜XÚÓ[ÙJ^X˜XÚÓ[ÙNŽœÛÛ™ÊNÈJNÂˆ›Üˆ
+]]Êˆ[ÙP]ÛˆˆÈ	œ]\›“[ÙP]Û‹	œÛÛ™Ó[ÙP]ÛˆJBˆÂˆ[ÙP]Û‹OœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆBˆ]\›“[ÙP]Û‹œÙ]ÛÛ\
+”]\›ˆ[ÙH^\ÈXXÚÙ[™\˜]Ü‰ÜÈ™[Y[X™\™Y]\›ˆÙÙ]\‹ˆŠNÂˆÛÛ™Ó[ÙP]Û‹œÙ]ÛÛ\
+”ÛÛ™È[ÙH^\ÈÛ\È\œ˜[™ÙY[ˆH^[\ÝˆŠNÂˆ\]T^X˜XÚÓ[ÙP]ÛœÊ
+NÂˆÛÛ™šYÝ\™P]ÛŠZ^\]Û‹“Z^\ˆ‹Ý\×HÈÙÙÛSZ^\•šY]Ê
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠX\Ý\]Û‹“X\Ý\ˆ‹Ý\×HÈÚÝÓZ^\ŠYJNÈJNÂˆÛÛ™šYÝ\™P]ÛŠ™XÛÜ™]Û‹”™XÛÜ™‹×HßJNÂˆ™XÛÜ™]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆ™XÛÜ™]Û‹œÙ]ÛÛ\
+]Y[È™XÛÜ™[™È\È›Ý[\[Y[YY]ˆŠNÂˆ^P]Û‹œÙ]^š\ÚX›J˜[ÙJNÂˆÝÜ]Û‹œÙ]^š\ÚX›J˜[ÙJNÂˆ™XÛÜ™]Û‹œÙ]^š\ÚX›J˜[ÙJNÂˆ™]Ú[™]Û‹œÙ]^š\ÚX›J˜[ÙJNÂˆ™]š[Ý\Ð]Û‹œÙ]^š\ÚX›J˜[ÙJNÂˆ™^]Û‹œÙ]^š\ÚX›J˜[ÙJNÂˆ^[\Ý]Û‹œÙ]]Û•^
+”^[\ÝŠNÂˆZ^\]Û‹œÙ]]Û•^
+“Z^\ˆŠNÂˆX\Ý\]Û‹œÙ]]Û•^
+“X\Ý\ˆŠNÂˆÝÜ]Û‹œÙ]]Û•^
+”ÝÜŠNÂˆÝÜ]Û‹œÙ]ÛÛ\
+”ÝÜ^X˜XÚËˆŠNÂˆ^P]Û‹œÙ]]Û•^
+”^HŠNÂˆ^P]Û‹œÙ]ÛÛ\
+”Ý\^X˜XÚËˆŠNÂˆ™]Ú[™]Û‹œÙ]ÛÛ\
+”™]\›ˆ^X˜XÚÈÈH™YÚ[›š[™ËˆŠNÂˆÛÛ™šYÝ\™P]ÛŠ™]Ú[™]Û‹”™]Ú[™‹Ý\×HÈ™]Ú[™^X˜XÚÊ
+NÈJNÂˆÛÛ™šYÝ\™P]ÛŠ™]š[Ý\Ð]Û‹”™]š[Ý\È˜\ˆ‹Ý\×HÈÚÚ\˜[œÜÜ
+LJNÈJNÂˆÛÛ™šYÝ\™P]ÛŠ™^]Û‹“™^˜\ˆ‹Ý\×HÈÚÚ\˜[œÜÜ
+JNÈJNÂˆÛÛ™šYÝ\™P]ÛŠÙ[™\˜]Ü“]]P]Û‹“H‹Ý\×BˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆÛÛœÝ]]È[™^H˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJHÙ]˜XÚÓ]]J[™^Ù[™\˜]Ü“]]P]Û‹™Ù]ÙÙÛTÝ]J
+JNÂˆJNÂˆÛÛ™šYÝ\™P]ÛŠÙ[™\˜]Ü”ÛÛÐ]Û‹”È‹Ý\×BˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆÛÛœÝ]]È[™^H˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJHÙ]˜XÚÔÛÛÊ[™^Ù[™\˜]Ü”ÛÛÐ]Û‹™Ù]ÙÙÛTÝ]J
+JNÂˆJNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLÍ‹ÌŠJNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMLKLŒËLÊJNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ]ÛÛ\
+“]]H\ÈÙ[™\˜]Ü‹ˆŠNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ]ÛÛ\
+”ÛÛÈ\ÈÙ[™\˜]Ü‹ˆŠNÂˆÛÛ™šYÝ\™P]ÛŠÙ[™\˜]Ü”Ù][™ÜÐ]Û‹”]\›ˆÙ][™ÜÈ‹Ý\×BˆÂˆXÙNŽ”Ü\Y[HÙ][™ÜÎÂˆÙ][™ÜË˜Y][JK”]\›ˆÙ][™ÜÈÚ[™HYY[ˆH]\ˆ]\˜][Ûˆ‹˜[ÙJNÂˆÙ][™ÜËœÚÝÓY[P\Þ[˜ÊXÙNŽ”Ü\Y[NŽ“Ü[ÛœÊ
+KÚ]\™Ù]ÛÛ\Û™[
+	™Ù[™\˜]Ü”Ù][™ÜÐ]ÛŠK×J[
+HßJNÂˆJNÂˆÙ[™\˜]Ü”Ù][™ÜÐ]Û‹œÙ]^š\ÚX›J˜[ÙJNÂˆÛÛ™šYÝ\™P]ÛŠÜ[”™\Ù]]Û‹“Ü[ˆ]\›ˆ™\Ù]‹Ý\×BˆÂˆÝ]\ËœÙ]^
+”]\›ˆ™\Ù]ØY[™È\È›Ý[\[Y[YY]ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆJNÂˆÛÛ™šYÝ\™P]ÛŠØ]™T™\Ù]]Û‹”Ø]™H]\›ˆ™\Ù]‹Ý\×BˆÂˆÝ]\ËœÙ]^
+”]\›ˆ™\Ù]Ø]š[™È\È›Ý[\[Y[YY]ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆJNÂˆÜ[”™\Ù]]Û‹œÙ]^š\ÚX›J˜[ÙJNÂˆØ]™T™\Ù]]Û‹œÙ]^š\ÚX›J˜[ÙJNÂˆ]\›”™\Ù]Ù[XÝÜ‹˜Y][J‘Y˜][‹JNÂˆ]\›”™\Ù]Ù[XÝÜ‹œÙ]Ù[XÝYY
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›”™\Ù]Ù[XÝÜ‹œÙ]ÛÛ\
+”Ù[XÝY]\›ˆ™\Ù]ˆŠNÂˆ]\›“[™Ý\Ü^KœÙ]^
+ŒMˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›“[™Ý\Ü^KœÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™Y
+NÂˆ]\›“[™Ý\Ü^KœÙ]ÛÛ\
+Ý\œ™[]\›ˆ[™ÝˆMˆÝ\ËˆŠNÂˆ]\›“[™Ý\Ü^KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒËŒŒKŒŽJJNÂˆ]\›“[™Ý\Ü^KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž˜˜XÚÙÜ›Ý[™ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKÍ‹ÊJNÂˆ]\›“[™Ý\Ü^KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž›Ý][™PÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKLŒ‹LÍŠJNÂˆ]\›“[™Ý\Ü^KœÙ]›Ü™\”Ú^™JÌKKJNÂˆY[™XZÙUš\ÚX›J]\›”™\Ù]Ù[XÝÜŠNÂˆY[™XZÙUš\ÚX›J]\›“[™Ý\Ü^JNÂˆÛÛ™šYÝ\™P]ÛŠ]\›“[™ÝÝÛ]Û‹¸¢$ˆ‹Ý\×HÈY\Ý]\›“[™Ý
+LJNÈJNÂˆ]\›“[™ÝÝÛ]Û‹œÙ]ÛÛ\
+”ÚÜ[ˆ\È]\›ˆžHÛ™HÝ\ˆŠNÂˆY[™XZÙUš\ÚX›J]\›“[™ÝÝÛ]ÛŠNÂˆÛÛ™šYÝ\™P]ÛŠ]\›“[™Ý\]Û‹ŠÈ‹Ý\×HÈY\Ý]\›“[™Ý
+JNÈJNÂˆ]\›“[™Ý\]Û‹œÙ]ÛÛ\
+‘^[™\È]\›ˆžHÛ™HÝ\ˆŠNÂˆY[™XZÙUš\ÚX›J]\›“[™Ý\]ÛŠNÂˆY[™XZÙUš\ÚX›JÝ]]Y]\ŠNÂˆÛÛ™šYÝ\™P]ÛŠÛÜ]Û‹“ÓÔ‹Ý\×HÈÙ]ÛÜ[˜X›Y
+ÛÜ]Û‹™Ù]ÙÙÛTÝ]J
+JNÈJNÂˆÛÜ]Û‹œÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆÛÜ]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LÌ‹MÍ
+JNÂˆÛÜ]Û‹œÙ]ÛÛ\
+•ÙÙÛHH˜[œÜÜÛÜ˜[™ÙKˆŠNÂˆÛÛ™šYÝ\™P]ÛŠY]›Û›ÛYP]Û‹“QU“È‹Ý\×HÈÙ]Y]›Û›ÛYQ[˜X›Y
+Y]›Û›ÛYP]Û‹™Ù]ÙÙÛTÝ]J
+JNÈJNÂˆY]›Û›ÛYP]Û‹œÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆY]›Û›ÛYP]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LÌ‹MÍ
+JNÂˆY]›Û›ÛYP]Û‹œÙ]ÛÛ\
+•ÙÙÛH˜XÚÝ[Ûˆ[™Ú[™IÜÈÛXÚÈ˜XÚËˆŠNÂˆÛÜÝ\ÛY\‹œÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ“[™X\’Üš^›Û[
+NÂˆÛÜÝ\ÛY\‹œÙ]˜[™ÙJK^[\ÝÜšYŽ˜˜\ÛÝ[JNÂˆÛÜÝ\ÛY\‹œÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ•^›ÞY˜[ÙKÎŒŠNÂˆÛÜÝ\ÛY\‹œÙ]˜[YJKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÜÝ\ÛY\‹œÙ]ÛÛ\
+“ÛÜÝ\˜\‹ˆŠNÂˆÛÜÝ\X™[œÙ]^
+”ÕT•‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÜ[™ÝX™[œÙ]^
+“S‘Õ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[YTÚYÛ˜]\™SX™[œÙ]^
+Í‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ›Üˆ
+]]ÊˆX™[ˆÈ	›ÛÜÝ\X™[	›ÛÜ[™ÝX™[	[YTÚYÛ˜]\™SX™[JBˆÂˆX™[OœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÍ‹NLËŒÊJNÂˆX™[OœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆY[™XZÙUš\ÚX›J
+›X™[
+NÂˆBˆÛÜÝ\ÛY\‹›Û•˜[YPÚ[™ÙHHÝ\×HÈ\]SÛÜ˜[™ÙJ
+NÈNÂˆÛÜ[™ÝÛY\‹œÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ“[™X\’Üš^›Û[
+NÂˆÛÜ[™ÝÛY\‹œÙ]˜[™ÙJK^[\ÝÜšYŽ˜˜\ÛÝ[JNÂˆÛÜ[™ÝÛY\‹œÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ•^›ÞY˜[ÙKÌ‹ŒŠNÂˆÛÜ[™ÝÛY\‹œÙ]˜[YJXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÜ[™ÝÛY\‹œÙ]ÛÛ\
+“ÛÜ[™Ý[ˆ˜\œËˆŠNÂˆÛÜ[™ÝÛY\‹›Û•˜[YPÚ[™ÙHHÝ\×HÈ\]SÛÜ˜[™ÙJ
+NÈNÂˆÛÛœÝÝŽ˜\œ˜^OXÙNŽÛÛ\Û™[
+‹OˆXÝ[Û]ÛœÈÞÂˆ	›™]Ô›Ú™XÝ]Û‹	›Ü[]Û‹	œØ]™P]Û‹	›ZYQ^Ü]Û‹	˜]Y[ÔÙ][™ÜÐ]Û‹	˜Y˜XÚÐ]Û‹ˆ	œ]\›]Û‹	œ^[\Ý]Û‹	œ^P]Û‹	œÝÜ]Û‹	œ]\›“[ÙP]Û‹	œÛÛ™Ó[ÙP]Û‹	›Z^\]Û‹	›X\Ý\]Û‹ˆ	œ™XÛÜ™]Û‹	œ™]Ú[™]Û‹	œ™]š[Ý\Ð]Û‹	›™^]Û‹	›ÛÜ]Û‹	›Y]›Û›ÛYP]Û‹ˆ	™Ù[™\˜]Ü“]]P]Û‹	™Ù[™\˜]Ü”ÛÛÐ]Û‹	™Ù[™\˜]Ü”Ù][™ÜÐ]Û‹	›Ü[”™\Ù]]Û‹	œØ]™T™\Ù]]Û‚ˆ_NÂˆ›Üˆ
+]]Êˆ]ÛˆˆXÝ[Û]ÛœÊHY[™XZÙUš\ÚX›J
+˜]ÛŠNÂˆY[™XZÙUš\ÚX›JÛÜÝ\ÛY\ŠNÂˆY[™XZÙUš\ÚX›JÛÜ[™ÝÛY\ŠNÂ‚ˆ[\ÓX™[œÙ]^
+”H‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[\ÓX™[œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNËŒËŒŒJJNÂˆY[™XZÙUš\ÚX›J[\ÓX™[
+NÂˆ[\ÔÛY\‹œÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ“[™X\’Üš^›Û[
+NÂˆ[\ÔÛY\‹œÙ]˜[™ÙJŒŒÌŒŒJNÂˆ[\ÔÛY\‹œÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ•^›ÞY˜[ÙKM
+NÂˆ[\ÔÛY\‹œÙ]˜[YJLŒŒXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[\ÔÛY\‹›Û•˜[YPÚ[™ÙHHÝ\×BˆÂˆYˆ
+Y]OH[ˆZ\Ô›Ú™XÝ
+H™]\›ŽÂˆÛÛœÝ]]ÈœHH[\ÔÛY\‹™Ù]˜[YJ
+NÂˆYˆ
+]]Êˆ[\ÈHY]O[\ÔÙ\]Y[˜ÙK™Ù][\Ê
+JH[\ËOœÙ]œJœJNÂˆ›Ú™XÝœÙ][š]X[[\ÐœJœJNÂˆ\]SÛÜ˜[™ÙJ
+NÂˆ\Ñ\HHYNÂˆÛÛœÝ]]ÈY]\ˆH›Ú™XÝ™Ù][š]X[[YTÚYÛ˜]\™J
+NÂˆ]\ÚXØ[]Z[ËœÙ]^
+•˜XÚÜÎˆˆ
+ÈXÙNŽ”Ýš[™Ê›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JH
+Èˆ‚ˆ
+ÈXÙNŽ”Ýš[™ÊœKJH
+Èˆ”H‚ˆ
+ÈXÙNŽ”Ýš[™ÊY]\‹›[Y\˜]ÜŠH
+È‹Èˆ
+ÈXÙNŽ”Ýš[™ÊY]\‹™[›ÛZ[˜]ÜŠBˆ
+ÈˆZ[Z[ˆÔÐÈ]\›œÈ\ˆÙ[™\˜]Üˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÝ]\ËœÙ]^
+•[\ÈÚ[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆNÂˆ[\ÓX™[œÙ][˜X›Y
+˜[ÙJNÂˆ[\ÔÛY\‹œÙ][˜X›Y
+˜[ÙJNÂˆY[™XZÙUš\ÚX›J[\ÔÛY\ŠNÂ‚ˆ˜XÚÔÙ[XÝÜ‹œÙ]^Ú[“›Ý[™ÔÙ[XÝY
+”Ù[XÝÙ[™\˜]ÜˆŠNÂˆ˜XÚÔÙ[XÝÜ‹œÙ]ÛÛ\
+ÚÛÜÙHHÙ[™\˜]ÜˆÚÜÙH]\›œËX[›È›Û[™Z^\ˆÙ][™ÜÈ[ÝH\™HY][™ËˆŠNÂˆ˜XÚÔÙ[XÝÜ‹œÙ][˜X›Y
+˜[ÙJNÂˆ˜XÚÔÙ[XÝÜ‹›ÛÚ[™ÙHHÝ\×HÈÙ[XÝ[œÝ[Y[˜XÚÊ
+NÈNÂˆY[™XZÙUš\ÚX›J˜XÚÔÙ[XÝÜŠNÂ‚ˆÝ]\ËœÙ]^
+Ü™X]HH›Ú™XÝY[ˆ[œÝ[Y[[ˆYH]\›‹ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÝ]\ËœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÌŒŒŒŠJNÂˆY[™XZÙUš\ÚX›JÝ]\ÊNÂˆ›Ú™XÝ]Z[ËœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆ]\ÚXØ[]Z[ËœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNËNNKŒL
+JNÂˆ]Y[Ñ]Z[ËœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNËNNKŒL
+JNÂˆY[™XZÙUš\ÚX›J›Ú™XÝ]Z[ÊNÂˆY[™XZÙUš\ÚX›J]\ÚXØ[]Z[ÊNÂˆY[™XZÙUš\ÚX›J]Y[Ñ]Z[ÊNÂ‚ˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]^
+’[œÝ[Y[H0­È]\›ˆLH‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]›Û
+XÙNŽ‘›ÛÜ[ÛœÊLËŒ‹XÙNŽ‘›ÛŽ˜›Û
+JNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒLËŒŽKŒÎJJNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]›Ü™\”Ú^™JXÙNŽ›Ü™\”Ú^™O[ŠŽ
+JNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]]J“[Ý™HÙ[™\˜]ÜˆŠNÂˆËÈ\ÈYXØ]Y]HX™[ÝÛœÈH[Ý™HÙ\Ý\™H[™›ÜØ\™È]ÂˆËÈÛÛÜ™[˜]\ÈÈ›Ú™XÝšY]Ë]›ÚY[™È\™[]]\Ý[XšYÝZ]K‚ˆÙ[™\˜]Ü‘˜YÒ[™KœÙ][\˜Ù\Ó[Ý\ÙPÛXÚÜÊYK˜[ÙJNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ][Ý\ÙPÝ\œÛÜŠXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ‘˜YÙÚ[™Ò[™Ý\œÛÜŠNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]ÛÛ\
+‘˜YÈ\ÈXY\ˆÈ[Ý™HHÙ[™\˜]Ü‹ˆ™\Ú^™Hœ›ÛHH[™[	ÜÈ›ÝÛK\šYÚÛÜ›™\‹ˆŠNÂˆÙ[™\˜]Ü‘˜YÒ[™K™˜YÔÝ\YHÝ\×JXÙNŽ”Ú[[ˆÚ[
+HÈ™YÚ[‘Ù[™\˜]Ü‘˜YÊÚ[
+NÈNÂˆÙ[™\˜]Ü‘˜YÒ[™K™˜YÙÙYHÝ\×JXÙNŽ”Ú[[ˆÚ[
+HÈ[Ý™QÙ[™\˜]Ü”[™[
+Ú[
+NÈNÂˆÙ[™\˜]Ü‘˜YÒ[™K™˜YÑ[™YHÝ\×HÈ[™Ù[™\˜]Ü‘˜YÊ
+NÈNÂˆY[™XZÙUš\ÚX›JÙ[™\˜]Ü‘˜YÒ[™JNÂˆÙ[™\˜]Ü‘˜YÒ[™K˜Y[Ý\ÙS\Ý[™\Š\ËYJNÂ‚ˆÙ[™\˜]Ü”™\Ú^™R[™Kœ™\Ú^™TÝ\YHÝ\×JXÙNŽ”Ú[[ˆÚ[
+HÈ™YÚ[‘Ù[™\˜]Ü”™\Ú^™JÚ[
+NÈNÂˆÙ[™\˜]Ü”™\Ú^™R[™Kœ™\Ú^™YžQ˜YÈHÝ\×JXÙNŽ”Ú[[ˆÚ[
+HÈ™\Ú^™QÙ[™\˜]Ü”[™[
+Ú[
+NÈNÂˆÙ[™\˜]Ü”™\Ú^™R[™Kœ™\Ú^™Q[™YHÝ\×HÈ[™Ù[™\˜]Ü”™\Ú^™J
+NÈNÂˆÙ[™\˜]Ü”™\Ú^™R[™KœÙ][\˜Ù\Ó[Ý\ÙPÛXÚÜÊYK˜[ÙJNÂˆY[™XZÙUš\ÚX›JÙ[™\˜]Ü”™\Ú^™R[™JNÂˆÙ[™\˜]Ü”™\Ú^™R[™K˜Y[Ý\ÙS\Ý[™\Š\ËYJNÂ‚ˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]]Û•^
+¸¢$ˆŠNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]ÛÛ\
+ÛÛ\ÙHHÙ[™\˜]ÜˆÈ]È]\›ˆÛÛ›ÛÈŠNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LË
+JNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹LL‹LÎJJNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹Œ‹ŒÍŠJNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Û’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹›ÛÛXÚÈHÝ\×HÈÙÙÛQÙ[™\˜]ÜÛÛ\ÙY
+
+NÈNÂˆY[™XZÙUš\ÚX›JÙ[™\˜]ÜÛÛ\ÙP]ÛŠNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]š\ÚX›J˜[ÙJNÂ‚ˆ]\›•]KœÙ]^
+”Ù[XÝ[ˆ[œÝ[Y[Ù[™\˜]ÜˆÈY]]\›œÈ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›•]KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆY[™XZÙUš\ÚX›J]\›•]JNÂˆ]\›•]KœÙ]š\ÚX›J˜[ÙJNÂ‚ˆ]ÚÙ[XÝÜ‹˜Y][S\Ý
+XZÙT]Ú˜[Y\Ê
+KJNÂˆ]ÚÙ[XÝÜ‹œÙ]Ù[XÝYY
+]ÚÒ][RY
+Œ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]ÚÙ[XÝÜ‹œÙ]ÛÛ\
+ÚÛÜÙHH›ÝH]ÚÈY][ˆHM‹\Ý\]\›‹ˆŠNÂˆ]ÚÙ[XÝÜ‹›ÛÚ[™ÙHHÝ\×HÈØYÙ[XÝY]ÚÝ\Ê
+NÈNÂˆ]ÚÙ[XÝÜ‹œÙ][˜X›Y
+˜[ÙJNÂˆY[™XZÙUš\ÚX›J]ÚÙ[XÝÜŠNÂˆ]ÚÙ[XÝÜ‹œÙ]š\ÚX›J˜[ÙJNÂ‚ˆX[›Ô›Û]Û‹œÙ]]Û•^
+”PS“È“ÓŠNÂˆX[›Ô›Û]Û‹œÙ]ÛÛ\
+“Ü[ˆHÙ[XÝY]\›ˆ[ˆHX[›È›ÛŠNÂˆX[›Ô›Û]Û‹œÙ]]J“Ü[ˆX[›È›ÛŠNÂˆX[›Ô›Û]Û‹›ÛÛXÚÈHÝ\×HÈÚÝÔX[›Ô›Û
+
+NÈNÂˆX[›Ô›Û]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆY[™XZÙUš\ÚX›JX[›Ô›Û]ÛŠNÂˆX[›Ô›Û]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆ]\›”™\Ù]Ù[XÝÜ‹œÙ][˜X›Y
+˜[ÙJNÂˆ]\›”™\Ù]Ù[XÝÜ‹œÙ]š\ÚX›J˜[ÙJNÂˆ]\›“[™Ý\Ü^KœÙ]š\ÚX›J˜[ÙJNÂˆ]\›“[™ÝÝÛ]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆ]\›“[™Ý\]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü”Ù][™ÜÐ]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÜ[”™\Ù]]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆØ]™T™\Ù]]Û‹œÙ]š\ÚX›J˜[ÙJNÂ‚ˆ›Üˆ
+[HHÈHÈ
+ÊÚJBˆÂˆ]\›˜[šÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWHHÝŽ›XZÙWÝ[š\]YOXÙNŽ•^]ÛŠXÙNŽ”Ýš[™ÎŽ˜Ú\•ÔÝš[™ÊÝ]X×ØØ\ÝXÙNŽšXÙWÝØÚ\Š	ÐIÈ
+ÈJJJNÂˆ]]Êˆ˜[šÐ]ÛˆH]\›˜[šÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWK™Ù]
+
+NÂˆ˜[šÐ]Û‹OœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆ˜[šÐ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LÌ‹MÍ
+JNÂˆ˜[šÐ]Û‹OœÙ]ÛÛ\
+”Ù[XÝ]\›ˆ˜[šÈˆ
+ÈXÙNŽ”Ýš[™ÎŽ˜Ú\•ÔÝš[™ÊÝ]X×ØØ\ÝXÙNŽšXÙWÝØÚ\Š	ÐIÈ
+ÈJJJNÂˆ˜[šÐ]Û‹O›ÛÛXÚÈHÝ\ËWHÈÙ[XÝ]\›˜[šÊJNÈNÂˆ˜[šÐ]Û‹OœÙ][˜X›Y
+˜[ÙJNÂˆY[™XZÙUš\ÚX›J
+˜˜[šÐ]ÛŠNÂˆ˜[šÐ]Û‹OœÙ]š\ÚX›J˜[ÙJNÂ‚ˆ]\›”ÛÝ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWHHÝŽ›XZÙWÝ[š\]YOXÙNŽ•^]ÛŠXÙNŽ”Ýš[™ÊH
+ÈJJNÂˆ]]ÊˆÛÝ]ÛˆH]\›”ÛÝ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWK™Ù]
+
+NÂˆÛÝ]Û‹OœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆÛÝ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMKLMLÌJJNÂˆÛÝ]Û‹OœÙ]ÛÛ\
+”Ù[XÝ]\›ˆÛÝˆ
+ÈXÙNŽ”Ýš[™ÊH
+ÈJJNÂˆÛÝ]Û‹O›ÛÛXÚÈHÝ\ËWHÈÙ[XÝ]\›”ÛÝ
+JNÈNÂˆÛÝ]Û‹OœÙ][˜X›Y
+˜[ÙJNÂˆY[™XZÙUš\ÚX›J
+œÛÝ]ÛŠNÂˆÛÝ]Û‹OœÙ]š\ÚX›J˜[ÙJNÂˆBˆ]\›˜[šÐ]ÛœÖÌKOœÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›”ÛÝ]ÛœÖÌKOœÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂ‚ˆ^[\ÝÚ[™ÝÈHÝŽ›XZÙWÝ[š\]YO^[\ÝÚ[™ÝÏŠˆÝ\×HÈ™]\›ˆ›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈKˆÝ\×J[›ÝÊHÈ™]\›ˆ›Ú™XÝ™Ù]˜XÚÓ˜[YJ›ÝÊNÈKˆÝ\×J[›ÝË[˜\ŠHÈ™]\›ˆÙ]^[\ÝÛ\X™[
+›ÝË˜\ŠNÈKˆÝ\×J[›ÝË[˜\ŠHÈÙÙÛT^[\ÝÛ\
+›ÝË˜\ŠNÈKˆÝ\×J[›ÝË[˜\ŠHÈZ[^[\ÝÛ\
+›ÝË˜\ŠNÈKˆÝ\×HÈš[š\Ú^[\ÝZ[Ù\Ý\™J
+NÈKˆÝ\×J[›ÝÊHÈ™]\›ˆÙ]˜XÚÓ]]J›ÝÊNÈKˆÝ\×J[›ÝË›ÛÛ˜[YJHÈÙ]˜XÚÓ]]J›ÝË˜[YJNÈKˆÝ\×J[›ÝÊHÈ™]\›ˆÙ]˜XÚÔÛÛÊ›ÝÊNÈKˆÝ\×J[›ÝË›ÛÛ˜[YJHÈÙ]˜XÚÔÛÛÊ›ÝË˜[YJNÈKˆÝ\×J[›ÝÊHÈ™]\›ˆÙ]˜XÚÔ™XÛÜ™\›J›ÝÊNÈKˆÝ\×J[›ÝË›ÛÛ˜[YJHÈÙ]˜XÚÔ™XÛÜ™\›J›ÝË˜[YJNÈKˆÝ\×J[›ÝË[ÛÝ\˜ÙP˜\‹[\Ý[˜][Û”›ÝË[\Ý[˜][Û˜\ŠBˆÂˆ[Ý™T^[\ÝÛ\
+›ÝËÛÝ\˜ÙP˜\‹\Ý[˜][Û”›ÝË\Ý[˜][Û˜\ŠNÂˆKˆÝ\×J[›ÝË[˜\‹XÙNŽÛÛ\Û™[
+ˆ\™Ù]
+HÈÚÝÔ^[\Ý]\›“Y[J›ÝË˜\‹\™Ù]
+NÈKˆÝ\×J[›ÝË[˜\ŠHÈ[]T^[\ÝÛ\
+›ÝË˜\ŠNÈKˆÝ\×J[›ÝË[˜\‹[\™XÝ[ÛŠHÈØÜ›Û^[\Ý]\›Š›ÝË˜\‹\™XÝ[ÛŠNÈJNÂˆ^[\ÝÚ[™ÝËOœÙ]˜XÚÐÛÛÝ\”›ÝšY\ŠÝ\×J[›ÝÊHÈ™]\›ˆ›Ú™XÝ™Ù]˜XÚÐÛÛÝ\Š›ÝÊNÈJNÂˆ^[\ÝÚ[™ÝËOœÙ]ÛÜ˜[™ÙQœ›ÛT[\ŠÝ\×J[Ý\˜\‹[[™Ý˜\œÊBˆÂˆÛÜÝ\ÛY\‹œÙ]˜[YJÝ\˜\‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÜ[™ÝÛY\‹œÙ]˜[YJ[™Ý˜\œËXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+[ÛÜ]Û‹™Ù]ÙÙÛTÝ]J
+JHÛÜ]Û‹œÙ]ÙÙÛTÝ]JYKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ\]SÛÜ˜[™ÙJ
+NÂˆJNÂˆ^[\ÝÚ[™ÝËOœÙ]˜XÚÐÛÛ^Y[R[™\ŠˆÝ\×J[›ÝËXÙNŽÛÛ\Û™[
+ˆ\™Ù]
+HÈÚÝÔ^[\Ý˜XÚÐÛÛ^Y[J›ÝË\™Ù]
+NÈJNÂˆ^[\ÝÚ[™ÝËOœÙ]Û\™]šY]ÊÝ\×J[›ÝË[˜\ŠHÈ™]\›ˆÙ]^[\Ý™]šY]Ó›Ý\Ê›ÝË˜\ŠNÈJNÂˆ^[\ÝÚ[™ÝËOœÙ]ÛÛ™Ð]]ÛX][ÛØ[˜XÚÜÊˆÝ\×J[˜XÚÒ[™^[ÛÛ™ÔÝ\
+BˆÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JJH™]\›ˆYŽÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆ›Üˆ
+[HHÈH›Ú™XÝ™Ù]ÛÛ™Ð]]ÛX][Û“[™PÛÝ[
+˜XÚÒY
+NÈ
+ÊÚJBˆÂˆÛÛœÝ]]È[™HH›Ú™XÝ™Ù]ÛÛ™Ð]]ÛX][Û“[™J˜XÚÒYJNÂˆYˆ
+[™KœYÚ[“˜[YHOH]]ÛX][Û”YÚ[“˜[YH	‰ˆ[™Kœ\˜[Y]\’YOH]]ÛX][Û”\˜[Y]\’Y
+Bˆ™]\›ˆ]˜[X]P]]ÛX][Û“[™J[™KÛÛ™ÔÝ\
+NÂˆBˆ™]\›ˆYŽÂˆKˆÝ\×J[˜XÚÒ[™^[ÛÛ™ÔÝ\›Ø]˜[YJBˆÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JBˆ]]ÛX][Û”YÚ[“˜[YKš\Ñ[\J
+H]]ÛX][Û”\˜[Y]\’Yš\Ñ[\J
+JH™]\›ŽÂˆ›Ú™XÝœÙ]ÛÛ™Ð]]ÛX][Û”Ú[
+›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+K]]ÛX][Û”YÚ[“˜[YKˆ]]ÛX][Û”\˜[Y]\’Y]]ÛX][Û”\˜[Y]\“˜[YKÛÛ™ÔÝ\˜[YJNÂˆ\Ñ\HHYNÂˆ\]Q[™Ú[™P]]ÛX][ÛŠ
+NÂˆÝ]\ËœÙ]^
+”ÛÛ™È^[\Ý]]ÛX][ÛˆÚ[\]YˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆJNÂˆ^[\ÝÚ[™ÝËOœÙ]]]ÛX][Û“[ÙPÚ[™ÙY
+Ý\×J›ÛÛ[˜X›Y
+BˆÂˆÝ]\ËœÙ]^
+[˜X›YˆÈ”^[\Ý]]ÛX][Ûˆ[ÙNˆ˜]ÈHÙ[XÝYYÚ[ˆ\˜[Y]\ˆXÜ›ÜÜÈÛÛ™È[YKˆ‚ˆˆ”^[\Ý]\›ˆ˜]Ú[™È[ÙH™\ÝÜ™Yˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆJNÂˆY[™XZÙUš\ÚX›J
+œ^[\ÝÚ[™ÝÊNÂˆ]Y][Û’Ù^X›Ø\™œÙ]]J”^HHÙ[XÝY[œÝ[Y[\™XÝKˆÛXÚÈÜˆ˜YÈXÜ›ÜÜÈÙ^\ÈÈ]Y][Ûˆ›Ý\ËˆŠNÂˆ]Y][Û’Ù^X›Ø\™›Û“›ÝHHÝ\×J[]Ú›ÛÛ\ÑÝÛŠHÈ]Y][Û”Ù[XÝY[œÝ[Y[
+]Ú\ÑÝÛŠNÈNÂˆY[™XZÙUš\ÚX›J]Y][Û’Ù^X›Ø\™
+NÂˆ]Y][Û’Ù^X›Ø\™œÙ]š\ÚX›J˜[ÙJNÂ‚ˆX[›Ô›ÛÚ[™ÝÈHÝŽ›XZÙWÝ[š\]YOX[›Ô›ÛÚ[™ÝÏŠˆÝ\×HÈ™]\›ˆ›Ú™XÝ™Ù]]\›“[™ÝÝ\ÊÙ[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+JNÈKˆÝ\×J[]Ú[Ý\
+BˆÂˆYˆ
+]ÚZ[š[][T]Ú]ÚˆX^[][T]ÚÝ\Ý\H
+H™]\›ˆ˜[ÙNÂˆ™]\›ˆ›ÝQÜšYÜÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+WNÂˆKˆÝ\×HÈ™]\›ˆ[›Ý\ÔÙ[XÝYÈKˆÝ\×J[]Ú[Ý\
+BˆÂˆ™]\›ˆ›Ú™XÝ™Ù]]\›“›ÝS[™Ý
+Ù[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+K]ÚÝ\
+NÂˆKˆÝ\×J[]Ú[Ý\›ÛÛ\˜\ÙJHÈÙÙÛTX[›Ô›Û›ÝJ]ÚÝ\\˜\ÙJNÈKˆÝ\×J[]Ú[Ý\[[™Ý
+HÈÙ]X[›Ô›Û›ÝS[™Ý
+]ÚÝ\[™Ý
+NÈKˆÝ\×HÈX[›Ô›ÛÙ\Ý\™PÚ[™ÙYH˜[ÙNÈX[›Ô›ÛÙ\Ý\™PXÝ]™HHYNÈKˆÝ\×BˆÂˆÛÛœÝ›ÛÛÚ[™ÙYHX[›Ô›ÛÙ\Ý\™PÚ[™ÙYÂˆX[›Ô›ÛÙ\Ý\™PXÝ]™HH˜[ÙNÂˆX[›Ô›ÛÙ\Ý\™PÚ[™ÙYH˜[ÙNÂˆYˆ
+Ú[™ÙY
+BˆÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+Ù]Ù[XÝY]\›•]J
+JNÂˆ™XZ[]\›Û\
+
+NÂˆBˆKˆÝ\×J[]Ú›ÛÛ\ÑÝÛŠBˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠH™]\›ŽÂˆÛÛœÝ^ˆ[]Y][ÛÚ[›™[HNÂˆYˆ
+\ÑÝÛŠBˆÂˆ
+ÊÛZYP]Y][Û“›ÝSÛœÎÂˆ\ÝZYPXÝ]š]HH”X[›ÈÙ^X›Ø\™]Úˆ
+ÈXÙNŽ”Ýš[™Ê]Ú
+H
+ÈˆÛˆŽÂˆ[œÝ[Y[˜XÚËOœ^QÝZYS›ÝJ]ÚNŽ“ZYPÚ[›™[
+]Y][ÛÚ[›™[
+KLˆYKYK˜[ÙJNÂˆBˆ[ÙBˆÂˆ\ÝZYPXÝ]š]HH”X[›ÈÙ^X›Ø\™]Úˆ
+ÈXÙNŽ”Ýš[™Ê]Ú
+H
+ÈˆÙ™ˆŽÂˆ[œÝ[Y[˜XÚËO\›“Ù™‘ÝZYS›Ý\ÊNŽ“ZYPÚ[›™[
+]Y][ÛÚ[›™[
+JNÂˆBˆJNÂˆX[›Ô›ÛÚ[™ÝËO˜]]ÛX][Û•˜[YHHÝ\×J[Ý\
+BˆÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆÛÛœÝ]]ÈÛÝ[H›Ú™XÝ™Ù]]\›]]ÛX][Û“[™PÛÝ[
+˜XÚÒYÙ[XÝY]\›’[™^
+
+JNÂˆ›Üˆ
+[[™R[™^HÈ[™R[™^ÛÝ[È
+ÊÛ[™R[™^
+BˆÂˆÛÛœÝ]]È[™HH›Ú™XÝ™Ù]]\›]]ÛX][Û“[™J˜XÚÒYÙ[XÝY]\›’[™^
+
+K[™R[™^
+NÂˆYˆ
+[™KœYÚ[“˜[YHOH]]ÛX][Û”YÚ[“˜[YH	‰ˆ[™Kœ\˜[Y]\’YOH]]ÛX][Û”\˜[Y]\’Y
+Bˆ™]\›ˆ]˜[X]P]]ÛX][Û“[™J[™KÝ\
+NÂˆBˆ™]\›ˆYŽÂˆNÂˆX[›Ô›ÛÚ[™ÝËO˜]]ÛX][Û”Ú[Ú[™ÙYHÝ\×J[Ý\›Ø]˜[YJBˆÂˆYˆ
+]]ÛX][Û”YÚ[“˜[YKš\Ñ[\J
+H]]ÛX][Û”\˜[Y]\’Yš\Ñ[\J
+JH™]\›ŽÂˆ›Ú™XÝœÙ]]\›]]ÛX][Û”Ú[
+Ù[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+Kˆ]]ÛX][Û”YÚ[“˜[YK]]ÛX][Û”\˜[Y]\’Y]]ÛX][Û”\˜[Y]\“˜[YKÝ\˜[YJNÂˆ\Ñ\HHYNÂˆ\]Q[™Ú[™P]]ÛX][ÛŠ
+NÂˆÝ]\ËœÙ]^
+”]\›ˆ]]ÛX][ÛˆÚ[\]YˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆNÂˆX[›Ô›ÛÚ[™ÝËO›Û]]ÛX][Û•\™Ù]Ú[™ÙYHÝ\×JÛÛœÝXÙNŽ”Ýš[™Éˆ\™Ù]
+BˆÂˆÛÛœÝ]]È\ÈHXÙNŽ”Ýš[™Ð\œ˜^NŽ™œ›ÛS[™\Ê\™Ù]
+NÂˆ]]ÛX][Û”YÚ[“˜[YHH\ËœÚ^™J
+HˆÈ\ÖÌHˆXÙNŽ”Ýš[™ÞßNÂˆ]]ÛX][Û”\˜[Y]\’YH\ËœÚ^™J
+HˆHÈ\ÖÌWHˆXÙNŽ”Ýš[™ÞßNÂˆ]]ÛX][Û”\˜[Y]\“˜[YHH\ËœÚ^™J
+HˆˆÈ\ÖÌ—HˆXÙNŽ”Ýš[™ÞßNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœ™\Z[
+
+NÂˆNÂˆ™Yœ™\ÚX[›Ô›Û]]ÛX][Û•\™Ù]Ê
+NÂˆX[›Ô›ÛÚ[™ÝËO›ÛÛÜÙHHÝ\×HÈÛÜÙTX[›Ô›ÛšY]Ê
+NÈNÂˆX[›Ô›ÛÚ[™ÝËO›Û“X[š\[][Û”Ý\YHÝ\×JXÙNŽ”Ú[[ˆÚ[\‹›ÛÛ™\Ú^š[™ÊBˆÂˆYˆ
+\X[›Ô›ÛX^[Z^™YX[›Ô›ÛÚ[™ÝÈOH[ŠH™]\›ŽÂˆÛÛœÝ]]ÈÛÜšÜÜXÙHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJ
+Kœ™YXÙY
+ML
+NÂˆÛÛœÝ]]È[™[HX[›Ô›Û™\ÝÜ™P›Ý[™Ëš\Ñ[\J
+HÈÙ[™\˜]Ü”[™[›Ý[™ÈˆX[›Ô›Û™\ÝÜ™P›Ý[™ÎÂˆÙ[™\˜]Ü”[™[›Ý[™ÈH[™[ÂˆX[›Ô›ÛX^[Z^™YH˜[ÙNÂˆÛÛœÝ]]ÈÚYHXÙNŽš›Z[ŠLÛÜšÜÜXÙK™Ù]ÚY
+
+JNÂˆÛÛœÝ]]ÈZYÚHXÙNŽš›Z[ŠLÛÜšÜÜXÙK™Ù]ZYÚ
+
+JNÂˆ[H[™[™Ù]
+
+H
+ÈLŽÂˆ[HH[™[™Ù]J
+H
+ÈÎÂˆYˆ
+™\Ú^š[™ÊBˆÂˆËÈÙY\H™\Ú^™HÛÜ›™\ˆ[™\ˆHÚ[\ˆÚ[ˆHX^[Z^™YˆËÈ›Û\È™\ÝÜ™YÛÈHØ[YHÙ\Ý\™HÛÛ[Y\È™\Ú^š[™Ë‚ˆHÚ[\‹žHÚYÂˆHHÚ[\‹žHHZYÚÂˆBˆ[ÙBˆÂˆËÈ™\Ù\™HHÚ[\‰ÜÈÜš^›Û[ÜÚ][ÛˆXÜ›ÜÜÈBˆËÈX^[Z^™Y]ËY›Ø][™ÈÚ^™HÚ[™ÙKZÙHH›Ü›X[Ú[™ÝË‚ˆÛÛœÝ]]ÈÛÝ\˜ÙUÚYHXÙNŽš›X^
+KX[›Ô›ÛÚ[™ÝËO™Ù]ÚY
+
+JNÂˆÛÛœÝ]]ÈÙ™œÙ]HXÙNŽš›[Z]
+ŒXÙNŽš›X^
+ŒÚYHÍŠKˆXÙNŽœ›Ý[™Ò[
+Ý]X×ØØ\ÝÝX›OŠÚ[\‹žHX[›Ô›ÛÚ[™ÝËO™Ù]
+
+JBˆ
+ˆÚYÈÛÝ\˜ÙUÚY
+JNÂˆHÚ[\‹žHÙ™œÙ]ÂˆHHÚ[\‹žHHMÂˆBˆX[›Ô›Û›Ý[™ÈHÈKÚYZYÚNÂˆX[›Ô›Û›Ý[™ËœÙ]ÜÚ][ÛŠˆXÙNŽš›[Z]
+ÛÜšÜÜXÙK™Ù]
+
+KXÙNŽš›X^
+ÛÜšÜÜXÙK™Ù]
+
+KÛÜšÜÜXÙK™Ù]šYÚ
+
+HHÚY
+KX[›Ô›Û›Ý[™Ë™Ù]
+
+JKˆXÙNŽš›[Z]
+ÛÜšÜÜXÙK™Ù]J
+KXÙNŽš›X^
+ÛÜšÜÜXÙK™Ù]J
+KÛÜšÜÜXÙK™Ù]›ÝÛJ
+HHZYÚ
+KX[›Ô›Û›Ý[™Ë™Ù]J
+JJNÂˆX[›Ô›Û]Û‹œÙ]]Û•^
+’S”Õ•SQS•ŠNÂˆ™\Ú^™Y
+
+NÂˆNÂˆX[›Ô›ÛÚ[™ÝËO›Û›Ý[™ÐÚ[™ÙYHÝ\×JXÙNŽ”™XÝ[™ÛO[ˆ›Ý[™ÊBˆÂˆX[›Ô›Û›Ý[™ÈH›Ý[™ÎÂˆX[›Ô›ÛX^[Z^™YH˜[ÙNÂˆNÂˆX[›Ô›ÛÚ[™ÝËO˜Y[Ý\ÙS\Ý[™\Š\ËYJNÂˆY[™XZÙUš\ÚX›J
+œX[›Ô›ÛÚ[™ÝÊNÂˆX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü‘ØÚÕšY]ÜÜœÙ]šY]ÙYÛÛ\Û™[
+	™Ù[™\˜]Ü‘ØÚÔÝš\˜[ÙJNÂˆÙ[™\˜]Ü‘ØÚÕšY]ÜÜœÙ]ØÜ›Û˜\œÔÚÝÛŠ˜[ÙKYJNÂˆY[™XZÙUš\ÚX›JÙ[™\˜]Ü‘ØÚÕšY]ÜÜ
+NÂˆÙ[™\˜]Ü‘ØÚÕšY]ÜÜœÙ]š\ÚX›J˜[ÙJNÂ‚ˆZ^\•Ú[™ÝÈHÝŽ›XZÙWÝ[š\]YOZ^\•Ú[™ÝÏŠ
+NÂˆY[™XZÙUš\ÚX›J
+›Z^\•Ú[™ÝÊNÂˆZ^\•Ú[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆZ^\•Ú[™ÝËO›Û‘›ØÝ\ÈHÝ\×BˆÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOÑœ›Û
+˜[ÙJNÂˆZ^\“[Ý™R[™KœÙ]š\ÚX›J˜[ÙJNÂˆZ^\”™\Ú^™R[™KœÙ]š\ÚX›J˜[ÙJNÂˆNÂˆZ^\•Ú[™ÝËO›Û‘˜YÙÙYHÝ\×JXÙNŽ”Ú[[ˆÜÚ][ÛŠBˆÂˆYˆ
+[Z^\›Ý[™Ò[š]X[\ÙYZ^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆÛÛœÝ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆZ^\”[™[›Ý[™ËœÙ]ÜÚ][ÛŠˆXÙNŽš›[Z]
+\™XK™Ù]
+
+KXÙNŽš›X^
+\™XK™Ù]
+
+K\™XK™Ù]šYÚ
+
+HHZ^\”[™[›Ý[™Ë™Ù]ÚY
+
+JKÜÚ][Û‹ž
+KˆXÙNŽš›[Z]
+\™XK™Ù]J
+KXÙNŽš›X^
+\™XK™Ù]J
+K\™XK™Ù]›ÝÛJ
+HHZ^\”[™[›Ý[™Ë™Ù]ZYÚ
+
+JKÜÚ][Û‹žJJNÂˆZ^\•Ú[™ÝËOœÙ]›Ý[™ÊZ^\”[™[›Ý[™ÊNÂˆ˜YÙÚ[™ÓZ^\ˆHYNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆNÂˆZ^\•Ú[™ÝËO›Û‘˜YÑ[™YHÝ\×HÈØ]™SZ^\”[™[›Ý[™Ê
+NÈNÂˆZ^\•Ú[™ÝËO›Û“Z[š[Z^™PÚ[™ÙYHÝ\×J›ÛÛZ[š[Z^™Y
+BˆÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆÛÛœÝ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆYˆ
+Z[š[Z^™Y
+HZ^\”[™[›Ý[™ËœÙ]ZYÚ
+ŠNÂˆ[ÙHZ^\”[™[›Ý[™ËœÙ]ZYÚ
+\™XK™Ù]ZYÚ
+
+JNÂˆZ^\•Ú[™ÝËOœÙ]›Ý[™ÊZ^\”[™[›Ý[™ÊNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆØ]™SZ^\”[™[›Ý[™Ê
+NÂˆNÂˆZ^\•Ú[™ÝËO›ÛÛÜÙHHÝ\×BˆÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆ™\Z[
+
+NÂˆNÂˆ›Üˆ
+]]ÊˆÛÛ›ÛˆÝŽ˜\œ˜^OXÙNŽÛÛ\Û™[
+‹MˆÂˆ	œX[›Ô›Û]Û‹	™Ù[™\˜]Ü“]]P]Û‹	™Ù[™\˜]Ü”ÛÛÐ]Û‹	™Ù[™\˜]Ü”Ù][™ÜÐ]Û‹ˆ	œ]\›”™\Ù]Ù[XÝÜ‹	›Ü[”™\Ù]]Û‹	œØ]™T™\Ù]]Û‹	œ]\›“[™ÝÝÛ]Û‹ˆ	œ]\›“[™Ý\Ü^K	œ]\›“[™Ý\]Û‹	˜XÚÔÙ[XÝÜ‹ˆ	™Ù[™\˜]ÜÛÛ\ÙP]Û‹	™Ù[™\˜]Ü‘˜YÒ[™K	™Ù[™\˜]Ü”™\Ú^™R[™HJBˆÛÛ›ÛO˜Y[Ý\ÙS\Ý[™\Š\ËYJNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›˜[šÐ]ÛœÊH]Û‹O˜Y[Ý\ÙS\Ý[™\Š\ËYJNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›”ÛÝ]ÛœÊH]Û‹O˜Y[Ý\ÙS\Ý[™\Š\ËYJNÂˆZ^\“[Ý™R[™K™˜YÔÝ\YHÝ\×JXÙNŽ”Ú[[ˆÚ[
+BˆÂˆYˆ
+[Z^\›Ý[™Ò[š]X[\ÙYZ^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆZ^\‘˜YÓÙ™œÙ]HÚ[HZ^\”[™[›Ý[™Ë™Ù]ÜÚ][ÛŠ
+NÂˆ˜YÙÚ[™ÓZ^\ˆHYNÂˆZ^\•Ú[™ÝËOÑœ›Û
+˜[ÙJNÂˆZ^\“[Ý™R[™KÑœ›Û
+˜[ÙJNÂˆZ^\”™\Ú^™R[™KÑœ›Û
+˜[ÙJNÂˆNÂˆZ^\“[Ý™R[™K™˜YÙÙYHÝ\×JXÙNŽ”Ú[[ˆÚ[
+HÈ[Ý™SZ^\”[™[
+Ú[
+NÈNÂˆZ^\“[Ý™R[™K™˜YÑ[™YHÝ\×HÈ[™Z^\‘˜YÊ
+NÈNÂˆZ^\”™\Ú^™R[™Kœ™\Ú^™TÝ\YHÝ\×JXÙNŽ”Ú[[ˆÚ[
+BˆÂˆYˆ
+[Z^\›Ý[™Ò[š]X[\ÙYZ^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆ™\Ú^š[™ÓZ^\ˆHYNÂˆZ^\”™\Ú^™TÝ\HÚ[ÂˆZ^\”™\Ú^™TÝ\›Ý[™ÈHZ^\”[™[›Ý[™ÎÂˆZ^\•Ú[™ÝËOÑœ›Û
+˜[ÙJNÂˆZ^\“[Ý™R[™KÑœ›Û
+˜[ÙJNÂˆZ^\”™\Ú^™R[™KÑœ›Û
+˜[ÙJNÂˆNÂˆZ^\”™\Ú^™R[™Kœ™\Ú^™YžQ˜YÈHÝ\×JXÙNŽ”Ú[[ˆÚ[
+HÈ™\Ú^™SZ^\”[™[
+Ú[
+NÈNÂˆZ^\”™\Ú^™R[™Kœ™\Ú^™Q[™YHÝ\×HÈ[™Z^\”™\Ú^™J
+NÈNÂˆY[™XZÙUš\ÚX›JZ^\“[Ý™R[™JNÂˆY[™XZÙUš\ÚX›JZ^\”™\Ú^™R[™JNÂˆZ^\“[Ý™R[™KœÙ]š\ÚX›J˜[ÙJNÂˆZ^\”™\Ú^™R[™KœÙ]š\ÚX›J˜[ÙJNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÐÛÝ[HÝ\×HÈ™]\›ˆY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+KœÚ^™J
+HˆÈNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÓ˜[YHHÝ\×J[[™^
+BˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆ™]\›ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JHÈ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]˜[YJ
+HˆXÙNŽ”Ýš[™ÞßNÂˆNÂˆZ^\•Ú[™ÝËOœ™[˜[YU˜XÚÈHÝ\×J[[™^ÛÛœÝXÙNŽ”Ýš[™Éˆ˜[YJBˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆÛÛœÝ]]ÈÛX[™YH˜[YKš[J
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JHÛX[™Yš\Ñ[\J
+JH™]\›ŽÂˆ]]Êˆ˜XÚÈH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+NÂˆYˆ
+˜XÚËO™Ù]˜[YJ
+HOHÛX[™Y	‰ˆ›Ú™XÝ™Ù]˜XÚÓ˜[YJ[™^
+HOHÛX[™Y
+H™]\›ŽÂˆYˆ
+˜XÚËO™Ù]˜[YJ
+HOHÛX[™Y
+H˜XÚËOœÙ]˜[YJÛX[™Y
+NÂˆ›Ú™XÝœÙ]˜XÚÓ˜[YJ[™^ÛX[™Y
+NÂˆ\Ñ\HHYNÂˆ™Yœ™\Ú˜XÚÔÙ[XÝÜŠ
+NÂˆ™Yœ™\ÚZ^\ÛÛ›ÛÊ
+NÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+Ù]Z^\•˜XÚÜÊ
+Kš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆÝ]\ËœÙ]^
+”™[˜[YYZ^\ˆÚ[›™[Èˆ
+ÈÛX[™Y
+È‹ˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÑØZ[ˆHÝ\×J[[™^
+HÈ™]\›ˆÙ]˜XÚÑØZ[‘Š[™^
+NÈNÂˆZ^\•Ú[™ÝËOœÙ]˜XÚÑØZ[ˆHÝ\×J[[™^ÝX›H˜[YJHÈÙ]˜XÚÑØZ[‘Š[™^˜[YJNÈNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÔ[ˆHÝ\×J[[™^
+HÈ™]\›ˆÙ]˜XÚÔ[Š[™^
+NÈNÂˆZ^\•Ú[™ÝËOœÙ]˜XÚÔ[ˆHÝ\×J[[™^ÝX›H˜[YJHÈÙ]˜XÚÔ[Š[™^˜[YJNÈNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÓ]]YHÝ\×J[[™^
+HÈ™]\›ˆÙ]˜XÚÓ]]J[™^
+NÈNÂˆZ^\•Ú[™ÝËOœÙ]˜XÚÓ]]YHÝ\×J[[™^›ÛÛ˜[YJHÈÙ]˜XÚÓ]]J[™^˜[YJNÈNÂˆZ^\•Ú[™ÝËOš\ÑÙ[™\˜]Ü•˜XÚÈHÝ\×J[[™^
+HÈ™]\›ˆ[™^Ù]Ù[™\˜]Ü•˜XÚÜÊ
+KœÚ^™J
+NÈNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÔÛÛÈHÝ\×J[[™^
+HÈ™]\›ˆÙ]˜XÚÔÛÛÊ[™^
+NÈNÂˆZ^\•Ú[™ÝËOœÙ]˜XÚÔÛÛÈHÝ\×J[[™^›ÛÛ˜[YJHÈÙ]˜XÚÔÛÛÊ[™^˜[YJNÈNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÑ\T™\ÜÛœÙHHÝ\×J[[™^›Ø]œ™\]Y[˜ÞJHÈ™]\›ˆÙ]˜XÚÑ\T™\ÜÛœÙJ[™^œ™\]Y[˜ÞJNÈNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÑ\T\˜[Y]\ˆHÝ\×J[[™^[\˜[Y]\ŠHÈ™]\›ˆÙ]˜XÚÑ\T\˜[Y]\Š[™^\˜[Y]\ŠNÈNÂˆZ^\•Ú[™ÝËOœÙ]˜XÚÑ\T\˜[Y]\ˆHÝ\×J[[™^[\˜[Y]\‹›Ø]˜[YJBˆÂˆÙ]˜XÚÑ\T\˜[Y]\Š[™^\˜[Y]\‹˜[YJNÂˆNÂˆZ^\•Ú[™ÝËOœÙ]˜XÚÑ\P˜[™HÝ\×J[[™^[˜[™›Ø]œ™\]Y[˜ÞK›Ø]ØZ[ŠBˆÂˆÙ]˜XÚÑ\P˜[™
+[™^˜[™œ™\]Y[˜ÞKØZ[ŠNÂˆNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÑ\Q[˜X›YHÝ\×J[[™^
+BˆÂˆÛÛœÝ]]Êˆ\HHÙ]˜XÚÑ\]X[\Ù\Š[™^
+NÂˆ™]\›ˆ\HOH[ˆ	‰ˆ\KOš\Ñ[˜X›Y
+
+NÂˆNÂˆZ^\•Ú[™ÝËOœÙ]˜XÚÑ\Q[˜X›YHÝ\×J[[™^›ÛÛ[˜X›Y
+BˆÂˆÙ]˜XÚÑ\Q[˜X›Y
+[™^[˜X›Y
+NÂˆNÂˆZ^\•Ú[™ÝËO›Û“Ü[‘\HHÝ\×J[[™^
+HÈÜ[•˜XÚÑ\]X[\Ù\Š[™^
+NÈNÂˆZ^\•Ú[™ÝËO™Ù][œÙ\˜[Y\ÈHÝ\×J[[™^
+HÈ™]\›ˆÙ][œÙ\˜[Y\Ê[™^
+NÈNÂˆZ^\•Ú[™ÝËO™Ù][œÙ\[˜X›YHÝ\×J[[™^[ÛÝ
+HÈ™]\›ˆÙ][œÙ\[˜X›Y
+[™^ÛÝ
+NÈNÂˆZ^\•Ú[™ÝËOÙÙÛR[œÙ\HÝ\×J[[™^[ÛÝ
+HÈÙÙÛR[œÙ\
+[™^ÛÝ
+NÈNÂˆZ^\•Ú[™ÝËO™Y][œÙ\HÝ\×J[[™^[ÛÝ
+HÈÜ[’[œÙ\Y]ÜŠ[™^ÛÝ
+NÈNÂˆZ^\•Ú[™ÝËOœ™[[Ý™R[œÙ\HÝ\×J[[™^[ÛÝ
+HÈ™[[Ý™R[œÙ\
+[™^ÛÝ
+NÈNÂˆZ^\•Ú[™ÝËO˜Y[œÙ\HÝ\×J[[™^[Ú[™
+HÈY[œÙ\
+[™^Ú[™
+NÈNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÔÙ[™ØZ[ˆHÝ\×J[[™^[\ÊHÈ™]\›ˆÙ]˜XÚÔÙ[™ØZ[‘Š[™^\ÊNÈNÂˆZ^\•Ú[™ÝËOœÙ]˜XÚÔÙ[™ØZ[ˆHÝ\×J[[™^[\ËÝX›H˜[YJHÈÙ]˜XÚÔÙ[™ØZ[‘Š[™^\Ë˜[YJNÈNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÓÝ]]\ÈHÝ\×J[[™^
+HÈ™]\›ˆÙ]˜XÚÓÝ]]\Ê[™^
+NÈNÂˆZ^\•Ú[™ÝËOœÙ]˜XÚÓÝ]]\ÈHÝ\×J[[™^[\ÊHÈÙ]˜XÚÓÝ]]\Ê[™^\ÊNÈNÂˆZ^\•Ú[™ÝËOš\Ñž™]\›ˆHÝ\×J[\ÊHÈ™]\›ˆÙ]ž™]\›•˜XÚÊ\ÊHOH[ŽÈNÂˆZ^\•Ú[™ÝËO›Û“Ü[‘ž™]\›ˆHÝ\×J[\ÊHÈÜ[‘ž™]\›‘Y]ÜŠ\ÊNÈNÂˆZ^\•Ú[™ÝËO™Ù]˜XÚÓY]\ˆHÝ\×J[[™^
+HOˆNŽ“]™[Y]\”YÚ[Š‚ˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆ™]\›ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JHÈ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]]™[Y]\”YÚ[Š
+Hˆ[ŽÂˆNÂˆZ^\•Ú[™ÝËO™Ù]X\Ý\“Y]\ÛÛ^HÝ\×J
+HOˆNŽ‘Y]^X˜XÚÐÛÛ^
+‚ˆÂˆ™]\›ˆY]OH[ˆÈY]O™Ù]Ý\œ™[^X˜XÚÐÛÛ^
+
+Hˆ[ŽÂˆNÂˆZ^\•Ú[™ÝËO™Ù]X\Ý\‘ØZ[ˆHÝ\×HÈ™]\›ˆY]OH[ˆ	‰ˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+HOH[‚ˆÈÙ]X\Ý\‘ØZ[‘Š
+HˆŒÈNÂˆZ^\•Ú[™ÝËOœÙ]X\Ý\‘ØZ[ˆHÝ\×JÝX›H˜[YJHÈÙ]X\Ý\‘ØZ[‘Š˜[YJNÈNÂˆZ^\•Ú[™ÝËO™Ù]X\Ý\”[ˆHÝ\×HÈ™]\›ˆY]OH[ˆ	‰ˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+HOH[‚ˆÈY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+KO™Ù][Š
+HˆŒÈNÂˆZ^\•Ú[™ÝËOœÙ]X\Ý\”[ˆHÝ\×JÝX›H˜[YJHÈÙ]X\Ý\”[Š˜[YJNÈNÂˆZ^\•Ú[™ÝËO™Ù]X\Ý\“]]YHÝ\×HÈ™]\›ˆ\ÓX\Ý\“]]Y
+
+NÈNÂˆZ^\•Ú[™ÝËOœÙ]X\Ý\“]]YHÝ\×J›ÛÛ˜[YJHÈÙ]X\Ý\“]]Y
+˜[YJNÈNÂ‚ˆ\]X[\Ù\•Ú[™ÝÈHÝŽ›XZÙWÝ[š\]YO\]X[\Ù\•Ú[™ÝÏŠ
+NÂˆ\]X[\Ù\•Ú[™ÝËO™Ù]˜XÚÓ˜[YHHÝ\×J[[™^
+BˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆYˆ
+Y]OH[ˆ	‰ˆ[™^OH˜XÚÜËœÚ^™J
+JH™]\›ˆXÙNŽ”Ýš[™Ê“X\Ý\ˆŠNÂˆ™]\›ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JHÈ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]˜[YJ
+HˆXÙNŽ”Ýš[™Ê‘Ù[™\˜]ÜˆŠNÂˆNÂˆ\]X[\Ù\•Ú[™ÝËO™Ù]\˜[Y]\ˆHÝ\×J[[™^[\˜[Y]\ŠHÈ™]\›ˆÙ]˜XÚÑ\T\˜[Y]\Š[™^\˜[Y]\ŠNÈNÂˆ\]X[\Ù\•Ú[™ÝËO™Ù]™\ÜÛœÙHHÝ\×J[[™^›Ø]œ™\]Y[˜ÞJHÈ™]\›ˆÙ]˜XÚÑ\T™\ÜÛœÙJ[™^œ™\]Y[˜ÞJNÈNÂˆ\]X[\Ù\•Ú[™ÝËOœÙ]\˜[Y]\ˆHÝ\×J[[™^[\˜[Y]\‹›Ø]˜[YJHÈÙ]˜XÚÑ\T\˜[Y]\Š[™^\˜[Y]\‹˜[YJNÈNÂˆ\]X[\Ù\•Ú[™ÝËOœÙ]˜[™˜[Y\ÈHÝ\×J[[™^[˜[™›Ø]œ™\]Y[˜ÞK›Ø]ØZ[ŠBˆÂˆÙ]˜XÚÑ\P˜[™
+[™^˜[™œ™\]Y[˜ÞKØZ[ŠNÂˆNÂ‚ˆ›Üˆ
+[HHÈHMŽÈ
+ÊÚJBˆÂˆÝ\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWHHÝŽ›XZÙWÝ[š\]YOXÙNŽ•^]ÛŠXÙNŽ”Ýš[™ÊH
+ÈJJNÂˆ]]ÊˆÝ\HÝ\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWK™Ù]
+
+NÂˆÝ\OœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]JYJNÂˆÝ\OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LÌ‹MÍ
+JNÂˆÝ\OœÙ][˜X›Y
+˜[ÙJNÂˆÝ\O›ÛÛXÚÈHÝ\ËWHÈ\]T]\›”Ý\
+KÝ\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKO™Ù]ÙÙÛTÝ]J
+JNÈNÂˆY[™XZÙUš\ÚX›J
+œÝ\
+NÂˆÝ\OœÙ]š\ÚX›J˜[ÙJNÂˆB‚ˆ\œ˜[™Ù[Y[]KœÙ]^
+”^[\ÝÚ[™ÝÎˆÛXÚÈH[Y[[™HÙ[ÈXÙHHÙ[XÝY]\›ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ\œ˜[™Ù[Y[]KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆY[™XZÙUš\ÚX›J\œ˜[™Ù[Y[]JNÂ‚ˆZ^\•]KœÙ]^
+“Z^\ˆH[œÝ[Y[H‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆZ^\•]KœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\œÎŽÚ]JNÂˆY[™XZÙUš\ÚX›JZ^\•]JNÂˆ]™[X™[œÙ]^
+“]™[‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[“X™[œÙ]^
+”[ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]™[X™[œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNËNNKŒL
+JNÂˆ[“X™[œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNËNNKŒL
+JNÂˆY[™XZÙUš\ÚX›J]™[X™[
+NÂˆY[™XZÙUš\ÚX›J[“X™[
+NÂˆ]™[ÛY\‹œÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ“[™X\’Üš^›Û[
+NÂˆ]™[ÛY\‹œÙ]˜[™ÙJMŒŒ‹ŒŒJNÂˆ]™[ÛY\‹œÙ]˜[YJŒXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]™[ÛY\‹œÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ•^›ÞšYÚ˜[ÙKŒŒŠNÂˆ]™[ÛY\‹œÙ]^˜[YTÝY™š^
+ˆˆŠNÂˆ]™[ÛY\‹›Û•˜[YPÚ[™ÙHHÝ\×BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠH™]\›ŽÂˆYˆ
+]]Êˆ›Û[YT[ˆH[œÝ[Y[˜XÚËO™Ù]›Û[YTYÚ[Š
+JBˆÂˆ›Û[YT[‹OœÙ]›Û[YQŠÝ]X×ØØ\Ý›Ø]Š]™[ÛY\‹™Ù]˜[YJ
+JJNÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+•˜XÚÈ]™[Ú[™ÙYˆØ]™HÈÙY\HÚ[™Ù\Ëˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆNÂˆ[”ÛY\‹œÙ]ÛY\”Ý[JXÙNŽ”ÛY\ŽŽ“[™X\’Üš^›Û[
+NÂˆ[”ÛY\‹œÙ]˜[™ÙJLKŒKŒŒJNÂˆ[”ÛY\‹œÙ]˜[YJŒXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[”ÛY\‹œÙ]^›ÞÝ[JXÙNŽ”ÛY\ŽŽ•^›ÞšYÚ˜[ÙKŒŒŠNÂˆ[”ÛY\‹›Û•˜[YPÚ[™ÙHHÝ\×BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠH™]\›ŽÂˆYˆ
+]]Êˆ›Û[YT[ˆH[œÝ[Y[˜XÚËO™Ù]›Û[YTYÚ[Š
+JBˆÂˆ›Û[YT[‹OœÙ][ŠÝ]X×ØØ\Ý›Ø]Š[”ÛY\‹™Ù]˜[YJ
+JJNÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+•˜XÚÈ[ˆÚ[™ÙYˆØ]™HÈÙY\HÚ[™Ù\Ëˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆNÂˆ]™[ÛY\‹œÙ][˜X›Y
+˜[ÙJNÂˆ[”ÛY\‹œÙ][˜X›Y
+˜[ÙJNÂˆY[™XZÙUš\ÚX›J]™[ÛY\ŠNÂˆY[™XZÙUš\ÚX›J[”ÛY\ŠNÂ‚ˆY]\”Ý]\ËœÙ]^
+•˜XÚÈÝ]]ˆ›È™XÙ[]Y[ÈXÝ]š]H‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆY]\”Ý]\ËœÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMÌŒŒŒŠJNÂˆY[™XZÙUš\ÚX›JY]\”Ý]\ÊNÂ‚ˆZ[X™[œÙ]^
+Z[LHŒŒËÎH‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆZ[X™[œÙ]\ÝYšXØ][Û•\JXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YšYÚ
+NÂˆZ[X™[œÙ]ÛÛÝ\ŠXÙNŽ“X™[Ž^ÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMMNKNMŠJNÂˆY[™XZÙUš\ÚX›JZ[X™[
+NÂˆÙ]Ú^™JLŒŒÍŒ
+NÂˆÛÛœÝÝŽ˜\œ˜^OXÙNŽÛÛ\Û™[
+‹NˆY[ÛÛ\Û™[ÈÞÂˆ	]K	›™]Ô›Ú™XÝ]Û‹	›Ü[]Û‹	œØ]™P]Û‹	›ZYQ^Ü]Û‹	˜]Y[ÔÙ][™ÜÐ]Û‹ˆ	˜Y˜XÚÐ]Û‹	œ]\›]Û‹	˜\œ˜[™Ù[Y[]K	›Z^\•]K	›]™[X™[ˆ	œ[“X™[	›]™[ÛY\‹	œ[”ÛY\‹	›Y]\”Ý]\Ë	œ›Ú™XÝ]Z[Ë	›]\ÚXØ[]Z[Ë	˜]Y[Ñ]Z[Âˆ_NÂˆ›Üˆ
+]]ÊˆÛÛ\Û™[ˆY[ÛÛ\Û™[ÊBˆÛÛ\Û™[OœÙ]š\ÚX›J˜[ÙJNÂˆÜ™X]T›Ú™XÝ
+
+NÂˆ\]P]Y[ÔÝ]\Ê
+NÂˆ]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+NÂˆÝ\[Y\’ŠXÙNŽš›[Z]
+‹ŒÙ][™ÜÈOH[ˆÈÙ][™ÜËO™Ù][˜[YJ\]T˜]Rˆ‹Ì
+HˆÌ
+JNÂˆ\Ý]]ÔØ]™S\ÈHXÙNŽ•[YNŽ™Ù]Z[\ÙXÛÛ™ÛÝ[\Š
+NÂˆYˆ
+Ù][™ÜÈOH[ˆ	‰ˆÙ][™ÜËO™Ù]›ÛÛ˜[YJœØØ[•œÝÐ]Ý\\‹˜[ÙJJBˆÂˆXÙNŽÛÛ\Û™[Ž”ØY™TÚ[\›Ú™XÝšY]ÏˆØY™U\Ê\ÊNÂˆXÙNŽ“Y\ÜØYÙSX[˜YÙ\ŽŽ˜Ø[\Þ[˜ÊÜØY™U\×BˆÂˆYˆ
+ØY™U\ÈOH[ŠHØY™U\ËOœÝ\œÝÔØØ[Š
+NÂˆJNÂˆBˆB‚ˆ”›Ú™XÝšY]Ê
+HÝ™\œšYBˆÂˆÝÜ[Y\Š
+NÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËO™]XÚY]\œÊ
+NÂˆ]XÚ˜XÚÓY]\Š
+NÂˆYˆ
+Y]OH[ŠBˆY]O™Ù]˜[œÜÜ
+
+KœÝÜ
+˜[ÙK˜[ÙJNÂˆB‚ˆ›ÚY[Y\Ø[˜XÚÊ
+HÝ™\œšYBˆÂˆ\]P]Y[ÔÝ]\Ê
+NÂˆ\]SY]\”Ý]\Ê
+NÂˆYˆ
+Y]OH[ŠBˆÂˆ]]Éˆ˜[œÜÜHY]O™Ù]˜[œÜÜ
+
+NÂˆÛÛœÝ›ÛÛ^Z[™ÈH˜[œÜÜš\Ô^Z[™Ê
+NÂˆÛÛœÝ]]ÈÙXÛÛ™ÈH˜[œÜÜ™Ù]ÜÚ][ÛŠ
+Kš[”ÙXÛÛ™Ê
+NÂˆYˆ
+^Z[™È	‰ˆ^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœÛÛ™ÊBˆ™[Y[X™\”ÛÛ™Ô]\›œÐ]
+ÙXÛÛ™ÊNÂˆÛÛœÝ]]ÈœHH›Ú™XÝ™Ù][š]X[[\ÐœJ
+NÂˆÛÛœÝ]]È]\›”Ý\ÈHXÙNŽš›X^
+K›Ú™XÝ™Ù]]\›“[™ÝÝ\ÊˆÙ[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+JJNÂˆÛÛœÝ]]ÈÝ\HÝŽ™›[Ù
+ÙXÛÛ™È
+ˆ
+œHÈŒŒ
+H
+ˆŒÝ]X×ØØ\ÝÝX›OŠ]\›”Ý\ÊJNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœÙ]^ZXYÝ\
+Ý\^Z[™ÊNÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœÙ]^ZXYÜÚ][ÛŠÙXÛÛ™ËœK^Z[™ÊNÂˆYˆ
+\^Z[™È	‰ˆ]Y][Û”]\›”^X˜XÚÊBˆÂˆ]Y][Û”]\›”^X˜XÚÈH˜[ÙNÂˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆ^P]Û‹œÙ]]Û•^
+”^HŠNÂˆBˆBˆYˆ
+]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+JBˆÂˆÛÛœÝ]]È[\˜[Z[]\ÈHXÙNŽš›[Z]
+Ù][™ÜËO™Ù][˜[YJ˜]]ÔØ]™SZ[]\È‹
+JNÂˆÛÛœÝ]]È›ÝÈHXÙNŽ•[YNŽ™Ù]Z[\ÙXÛÛ™ÛÝ[\Š
+NÂˆÛÛœÝ]]È[\˜[\ÈHÝ]X×ØØ\ÝXÙNŽZ[ÌŠ[\˜[Z[]\È
+ˆŒ
+ˆL
+NÂˆYˆ
+[\˜[Z[]\Èˆ	‰ˆ\Ô›Ú™XÝ	‰ˆY]OH[ˆ	‰ˆ\Ñ\H	‰ˆ›Ú™XÝš\Ñš[J
+Bˆ	‰ˆÝ]X×ØØ\ÝXÙNŽZ[ÌŠ›ÝÈH\Ý]]ÔØ]™S\ÊHH[\˜[\ÊBˆÂˆ\Ý]]ÔØ]™S\ÈH›ÝÎÂˆØ]™UÑš[J›Ú™XÝ™Ù]š[J
+JNÂˆBˆBˆB‚ˆ›ÚYZ[
+XÙNŽ‘Ü˜\XÜÉˆÊHÝ™\œšYBˆÂˆË™š[[
+XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌ‹M‹L
+JNÂˆYˆ
+YÙ[™\˜]Ü”[™[›Ý[™Ëš\Ñ[\J
+JBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKËN
+JNÂˆË™š[›Ý[™Y™XÝ[™ÛJÙ[™\˜]Ü”[™[›Ý[™ËÑ›Ø]
+
+KŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠL‹LÍËMLJJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJÙ[™\˜]Ü”[™[›Ý[™ËÑ›Ø]
+
+KŒ‹KŒŠNÂˆ]]È]P˜\ˆHÙ[™\˜]Ü”[™[›Ý[™ËÚ]ZYÚ
+ŒŠKÑ›Ø]
+
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKKÍÊJNÂˆË™š[›Ý[™Y™XÝ[™ÛJ]P˜\‹ËŒŠNÂˆË™š[™XÝ
+]P˜\‹Ú]J]P˜\‹™Ù]›ÝÛJ
+HHËŒŠJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLLKLÊJNÂˆË™˜]ÒÜš^›Û[[™JÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]J
+H
+ÈŒKˆÝ]X×ØØ\Ý›Ø]ŠÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]
+
+H
+ÈJKˆÝ]X×ØØ\Ý›Ø]ŠÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]šYÚ
+
+HHJJNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMMËNLËŒ
+JNÂˆ›Üˆ
+[›ÝÈHÈ›ÝÈÎÈ
+ÊÜ›ÝÊBˆ›Üˆ
+[ÛÛ[[ˆHÈÛÛ[[ˆŽÈ
+ÊØÛÛ[[ŠBˆË™š[[\ÙJÝ]X×ØØ\Ý›Ø]ŠÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]
+
+H
+ÈH
+ÈÛÛ[[ˆ
+ˆJKˆÝ]X×ØØ\Ý›Ø]ŠÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]J
+H
+Èˆ
+È›ÝÈ
+ˆJK‹Œ‹‹ŒŠNÂˆBˆYˆ
+YÙ[™\˜]Ü’[œÝ[Y[›Ý[™Ëš\Ñ[\J
+H	‰ˆ
+X[›Ô›ÛÚ[™ÝÈOH[ˆ\X[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JJBˆÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÎKMËŽ
+JNÂˆË™š[›Ý[™Y™XÝ[™ÛJÙ[™\˜]Ü’[œÝ[Y[›Ý[™ËÑ›Ø]
+
+KKŒŠNÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠM‹LŽKMJJNÂˆË™˜]Ô›Ý[™Y™XÝ[™ÛJÙ[™\˜]Ü’[œÝ[Y[›Ý[™ËÑ›Ø]
+
+KKŒ‹KŒŠNÂˆ]]È[œÝ[Y[XY\ˆHÙ[™\˜]Ü’[œÝ[Y[›Ý[™ËÚ]ZYÚ
+Ì
+Kœ™YXÙY
+L
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠN‹ŒËŒŒ
+JNÂˆËœÙ]›Û
+LËŒŠNÂˆË™˜]Õ^
+’S”Õ•SQS•ÕRH‹[œÝ[Y[XY\‹œ™[[Ý™Qœ›ÛSY
+MÌ
+KXÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YY
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLM‹N
+JNÂˆË™˜]Õ^
+Ù][œÝ[Y[XY\•^
+
+K[œÝ[Y[XY\‹XÙNŽ’\ÝYšXØ][ÛŽŽ˜Ù[™YšYÚ
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÌ‹NKLLÊJNÂˆË™˜]ÒÜš^›Û[[™JÙ[™\˜]Ü’[œÝ[Y[›Ý[™Ë™Ù]J
+H
+ÈÌ‹ˆÝ]X×ØØ\Ý›Ø]ŠÙ[™\˜]Ü’[œÝ[Y[›Ý[™Ë™Ù]
+
+H
+ÈL
+KˆÝ]X×ØØ\Ý›Ø]ŠÙ[™\˜]Ü’[œÝ[Y[›Ý[™Ë™Ù]šYÚ
+
+HHL
+JNÂˆBˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLKŒÊJNÂˆË™š[™XÝ
+Ù]ÚY
+
+KŽ
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠËÌ‹ÍÊJNÂˆË™š[™XÝ
+ŽÙ]ÚY
+
+KM
+NÂˆËœÙ]ÛÛÝ\ŠXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍKMJJNÂˆË™š[™XÝ
+Ù]ZYÚ
+
+HHŒ‹Ù]ÚY
+
+KŒŠNÂˆB‚ˆ›ÚY™YÚ[‘Ù[™\˜]Ü‘˜YÊXÙNŽ”Ú[[ˆÚ[
+BˆÂˆYˆ
+Ù[™\˜]Ü”[™[›Ý[™Ëš\Ñ[\J
+JH™]\›ŽÂˆœš[™ÑÙ[™\˜]Ü•Ñœ›Û
+
+NÂˆÙ[™\˜]Ü‘˜YÔÝ\ÜÚ][ÛˆHÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]ÜÚ][ÛŠ
+NÂˆÙ[™\˜]Ü‘˜YÓÙ™œÙ]HÚ[HÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]ÜÚ][ÛŠ
+NÂˆ˜YÙÚ[™ÑÙ[™\˜]ÜˆHYNÂˆ™\Ú^š[™ÑÙ[™\˜]ÜˆH˜[ÙNÂˆB‚ˆ›ÚY[Ý\ÙQ˜YÊÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆYˆ
+Y˜YÙÚ[™ÑÙ[™\˜]ÜŠH™]\›ŽÂˆÛÛœÝ]]ÈÚ[H]™[™Ù]]™[™[]]™UÊ\ÊKœÜÚ][Û‹Ò[
+
+NÂˆ[Ý™QÙ[™\˜]Ü”[™[
+Ú[
+NÂˆ™\Ú^™Y
+
+NÂˆ™\Z[
+
+NÂˆB‚ˆ›ÚY™YÚ[‘Ù[™\˜]Ü”™\Ú^™JXÙNŽ”Ú[[ˆÚ[
+BˆÂˆYˆ
+Ù[™\˜]Ü”[™[›Ý[™Ëš\Ñ[\J
+JH™]\›ŽÂˆ™\Ú^š[™ÑÙ[™\˜]ÜˆHYNÂˆ˜YÙÚ[™ÑÙ[™\˜]ÜˆH˜[ÙNÂˆÙ[™\˜]Ü‘˜YÔÝ\HÚ[ÂˆÙ[™\˜]Ü”™\Ú^™TÝ\HÙ[™\˜]Ü”[™[›Ý[™ÎÂˆB‚ˆ›ÚY™\Ú^™QÙ[™\˜]Ü”[™[
+XÙNŽ”Ú[[ˆÚ[
+BˆÂˆYˆ
+\™\Ú^š[™ÑÙ[™\˜]ÜŠH™]\›ŽÂˆÛÛœÝ]]È]˜Z[X›HHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆÛÛœÝ]]È[HHÚ[HÙ[™\˜]Ü‘˜YÔÝ\ÂˆÛÛœÝ]]ÈX^ÚYH]˜Z[X›K™Ù]ÚY
+
+NÂˆÛÛœÝ]]ÈX^ZYÚH]˜Z[X›K™Ù]ZYÚ
+
+NÂˆÙ[™\˜]Ü”[™[›Ý[™ËœÙ]ÚY
+XÙNŽš›[Z]
+XÙNŽš›Z[ŠX^ÚY
+KX^ÚYˆÙ[™\˜]Ü”™\Ú^™TÝ\™Ù]ÚY
+
+H
+È[Kž
+JNÂˆÛÛœÝ]]ÈZ[š[][RZYÚHÙ[™\˜]ÜÛÛ\ÙYÈÍˆÍLÂˆÙ[™\˜]Ü”[™[›Ý[™ËœÙ]ZYÚ
+XÙNŽš›[Z]
+XÙNŽš›Z[ŠZ[š[][RZYÚX^ZYÚ
+KX^ZYÚˆÙ[™\˜]Ü”™\Ú^™TÝ\™Ù]ZYÚ
+
+H
+È[KžJJNÂˆ™\Ú^™Y
+
+NÂˆ™\Z[
+
+NÂˆB‚ˆ›ÚY[Ý™QÙ[™\˜]Ü”[™[
+XÙNŽ”Ú[[ˆÚ[
+BˆÂˆYˆ
+Y˜YÙÚ[™ÑÙ[™\˜]ÜŠH™]\›ŽÂˆ]]È]˜Z[X›HHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆÛÛœÝ]]ÈHXÙNŽš›[Z]
+]˜Z[X›K™Ù]
+
+KˆXÙNŽš›X^
+]˜Z[X›K™Ù]
+
+K]˜Z[X›K™Ù]šYÚ
+
+HHÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]ÚY
+
+JKˆÚ[žHÙ[™\˜]Ü‘˜YÓÙ™œÙ]ž
+NÂˆÛÛœÝ]]ÈHHXÙNŽš›[Z]
+]˜Z[X›K™Ù]J
+KˆXÙNŽš›X^
+]˜Z[X›K™Ù]J
+K]˜Z[X›K™Ù]›ÝÛJ
+HHÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]ZYÚ
+
+JKˆÚ[žHHÙ[™\˜]Ü‘˜YÓÙ™œÙ]žJNÂˆÙ[™\˜]Ü”[™[›Ý[™ËœÙ]ÜÚ][ÛŠJNÂˆYˆ
+Ù[™\˜]ÜÛÛ\ÙY	‰ˆY^[™YÙ[™\˜]Ü›Ý[™Ëš\Ñ[\J
+JBˆ^[™YÙ[™\˜]Ü›Ý[™ËœÙ]ÜÚ][ÛŠJNÂˆ™\Ú^™Y
+
+NÂˆ™\Z[
+
+NÂˆB‚ˆ›ÚY[Ý\ÙU\
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYBˆÂˆ˜YÙÚ[™ÑÙ[™\˜]ÜˆH˜[ÙNÂˆ™\ÜÙ[™\˜]Ü“[Ý™J
+NÂˆB‚ˆ›ÚY[™Ù[™\˜]Ü”™\Ú^™J
+BˆÂˆ™\Ú^š[™ÑÙ[™\˜]ÜˆH˜[ÙNÂˆÝ]\ËœÙ]^
+‘Ù[™\˜]Üˆ™\Ú^™YˆHX[›È›ÛÜšYš]ÈH\]Y[™[ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY[™Ù[™\˜]Ü‘˜YÊ
+BˆÂˆ˜YÙÚ[™ÑÙ[™\˜]ÜˆH˜[ÙNÂˆ™\ÜÙ[™\˜]Ü“[Ý™J
+NÂˆB‚ˆ›ÚY™\ÜÙ[™\˜]Ü“[Ý™J
+BˆÂˆYˆ
+Ù[™\˜]Ü”[™[›Ý[™Ë™Ù]ÜÚ][ÛŠ
+HOHÙ[™\˜]Ü‘˜YÔÝ\ÜÚ][ÛŠBˆÝ]\ËœÙ]^
+‘Ù[™\˜]Üˆ[Ý™Yˆ]È[X™YYX[›È›Û[™]\›ˆÛÛ›ÛÈÝ^H[šÙYˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY[Ý\ÙS[Ý™JÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ˆ]™[
+HÝ™\œšYBˆÂˆÛÛœÝ]]ÈÚ[H]™[™Ù]]™[™[]]™UÊ\ÊKœÜÚ][Û‹Ò[
+
+NÂˆ]]È™\Ú^™P›Ý[™ÈHÙ[™\˜]Ü”[™[›Ý[™ÎÂˆ™\Ú^™P›Ý[™ÈH™\Ú^™P›Ý[™Ëœ™[[Ý™Qœ›ÛTšYÚ
+N
+Kœ™[[Ý™Qœ›ÛP›ÝÛJN
+NÂˆYˆ
+YÙ[™\˜]Ü”[™[›Ý[™Ëš\Ñ[\J
+H	‰ˆ™\Ú^™P›Ý[™Ë˜ÛÛZ[œÊÚ[
+JBˆÙ][Ý\ÙPÝ\œÛÜŠXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ›ÝÛTšYÚÛÜ›™\”™\Ú^™PÝ\œÛÜŠNÂˆ[ÙBˆÙ][Ý\ÙPÝ\œÛÜŠYÙ[™\˜]Ü”[™[›Ý[™Ëš\Ñ[\J
+Bˆ	‰ˆÙ[™\˜]Ü”[™[›Ý[™ËÚ]ZYÚ
+ŒŠK˜ÛÛZ[œÊÚ[
+BˆÈXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ‘˜YÙÚ[™Ò[™Ý\œÛÜ‚ˆˆXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ“›Ü›X[Ý\œÛÜŠNÂˆB‚ˆ›ÚY[Ý\ÙQ^]
+ÛÛœÝXÙNŽ“[Ý\ÙQ]™[	ŠHÝ™\œšYBˆÂˆÙ][Ý\ÙPÝ\œÛÜŠXÙNŽ“[Ý\ÙPÝ\œÛÜŽŽ“›Ü›X[Ý\œÛÜŠNÂˆB‚ˆ›ÚY™\Ú^™Y
+
+HÝ™\œšYBˆÂˆ]]ÈY[T›ÝÈHÙ]ØØ[›Ý[™Ê
+Kœ™[[Ý™Qœ›ÛUÜ
+Ž
+Kœ™YXÙY
+ŠNÂˆš[SY[P]Û‹œÙ]›Ý[™ÊY[T›ÝËœ™[[Ý™Qœ›ÛSY
+
+JNÂˆY]Y[P]Û‹œÙ]›Ý[™ÊY[T›ÝËœ™[[Ý™Qœ›ÛSY
+
+JNÂˆšY]ÓY[P]Û‹œÙ]›Ý[™ÊY[T›ÝËœ™[[Ý™Qœ›ÛSY
+L
+JNÂˆ[œÙ\Y[P]Û‹œÙ]›Ý[™ÊY[T›ÝËœ™[[Ý™Qœ›ÛSY
+M
+JNÂˆÜ[ÛœÓY[P]Û‹œÙ]›Ý[™ÊY[T›ÝËœ™[[Ý™Qœ›ÛSY
+Ž
+JNÂˆÚ[™ÝÓY[P]Û‹œÙ]›Ý[™ÊY[T›ÝËœ™[[Ý™Qœ›ÛSY
+ŒŠJNÂˆ[Y[P]Û‹œÙ]›Ý[™ÊY[T›ÝËœ™[[Ý™Qœ›ÛSY
+L
+JNÂ‚ˆ]]È˜[œÜÜ›ÝÈHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+Ž
+Kœ™[[Ý™Qœ›ÛUÜ
+M
+Kœ™YXÙY
+ÊNÂˆ]]ÈY]\›Ý[™ÈH˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛTšYÚ
+MM
+Kœ™YXÙY
+ÊNÂˆÝ]]Y]\‹œÙ]›Ý[™ÊY]\›Ý[™ÊNÂˆÛÛœÝ]]ÈÛÛ›ÛHH˜[œÜÜ›ÝË™Ù]J
+H
+ÈMNÂˆ[\ÓX™[œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+Í
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+
+JNÂˆ[\ÔÛY\‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+L
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+
+JNÂˆ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆ]]È[ÙP›Ý[™ÈH˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+N
+KÚ]JÛÛ›ÛHHJKÚ]ZYÚ
+ÌŠNÂˆ]\›“[ÙP]Û‹œÙ]›Ý[™Ê[ÙP›Ý[™Ëœ™[[Ý™Qœ›ÛUÜ
+MJJNÂˆÛÛ™Ó[ÙP]Û‹œÙ]›Ý[™Ê[ÙP›Ý[™Ëœ™[[Ý™Qœ›ÛUÜ
+MJJNÂˆ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆ^P]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+Í
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+Ì
+JNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆÝÜ]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+Í
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+Ì
+JNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆ™]Ú[™]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+Í
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+Ì
+JNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆ™]š[Ý\Ð]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+Í
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+Ì
+JNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆ™^]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+Í
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+Ì
+JNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆ™XÛÜ™]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+Í
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+Ì
+JNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+JNÂˆÛÜ]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+LŠKÚ]JÛÛ›ÛJKÚ]ZYÚ
+ŠJNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+JNÂˆ]]ÈÝ\›Ý[™ÈH˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+MŠNÂˆÛÜÝ\X™[œÙ]›Ý[™ÊÝ\›Ý[™ËÚ]J˜[œÜÜ›ÝË™Ù]J
+JKÚ]ZYÚ
+LŠJNÂˆÛÜÝ\ÛY\‹œÙ]›Ý[™ÊÝ\›Ý[™ËÚ]JÛÛ›ÛJKÚ]ZYÚ
+
+JNÂˆ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+JNÂˆ]]È[™Ý›Ý[™ÈH˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+LŠNÂˆÛÜ[™ÝX™[œÙ]›Ý[™Ê[™Ý›Ý[™ËÚ]J˜[œÜÜ›ÝË™Ù]J
+JKÚ]ZYÚ
+LŠJNÂˆÛÜ[™ÝÛY\‹œÙ]›Ý[™Ê[™Ý›Ý[™ËÚ]JÛÛ›ÛJKÚ]ZYÚ
+
+JNÂˆ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆY]›Û›ÛYP]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+ŠJNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+JNÂˆ[YTÚYÛ˜]\™SX™[œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+Î
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+
+JNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆ^[\Ý]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+Ì
+JNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+
+NÂˆZ^\]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+ŠKÚ]JÛÛ›ÛJKÚ]ZYÚ
+Ì
+JNÈ˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+
+NÂˆX\Ý\]Û‹œÙ]›Ý[™Ê˜[œÜÜ›ÝËœ™[[Ý™Qœ›ÛSY
+
+KÚ]JÛÛ›ÛJKÚ]ZYÚ
+Ì
+JNÂ‚ˆ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠBˆ^[\ÝÚ[™ÝËOœÙ]›Ý[™Ê\™XJNÂˆÙ[™\˜]Ü‘ØÚÕšY]ÜÜœÙ]›Ý[™ÊLXÙNŽš›X^
+‹Ù]ZYÚ
+
+HHJKXÙNŽš›X^
+Ù]ÚY
+
+HHŒ
+KJNÂˆÛÛœÝ[ØÚÐ]Û•ÚYHMLÂˆÙ[™\˜]Ü‘ØÚÔÝš\œÙ]Ú^™JÝ]X×ØØ\Ý[ŠÙ[™\˜]Ü‘ØÚÐ]ÛœËœÚ^™J
+JH
+ˆØÚÐ]Û•ÚYJNÂˆ›Üˆ
+[HHÈHÝ]X×ØØ\Ý[ŠÙ[™\˜]Ü‘ØÚÐ]ÛœËœÚ^™J
+JNÈ
+ÊÚJBˆÙ[™\˜]Ü‘ØÚÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]›Ý[™ÊH
+ˆØÚÐ]Û•ÚYØÚÐ]Û•ÚYHËŒÊNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ˆ	‰ˆZ^\›Ý[™Ò[š]X[\ÙY
+BˆÂˆÛÛœÝ]]ÈZ[•ÚYHXÙNŽš›Z[ŠŒŒ\™XK™Ù]ÚY
+
+JNÂˆÛÛœÝ]]ÈZ[’ZYÚHXÙNŽš›Z[ŠŒ\™XK™Ù]ZYÚ
+
+JNÂˆÛÛœÝ]]È[™[ZYÚHZ^\•Ú[™ÝËOš\ÓZ[š[Z^™Y
+
+HÈ‚ˆˆXÙNŽš›[Z]
+Z[’ZYÚ\™XK™Ù]ZYÚ
+
+KZ^\”[™[›Ý[™Ë™Ù]ZYÚ
+
+JNÂˆZ^\”[™[›Ý[™ËœÙ]Ú^™JXÙNŽš›[Z]
+Z[•ÚY\™XK™Ù]ÚY
+
+KZ^\”[™[›Ý[™Ë™Ù]ÚY
+
+JK[™[ZYÚ
+NÂˆZ^\”[™[›Ý[™ËœÙ]
+XÙNŽš›[Z]
+\™XK™Ù]
+
+KXÙNŽš›X^
+\™XK™Ù]
+
+K\™XK™Ù]šYÚ
+
+HHZ^\”[™[›Ý[™Ë™Ù]ÚY
+
+JKˆZ^\”[™[›Ý[™Ë™Ù]
+
+JJNÂˆZ^\”[™[›Ý[™ËœÙ]JXÙNŽš›[Z]
+\™XK™Ù]J
+KXÙNŽš›X^
+\™XK™Ù]J
+K\™XK™Ù]›ÝÛJ
+HHZ^\”[™[›Ý[™Ë™Ù]ZYÚ
+
+JKˆZ^\”[™[›Ý[™Ë™Ù]J
+JJNÂˆZ^\•Ú[™ÝËOœÙ]›Ý[™ÊZ^\”[™[›Ý[™ÊNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆBˆÙ[™\˜]Ü’[œÝ[Y[›Ý[™ÈHßNÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆ	‰ˆX[Ù[™\˜]ÜœÓZ[š[Z^™Y
+BˆÂˆYˆ
+Ù[™\˜]Ü”[™[›Ý[™Ëš\Ñ[\J
+JBˆÙ[™\˜]Ü”[™[›Ý[™ÈHÈ\™XK™Ù]
+
+K\™XK™Ù]J
+KXÙNŽš›Z[Š\™XK™Ù]ÚY
+
+KL
+KXÙNŽš›Z[Š\™XK™Ù]ZYÚ
+
+KMŒ
+HNÂˆÛÛœÝ]]È[™[ÚYHXÙNŽš›[Z]
+XÙNŽš›Z[Š\™XK™Ù]ÚY
+
+JK\™XK™Ù]ÚY
+
+KÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]ÚY
+
+JNÂˆÛÛœÝ]]ÈZ[š[][T[™[ZYÚHÙ[™\˜]ÜÛÛ\ÙYÈÍˆÍLÂˆÛÛœÝ]]È[™[ZYÚHXÙNŽš›[Z]
+XÙNŽš›Z[ŠZ[š[][T[™[ZYÚ\™XK™Ù]ZYÚ
+
+JKˆ\™XK™Ù]ZYÚ
+
+KÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]ZYÚ
+
+JNÂˆÙ[™\˜]Ü”[™[›Ý[™ËœÙ]Ú^™J[™[ÚY[™[ZYÚ
+NÂˆÙ[™\˜]Ü”[™[›Ý[™ËœÙ]
+XÙNŽš›[Z]
+\™XK™Ù]
+
+KXÙNŽš›X^
+\™XK™Ù]
+
+K\™XK™Ù]šYÚ
+
+HH[™[ÚY
+KÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]
+
+JJNÂˆÙ[™\˜]Ü”[™[›Ý[™ËœÙ]JXÙNŽš›[Z]
+\™XK™Ù]J
+KXÙNŽš›X^
+\™XK™Ù]J
+K\™XK™Ù]›ÝÛJ
+HH[™[ZYÚ
+KÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]J
+JJNÂˆÙ[™\˜]Ü”™\Ú^™R[™KœÙ]›Ý[™ÊÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]šYÚ
+
+HHNˆÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]›ÝÛJ
+HHNNN
+NÂˆ]]È[™[HÙ[™\˜]Ü”[™[›Ý[™ÎÂˆ]]ÈÙ[™\˜]Ü’XY\ˆH[™[œ™[[Ý™Qœ›ÛUÜ
+ŒŠNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]›Ý[™ÊÙ[™\˜]Ü’XY\‹œ™[[Ý™Qœ›ÛTšYÚ
+
+Kœ™YXÙY
+JJNÂˆ˜XÚÔÙ[XÝÜ‹œÙ]›Ý[™ÊÙ[™\˜]Ü’XY\‹œ™[[Ý™Qœ›ÛTšYÚ
+NL
+Kœ™YXÙY
+
+JNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]›Ý[™ÊÙ[™\˜]Ü’XY\ŠNÂˆ˜XÚÔÙ[XÝÜ‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆ]\›•]KœÙ]›Ý[™Ê
+NÂˆ]]È]\›ÛÛ›ÛÈH[™[œ™[[Ý™Qœ›ÛUÜ
+MŠKœ™YXÙY
+
+NÂˆÙ[™\˜]Ü“]]P]Û‹œÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+ÊKÚ]J]\›ÛÛ›ÛË™Ù]J
+H
+ÈŠKÚ]ZYÚ
+ŒŠJNÂˆ]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+ÊKÚ]J]\›ÛÛ›ÛË™Ù]J
+H
+ÈŠKÚ]ZYÚ
+ŒŠJNÂˆ]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+ŠNÂˆÛÛœÝ]]È˜[šÖH]\›ÛÛ›ÛË™Ù]
+
+NÂˆ›Üˆ
+[HHÈHÈ
+ÊÚJBˆÂˆÛÛœÝ]]ÈH˜[šÖ
+ÈH
+ˆÍÂˆ]\›˜[šÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]›Ý[™Ê]\›ÛÛ›ÛË™Ù]J
+KÌKŒÊNÂˆ]\›”ÛÝ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]›Ý[™Ê]\›ÛÛ›ÛË™Ù]J
+H
+È‹ÌKŒÊNÂˆBˆ]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+
+ˆÍ
+È
+NÂˆÛÛœÝ]]ÈÛÛ›ÛHH]\›ÛÛ›ÛË™Ù]J
+H
+ÈLÎÂˆX[›Ô›Û]Û‹œÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+LÍŠKÚ]ZYÚ
+ÊKÚ]JÛÛ›ÛJJNÂˆ]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+
+NÂˆÙ[™\˜]Ü”Ù][™ÜÐ]Û‹œÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+Ž
+KÚ]ZYÚ
+ÊKÚ]JÛÛ›ÛJJNÂˆ]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+
+NÂˆ]\›”™\Ù]Ù[XÝÜ‹œÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+LŽ
+KÚ]ZYÚ
+ÊKÚ]JÛÛ›ÛJJNÂˆ]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+ÊNÂˆÜ[”™\Ù]]Û‹œÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+Ž
+KÚ]ZYÚ
+ÊKÚ]JÛÛ›ÛJJNÂˆ]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+ŠNÂˆØ]™T™\Ù]]Û‹œÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+Ž
+KÚ]ZYÚ
+ÊKÚ]JÛÛ›ÛJJNÂˆ]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+JNÂˆ]\›“[™ÝÝÛ]Û‹œÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+Œ
+KÚ]ZYÚ
+ÊKÚ]JÛÛ›ÛJJNÂˆ]\›“[™Ý\Ü^KœÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+ŠKÚ]ZYÚ
+ÊKÚ]JÛÛ›ÛJJNÂˆ]\›“[™Ý\]Û‹œÙ]›Ý[™Ê]\›ÛÛ›ÛËœ™[[Ý™Qœ›ÛSY
+Œ
+KÚ]ZYÚ
+ÊKÚ]JÛÛ›ÛJJNÂˆ›Üˆ
+]]ÊˆÛÛ›ÛˆÝŽ˜\œ˜^OXÙNŽÛÛ\Û™[
+‹LˆÂˆ	œX[›Ô›Û]Û‹	™Ù[™\˜]Ü“]]P]Û‹	™Ù[™\˜]Ü”ÛÛÐ]Û‹	™Ù[™\˜]Ü”Ù][™ÜÐ]Û‹ˆ	œ]\›”™\Ù]Ù[XÝÜ‹	›Ü[”™\Ù]]Û‹	œØ]™T™\Ù]]Û‹	œ]\›“[™ÝÝÛ]Û‹ˆ	œ]\›“[™Ý\Ü^K	œ]\›“[™Ý\]ÛˆJBˆÛÛ›ÛOœÙ]š\ÚX›JYÙ[™\˜]ÜÛÛ\ÙY	‰ˆ[œÝ[Y[˜XÚÈOH[ŠNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›˜[šÐ]ÛœÊH]Û‹OœÙ]š\ÚX›JYÙ[™\˜]ÜÛÛ\ÙY	‰ˆ[œÝ[Y[˜XÚÈOH[ŠNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›”ÛÝ]ÛœÊH]Û‹OœÙ]š\ÚX›JYÙ[™\˜]ÜÛÛ\ÙY	‰ˆ[œÝ[Y[˜XÚÈOH[ŠNÂˆÙ[™\˜]Ü’[œÝ[Y[›Ý[™ÈHÙ[™\˜]ÜÛÛ\ÙYÈXÙNŽ”™XÝ[™ÛO[žßBˆˆÙ[™\˜]Ü”[™[›Ý[™ËÚ]š[[YYY
+LŠKÚ]š[[YYšYÚ
+LŠBˆÚ]J]\›ÛÛ›ÛË™Ù]›ÝÛJ
+H
+È
+KÚ]›ÝÛJÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]›ÝÛJ
+HHL
+NÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠBˆÂˆ]]È›Û›Ý[™ÈHÙ[™\˜]Ü’[œÝ[Y[›Ý[™ÎÂˆYˆ
+YÙ[™\˜]ÜÛÛ\ÙY
+BˆÂˆ›Û›Ý[™ËœÙ]šYÚ
+XÙNŽš›X^
+›Û›Ý[™Ë™Ù]
+
+KÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]šYÚ
+
+HHŒ
+JNÂˆ›Û›Ý[™ËœÙ]›ÝÛJXÙNŽš›X^
+›Û›Ý[™Ë™Ù]J
+KÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]›ÝÛJ
+HHŒ
+JNÂˆBˆYˆ
+X[›Ô›ÛX^[Z^™YX[›Ô›Û›Ý[™Ëš\Ñ[\J
+JBˆX[›Ô›Û›Ý[™ÈH›Û›Ý[™ÎÂˆ[ÙBˆÂˆÛÛœÝ]]ÈÛÜšÜÜXÙHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJ
+Kœ™YXÙY
+ML
+NÂˆX[›Ô›Û›Ý[™ËœÙ]Ú^™JXÙNŽš›[Z]
+XÙNŽš›Z[ŠŒÛÜšÜÜXÙK™Ù]ÚY
+
+JKÛÜšÜÜXÙK™Ù]ÚY
+
+KX[›Ô›Û›Ý[™Ë™Ù]ÚY
+
+JKˆXÙNŽš›[Z]
+XÙNŽš›Z[ŠŒÛÜšÜÜXÙK™Ù]ZYÚ
+
+JKÛÜšÜÜXÙK™Ù]ZYÚ
+
+KX[›Ô›Û›Ý[™Ë™Ù]ZYÚ
+
+JJNÂˆX[›Ô›Û›Ý[™ËœÙ]ÜÚ][ÛŠˆXÙNŽš›[Z]
+ÛÜšÜÜXÙK™Ù]
+
+KXÙNŽš›X^
+ÛÜšÜÜXÙK™Ù]
+
+KÛÜšÜÜXÙK™Ù]šYÚ
+
+HHX[›Ô›Û›Ý[™Ë™Ù]ÚY
+
+JKX[›Ô›Û›Ý[™Ë™Ù]
+
+JKˆXÙNŽš›[Z]
+ÛÜšÜÜXÙK™Ù]J
+KXÙNŽš›X^
+ÛÜšÜÜXÙK™Ù]J
+KÛÜšÜÜXÙK™Ù]›ÝÛJ
+HHX[›Ô›Û›Ý[™Ë™Ù]ZYÚ
+
+JKX[›Ô›Û›Ý[™Ë™Ù]J
+JJNÂˆ›Û›Ý[™ÈHX[›Ô›Û›Ý[™ÎÂˆBˆX[›Ô›ÛÚ[™ÝËOœÙ]›Ý[™Ê›Û›Ý[™ÊNÂˆYˆ
+Ù[™\˜]ÜÛÛ\ÙY
+HX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆBˆYˆ
+XÝ]™R[œÝ[Y[Y]ÜˆOH[ŠBˆÂˆ]]ÈY]Ü›Ý[™ÈHÙ[™\˜]Ü’[œÝ[Y[›Ý[™ÎÂˆYˆ
+YÙ[™\˜]ÜÛÛ\ÙY
+BˆÂˆY]Ü›Ý[™ËœÙ]šYÚ
+XÙNŽš›X^
+Y]Ü›Ý[™Ë™Ù]
+
+KÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]šYÚ
+
+HH
+JNÂˆY]Ü›Ý[™ËœÙ]›ÝÛJXÙNŽš›X^
+Y]Ü›Ý[™Ë™Ù]J
+KÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]›ÝÛJ
+HHM
+JNÂˆBˆXÝ]™R[œÝ[Y[Y]Ü‹OœÙ]›Ý[™ÊY]Ü›Ý[™ÊNÂˆXÝ]™R[œÝ[Y[Y]Ü‹OœÙ]š\ÚX›JYÙ[™\˜]ÜÛÛ\ÙYˆ	‰ˆ
+X[›Ô›ÛÚ[™ÝÈOH[ˆ\X[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JJNÂˆÛÛœÝ]]ÈÙ^X›Ø\™›Ý[™ÈHÙ[™\˜]Ü”[™[›Ý[™ËÚ]š[[YYY
+LŠKÚ]š[[YYšYÚ
+LŠBˆÚ]›ÝÛJÙ[™\˜]Ü”[™[›Ý[™Ë™Ù]›ÝÛJ
+HH
+Kœ™[[Ý™Qœ›ÛP›ÝÛJÎ
+NÂˆ]Y][Û’Ù^X›Ø\™œÙ]›Ý[™ÊÙ^X›Ø\™›Ý[™ÊNÂˆ]Y][Û’Ù^X›Ø\™œÙ]š\ÚX›JYÙ[™\˜]ÜÛÛ\ÙYˆ	‰ˆ
+X[›Ô›ÛÚ[™ÝÈOH[ˆ\X[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JJNÂˆBˆ[ÙH]Y][Û’Ù^X›Ø\™œÙ]š\ÚX›J˜[ÙJNÂˆBˆ[ÙBˆÂˆÙ[™\˜]Ü”[™[›Ý[™ÈHßNÂˆYˆ
+XÝ]™R[œÝ[Y[Y]ÜˆOH[ŠBˆXÝ]™R[œÝ[Y[Y]Ü‹OœÙ]š\ÚX›J˜[ÙJNÂˆ]Y][Û’Ù^X›Ø\™œÙ]š\ÚX›J˜[ÙJNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü”™\Ú^™R[™KœÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆ˜XÚÔÙ[XÝÜ‹œÙ]š\ÚX›J˜[ÙJNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›˜[šÐ]ÛœÊH]Û‹OœÙ]š\ÚX›J˜[ÙJNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›”ÛÝ]ÛœÊH]Û‹OœÙ]š\ÚX›J˜[ÙJNÂˆ›Üˆ
+]]ÊˆÛÛ›ÛˆÝŽ˜\œ˜^OXÙNŽÛÛ\Û™[
+‹LˆÂˆ	œX[›Ô›Û]Û‹	™Ù[™\˜]Ü“]]P]Û‹	™Ù[™\˜]Ü”ÛÛÐ]Û‹	™Ù[™\˜]Ü”Ù][™ÜÐ]Û‹ˆ	œ]\›”™\Ù]Ù[XÝÜ‹	›Ü[”™\Ù]]Û‹	œØ]™T™\Ù]]Û‹	œ]\›“[™ÝÝÛ]Û‹ˆ	œ]\›“[™Ý\Ü^K	œ]\›“[™Ý\]ÛˆJBˆÛÛ›ÛOœÙ]š\ÚX›J˜[ÙJNÂˆBˆÝ]\ËœÙ]›Ý[™ÊLÙ]ZYÚ
+
+HHŒKXÙNŽš›X^
+Ù]ÚY
+
+HHŒJKN
+NÂˆZ[X™[œÙ]›Ý[™ÊÙ]ÚY
+
+HHNÙ]ZYÚ
+
+HHŒ‹MÌN
+NÂˆYˆ
+Ù[™\˜]Ü‘ØÚÕšY]ÜÜš\Õš\ÚX›J
+JHÙ[™\˜]Ü‘ØÚÕšY]ÜÜÑœ›Û
+˜[ÙJNÂˆB‚œš]˜]N‚ˆÝXÝ›Ú™XÝÛ˜\ÚÝˆÂˆ›Ú™XÝØÝ[Y[ØÝ[Y[ÂˆXÙNŽ•˜[YU™YHY]Ý]NÂˆ›ÛÛY›Ú™XÝH˜[ÙNÂˆ›ÛÛ\HH˜[ÙNÂˆXÙNŽ”Ýš[™ÈÙ[XÝY˜XÚÒYÂˆ[˜[šÈHÂˆ[ÛÝHÂˆ[]ÚHŒÂˆNÂ‚ˆÝXÝ[™Ñ[žBˆÂˆ›Ú™XÝÛ˜\ÚÝÛ˜\ÚÝÂˆXÙNŽ”Ýš[™ÈX™[ÂˆNÂ‚ˆÝXÝ]\›Û\›Ø\™ˆÂˆ›ÛÛ\Ó›Ý\ÈH˜[ÙNÂˆ[[™ÝÝ\ÈHMŽÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^O›ÛÛ‹ÍÏˆ›Ý\ÞßNÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^O[‹ÍÏˆ[™ÝÞßNÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^O[‹ÍÏˆ™[ØÚ]Y\ÞßNÂˆNÂ‚ˆÝXÝ]\›‘]BˆÂˆ›ÛÛÜ™X]YH˜[ÙNÂˆ[[™ÝÝ\ÈHMŽÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^O›ÛÛ‹ÍÏˆ›Ý\ÞßNÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^O[‹ÍÏˆ[™ÝÞßNÂˆÝŽ˜\œ˜^OÝŽ˜\œ˜^O[‹ÍÏˆ™[ØÚ]Y\ÞßNÂˆNÂ‚ˆ›ÚYÚÝÓY[JXÙNŽ•^]Û‰ˆÛÝ\˜ÙK[Y[RÚ[™
+BˆÂˆXÙNŽ”Ü\Y[HY[NÂˆYˆ
+Y[RÚ[™OH
+HËÈš[BˆÂˆY[K˜Y][JLK“™]È›Ú™XÝ‹‹ˆŠNÂˆY[K˜Y][JL‹“Ü[ˆ›Ú™XÝ‹‹ˆŠNÂˆY[K˜Y][JLË”Ø]™H›Ú™XÝŠNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JL‹”›Ú™XÝÙ][™ÜË‹‹ˆ‹\Ô›Ú™XÝ
+NÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JL‘^ÜRQK‹‹ˆ‹\Ô›Ú™XÝ	‰ˆ\Ô]\›ˆ	‰ˆ]\›Û\OH[ŠNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JLK”]Z]Ü˜š]ŠNÂˆBˆ[ÙHYˆ
+Y[RÚ[™OHJHËÈY]ˆÂˆY[K˜Y][JŒK[™Ò\ÝÜžK™[\J
+HÈ•[™Èˆˆ•[™Èˆ
+È[™Ò\ÝÜžK˜˜XÚÊ
+K›X™[ˆ][™Ò\ÝÜžK™[\J
+JNÂˆY[K˜Y][JŒ‹™YÒ\ÝÜžK™[\J
+HÈ”™YÈˆˆ”™YÈˆ
+È™YÒ\ÝÜžK˜˜XÚÊ
+K›X™[ˆ\™YÒ\ÝÜžK™[\J
+JNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JŒËÝ]]\›ˆ›Ý\È‹\Ô]\›ŠNÂˆY[K˜Y][JŒÛÜH]\›ˆ›Ý\È‹\Ô]\›ŠNÂˆY[K˜Y][JŒK”\ÝH]\›ˆ›Ý\È‹[œÝ[Y[˜XÚÈOH[ˆ	‰ˆ]\›Û\›Ø\™š\Ó›Ý\ÊNÂˆY[K˜Y][JŒLË”Ù[XÝ[›Ý\È‹\Ô]\›ŠNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JŒ‹”˜[™ÛZ^™H‹[œÝ[Y[˜XÚÈOH[ŠNÂˆY[K˜Y][JŒË”˜[™ÛZ^™HÜ[ÛœË‹‹ˆ‹[œÝ[Y[˜XÚÈOH[ŠNÂˆY[K˜Y][JŒ’[X[š^™K‹‹ˆ‹\Ô]\›ŠNÂˆY[K˜Y][JŒK”]X[^™K‹‹ˆ‹\Ô]\›ŠNÂˆY[K˜Y][JŒL•˜[œÜÜÙK‹‹ˆ‹\Ô]\›ŠNÂˆY[K˜Y][JŒLK”ØØ[H™[ØÚ]Y\Ë‹‹ˆ‹\Ô]\›ŠNÂˆY[K˜Y][JŒL‹“[™Ý‹‹ˆ‹\Ô]\›ŠNÂˆY[K˜Y][JŒM\HÜ›ÛÝ™H[\]K‹‹ˆ
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆY[K˜Y][JŒMK\HXÚÈ[\]K‹‹ˆ
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆBˆ[ÙHYˆ
+Y[RÚ[™OHŠHËÈšY]ÂˆÂˆY[K˜Y][JÌK”^[\Ý‹YK^[\ÝÚ[™ÝÈOH[ˆ	‰ˆ^[\ÝÚ[™ÝËOš\Õš\ÚX›J
+JNÂˆY[K˜Y][JÌ‹“Z^[™ÈÛÛœÛÛH‹YKZ^\•Ú[™ÝÈOH[ˆ	‰ˆZ^\•Ú[™ÝËOš\Õš\ÚX›J
+JNÂˆY[K˜Y][JÌË“X\Ý\ˆÙXÝ[Ûˆ‹YKZ^\•Ú[™ÝÈOH[ˆ	‰ˆZ^\•Ú[™ÝËOš\Õš\ÚX›J
+JNÂˆY[K˜Y][JÌ‘]™[Y]ÜˆÈX[›È›Û‹\Ô]\›‹ˆX[›Ô›ÛÚ[™ÝÈOH[ˆ	‰ˆX[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JÌK]Y[ÈÝ]]Ù][™ÜË‹‹ˆŠNÂˆY[K˜Y][JÌ•[\Ë‹‹ˆ‹\Ô›Ú™XÝ
+NÂˆY[K˜Y][JÌK•[YHÚYÛ˜]\™K‹‹ˆ‹\Ô›Ú™XÝ
+NÂˆY[K˜Y][JÌLK•[YH
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆY[K˜Y][JÌL“[Ù[\Ë‹‹ˆ‹\Ô›Ú™XÝ
+NÂˆ]]ÊˆÜÚ[™ÝÈH[˜[ZX×ØØ\ÝXÙNŽ”™\Ú^˜X›UÚ[™ÝÊŠÙ]Ü]™[ÛÛ\Û™[
+
+JNÂˆY[K˜Y][JÌË‘[ØÜ™Y[ˆ
+ŒLJH‹ÜÚ[™ÝÈOH[‹ˆÜÚ[™ÝÈOH[ˆ	‰ˆÜÚ[™ÝËOš\Ñ[ØÜ™Y[Š
+JNÂˆY[K˜Y][JÌ‹”ÚÝÈÝ]\È˜\ˆ‹YKÝ]\Ëš\Õš\ÚX›J
+JNÂˆY[K˜Y][JÌL‹”ÚÝÈ[È‹YKÚÝÒ[ÊNÂˆBˆ[ÙHYˆ
+Y[RÚ[™OHÊHËÈ[œÙ\ˆÂˆËÈÙY\H[œÙ\Y\˜\˜ÚHÛÜÙHÈÜš[ÛŽˆZ[Z[ˆ[œÝ[Y[ÂˆËÈ]™H[™\ˆÞ[ËÚ[H\™\\H[œÝ[Y[È]™HZ\ˆÝÛ‚ˆËÈÙ\\˜]H”Õ[œÝ[Y[ÈÙXÝ[Û‹‚ˆY[K˜Y][JŒ‘[H˜XÚÈ
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆY[K˜Y][JŒK”X[›È
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆY[K˜Y][JŒ‹”›ËNH
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆY[K˜Y][JŒË”Ø[\\ˆ
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆXÙNŽ”Ü\Y[HÞ[ÎÂˆÞ[Ë˜Y][JKZ[Z[ˆÔÐÈÞ[ŠNÂˆY[K˜YÝX“Y[J”Þ[È‹Þ[ÊNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂ‚ˆXÙNŽ”Ü\Y[H[\]\ÎÂˆ[\]\Ë˜Y][JL’[œÝ[Y[[\]H
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆ[\]\Ë˜Y][JLK”]\›ˆ[\]H
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆY[K˜YÝX“Y[J•[\]\È‹[\]\ÊNÂ‚ˆXÙNŽ”Ü\Y[HœÝY™™XÝÎÂˆœÝY™™XÝË˜Y][JK•”ÕÈY™™XÝÈ\™H›Ý]˜Z[X›HY]‹˜[ÙJNÂˆY[K˜YÝX“Y[J•”ÕY™™XÝÈ‹œÝY™™XÝÊNÂ‚ˆXÙNŽ”Ü\Y[HœÝÒ[œÝ[Y[ÎÂˆœÝÒ[œÝ[Y[Ë˜Y][J”ØØ[ˆÈX[˜YÙH”ÕÈ[œÝ[Y[Ë‹‹ˆ‹\Ô›Ú™XÝ
+NÂˆœÝÒ[œÝ[Y[Ë˜YÙ\\˜]ÜŠ
+NÂˆYÛ›ÝÛ•œÝÒ[œÝ[Y[ÕÓY[JœÝÒ[œÝ[Y[ÊNÂˆY[K˜YÝX“Y[J•”Õ[œÝ[Y[È‹œÝÒ[œÝ[Y[ÊNÂ‚ˆXÙNŽ”Ü\Y[H\™XÝÂˆ\™XÝ˜Y][J‘\™XÝ[œÝ[Y[È\™H›Ý]˜Z[X›H‹˜[ÙJNÂˆY[K˜YÝX“Y[J‘\™XÝ‹\™XÝ
+NÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆXÙNŽ”Ü\Y[Hž[˜[ZXÜÎÂˆž[˜[ZXÜË˜Y][JK“›È[˜[ZXÜÈY™™XÝÈ]˜Z[X›HY]‹˜[ÙJNÂˆY[K˜YÝX“Y[J‘–[˜[ZXÜÈ‹ž[˜[ZXÜÊNÂˆXÙNŽ”Ü\Y[HžXÚÑ[^NÂˆžXÚÑ[^K˜Y][J‹“›ÈXÚËÙ[^HY™™XÝÈ]˜Z[X›HY]‹˜[ÙJNÂˆY[K˜YÝX“Y[J‘–XÚËÑ[^H‹žXÚÑ[^JNÂˆXÙNŽ”Ü\Y[Hž™]™\˜ŽÂˆž™]™\˜‹˜Y][JË“›È™]™\˜ˆY™™XÝÈ]˜Z[X›HY]‹˜[ÙJNÂˆY[K˜YÝX“Y[J‘–™]™\˜ˆ‹ž™]™\˜ŠNÂˆXÙNŽ”Ü\Y[Hžš[\ŽÂˆžš[\‹˜Y][JZ[Z[ˆ\]X[\Ù\ˆ‹[œÝ[Y[˜XÚÈOH[ŠNÂˆY[K˜YÝX“Y[J‘–š[\ˆ‹žš[\ŠNÂˆXÙNŽ”Ü\Y[HžZ\ØÎÂˆžZ\ØË˜Y][JŽ“›ÈZ\ØÙ[[™[Ý\ÈY™™XÝÈ]˜Z[X›HY]‹˜[ÙJNÂˆY[K˜YÝX“Y[J‘–Z\ØÈ‹žZ\ØÊNÂˆXÙNŽ”Ü\Y[HžÛ\ŽÂˆžÛ\‹˜Y][JŽK“›È–Û\œÈ]˜Z[X›HY]‹˜[ÙJNÂˆY[K˜YÝX“Y[J‘–Û\ˆ‹žÛ\ŠNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆXÙNŽ”Ü\Y[H]Y[Õ˜XÚÎÂˆ]Y[Õ˜XÚË˜Y][J‹]Y[È˜XÚÈ
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆY[K˜YÝX“Y[J]Y[È˜XÚÈ‹]Y[Õ˜XÚÊNÂˆY[K˜Y][JË“RQHÝ]
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆBˆ[ÙHYˆ
+Y[RÚ[™OH
+HËÈÜ[ÛœÂˆÂˆY[K˜Y][JLK“ÛÜ‹\Ô›Ú™XÝÛÜ]Û‹™Ù]ÙÙÛTÝ]J
+JNÂˆY[K˜Y][JL‹“Y]›Û›ÛYH‹\Ô›Ú™XÝY]›Û›ÛYP]Û‹™Ù]ÙÙÛTÝ]J
+JNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JLË]Y[ÈÝ]]Ù][™ÜË‹‹ˆŠNÂˆY[K˜Y][JLM‹]Y[ÈÈRQHXYÛ›ÜÝXÜË‹‹ˆŠNÂˆY[K˜Y][JL]Y[È[œ]Ù][™ÜË‹‹ˆŠNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JLK“RQH[œ]Ù][™ÜË‹‹ˆŠNÂˆY[K˜Y][JL‹“RQH[ˆÛÛ›Û\œË‹‹ˆ
+›Ý]˜Z[X›JH‹˜[ÙJNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JLË”Ø[\H]Ë‹‹ˆŠNÂˆY[K˜Y][JL•”Õ]Ë‹‹ˆŠNÂˆY[K˜Y][JLM”ÚÚ[œÈ
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆY[K˜Y][JLMK•Ø[\\œÈ
+›Ý]˜Z[X›HY]
+H‹˜[ÙJNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JLK•[YHÚYÛ˜]\™K‹‹ˆ‹\Ô›Ú™XÝ
+NÂˆY[K˜Y][JLL•[YX˜\ÙK‹‹ˆ
+ÛÛZ[™È[ˆH]\ˆ\ÜÊH‹˜[ÙJNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JLLK”™Y™\™[˜Ù\Ë‹‹ˆŠNÂˆY[K˜Y][JLL‹”›Ú™XÝÙ][™ÜË‹‹ˆ‹\Ô›Ú™XÝ
+NÂˆY[K˜Y][JLLË”^[\ÝÙ][™ÜË‹‹ˆŠNÂˆBˆ[ÙHYˆ
+Y[RÚ[™OHJHËÈÚ[™ÝÂˆÂˆY[K˜Y][JŒK”^[\Ý‹YK^[\ÝÚ[™ÝÈOH[ˆ	‰ˆ^[\ÝÚ[™ÝËOš\Õš\ÚX›J
+JNÂˆY[K˜Y][JŒ‹“Z^[™ÈÛÛœÛÛH‹YKZ^\•Ú[™ÝÈOH[ˆ	‰ˆZ^\•Ú[™ÝËOš\Õš\ÚX›J
+JNÂˆY[K˜Y][JŒË“X\Ý\ˆÙXÝ[Ûˆ‹YKZ^\•Ú[™ÝÈOH[ˆ	‰ˆZ^\•Ú[™ÝËOš\Õš\ÚX›J
+JNÂˆY[K˜Y][JŒ”X[›È›Û‹\Ô]\›‹ˆX[›Ô›ÛÚ[™ÝÈOH[ˆ	‰ˆX[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JŒKÛÛ\XÝZ^\ˆ‹Z^\•Ú[™ÝÈOH[ŠNÂˆY[K˜Y][JŒL‘^[™Z^\ˆ‹Z^\•Ú[™ÝÈOH[ŠNÂˆY[K˜Y][JŒLK“Z[š[Z^™HZ^\ˆ‹Z^\•Ú[™ÝÈOH[ˆ	‰ˆZ^\•Ú[™ÝËOš\Õš\ÚX›J
+JNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜Y][JŒK’YH[Ú[Ú[™ÝÜÈŠNÂˆY[K˜Y][JŒ‹“Z[š[Z^™H[Ú[™ÝÜÈÈ]\›ˆÛÛ›ÛÈŠNÂˆY[K˜Y][JŒËØ\ØØYHÜ[ˆÚ[™ÝÜÈŠNÂˆY[K˜Y][JŒÙ[™\˜]ÜÛÛ\ÙYÈ”™\ÝÜ™HÙ[™\˜]Üˆˆˆ“Z[š[Z^™HÙ[™\˜]Üˆ‹ˆ[œÝ[Y[˜XÚÈOH[‹Ù[™\˜]ÜÛÛ\ÙY
+NÂˆY[K˜Y][JŒL‹[Ù[™\˜]ÜœÓZ[š[Z^™YÈ”™\ÝÜ™HÙ[™\˜]Üˆ[™[Èˆˆ“Z[š[Z^™H[Ù[™\˜]ÜœÈ‹ˆYÙ]Ù[™\˜]Ü•˜XÚÜÊ
+Kš\Ñ[\J
+K[Ù[™\˜]ÜœÓZ[š[Z^™Y
+NÂˆBˆ[ÙBˆÂˆY[K˜Y][JÌKX›Ý]Ü˜š]ŠNÂˆB‚ˆY[KœÚÝÓY[P\Þ[˜ÊXÙNŽ”Ü\Y[NŽ“Ü[ÛœÊ
+KÚ]\™Ù]ÛÛ\Û™[
+	œÛÝ\˜ÙJKˆÝ\ËY[RÚ[™J[™\Ý[
+HÈ[™SY[T™\Ý[
+Y[RÚ[™™\Ý[
+NÈJNÂˆB‚ˆ›ÚY[™SY[T™\Ý[
+[Y[RÚ[™[][JBˆÂˆYˆ
+][HOH
+H™]\›ŽÂˆÛÛœÝ[œÝÒ[™^H][HHLÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊœÝÒ[™^œÝÓY[Q\ØÜš\[ÛœËœÚ^™J
+JJBˆÂˆYœÝÒ[œÝ[Y[
+œÝÓY[Q\ØÜš\[ÛœË™Ù]™Y™\™[˜ÙJœÝÒ[™^
+JNÂˆ™]\›ŽÂˆBˆÝÚ]Ú
+][JBˆÂˆØ\ÙHŒNˆ[™Ô›Ú™XÝXÝ[ÛŠ
+NÈœ™XZÎÂˆØ\ÙHŒŽˆ™YÔ›Ú™XÝXÝ[ÛŠ
+NÈœ™XZÎÂˆØ\ÙHŒÎˆÛÜSÜÝ]]\›“›Ý\ÊYJNÈœ™XZÎÂˆØ\ÙHŒˆÛÜSÜÝ]]\›“›Ý\Ê˜[ÙJNÈœ™XZÎÂˆØ\ÙHŒNˆ\ÝT]\›“›Ý\Ê
+NÈœ™XZÎÂˆØ\ÙHŒŽˆ˜[™ÛZ^™PÝ\œ™[]\›Š
+NÈœ™XZÎÂˆØ\ÙHŒÎˆÚÝÔ˜[™ÛZ^™SÜ[ÛœÊ
+NÈœ™XZÎÂˆØ\ÙHŒˆ[X[š^™PÝ\œ™[]\›Š
+NÈœ™XZÎÂˆØ\ÙHŒNˆÚÝÔ]X[^™QX[ÙÊ
+NÈœ™XZÎÂˆØ\ÙHŒLˆÚÝÕ˜[œÜÜÙQX[ÙÊ
+NÈœ™XZÎÂˆØ\ÙHŒLNˆÚÝÔØØ[U™[ØÚ]Y\ÑX[ÙÊ
+NÈœ™XZÎÂˆØ\ÙHŒLŽˆÚÝÓ[™ÝX[ÙÊ
+NÈœ™XZÎÂˆØ\ÙHŒLÎˆÙ[XÝ[]\›“›Ý\Ê
+NÈœ™XZÎÂˆØ\ÙHLNˆÜ™X]T›Ú™XÝ
+
+NÈœ™XZÎÂˆØ\ÙHLŽˆÜ[”›Ú™XÝ
+
+NÈœ™XZÎÂˆØ\ÙHLÎˆØ]™T›Ú™XÝ
+
+NÈœ™XZÎÂˆØ\ÙHLˆ^ÜZYJ
+NÈœ™XZÎÂˆØ\ÙHLŽˆØ\ÙHLLŽˆÚÝÔ›Ú™XÝÙ][™ÜÊ
+NÈœ™XZÎÂˆØ\ÙHLLNˆÚÝÔ™Y™\™[˜Ù\Ê
+NÈœ™XZÎÂˆØ\ÙHLLÎˆÚÝÔ^[\ÝÙ][™ÜÊ
+NÈœ™XZÎÂˆØ\ÙHLNˆXÙNŽ’•PÑP\XØ][ÛŽŽ™Ù][œÝ[˜ÙJ
+KOœÞ\Ý[T™\]Y\ÝY]Z]
+
+NÈœ™XZÎÂˆØ\ÙHÌNˆÙÙÛT^[\ÝšY]Ê
+NÈœ™XZÎÂˆØ\ÙHÌŽˆÚÝÓZ^\Š
+NÈœ™XZÎÂˆØ\ÙHÌÎˆÚÝÓZ^\ŠYJNÈœ™XZÎÂˆØ\ÙHÌˆÚÝÔX[›Ô›Û
+
+NÈœ™XZÎÂˆØ\ÙHÌNˆØ\ÙHLÎˆÚÝÐ]Y[ÔÙ][™ÜÊ
+NÈœ™XZÎÂˆØ\ÙHLMŽˆÚÝÐ]Y[ÑXYÛ›ÜÝXÜÊ
+NÈœ™XZÎÂˆØ\ÙHÌˆÚÝÕ[\ÑX[ÙÊ
+NÈœ™XZÎÂˆØ\ÙHÌNˆØ\ÙHLNˆÚÝÕ[YTÚYÛ˜]\™QX[ÙÊ
+NÈœ™XZÎÂˆØ\ÙHÌLˆÚÝÓ[Ù[\Ê
+NÈœ™XZÎÂˆØ\ÙHÌÎ‚ˆYˆ
+]]ÊˆÚ[™ÝÈH[˜[ZX×ØØ\ÝXÙNŽ”™\Ú^˜X›UÚ[™ÝÊŠÙ]Ü]™[ÛÛ\Û™[
+
+JJBˆÚ[™ÝËOœÙ][ØÜ™Y[Š]Ú[™ÝËOš\Ñ[ØÜ™Y[Š
+JNÂˆœ™XZÎÂˆØ\ÙHLˆØ\ÙHLNˆÚÝÐ]Y[ÔÙ][™ÜÊ
+NÈœ™XZÎÂˆØ\ÙHLÎˆÚÝÔØ[\T]ÑX[ÙÊ
+NÈœ™XZÎÂˆØ\ÙHLˆÚÝÕœÝ]ÑX[ÙÊ
+NÈœ™XZÎÂˆØ\ÙHÌŽ‚ˆÝ]\ËœÙ]š\ÚX›J\Ý]\Ëš\Õš\ÚX›J
+JNÂˆZ[X™[œÙ]š\ÚX›JÝ]\Ëš\Õš\ÚX›J
+JNÂˆ™\Ú^™Y
+
+NÂˆœ™XZÎÂˆØ\ÙHÌLŽ‚ˆÚÝÒ[ÈH\ÚÝÒ[ÎÂˆYˆ
+ÛÛ\Ú[™ÝÈOH[ŠBˆÂˆÛÛ\Ú[™ÝËOšYU\
+
+NÂˆÛÛ\Ú[™ÝËOœÙ]Z[\ÙXÛÛ™Ð™Y›Ü™U\\X\œÊÚÝÒ[ÈÈLˆŒMÍÍÊNÂˆBˆYˆ
+]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+JBˆÂˆÙ][™ÜËOœÙ]˜[YJœÚÝÒ[È‹ÚÝÒ[ÊNÂˆ\XØ][Û”›Ü\Y\ËœØ]™RY“™YYY
+
+NÂˆBˆœ™XZÎÂˆØ\ÙHNˆ[œÙ\Z[[’[œÝ[Y[
+
+NÈœ™XZÎÂˆØ\ÙHˆÚÝÕœÝÒ[œÝ[Y[œ›ÝÜÙ\Š
+NÈœ™XZÎÂˆØ\ÙHNˆY]\›Š
+NÈœ™XZÎÂˆØ\ÙH‚ˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠBˆÜ[•˜XÚÑ\]X[\Ù\ŠÙ]Z^\•˜XÚÜÊ
+Kš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆœ™XZÎÂˆØ\ÙHLNˆÛÜ]Û‹œÙ]ÙÙÛTÝ]J[ÛÜ]Û‹™Ù]ÙÙÛTÝ]J
+KXÙNŽœÙ[™›ÝYšXØ][ÛŠNÈœ™XZÎÂˆØ\ÙHLŽˆY]›Û›ÛYP]Û‹œÙ]ÙÙÛTÝ]J[Y]›Û›ÛYP]Û‹™Ù]ÙÙÛTÝ]J
+KXÙNŽœÙ[™›ÝYšXØ][ÛŠNÈœ™XZÎÂˆØ\ÙHŒNˆÙÙÛT^[\ÝšY]Ê
+NÈœ™XZÎÂˆØ\ÙHŒŽˆÚÝÓZ^\Š
+NÈœ™XZÎÂˆØ\ÙHŒÎˆÚÝÓZ^\ŠYJNÈœ™XZÎÂˆØ\ÙHŒˆÚÝÔX[›Ô›Û
+
+NÈœ™XZÎÂˆØ\ÙHŒN‚ˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆYˆ
+\]X[\Ù\•Ú[™ÝÈOH[ŠH\]X[\Ù\•Ú[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆYˆ
+]Y[ÔÙ][™ÜÕÚ[™ÝÈOH[ŠH]Y[ÔÙ][™ÜÕÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆœ™XZÎÂˆØ\ÙHŒŽ‚ˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆ›Üˆ
+]]ÊˆÚ[™ÝÈˆÈÝ]X×ØØ\ÝXÙNŽ‘ØÝ[Y[Ú[™ÝÊŠ\]X[\Ù\•Ú[™ÝË™Ù]
+
+JKˆÝ]X×ØØ\ÝXÙNŽ‘ØÝ[Y[Ú[™ÝÊŠ]Y[ÔÙ][™ÜÕÚ[™ÝË™Ù]
+
+JHJBˆYˆ
+Ú[™ÝÈOH[ˆ	‰ˆÚ[™ÝËOš\Õš\ÚX›J
+JHÚ[™ÝËOœÙ]Z[š[Z\ÙY
+YJNÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆ	‰ˆYÙ[™\˜]ÜÛÛ\ÙY
+BˆÙÙÛQÙ[™\˜]ÜÛÛ\ÙY
+
+NÂˆœ™XZÎÂˆØ\ÙHŒÎˆØ\ØØYSÜ[•Ú[™ÝÜÊ
+NÈœ™XZÎÂˆØ\ÙHŒˆÙÙÛQÙ[™\˜]ÜÛÛ\ÙY
+
+NÈœ™XZÎÂˆØ\ÙHŒLŽ‚ˆ[Ù[™\˜]ÜœÓZ[š[Z^™YHX[Ù[™\˜]ÜœÓZ[š[Z^™YÂˆYˆ
+[Ù[™\˜]ÜœÓZ[š[Z^™Y
+BˆÂˆÙ[™\˜]ÜÛÛ\ÙYH˜[ÙNÂˆX[›Ô›ÛX^[Z^™YH˜[ÙNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆYˆ
+\X[›Ô›Û™\ÝÜ™P›Ý[™Ëš\Ñ[\J
+JHÙ[™\˜]Ü”[™[›Ý[™ÈHX[›Ô›Û™\ÝÜ™P›Ý[™ÎÂˆX[›Ô›Û]Û‹œÙ]]Û•^
+”PS“È“ÓŠNÂˆÝ]\ËœÙ]^
+[Ù[™\˜]Üˆ[™[ÈZ[š[Z^™YˆÙ[XÝÛ™Hœ›ÛHHÙ[™\˜]Üˆ˜\ˆÈ™\ÝÜ™H]ˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ™\Ú^™Y
+
+NÂˆœ™XZÎÂˆØ\ÙHŒNˆÙ]Z^\”[™[Ú^™J˜[ÙJNÈœ™XZÎÂˆØ\ÙHŒLˆÙ]Z^\”[™[Ú^™JYJNÈœ™XZÎÂˆØ\ÙHŒLN‚ˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆœ™XZÎÂˆØ\ÙHÌNˆXÙNŽ[\Ú[™ÝÎŽœÚÝÓY\ÜØYÙP›Þ\Þ[˜ÊXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛ‹X›Ý]Ü˜š]‹ˆ“Ü˜š]\ÈHÝ[™[Û™K]\›‹Yš\œÝUÈZ[Ú]•PÑH[™˜XÚÝ[Ûˆ[™Ú[™KˆŠNÈœ™XZÎÂˆY˜][ˆœ™XZÎÂˆBˆXÙNŽšYÛ›Ü™U[\ÙY
+Y[RÚ[™
+NÂˆB‚ˆ›ÚYÚÝÔ›Ú™XÝÙ][™ÜÊ
+BˆÂˆYˆ
+Z\Ô›Ú™XÝ
+H™]\›ŽÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ”›Ú™XÝÙ][™ÜÈ‹‘Ù[™\˜[[™›Ü›X][Ûˆ[™›Ú™XÝ[]™[Ü[ÛœËˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠ›˜[YH‹›Ú™XÝ™Ù]˜[YJ
+K”›Ú™XÝ˜[YNˆŠNÂˆX[ÙË˜Y^Y]ÜŠ™\ØÜš\[Ûˆ‹›Ú™XÝ™Ù]\ØÜš\[ÛŠ
+K‘\ØÜš\[ÛŽˆŠNÂˆYˆ
+]]Êˆ\ØÜš\[ÛˆHX[ÙË™Ù]^Y]ÜŠ™\ØÜš\[ÛˆŠJBˆÂˆ\ØÜš\[Û‹OœÙ]][S[™JYJNÂˆ\ØÜš\[Û‹OœÙ]™]\›’Ù^TÝ\Ó™]Ó[™JYJNÂˆBˆX[ÙË˜Y^Y]ÜŠ˜Ü™X]Ü•\›‹›Ú™XÝ™Ù]Ü™X]Ü•\›
+
+KÜ™X]ÜˆÙXœYÙHT“ˆŠNÂˆX[ÙË˜Y^›ØÚÊÚ[™Ù\È\™HÝÜ™Y[ˆHÜ˜š]›Ú™XÝš[Kˆ[œÝ[Y[[™[™È[™[\›˜]H[š[™ÈX›\È\™H›Ý]˜Z[X›HY]ˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹KXÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽœ™]\›’Ù^K
+JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^K
+JNÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂ‚ˆÛÛœÝ]]È˜[YHHX[ÙË™Ù]^Y]ÜÛÛ[Ê›˜[YHŠKš[J
+NÂˆÛÛœÝ]]È\ØÜš\[ÛˆHX[ÙË™Ù]^Y]ÜÛÛ[Ê™\ØÜš\[ÛˆŠKš[J
+NÂˆÛÛœÝ]]ÈÜ™X]Ü•\›HX[ÙË™Ù]^Y]ÜÛÛ[Ê˜Ü™X]Ü•\›ŠKš[J
+NÂˆYˆ
+˜[YHOH›Ú™XÝ™Ù]˜[YJ
+H	‰ˆ\ØÜš\[ÛˆOH›Ú™XÝ™Ù]\ØÜš\[ÛŠ
+Bˆ	‰ˆÜ™X]Ü•\›OH›Ú™XÝ™Ù]Ü™X]Ü•\›
+
+JH™]\›ŽÂˆ™[Y[X™\•[™ÊÚ[™ÙH›Ú™XÝÙ][™ÜÈŠNÂˆ›Ú™XÝœÙ]˜[YJ˜[YJNÂˆ›Ú™XÝœÙ]\ØÜš\[ÛŠ\ØÜš\[ÛŠNÂˆ›Ú™XÝœÙ]Ü™X]Ü•\›
+Ü™X]Ü•\›
+NÂˆ\Ñ\HHYNÂˆ™Yœ™\Ú›Ú™XÝšY]Ê”›Ú™XÝÙ][™ÜÈ\]YˆØ]™HÈÙY\HÚ[™ÙKˆŠNÂˆB‚ˆ›ÚYÚÝÔ™Y™\™[˜Ù\Ê
+BˆÂˆ]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+NÂˆYˆ
+Ù][™ÜÈOH[ŠH™]\›ŽÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ”™Y™\™[˜Ù\È‹•š\ÝX[\]H[™]]ÛX]XÈØ]™HÙ][™ÜËˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠ\]T˜]H‹XÙNŽ”Ýš[™ÊÙ][™ÜËO™Ù][˜[YJ\]T˜]Rˆ‹Ì
+JKˆ•\]H˜]H
+œ˜[Y\È\ˆÙXÛÛ™
+NˆŠNÂˆX[ÙË˜Y^Y]ÜŠQXØ^H‹XÙNŽ”Ýš[™ÊÙ][™ÜËO™Ù][˜[YJQXØ^H‹ÍJJKˆ••HXØ^H
+\˜Ù[
+NˆŠNÂˆX[ÙË˜Y^Y]ÜŠ˜]]ÔØ]™H‹XÙNŽ”Ýš[™ÊÙ][™ÜËO™Ù][˜[YJ˜]]ÔØ]™SZ[]\È‹
+JKˆ]]Ë\Ø]™H]™\žHˆZ[]\È
+\ØX›\ÊNˆŠNÂˆX[ÙË˜Y^Y]ÜŠ™Y˜][›Ú™XÝ‹Ù][™ÜËO™Ù]˜[YJ™Y˜][›Ú™XÝ]ŠKˆ‘Y˜][›Ú™XÝš[NˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹KXÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽœ™]\›’Ù^K
+JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^K
+JNÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂ‚ˆÛÛœÝ]]È\]T˜]HHXÙNŽš›[Z]
+‹ŒX[ÙË™Ù]^Y]ÜÛÛ[Ê\]T˜]HŠK™Ù][˜[YJ
+JNÂˆÛÛœÝ]]ÈQXØ^HHXÙNŽš›[Z]
+KLX[ÙË™Ù]^Y]ÜÛÛ[ÊQXØ^HŠK™Ù][˜[YJ
+JNÂˆÛÛœÝ]]È]]ÔØ]™SZ[]\ÈHXÙNŽš›[Z]
+X[ÙË™Ù]^Y]ÜÛÛ[Ê˜]]ÔØ]™HŠK™Ù][˜[YJ
+JNÂˆÙ][™ÜËOœÙ]˜[YJ\]T˜]Rˆ‹\]T˜]JNÂˆÙ][™ÜËOœÙ]˜[YJQXØ^H‹QXØ^JNÂˆÙ][™ÜËOœÙ]˜[YJ˜]]ÔØ]™SZ[]\È‹]]ÔØ]™SZ[]\ÊNÂˆÙ][™ÜËOœÙ]˜[YJ™Y˜][›Ú™XÝ]‹X[ÙË™Ù]^Y]ÜÛÛ[Ê™Y˜][›Ú™XÝŠKš[J
+JNÂˆ\XØ][Û”›Ü\Y\ËœØ]™RY“™YYY
+
+NÂˆÝ\[Y\’Š\]T˜]JNÂˆ\Ý]]ÔØ]™S\ÈHXÙNŽ•[YNŽ™Ù]Z[\ÙXÛÛ™ÛÝ[\Š
+NÂˆÝ]\ËœÙ]^
+”™Y™\™[˜Ù\ÈØ]™Yˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÚÝÔØ[\T]ÑX[ÙÊ
+BˆÂˆÚÝÔÙX\˜Ú]ÑX[ÙÊ”Ø[\H]È‹œØ[\T]È‹”Ø[\HÙX\˜Ú›Û\œÈØ]™YˆŠNÂˆB‚ˆ›ÚYÚÝÕœÝ]ÑX[ÙÊ
+BˆÂˆÚÝÔÙX\˜Ú]ÑX[ÙÊ•”Õ]È‹œÝ]È‹ˆ•”ÕÈÙX\˜Ú›Û\œÈØ]™Yˆ‹YJNÂˆB‚ˆXÙNŽ”Ýš[™Ð\œ˜^HÙ]œÝÙX\˜Ú]Ê
+BˆÂˆXÙNŽ”Ýš[™Ð\œ˜^H]ÎÂˆYˆ
+]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+JBˆÂˆ]Ë˜YÚÙ[œÊÙ][™ÜËO™Ù]˜[YJœÝ]ÈŠKŽ×—ˆ‹—ˆŠNÂˆ]Ëš[J
+NÂˆ]Ëœ™[[Ý™Q[\TÝš[™ÜÊ
+NÂˆBˆ™]\›ˆ]ÎÂˆB‚ˆ›ÚYÚÝÕœÝÒ[œÝ[Y[œ›ÝÜÙ\Š
+BˆÂˆYˆ
+Z\Ô›Ú™XÝ
+H™]\›ŽÂˆYˆ
+œÝÒ[œÝ[Y[œ›ÝÜÙ\ˆOH[ŠBˆÂˆ]]ÉˆYÚ[œÈH[™Ú[™K™Ù]YÚ[“X[˜YÙ\Š
+NÂˆœÝÒ[œÝ[Y[œ›ÝÜÙ\ˆHÝŽ›XZÙWÝ[š\]YOœÝÒ[œÝ[Y[œ›ÝÜÙ\ŠˆYÚ[œËœYÚ[‘›Ü›X]X[˜YÙ\‹YÚ[œËšÛ›ÝÛ”YÚ[“\ÝˆÝ\×HÈ™]\›ˆÙ]œÝÙX\˜Ú]Ê
+NÈKˆÝ\×HÈÚÝÕœÝ]ÑX[ÙÊ
+NÈKˆÝ\×JÛÛœÝXÙNŽ”YÚ[‘\ØÜš\[Û‰ˆ\ØÜš\[ÛŠHÈYœÝÒ[œÝ[Y[
+\ØÜš\[ÛŠNÈJNÂˆBˆœÝÒ[œÝ[Y[œ›ÝÜÙ\‹OœÙ]š\ÚX›JYJNÂˆœÝÒ[œÝ[Y[œ›ÝÜÙ\‹OÑœ›Û
+YJNÂˆYˆ
+œÝÒ[œÝ[Y[œ›ÝÜÙ\‹O›™YYÒ[š]X[ØØ[Š
+JHœÝÒ[œÝ[Y[œ›ÝÜÙ\‹OœØØ[“›ÝÊ
+NÂˆB‚ˆ›ÚYÝ\œÝÔØØ[Š
+BˆÂˆYˆ
+œÝÒ[œÝ[Y[œ›ÝÜÙ\ˆOH[ŠBˆÂˆ]]ÉˆYÚ[œÈH[™Ú[™K™Ù]YÚ[“X[˜YÙ\Š
+NÂˆœÝÒ[œÝ[Y[œ›ÝÜÙ\ˆHÝŽ›XZÙWÝ[š\]YOœÝÒ[œÝ[Y[œ›ÝÜÙ\ŠˆYÚ[œËœYÚ[‘›Ü›X]X[˜YÙ\‹YÚ[œËšÛ›ÝÛ”YÚ[“\ÝˆÝ\×HÈ™]\›ˆÙ]œÝÙX\˜Ú]Ê
+NÈKˆÝ\×HÈÚÝÕœÝ]ÑX[ÙÊ
+NÈKˆÝ\×JÛÛœÝXÙNŽ”YÚ[‘\ØÜš\[Û‰ˆ\ØÜš\[ÛŠHÈYœÝÒ[œÝ[Y[
+\ØÜš\[ÛŠNÈJNÂˆBˆœÝÒ[œÝ[Y[œ›ÝÜÙ\‹OœÙ]š\ÚX›J˜[ÙJNÂˆœÝÒ[œÝ[Y[œ›ÝÜÙ\‹OœØØ[“›ÝÊ
+NÂˆB‚ˆXÙNŽ”Ýš[™ÈÙ]œÝÒ[œÝ[Y[Ü›Ý\
+ÛÛœÝXÙNŽ”YÚ[‘\ØÜš\[Û‰ˆ\ØÜš\[ÛŠBˆÂˆÛÛœÝ]]ÈYÚ[”]HXÙNŽ‘š[J\ØÜš\[Û‹™š[SÜ’Y[YšY\ŠBˆ™Ù][]˜[YJ
+Kœ™\XÙPÚ\˜XÝ\Š	×	Ë	ËÉÊNÂˆÛÛœÝ]]ÈÝ\ÝÛT]ÈHÙ]œÝÙX\˜Ú]Ê
+NÂˆ›Üˆ
+ÛÛœÝ]]Éˆ]ˆÝ\ÝÛT]ÊBˆÂˆÛÛœÝXÙNŽ‘š[H›ÛÝ
+]
+NÂˆÛÛœÝ]]È›ÛÝ]H›ÛÝ™Ù][]˜[YJ
+Kœ™\XÙPÚ\˜XÝ\Š	×	Ë	ËÉÊKš[PÚ\˜XÝ\œÐ][™
+‹ÈŠNÂˆYˆ
+›ÛÝ]š\Ñ[\J
+H\YÚ[”]œÝ\ÕÚ]YÛ›Ü™PØ\ÙJ›ÛÝ]
+È‹ÈŠJHÛÛ[YNÂˆÛÛœÝ]]È™[]]™T]HYÚ[”]œÝXœÝš[™Ê›ÛÝ]›[™Ý
+
+H
+ÈJNÂˆÛÛœÝ]]Èš\œÝ›Û\ˆH™[]]™T]\Ñš\œÝØØÝ\œ™[˜ÙSÙŠ‹È‹˜[ÙK˜[ÙJNÂˆYˆ
+š\œÝ›Û\‹™[™ÕÚ]YÛ›Ü™PØ\ÙJ‹œÝÈŠJH™]\›ˆ›ÛÝ™Ù]š[S˜[YJ
+NÂˆ™]\›ˆš\œÝ›Û\‹š\Ó›Ý[\J
+HÈš\œÝ›Û\ˆˆ›ÛÝ™Ù]š[S˜[YJ
+NÂˆB‚ˆXÙNŽ\œ˜^OXÙNŽ‘š[Oˆ›ÛÝÎÂˆ]]Éˆ›Ü›X]ÈH[™Ú[™K™Ù]YÚ[“X[˜YÙ\Š
+KœYÚ[‘›Ü›X]X[˜YÙ\ŽÂˆ›Üˆ
+[HHÈH›Ü›X]Ë™Ù][Q›Ü›X]Ê
+NÈ
+ÊÚJBˆYˆ
+]]Êˆ›Ü›X]H›Ü›X]Ë™Ù]›Ü›X]
+JNÈ›Ü›X]OH[ˆ	‰ˆ›Ü›X]O™Ù]˜[YJ
+HOH•”ÕÈŠBˆÂˆÛÛœÝ]]ÈY˜][ÈH›Ü›X]O™Ù]Y˜][ØØ][ÛœÕÔÙX\˜Ú
+
+NÂˆ›Üˆ
+[][™^HÈ][™^Y˜][Ë™Ù][T]Ê
+NÈ
+ÊÜ][™^
+Bˆ›ÛÝË˜Y
+Y˜][ÖÜ][™^JNÂˆB‚ˆ›Üˆ
+ÛÛœÝ]]Éˆ›ÛÝˆ›ÛÝÊBˆÂˆ]]È›ÛÝ]H›ÛÝ™Ù][]˜[YJ
+Kœ™\XÙPÚ\˜XÝ\Š	×	Ë	ËÉÊKš[PÚ\˜XÝ\œÐ][™
+‹ÈŠNÂˆYˆ
+›ÛÝ]š\Ñ[\J
+H\YÚ[”]œÝ\ÕÚ]YÛ›Ü™PØ\ÙJ›ÛÝ]
+È‹ÈŠJHÛÛ[YNÂˆ]]È™[]]™T]HYÚ[”]œÝXœÝš[™Ê›ÛÝ]›[™Ý
+
+H
+ÈJNÂˆÛÛœÝ]]Èš\œÝ›Û\ˆH™[]]™T]\Ñš\œÝØØÝ\œ™[˜ÙSÙŠ‹È‹˜[ÙK˜[ÙJNÂˆYˆ
+š\œÝ›Û\‹™[™ÕÚ]YÛ›Ü™PØ\ÙJ‹œÝÈŠJH™]\›ˆßNÂˆYˆ
+š\œÝ›Û\‹š\Ó›Ý[\J
+JH™]\›ˆš\œÝ›Û\ŽÂˆ™]\›ˆßNÂˆBˆ™]\›ˆXÙNŽ‘š[J\ØÜš\[Û‹™š[SÜ’Y[YšY\ŠK™Ù]\™[\™XÝÜžJ
+K™Ù]š[S˜[YJ
+NÂˆB‚ˆ›ÚYYÛ›ÝÛ•œÝÒ[œÝ[Y[ÕÓY[JXÙNŽ”Ü\Y[IˆY[JBˆÂˆœÝÓY[Q\ØÜš\[ÛœË˜ÛX\Š
+NÂˆXÙNŽ\œ˜^OXÙNŽ”YÚ[‘\ØÜš\[Ûˆ[œÝ[Y[ÎÂˆ›Üˆ
+ÛÛœÝ]]Éˆ\ØÜš\[Ûˆˆ[™Ú[™K™Ù]YÚ[“X[˜YÙ\Š
+KšÛ›ÝÛ”YÚ[“\Ý™Ù]\\Ê
+JBˆYˆ
+\ØÜš\[Û‹œYÚ[‘›Ü›X]˜[YHOH•”ÕÈˆ	‰ˆ\ØÜš\[Û‹š\Ò[œÝ[Y[
+Bˆ[œÝ[Y[Ë˜Y
+\ØÜš\[ÛŠNÂˆÝŽœÛÜ
+[œÝ[Y[Ë˜™YÚ[Š
+K[œÝ[Y[Ë™[™
+
+K×JÛÛœÝ]]ÉˆKÛÛœÝ]]ÉˆŠBˆÂˆ™]\›ˆK›˜[YK˜ÛÛ\\™RYÛ›Ü™PØ\ÙJ‹›˜[YJHÂˆJNÂˆYˆ
+[œÝ[Y[Ëš\Ñ[\J
+JBˆÂˆY[K˜Y][JK“›È”ÕÈ[œÝ[Y[ÈØØ[›™YY]‹˜[ÙJNÂˆ™]\›ŽÂˆB‚ˆÝŽ›X\XÙNŽ”Ýš[™ËXÙNŽ”Ü\Y[OˆÜ›Ý\YÂˆ›Üˆ
+ÛÛœÝ]]Éˆ\ØÜš\[Ûˆˆ[œÝ[Y[ÊBˆÂˆÛÛœÝ[YHL
+ÈœÝÓY[Q\ØÜš\[ÛœËœÚ^™J
+NÂˆœÝÓY[Q\ØÜš\[ÛœË˜Y
+\ØÜš\[ÛŠNÂˆXÙNŽ”Ü\Y[NŽ’][H][J\ØÜš\[Û‹›˜[YJNÂˆ][KœÙ]Q
+Y
+NÂˆÛÛœÝ]]ÈÜ›Ý\HÙ]œÝÒ[œÝ[Y[Ü›Ý\
+\ØÜš\[ÛŠNÂˆYˆ
+Ü›Ý\š\Ñ[\J
+JHY[K˜Y][JÝŽ›[Ý™J][JJNÂˆ[ÙHÜ›Ý\YÙÜ›Ý\K˜Y][JÝŽ›[Ý™J][JJNÂˆBˆ›Üˆ
+]]ÉˆÙÜ›Ý\Ü›Ý\Y[WHˆÜ›Ý\Y
+BˆY[K˜YÝX“Y[JÜ›Ý\Ü›Ý\Y[JNÂˆB‚ˆXÙNŽ”Ýš[™ÈÙ][œÝ[Y[XY\•^
+
+HÛÛœÝˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠBˆ›Üˆ
+]]ÊˆYÚ[ˆˆ[œÝ[Y[˜XÚËOœYÚ[“\Ý
+BˆYˆ
+]]Êˆ^\›˜[H[˜[ZX×ØØ\ÝNŽ‘^\›˜[YÚ[ŠŠYÚ[ŠJBˆ™]\›ˆ^\›˜[O™Ù]˜[YJ
+H
+Èˆ0­È”ÕÈS”Õ•SQS•ŽÂˆ™]\›ˆÔÐÈ0­È•RSRSˆÖS•ŽÂˆB‚ˆ›ÚYYœÝÒ[œÝ[Y[
+ÛÛœÝXÙNŽ”YÚ[‘\ØÜš\[Û‰ˆ\ØÜš\[ÛŠBˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ŠBˆÂˆÚÝÑ\œ›ÜŠ”›Ú™XÝ™\]Z\™Y‹Ü™X]HÜˆÜ[ˆH›Ú™XÝ™Y›Ü™H[œÙ\[™ÈH”ÕÈ[œÝ[Y[ˆŠNÂˆ™]\›ŽÂˆBˆ™[Y[X™\•[™Ê’[œÙ\”ÕÈ[œÝ[Y[ŠNÂ‚ˆËÈH™]È˜XÚÝ[ÛˆY]ÛÛZ[œÈÛ™H[\H]Y[È˜XÚËˆ™]\ÙH]›ÜˆBˆËÈš\œÝÜ˜š][œÝ[Y[ÛÈ[™Ú[™K]˜XÚÈ[™^\ÈÝ^H[YÛ™YÚ]BˆËÈÜ˜š]›Ú™XÝ˜XÚÈQËˆ[œÙ\[™ÈHÙXÛÛ™[™Ú[™H˜XÚÈ\™H\ÙYˆËÈÈXZÙHHš\œÝ”Õ	ÜÈX[›Ë\›ÛY]È\™Ù][ˆ[\HQX]š[™ÂˆËÈ]Ú[[[ˆ›Ý]\›ˆ[™ÛÛ™È^X˜XÚË‚ˆ]]È[™Ú[™U˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆÛÛœÝ›ÛÛ™]\Ú[™Ò[š]X[˜XÚÈH›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+HOH	‰ˆ[™Ú[™U˜XÚÜËœÚ^™J
+HOHNÂˆNŽ]Y[Õ˜XÚÊˆ˜XÚÈH™]\Ú[™Ò[š]X[˜XÚÂˆÈ[™Ú[™U˜XÚÜË™Ù][˜ÚXÚÙY
+
+Hˆ[ŽÂˆYˆ
+˜XÚÈOH[ŠBˆÂˆ]]È[œÙ\Y˜XÚÈHY]Oš[œÙ\™]Ð]Y[Õ˜XÚÊNŽ•˜XÚÒ[œÙ\Ú[Ž™Ù][™Ù•˜XÚÜÊ
+™Y]
+K[ŠNÂˆ˜XÚÈH[œÙ\Y˜XÚË™Ù]
+
+NÂˆBˆYˆ
+˜XÚÈOH[ŠBˆÂˆÚÝÑ\œ›ÜŠÛÝ[›ÝY”ÕÈ[œÝ[Y[‹•˜XÚÝ[Ûˆ[™Ú[™HÛÝ[›ÝÜ™X]H[ˆ]Y[È˜XÚËˆŠNÂˆ™]\›ŽÂˆB‚ˆ]]ÈYÚ[ˆHY]O™Ù]YÚ[ØXÚJ
+K˜Ü™X]S™]ÔYÚ[ŠNŽ‘^\›˜[YÚ[ŽŽž[\S˜[YK\ØÜš\[ÛŠNÂˆYˆ
+YÚ[ˆOH[ŠBˆÂˆYˆ
+\™]\Ú[™Ò[š]X[˜XÚÊHY]O™[]U˜XÚÊ˜XÚÊNÂˆÚÝÑ\œ›ÜŠÛÝ[›ÝØY”ÕÈ[œÝ[Y[‹•HÙ[XÝYYÚ[ˆÛÝ[›Ý™H[œÝ[X]YˆÚXÚÈ]È[œÝ[][Ûˆ[™\˜Ú]XÝ\™KˆŠNÂˆ™]\›ŽÂˆB‚ˆÛÛœÝ]]È˜XÚÓ˜[YHH\ØÜš\[Û‹›˜[YKš\Ó›Ý[\J
+HÈ\ØÜš\[Û‹›˜[YBˆˆ•”ÕÈ[œÝ[Y[ˆ
+ÈXÙNŽ”Ýš[™Ê›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+H
+ÈJNÂˆ˜XÚËOœÙ]˜[YJ˜XÚÓ˜[YJNÂˆ˜XÚËOœYÚ[“\Ýš[œÙ\YÚ[ŠYÚ[‹[ŠNÂˆËÈ™\\™HH]™HRQH]\ÈÛÛÛˆ\È[ˆ[œÝ[Y[\ÈYYÛÂˆËÈ\™XÝÙ^X›Ø\™]Y][ÛˆÛÜšÜÈ™Y›Ü™H˜[œÜÜ\È™Y[ˆÝ\Y‚ˆY]Oœ™\Ý\^X˜XÚÊ
+NÂˆ›Ú™XÝ˜Y[œÝ[Y[˜XÚÊ
+NÂˆ›Ú™XÝœÙ]˜XÚÓ˜[YJ›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+HHK˜XÚÓ˜[YJNÂˆ[œÝ[Y[˜XÚÈH˜XÚÎÂˆ]\›Û\H[ŽÂˆ\]PXÝ]™R[œÝ[Y[Y]ÜŠ
+NÂˆ™Yœ™\Ú˜XÚÔÙ[XÝÜŠ
+NÂˆ™XY]\›”Ý\Ê
+NÂˆ™Yœ™\ÚZ^\ÛÛ›ÛÊ
+NÂˆ\Ñ\HHYNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+LHŠNÂˆ™Yœ™\Ú›Ú™XÝšY]ÊYY”ÕÈ[œÝ[Y[ˆ
+È\ØÜš\[Û‹›˜[YH
+È‹ˆØ]™HÈÙY\HÚ[™ÙKˆŠNÂˆB‚ˆ›ÚYÚÝÔÙX\˜Ú]ÑX[ÙÊÛÛœÝXÙNŽ”Ýš[™Éˆ]KÛÛœÝXÙNŽ”Ýš[™ÉˆÙ][™ÜÒÙ^KˆÛÛœÝXÙNŽ”Ýš[™ÉˆØ]™YÝ]\Ë›ÛÛ[˜ÛYUœÝÝ\\Ü[ÛˆH˜[ÙJBˆÂˆ]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+NÂˆYˆ
+Ù][™ÜÈOH[ŠH™]\›ŽÂˆXÙNŽ”Ýš[™Ð\œ˜^H]ÎÂˆ]Ë˜YÚÙ[œÊÙ][™ÜËO™Ù]˜[YJÙ][™ÜÒÙ^JKŽ×—ˆ‹—ˆŠNÂˆ]Ëš[J
+NÂˆ]Ëœ™[[Ý™Q[\TÝš[™ÜÊ
+NÂˆ]]ÈÚ[™ÝÈHÝŽ›XZÙWÝ[š\]YOÙX\˜Ú]ÕÚ[™ÝÏŠ]KÝŽ›[Ý™J]ÊKˆÝ\ËÙ][™ÜÒÙ^KØ]™YÝ]\×JXÙNŽ”Ýš[™Ð\œ˜^H\]Y]ÊBˆÂˆYˆ
+]]Êˆ\Ù\”Ù][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+JBˆÂˆ\Ù\”Ù][™ÜËOœÙ]˜[YJÙ][™ÜÒÙ^K\]Y]Ëš›Ú[’[ÔÝš[™ÊŽÈŠJNÂˆ\XØ][Û”›Ü\Y\ËœØ]™RY“™YYY
+
+NÂˆÝ]\ËœÙ]^
+Ø]™YÝ]\ËXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆK[˜ÛYUœÝÝ\\Ü[Û‹ˆ[˜ÛYUœÝÝ\\Ü[Ûˆ	‰ˆÙ][™ÜËO™Ù]›ÛÛ˜[YJœØØ[•œÝÐ]Ý\\‹˜[ÙJKˆÝ\×J›ÛÛ[˜X›Y
+BˆÂˆYˆ
+]]Êˆ\Ù\”Ù][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+JBˆÂˆ\Ù\”Ù][™ÜËOœÙ]˜[YJœØØ[•œÝÐ]Ý\\‹[˜X›Y
+NÂˆ\XØ][Û”›Ü\Y\ËœØ]™RY“™YYY
+
+NÂˆBˆJNÂˆÚ[™ÝËOœÙ]š\ÚX›JYJNÂˆÚ[™ÝËOÑœ›Û
+YJNÂˆYˆ
+Ù][™ÜÒÙ^HOHœØ[\T]ÈŠHØ[\T]ÕÚ[™ÝÈHÝŽ›[Ý™JÚ[™ÝÊNÂˆ[ÙHœÝ]ÕÚ[™ÝÈHÝŽ›[Ý™JÚ[™ÝÊNÂˆB‚ˆ›ÚYÚÝÕ[\ÑX[ÙÊ
+BˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ŠH™]\›ŽÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ•[\È‹”Ù]H›Ú™XÝ	ÜÈ[š]X[[\Ëˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠ˜œH‹XÙNŽ”Ýš[™Ê[\ÔÛY\‹™Ù]˜[YJ
+KJK™X]È\ˆZ[]NˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹KXÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽœ™]\›’Ù^K
+JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^K
+JNÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂ‚ˆÛÛœÝ]]ÈœHHXÙNŽš›[Z]
+ŒŒÌŒX[ÙË™Ù]^Y]ÜÛÛ[Ê˜œHŠK™Ù]ÝX›U˜[YJ
+JNÂˆYˆ
+ÝŽ˜XœÊœHH[\ÔÛY\‹™Ù]˜[YJ
+JHŒJH™]\›ŽÂˆ™[Y[X™\•[™ÊÚ[™ÙH[\ÈŠNÂˆ[\ÔÛY\‹œÙ]˜[YJœKXÙNŽœÙ[™›ÝYšXØ][Û”Þ[˜ÊNÂˆB‚ˆ›ÚYÚÝÕ[YTÚYÛ˜]\™QX[ÙÊ
+BˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]ÈÝ\œ™[H›Ú™XÝ™Ù][š]X[[YTÚYÛ˜]\™J
+NÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ•[YHÚYÛ˜]\™H‹”Ù]H›Ú™XÝ	ÜÈ[š]X[Y]\‹ˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠ›[Y\˜]Üˆ‹XÙNŽ”Ýš[™ÊÝ\œ™[›[Y\˜]ÜŠK™X]È\ˆ˜\ŽˆŠNÂˆX[ÙË˜Y^Y]ÜŠ™[›ÛZ[˜]Üˆ‹XÙNŽ”Ýš[™ÊÝ\œ™[™[›ÛZ[˜]ÜŠK™X][š]
+K‹M‹ÌŠNˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹KXÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽœ™]\›’Ù^K
+JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^K
+JNÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂ‚ˆÛÛœÝ]]È[Y\˜]ÜˆHXÙNŽš›[Z]
+KÌ‹X[ÙË™Ù]^Y]ÜÛÛ[Ê›[Y\˜]ÜˆŠK™Ù][˜[YJ
+JNÂˆ]]È[›ÛZ[˜]ÜˆHX[ÙË™Ù]^Y]ÜÛÛ[Ê™[›ÛZ[˜]ÜˆŠK™Ù][˜[YJ
+NÂˆYˆ
+[›ÛZ[˜]ÜˆOHH	‰ˆ[›ÛZ[˜]ÜˆOHˆ	‰ˆ[›ÛZ[˜]ÜˆOH	‰ˆ[›ÛZ[˜]ÜˆOHˆ	‰ˆ[›ÛZ[˜]ÜˆOHMˆ	‰ˆ[›ÛZ[˜]ÜˆOHÌŠBˆ[›ÛZ[˜]ÜˆHÂˆYˆ
+Ý\œ™[›[Y\˜]ÜˆOH[Y\˜]Üˆ	‰ˆÝ\œ™[™[›ÛZ[˜]ÜˆOH[›ÛZ[˜]ÜŠH™]\›ŽÂ‚ˆ™[Y[X™\•[™ÊÚ[™ÙH[YHÚYÛ˜]\™HŠNÂˆ›Ú™XÝœÙ][š]X[[YTÚYÛ˜]\™J[Y\˜]Ü‹[›ÛZ[˜]ÜŠNÂˆYˆ
+]]Êˆ[š]X[Y]\ˆHY]O[\ÔÙ\]Y[˜ÙK™Ù][YTÚYÊ
+JBˆ[š]X[Y]\‹OœÙ]Ýš[™Õ[YTÚYÊXÙNŽ”Ýš[™Ê[Y\˜]ÜŠH
+È‹Èˆ
+ÈXÙNŽ”Ýš[™Ê[›ÛZ[˜]ÜŠJNÂˆ\]SÛÜ˜[™ÙJ
+NÂˆÛÛœÝ]]ÈÚYÛ˜]\™U^HXÙNŽ”Ýš[™Ê[Y\˜]ÜŠH
+È‹Èˆ
+ÈXÙNŽ”Ýš[™Ê[›ÛZ[˜]ÜŠNÂˆ[YTÚYÛ˜]\™SX™[œÙ]^
+ÚYÛ˜]\™U^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\ÚXØ[]Z[ËœÙ]^
+•˜XÚÜÎˆˆ
+ÈXÙNŽ”Ýš[™Ê›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JH
+Èˆ‚ˆ
+ÈXÙNŽ”Ýš[™Ê[\ÔÛY\‹™Ù]˜[YJ
+KJH
+Èˆ”Hˆ
+ÈÚYÛ˜]\™U^ˆ
+ÈˆZ[Z[ˆÔÐÈ]\›œÈ\ˆÙ[™\˜]Üˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+•[YHÚYÛ˜]\™HÚ[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÚÝÓ[Ù[\Ê
+BˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆYˆ
+˜XÚÜËš\Ñ[\J
+JBˆÂˆÚÝÑ\œ›ÜŠ“[Ù[\È‹•\È›Ú™XÝ\È›ÈXÝ]™H[œÝ[Y[Ù[™\˜]ÜœËˆŠNÂˆ™]\›ŽÂˆB‚ˆXÙNŽ”Ýš[™Ð\œ˜^H˜[Y\ÎÂˆÛÛœÝ]]ÈÙ[XÝY[™^H˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆ›Üˆ
+[HHÈH˜XÚÜËœÚ^™J
+NÈ
+ÊÚJBˆ˜[Y\Ë˜Y
+˜XÚÜË™Ù][˜ÚXÚÙY
+JKO™Ù]˜[YJ
+H
+Èˆ0­ÈZ[Z[ˆÔÐÈ[œÝ[Y[ŠNÂ‚ˆXÙNŽ[\Ú[™ÝÈX[ÙÊ“[Ù[\È‹”Ù[XÝHÙ[™\˜]ÜˆÈXÝ]˜]H[ˆH›Ú™XÝÛÜšÜÜXÙKˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜YÛÛX›Ð›Þ
+™Ù[™\˜]Üˆ‹˜[Y\Ë‘Ù[™\˜]ÜŽˆŠNÂˆYˆ
+]]ÊˆÙ[XÝÜˆHX[ÙË™Ù]ÛÛX›Ð›ÞÛÛ\Û™[
+™Ù[™\˜]ÜˆŠJBˆÙ[XÝÜ‹OœÙ]Ù[XÝY][R[™^
+XÙNŽš›X^
+Ù[XÝY[™^
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆX[ÙË˜Y]ÛŠXÝ]˜]H‹KXÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽœ™]\›’Ù^K
+JNÂˆX[ÙË˜Y]ÛŠÛÜÙH‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^K
+JNÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆYˆ
+]]ÊˆÙ[XÝÜˆHX[ÙË™Ù]ÛÛX›Ð›ÞÛÛ\Û™[
+™Ù[™\˜]ÜˆŠJBˆ˜XÚÔÙ[XÝÜ‹œÙ]Ù[XÝYY
+Ù[XÝÜ‹O™Ù]Ù[XÝY][R[™^
+
+H
+ÈKXÙNŽœÙ[™›ÝYšXØ][Û”Þ[˜ÊNÂˆB‚ˆ›ÚYÚÝÔ^[\ÝÙ][™ÜÊ
+BˆÂˆÚÝÔ^[\Ý
+
+NÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœÚÝÔÙ][™ÜÊ
+NÂˆB‚ˆ›ÚYÙ[XÝ[]\›“›Ý\Ê
+BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆZ\Ô]\›ŠH™]\›ŽÂˆÛÛœÝ]]È\Ð[žS›Ý\ÈHÝŽ˜[žWÛÙŠ›ÝQÜšY˜™YÚ[Š
+K›ÝQÜšY™[™
+
+K×JÛÛœÝ]]Éˆ]ÚÝ\ÊBˆÂˆ™]\›ˆÝŽ˜[žWÛÙŠ]ÚÝ\Ë˜™YÚ[Š
+K]ÚÝ\Ë™[™
+
+K×J›ÛÛXÝ]™JHÈ™]\›ˆXÝ]™NÈJNÂˆJNÂˆ[›Ý\ÔÙ[XÝYH\Ð[žS›Ý\ÎÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+Ù]Ù[XÝY]\›•]J
+JNÂˆÝ]\ËœÙ]^
+\Ð[žS›Ý\ÈÈ”Ù[XÝY[›Ý\È[ˆHÝ\œ™[]\›‹ˆ‚ˆˆ•HÝ\œ™[]\›ˆ\È›È›Ý\ÈÈÙ[XÝˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÛÜSÜÝ]]\›“›Ý\Ê›ÛÛÝ]
+BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆY]OH[ˆZ\Ô]\›ŠH™]\›ŽÂˆ]\›Û\›Ø\™HßNÂˆ]\›Û\›Ø\™›[™ÝÝ\ÈHÙ[XÝY]\›“[™Ý
+
+NÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆ›ÛÛ›Ý[™›ÝHH˜[ÙNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆÛÛœÝ]]È[˜X›YH›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\
+NÂˆ]\›Û\›Ø\™››Ý\ÖÜ›Ý×VØÛÛ[[—HH[˜X›YÂˆYˆ
+[˜X›Y
+BˆÂˆ›Ý[™›ÝHHYNÂˆ]\›Û\›Ø\™›[™ÝÖÜ›Ý×VØÛÛ[[—HH›Ú™XÝ™Ù]]\›“›ÝS[™Ý
+˜XÚÒY]\›’[™^]ÚÝ\
+NÂˆ]\›Û\›Ø\™™[ØÚ]Y\ÖÜ›Ý×VØÛÛ[[—HH›Ú™XÝ™Ù]]\›“›ÝU™[ØÚ]J˜XÚÒY]\›’[™^]ÚÝ\
+NÂˆBˆBˆ]\›Û\›Ø\™š\Ó›Ý\ÈH›Ý[™›ÝNÂˆYˆ
+XÝ]Y›Ý[™›ÝJH™]\›ŽÂ‚ˆ™[Y[X™\•[™ÊÝ]]\›ˆ›Ý\ÈŠNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+BˆYˆ
+]\›Û\›Ø\™››Ý\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+WJBˆ›Ú™XÝœÙ]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\˜[ÙJNÂˆ™XY]\›”Ý\Ê
+NÂˆ[›Ý\ÔÙ[XÝYH˜[ÙNÂˆ™Yœ™\Ú]\›“[™Ý\Ü^J
+NÂˆØYÙ[XÝY]ÚÝ\Ê
+NÂˆ\Ñ\HHYNÂˆ™XZ[]\›Û\
+
+NÂˆÝ]\ËœÙ]^
+Ý]›Ý\Èœ›ÛH]\›ˆˆ
+ÈXÙNŽ”Ýš[™ÎŽ˜Ú\•ÔÝš[™ÊÝ]X×ØØ\ÝXÙNŽšXÙWÝØÚ\Š	ÐIÈ
+È]\›’[™^È
+JBˆ
+ÈXÙNŽ”Ýš[™Ê]\›’[™^	H
+ÈJH
+È‹ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY\ÝT]\›“›Ý\Ê
+BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆY]OH[ˆ\]\›Û\›Ø\™š\Ó›Ý\ÊH™]\›ŽÂˆ™[Y[X™\•[™Ê”\ÝH]\›ˆ›Ý\ÈŠNÂˆ[›Ý\ÔÙ[XÝYH˜[ÙNÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆ›Ú™XÝœÙ]]\›Ü™X]Y
+˜XÚÒY]\›’[™^YJNÂˆ›Ú™XÝœÙ]]\›“[™ÝÝ\Ê˜XÚÒY]\›’[™^]\›Û\›Ø\™›[™ÝÝ\ÊNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆÛÛœÝ]]È[˜X›YH]\›Û\›Ø\™››Ý\ÖÜ›Ý×VØÛÛ[[—NÂˆ›Ú™XÝœÙ]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\[˜X›Y
+NÂˆYˆ
+[˜X›Y
+BˆÂˆ›Ú™XÝœÙ]]\›“›ÝS[™Ý
+˜XÚÒY]\›’[™^]ÚÝ\ˆ]\›Û\›Ø\™›[™ÝÖÜ›Ý×VØÛÛ[[—JNÂˆ›Ú™XÝœÙ]]\›“›ÝU™[ØÚ]J˜XÚÒY]\›’[™^]ÚÝ\ˆ]\›Û\›Ø\™™[ØÚ]Y\ÖÜ›Ý×VØÛÛ[[—JNÂˆBˆBˆ™XY]\›”Ý\Ê
+NÂˆ™Yœ™\Ú]\›“[™Ý\Ü^J
+NÂˆØYÙ[XÝY]ÚÝ\Ê
+NÂˆ\Ñ\HHYNÂˆ™XZ[]\›Û\
+
+NÂˆÝ]\ËœÙ]^
+”\ÝY›Ý\È[ÈHÙ[XÝY]\›‹ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ]\›‘]HØ\\™T]\›‘]JÛÛœÝXÙNŽ”Ýš[™Éˆ˜XÚÒY[]\›’[™^
+HÛÛœÝˆÂˆ]\›‘]H]NÂˆ]K˜Ü™X]YH›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒY]\›’[™^
+NÂˆ]K›[™ÝÝ\ÈH›Ú™XÝ™Ù]]\›“[™ÝÝ\Ê˜XÚÒY]\›’[™^
+NÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆ]K››Ý\ÖÜ›Ý×VØÛÛ[[—HH›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\
+NÂˆYˆ
+]K››Ý\ÖÜ›Ý×VØÛÛ[[—JBˆÂˆ]K›[™ÝÖÜ›Ý×VØÛÛ[[—HH›Ú™XÝ™Ù]]\›“›ÝS[™Ý
+˜XÚÒY]\›’[™^]ÚÝ\
+NÂˆ]K™[ØÚ]Y\ÖÜ›Ý×VØÛÛ[[—HH›Ú™XÝ™Ù]]\›“›ÝU™[ØÚ]J˜XÚÒY]\›’[™^]ÚÝ\
+NÂˆBˆBˆ™]\›ˆ]NÂˆB‚ˆ›ÚYÜš]T]\›‘]JÛÛœÝXÙNŽ”Ýš[™Éˆ˜XÚÒY[]\›’[™^ÛÛœÝ]\›‘]Iˆ]JBˆÂˆ›Ú™XÝœÙ]]\›Ü™X]Y
+˜XÚÒY]\›’[™^]K˜Ü™X]Y
+NÂˆ›Ú™XÝœÙ]]\›“[™ÝÝ\Ê˜XÚÒY]\›’[™^]K›[™ÝÝ\ÊNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆÛÛœÝ]]È[˜X›YH]K››Ý\ÖÜ›Ý×VØÛÛ[[—NÂˆ›Ú™XÝœÙ]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\[˜X›Y
+NÂˆYˆ
+[˜X›Y
+BˆÂˆ›Ú™XÝœÙ]]\›“›ÝS[™Ý
+˜XÚÒY]\›’[™^]ÚÝ\ˆXÙNŽš›[Z]
+KHÝ\]K›[™ÝÖÜ›Ý×VØÛÛ[[—JJNÂˆ›Ú™XÝœÙ]]\›“›ÝU™[ØÚ]J˜XÚÒY]\›’[™^]ÚÝ\ˆXÙNŽš›[Z]
+KLË]K™[ØÚ]Y\ÖÜ›Ý×VØÛÛ[[—JJNÂˆBˆBˆB‚ˆ›ÚYš[š\Ú]\›‘Y]
+ÛÛœÝXÙNŽ”Ýš[™ÉˆY\ÜØYÙJBˆÂˆ™XY]\›”Ý\Ê
+NÂˆ™Yœ™\Ú]\›“[™Ý\Ü^J
+NÂˆØYÙ[XÝY]ÚÝ\Ê
+NÂˆ\Ñ\HHYNÂˆ™XZ[]\›Û\
+
+NÂˆÝ]\ËœÙ]^
+Y\ÜØYÙH
+ÈˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÚÝÔ˜[™ÛZ^™SÜ[ÛœÊ
+BˆÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ”˜[™ÛZ^™HÜ[ÛœÈ‹”Ù]H›ÝH˜[™ÙH[™[œÚ]H\ÙYžH˜[™ÛZ^™Kˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠ™[œÚ]H‹XÙNŽ”Ýš[™Ê˜[™ÛQ[œÚ]T\˜Ù[
+K‘[œÚ]H
+\˜Ù[
+NˆŠNÂˆX[ÙË˜Y^Y]ÜŠ›ÝÈ‹XÙNŽ”Ýš[™Ê˜[™ÛT]ÚÝÊK“ÝÙ\Ý]Ú
+RQH›ÝJNˆŠNÂˆX[ÙË˜Y^Y]ÜŠšYÚ‹XÙNŽ”Ýš[™Ê˜[™ÛT]ÚYÚ
+K’YÚ\Ý]Ú
+RQH›ÝJNˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹
+NÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆ˜[™ÛQ[œÚ]T\˜Ù[HXÙNŽš›[Z]
+KLX[ÙË™Ù]^Y]ÜÛÛ[Ê™[œÚ]HŠK™Ù][˜[YJ
+JNÂˆ˜[™ÛT]ÚÝÈHXÙNŽš›[Z]
+Z[š[][T]ÚX^[][T]ÚX[ÙË™Ù]^Y]ÜÛÛ[Ê›ÝÈŠK™Ù][˜[YJ
+JNÂˆ˜[™ÛT]ÚYÚHXÙNŽš›[Z]
+˜[™ÛT]ÚÝËX^[][T]ÚX[ÙË™Ù]^Y]ÜÛÛ[ÊšYÚŠK™Ù][˜[YJ
+JNÂˆÝ]\ËœÙ]^
+”˜[™ÛZ^™HÜ[ÛœÈØ]™Yˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY˜[™ÛZ^™PÝ\œ™[]\›Š
+BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆ]]È]HHØ\\™T]\›‘]J˜XÚÒY]\›’[™^
+NÂˆÛÛœÝ]]È[™ÝH]K›[™ÝÝ\ÎÂˆ]]Éˆ˜[™ÛHHXÙNŽ”˜[™ÛNŽ™Ù]Þ\Ý[T˜[™ÛJ
+NÂˆ›Üˆ
+[Ý\HÈÝ\[™ÝÈ
+ÊÜÝ\
+BˆÂˆYˆ
+˜[™ÛK›™^[
+L
+HH˜[™ÛQ[œÚ]T\˜Ù[
+HÛÛ[YNÂˆÛÛœÝ]]È]ÚH˜[™ÛK›™^[
+XÙNŽ”˜[™ÙO[Š˜[™ÛT]ÚÝË˜[™ÛT]ÚYÚ
+ÈJJNÂˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆ]K››Ý\ÖÜ›Ý×VØÛÛ[[—HHYNÂˆ]K›[™ÝÖÜ›Ý×VØÛÛ[[—HHNÂˆ]K™[ØÚ]Y\ÖÜ›Ý×VØÛÛ[[—HH˜[™ÛK›™^[
+XÙNŽ”˜[™ÙO[ŠÌLŒJJNÂˆBˆ]K˜Ü™X]YHYNÂˆ™[Y[X™\•[™Ê”˜[™ÛZ^™H]\›ˆŠNÂˆÜš]T]\›‘]J˜XÚÒY]\›’[™^]JNÂˆš[š\Ú]\›‘Y]
+”]\›ˆ˜[™ÛZ^™YˆŠNÂˆB‚ˆ›ÚY[X[š^™PÝ\œ™[]\›Š
+BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆY]OH[ˆZ\Ô]\›ŠH™]\›ŽÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ’[X[š^™H‹•˜\žH›ÝHÝ\[Y\ÈžH\ÈÛ™HÝ\[™™[ØÚ]Y\ÈžHHÙ[XÝY[[Ý[ˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠ[Z[™È‹ŒH‹•[Z[™È˜\šX][Ûˆ
+Ý\Ë8 $Í
+NˆŠNÂˆX[ÙË˜Y^Y]ÜŠ™[ØÚ]H‹Ž‹•™[ØÚ]H˜\šX][Ûˆ
+8 $ÌÌŠNˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹
+NÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆÛÛœÝ]]È[Z[™ÈHXÙNŽš›[Z]
+X[ÙË™Ù]^Y]ÜÛÛ[Ê[Z[™ÈŠK™Ù][˜[YJ
+JNÂˆÛÛœÝ]]È™[ØÚ]HHXÙNŽš›[Z]
+Ì‹X[ÙË™Ù]^Y]ÜÛÛ[Ê™[ØÚ]HŠK™Ù][˜[YJ
+JNÂˆYˆ
+[Z[™ÈOH	‰ˆ™[ØÚ]HOH
+H™]\›ŽÂ‚ˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆ]]È]HHØ\\™T]\›‘]J˜XÚÒY]\›’[™^
+NÂˆ]\›‘]H™\Ý[H]NÂˆ›Üˆ
+]]Éˆ›ÝÈˆ™\Ý[››Ý\ÊH›ÝË™š[
+˜[ÙJNÂˆ]]Éˆ˜[™ÛHHXÙNŽ”˜[™ÛNŽ™Ù]Þ\Ý[T˜[™ÛJ
+NÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\]K›[™ÝÝ\ÎÈ
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆYˆ
+Y]K››Ý\ÖÜ›Ý×VØÛÛ[[—JHÛÛ[YNÂˆÛÛœÝ]]ÈÚYH[Z[™ÈOHÈˆ˜[™ÛK›™^[
+ˆ
+ˆ[Z[™È
+ÈJHH[Z[™ÎÂˆÛÛœÝ]]È[Ý™YÝ\HXÙNŽš›[Z]
+]K›[™ÝÝ\ÈHKÝ\
+ÈÚY
+NÂˆÛÛœÝ]]È[Ý™YÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠ[Ý™YÝ\
+NÂˆ™\Ý[››Ý\ÖÜ›Ý×VÛ[Ý™YÛÛ[[—HHYNÂˆ™\Ý[›[™ÝÖÜ›Ý×VÛ[Ý™YÛÛ[[—HH]K›[™ÝÖÜ›Ý×VØÛÛ[[—NÂˆ™\Ý[™[ØÚ]Y\ÖÜ›Ý×VÛ[Ý™YÛÛ[[—HHXÙNŽš›[Z]
+KLËˆ]K™[ØÚ]Y\ÖÜ›Ý×VØÛÛ[[—H
+È
+™[ØÚ]HOHÈˆ˜[™ÛK›™^[
+ˆ
+ˆ™[ØÚ]H
+ÈJHH™[ØÚ]JJNÂˆBˆ™[Y[X™\•[™Ê’[X[š^™H]\›ˆŠNÂˆÜš]T]\›‘]J˜XÚÒY]\›’[™^™\Ý[
+NÂˆš[š\Ú]\›‘Y]
+”]\›ˆ[X[š^™YˆŠNÂˆB‚ˆ›ÚYÚÝÔ]X[^™QX[ÙÊ
+BˆÂˆYˆ
+Z\Ô]\›ŠH™]\›ŽÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ”]X[^™H‹”Û˜\›ÝHÝ\ÈÈHš]ZXÈÜšYˆ‹XÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠœ™\ÛÛ][Ûˆ‹ŒMˆ‹”™\ÛÛ][Ûˆ
+›Ý\È\ˆ˜\ŠNˆŠNÂˆX[ÙË˜Y^Y]ÜŠ™\˜][ÛœÈ‹Œ‹[ÛÈ]X[^™H\˜][ÛœÏÈHHY\ËH›ÎˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹
+NÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆÛÛœÝ]]È™\ÛÛ][ÛˆHXÙNŽš›[Z]
+KX[ÙË™Ù]^Y]ÜÛÛ[Êœ™\ÛÛ][ÛˆŠK™Ù][˜[YJ
+JNÂˆÛÛœÝ]]È]X[^™Q\˜][ÛœÈHX[ÙË™Ù]^Y]ÜÛÛ[Ê™\˜][ÛœÈŠK™Ù][˜[YJ
+HOHÂˆÛÛœÝ]]ÈÜšYHXÙNŽš›X^
+KMˆÈ™\ÛÛ][ÛŠNÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆ]]È]HHØ\\™T]\›‘]J˜XÚÒY]\›’[™^
+NÂˆ]\›‘]H™\Ý[H]NÂˆ›Üˆ
+]]Éˆ›ÝÈˆ™\Ý[››Ý\ÊH›ÝË™š[
+˜[ÙJNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\]K›[™ÝÝ\ÎÈ
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆYˆ
+Y]K››Ý\ÖÜ›Ý×VØÛÛ[[—JHÛÛ[YNÂˆÛÛœÝ]]ÈÛ˜\YHXÙNŽš›[Z]
+]K›[™ÝÝ\ÈHK
+
+Ý\
+ÈÜšYÈŠHÈÜšY
+H
+ˆÜšY
+NÂˆÛÛœÝ]]ÈÝ]ÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÛ˜\Y
+NÂˆ™\Ý[››Ý\ÖÜ›Ý×VÛÝ]ÛÛ[[—HHYNÂˆ™\Ý[›[™ÝÖÜ›Ý×VÛÝ]ÛÛ[[—HH]X[^™Q\˜][ÛœÂˆÈXÙNŽš›X^
+K
+
+]K›[™ÝÖÜ›Ý×VØÛÛ[[—H
+ÈÜšYÈŠHÈÜšY
+H
+ˆÜšY
+Bˆˆ]K›[™ÝÖÜ›Ý×VØÛÛ[[—NÂˆ™\Ý[™[ØÚ]Y\ÖÜ›Ý×VÛÝ]ÛÛ[[—HH]K™[ØÚ]Y\ÖÜ›Ý×VØÛÛ[[—NÂˆBˆ™[Y[X™\•[™Ê”]X[^™H]\›ˆŠNÂˆÜš]T]\›‘]J˜XÚÒY]\›’[™^™\Ý[
+NÂˆš[š\Ú]\›‘Y]
+”]\›ˆ]X[^™YˆŠNÂˆB‚ˆ›ÚYÚÝÕ˜[œÜÜÙQX[ÙÊ
+BˆÂˆYˆ
+Z\Ô]\›ŠH™]\›ŽÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ•˜[œÜÜÙH‹•˜[œÜÜÙH\È]\›ˆÜˆ[Ü™H]\›œÈÛˆHÙ[XÝYÙ[™\˜]Ü‹ˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠœÙ[Z]Û™\È‹ŒH‹”Ù[Z]Û™\ÎˆŠNÂˆX[ÙË˜Y^Y]ÜŠœØÛÜH‹Œ‹”ØÛÜNˆÝ\œ™[]\›‹HÙ[™\˜]Ü‹ˆ[Ù[™\˜]ÜœÎˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹
+NÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆÛÛœÝ]]È[[Ý[HXÙNŽš›[Z]
+MX[ÙË™Ù]^Y]ÜÛÛ[ÊœÙ[Z]Û™\ÈŠK™Ù][˜[YJ
+JNÂˆÛÛœÝ]]ÈØÛÜHHXÙNŽš›[Z]
+‹X[ÙË™Ù]^Y]ÜÛÛ[ÊœØÛÜHŠK™Ù][˜[YJ
+JNÂˆYˆ
+[[Ý[OH
+H™]\›ŽÂˆÛÛœÝ]]ÈÙ[XÝY˜XÚÈHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆ™[Y[X™\•[™Ê•˜[œÜÜÙH]\›ˆŠNÂˆ›Üˆ
+[HÈ›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÝ
+BˆÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+
+NÂˆYˆ
+ØÛÜHOHˆ	‰ˆ˜XÚÒYOHÙ[XÝY˜XÚÊHÛÛ[YNÂˆÛÛœÝ]]Èš\œÝHØÛÜHOHÈÙ[XÝY]\›’[™^
+
+HˆÂˆÛÛœÝ]]È\ÝHØÛÜHOHÈš\œÝ
+ÈHˆÂˆ›Üˆ
+[]\›ˆHš\œÝÈ]\›ˆ\ÝÈ
+ÊÜ]\›ŠBˆÂˆ]]È]HHØ\\™T]\›‘]J˜XÚÒY]\›ŠNÂˆYˆ
+Y]K˜Ü™X]Y
+HÛÛ[YNÂˆ]\›‘]H™\Ý[H]NÂˆ›Üˆ
+]]Éˆ›ÝÈˆ™\Ý[››Ý\ÊH›ÝË™š[
+˜[ÙJNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆYˆ
+Y]K››Ý\ÖÜ›Ý×VØÛÛ[[—JHÛÛ[YNÂˆÛÛœÝ]]È™]Ô]ÚH]Ú
+È[[Ý[ÂˆYˆ
+™]Ô]ÚZ[š[][T]Ú™]Ô]ÚˆX^[][T]Ú
+HÛÛ[YNÂˆÛÛœÝ]]È™]Ô›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ™]Ô]ÚHZ[š[][T]Ú
+NÂˆ™\Ý[››Ý\ÖÛ™]Ô›Ý×VØÛÛ[[—HHYNÂˆ™\Ý[›[™ÝÖÛ™]Ô›Ý×VØÛÛ[[—HH]K›[™ÝÖÜ›Ý×VØÛÛ[[—NÂˆ™\Ý[™[ØÚ]Y\ÖÛ™]Ô›Ý×VØÛÛ[[—HH]K™[ØÚ]Y\ÖÜ›Ý×VØÛÛ[[—NÂˆBˆÜš]T]\›‘]J˜XÚÒY]\›‹™\Ý[
+NÂˆBˆBˆš[š\Ú]\›‘Y]
+•˜[œÜÜÙH\YYˆŠNÂˆB‚ˆ›ÚYÚÝÔØØ[U™[ØÚ]Y\ÑX[ÙÊ
+BˆÂˆYˆ
+Z\Ô]\›ŠH™]\›ŽÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ”ØØ[H™[ØÚ]Y\È‹”ØØ[H›ÝH™[ØÚ]Y\ÈXÜ›ÜÜÈHÙ[XÝY]\›‹ˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠ˜™YÚ[ˆ‹ŒH‹™YÚ[ˆ™[ØÚ]H
+x $ÌLÊNˆŠNÂˆX[ÙË˜Y^Y]ÜŠ™[™‹ŒLÈ‹‘[™™[ØÚ]H
+x $ÌLÊNˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹
+NÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆÛÛœÝ]]È™YÚ[ˆHXÙNŽš›[Z]
+KLËX[ÙË™Ù]^Y]ÜÛÛ[Ê˜™YÚ[ˆŠK™Ù][˜[YJ
+JNÂˆÛÛœÝ]]È[™HXÙNŽš›[Z]
+KLËX[ÙË™Ù]^Y]ÜÛÛ[Ê™[™ŠK™Ù][˜[YJ
+JNÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆ]]È]HHØ\\™T]\›‘]J˜XÚÒY]\›’[™^
+NÂˆÝŽ™XÝÜÝŽœZ\[[ˆØØ][ÛœÎÂˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+Bˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+BˆYˆ
+]K››Ý\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+WJBˆØØ][ÛœË™[\XÙWØ˜XÚÊ]ÚÝ\
+NÂˆYˆ
+ØØ][ÛœË™[\J
+JH™]\›ŽÂˆ™[Y[X™\•[™Ê”ØØ[H™[ØÚ]Y\ÈŠNÂˆ›Üˆ
+Ú^™WÝHHÈHØØ][ÛœËœÚ^™J
+NÈ
+ÊÚJBˆÂˆÛÛœÝ]]Èœ˜XÝ[ÛˆHØØ][ÛœËœÚ^™J
+HHHÈŒˆÝ]X×ØØ\ÝÝX›OŠJHÈ
+ØØ][ÛœËœÚ^™J
+HHJNÂˆÛÛœÝ]]È™[ØÚ]HHXÙNŽœ›Ý[™Ò[
+™YÚ[ˆ
+È
+[™H™YÚ[ŠH
+ˆœ˜XÝ[ÛŠNÂˆ›Ú™XÝœÙ]]\›“›ÝU™[ØÚ]J˜XÚÒY]\›’[™^ØØ][ÛœÖÚWK™š\œÝØØ][ÛœÖÚWKœÙXÛÛ™™[ØÚ]JNÂˆBˆš[š\Ú]\›‘Y]
+“›ÝH™[ØÚ]Y\ÈØØ[YˆŠNÂˆB‚ˆ›ÚYÚÝÓ[™ÝX[ÙÊ
+BˆÂˆYˆ
+Z\Ô]\›ŠH™]\›ŽÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ“[™Ý‹”ØØ[H]\›ˆ›ÝHÜÚ][ÛœÈ[™ÛÜˆ\˜][ÛœËˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠœ\˜Ù[‹ŒL‹”ØØ[H\˜Ù[ˆŠNÂˆX[ÙË˜Y^Y]ÜŠœÝ\È‹Œ‹”ØØ[HÝ\[Y\ÏÈHHY\ËH›ÎˆŠNÂˆX[ÙË˜Y^Y]ÜŠ™\˜][ÛœÈ‹ŒH‹”ØØ[H\˜][ÛœÏÈHHY\ËH›ÎˆŠNÂˆX[ÙË˜Y]ÛŠ“ÒÈ‹JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹
+NÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆÛÛœÝ]]È\˜Ù[HXÙNŽš›[Z]
+LX[ÙË™Ù]^Y]ÜÛÛ[Êœ\˜Ù[ŠK™Ù][˜[YJ
+JNÂˆÛÛœÝ]]ÈØØ[TÝ\ÈHX[ÙË™Ù]^Y]ÜÛÛ[ÊœÝ\ÈŠK™Ù][˜[YJ
+HOHÂˆÛÛœÝ]]ÈØØ[Q\˜][ÛœÈHX[ÙË™Ù]^Y]ÜÛÛ[Ê™\˜][ÛœÈŠK™Ù][˜[YJ
+HOHÂˆYˆ
+\ØØ[TÝ\È	‰ˆ\ØØ[Q\˜][ÛœÊH™]\›ŽÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆ]]È]HHØ\\™T]\›‘]J˜XÚÒY]\›’[™^
+NÂˆ]\›‘]H™\Ý[H]NÂˆ›Üˆ
+]]Éˆ›ÝÈˆ™\Ý[››Ý\ÊH›ÝË™š[
+˜[ÙJNÂˆYˆ
+ØØ[TÝ\ÊBˆ™\Ý[›[™ÝÝ\ÈHXÙNŽš›[Z]
+KXÙNŽœ›Ý[™Ò[
+]K›[™ÝÝ\È
+ˆ\˜Ù[ÈLŒ
+JNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+BˆÂˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆYˆ
+Y]K››Ý\ÖÜ›Ý×VØÛÛ[[—JHÛÛ[YNÂˆÛÛœÝ]]È[Ý™YHØØ[TÝ\ÈÈXÙNŽš›[Z]
+™\Ý[›[™ÝÝ\ÈHKˆXÙNŽœ›Ý[™Ò[
+Ý\
+ˆ\˜Ù[ÈLŒ
+JHˆÝ\ÂˆÛÛœÝ]]ÈÝ]ÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠ[Ý™Y
+NÂˆ™\Ý[››Ý\ÖÜ›Ý×VÛÝ]ÛÛ[[—HHYNÂˆ™\Ý[›[™ÝÖÜ›Ý×VÛÝ]ÛÛ[[—HHØØ[Q\˜][ÛœÂˆÈXÙNŽš›[Z]
+KH[Ý™YXÙNŽœ›Ý[™Ò[
+]K›[™ÝÖÜ›Ý×VØÛÛ[[—H
+ˆ\˜Ù[ÈLŒ
+JBˆˆ]K›[™ÝÖÜ›Ý×VØÛÛ[[—NÂˆ™\Ý[™[ØÚ]Y\ÖÜ›Ý×VÛÝ]ÛÛ[[—HH]K™[ØÚ]Y\ÖÜ›Ý×VØÛÛ[[—NÂˆBˆ™[Y[X™\•[™Ê”ØØ[H]\›ˆ[™ÝŠNÂˆÜš]T]\›‘]J˜XÚÒY]\›’[™^™\Ý[
+NÂˆš[š\Ú]\›‘Y]
+”]\›ˆ[™Ý\]YˆŠNÂˆB‚ˆ›ÚY[œÙ\Z[[’[œÝ[Y[
+
+BˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ŠBˆÜ™X]T›Ú™XÝ
+
+NÂˆYˆ
+\Ô›Ú™XÝ	‰ˆY]OH[ŠBˆY[œÝ[Y[˜XÚÊ
+NÂˆB‚ˆ›Ú™XÝÛ˜\ÚÝØ\\™T›Ú™XÝÛ˜\ÚÝ
+
+BˆÂˆ›Ú™XÝÛ˜\ÚÝÛ˜\ÚÝÂˆÛ˜\ÚÝ™ØÝ[Y[H›Ú™XÝÂˆÛ˜\ÚÝšY›Ú™XÝH\Ô›Ú™XÝ	‰ˆY]OH[ŽÂˆÛ˜\ÚÝ™\HH\Ñ\NÂˆÛ˜\ÚÝ˜˜[šÈHÙ[XÝY˜[šÒ[™^ÂˆÛ˜\ÚÝœÛÝHÙ[XÝYÛÝ[™^ÂˆÛ˜\ÚÝœ]ÚHÙ[XÝY]Ú
+
+NÂˆYˆ
+Û˜\ÚÝšY›Ú™XÝ
+BˆÂˆY]O™›\ÚÝ]J
+NÂˆÛ˜\ÚÝ™Y]Ý]HHY]OœÝ]K˜Ü™X]PÛÜJ
+NÂˆÛ˜\ÚÝ™ØÝ[Y[œÙ]˜XÚÝ[Û‘Y]Ý]JÛ˜\ÚÝ™Y]Ý]JNÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆÛÛœÝ]]ÈÙ[XÝY[™^H˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊÙ[XÝY[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JJBˆÛ˜\ÚÝœÙ[XÝY˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+Ù[XÝY[™^
+NÂˆBˆ™]\›ˆÛ˜\ÚÝÂˆB‚ˆ›ÚY™[Y[X™\•[™ÊÛÛœÝXÙNŽ”Ýš[™ÉˆX™[
+BˆÂˆ[™Ò\ÝÜžKœ\ÚØ˜XÚÊÈØ\\™T›Ú™XÝÛ˜\ÚÝ
+
+KX™[JNÂˆYˆ
+[™Ò\ÝÜžKœÚ^™J
+HˆL
+Bˆ[™Ò\ÝÜžK™\˜\ÙJ[™Ò\ÝÜžK˜™YÚ[Š
+JNÂˆ™YÒ\ÝÜžK˜ÛX\Š
+NÂˆB‚ˆ›ÚY™\ÝÜ™T›Ú™XÝÛ˜\ÚÝ
+ÛÛœÝ›Ú™XÝÛ˜\ÚÝ	ˆÛ˜\ÚÝÛÛœÝXÙNŽ”Ýš[™ÉˆY\ÜØYÙJBˆÂˆ™\Ù]]\›]ÛœÊ
+NÂˆ›Ú™XÝHÛ˜\ÚÝ™ØÝ[Y[ÂˆY]œ™\Ù]
+
+NÂˆYˆ
+Û˜\ÚÝšY›Ú™XÝ	‰ˆÛ˜\ÚÝ™Y]Ý]Kš\Õ˜[Y
+
+JBˆY]HNŽ›ØYY]œ›ÛTÝ]J[™Ú[™KÛ˜\ÚÝ™Y]Ý]K˜Ü™X]PÛÜJ
+JNÂˆ\Ô›Ú™XÝHÛ˜\ÚÝšY›Ú™XÝ	‰ˆY]OH[ŽÂˆ\Ñ\HHÛ˜\ÚÝ™\NÂˆÙ[XÝY˜[šÒ[™^HÛ˜\ÚÝ˜˜[šÎÂˆÙ[XÝYÛÝ[™^HÛ˜\ÚÝœÛÝÂˆ]ÚÙ[XÝÜ‹œÙ]Ù[XÝYY
+]ÚÒ][RY
+Û˜\ÚÝœ]Ú
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ›Üˆ
+[HHÈHÈ
+ÊÚJBˆÂˆ]\›˜[šÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]JHOHÙ[XÝY˜[šÒ[™^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›”ÛÝ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]JHOHÙ[XÝYÛÝ[™^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆYˆ
+\Ô›Ú™XÝ
+BˆÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆ›Üˆ
+[HHÈH˜XÚÜËœÚ^™J
+H	‰ˆH›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÚJBˆYˆ
+›Ú™XÝ™Ù]˜XÚÒY
+JHOHÛ˜\ÚÝœÙ[XÝY˜XÚÒY
+BˆÂˆ[œÝ[Y[˜XÚÈH˜XÚÜË™Ù][˜ÚXÚÙY
+JNÂˆœ™XZÎÂˆBˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠBˆš[™š\œÝ[œÝ[Y[˜XÚÊ
+NÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠBˆÂˆÛÛœÝ]]ÈÙ[XÝY[™^H˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆ˜XÚÔÙ[XÝÜ‹œÙ]Ù[XÝYY
+Ù[XÝY[™^
+ÈKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™XY]\›”Ý\Ê
+NÂˆ™Yœ™\ÚZ^\ÛÛ›ÛÊ
+NÂˆBˆBˆ™Yœ™\Ú˜XÚÔÙ[XÝÜŠ
+NÂˆ™Yœ™\Ú›Ú™XÝšY]ÊY\ÜØYÙJNÂˆB‚ˆ›ÚY[™Ô›Ú™XÝXÝ[ÛŠ
+BˆÂˆYˆ
+[™Ò\ÝÜžK™[\J
+JH™]\›ŽÂˆ]]ÈÝ\œ™[HØ\\™T›Ú™XÝÛ˜\ÚÝ
+
+NÂˆÛÛœÝ]]ÈX™[H[™Ò\ÝÜžK˜˜XÚÊ
+K›X™[Âˆ™YÒ\ÝÜžKœ\ÚØ˜XÚÊÈÝŽ›[Ý™JÝ\œ™[
+KX™[JNÂˆ]]È\™Ù]HÝŽ›[Ý™J[™Ò\ÝÜžK˜˜XÚÊ
+JNÂˆ[™Ò\ÝÜžKœÜØ˜XÚÊ
+NÂˆ™\ÝÜ™T›Ú™XÝÛ˜\ÚÝ
+\™Ù]œÛ˜\ÚÝ•[™Yˆ
+ÈX™[
+È‹ˆŠNÂˆB‚ˆ›ÚY™YÔ›Ú™XÝXÝ[ÛŠ
+BˆÂˆYˆ
+™YÒ\ÝÜžK™[\J
+JH™]\›ŽÂˆ]]ÈÝ\œ™[HØ\\™T›Ú™XÝÛ˜\ÚÝ
+
+NÂˆÛÛœÝ]]ÈX™[H™YÒ\ÝÜžK˜˜XÚÊ
+K›X™[Âˆ[™Ò\ÝÜžKœ\ÚØ˜XÚÊÈÝŽ›[Ý™JÝ\œ™[
+KX™[JNÂˆ]]È\™Ù]HÝŽ›[Ý™J™YÒ\ÝÜžK˜˜XÚÊ
+JNÂˆ™YÒ\ÝÜžKœÜØ˜XÚÊ
+NÂˆ™\ÝÜ™T›Ú™XÝÛ˜\ÚÝ
+\™Ù]œÛ˜\ÚÝ”™YYˆ
+ÈX™[
+È‹ˆŠNÂˆB‚ˆ›ÚY™]Ú[™^X˜XÚÊ
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆY]O™Ù]˜[œÜÜ
+
+KœÝÜ
+˜[ÙK˜[ÙJNÂˆY]O™Ù]˜[œÜÜ
+
+KœÙ]ÜÚ][ÛŠ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊŒ
+JNÂˆ^P]Û‹œÙ]]Û•^
+”^HŠNÂˆÝ]\ËœÙ]^
+”™]\›™YÈHÝ\ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÚÚ\˜[œÜÜ
+[˜\œÊBˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆ]]Éˆ˜[œÜÜHY]O™Ù]˜[œÜÜ
+
+NÂˆÛÛœÝ]]È˜\”ÙXÛÛ™ÈHŒÈXÙNŽš›X^
+ŒŒ[\ÔÛY\‹™Ù]˜[YJ
+JNÂˆÛÛœÝ]]ÈÝ\œ™[H˜[œÜÜ™Ù]ÜÚ][ÛŠ
+Kš[”ÙXÛÛ™Ê
+NÂˆ˜[œÜÜœÙ]ÜÚ][ÛŠ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊXÙNŽš›X^
+ŒÝ\œ™[
+È˜\œÈ
+ˆ˜\”ÙXÛÛ™ÊJJNÂˆB‚ˆ›ÚY\]SÛÜ˜[™ÙJ
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆÛÛœÝ]]ÈœHHXÙNŽš›X^
+ŒŒ[\ÔÛY\‹™Ù]˜[YJ
+JNÂˆÛÛœÝ]]ÈY]\ˆH›Ú™XÝ™Ù][š]X[[YTÚYÛ˜]\™J
+NÂˆÛÛœÝ]]ÈÙXÛÛ™Ô\˜\ˆH
+ŒŒÈœJH
+ˆY]\‹›[Y\˜]Üˆ
+ˆ
+ŒÈXÙNŽš›X^
+KY]\‹™[›ÛZ[˜]ÜŠJNÂˆÛÛœÝ]]ÈÝ\˜\ˆHXÙNŽœ›Ý[™Ò[
+ÛÜÝ\ÛY\‹™Ù]˜[YJ
+JNÂˆÛÛœÝ]]È[™Ý˜\œÈHXÙNŽœ›Ý[™Ò[
+ÛÜ[™ÝÛY\‹™Ù]˜[YJ
+JNÂˆÛÛœÝ]]ÈÛÜ[˜X›YHÛÜ]Û‹™Ù]ÙÙÛTÝ]J
+NÂˆÛÛœÝ]]ÈÝ\ÙXÛÛ™ÈH
+ÛÜÝ\ÛY\‹™Ù]˜[YJ
+HHKŒ
+H
+ˆÙXÛÛ™Ô\˜\ŽÂˆÛÛœÝ]]È[™ÝÙXÛÛ™ÈHÛÜ[™ÝÛY\‹™Ù]˜[YJ
+H
+ˆÙXÛÛ™Ô\˜\ŽÂˆ]]Éˆ˜[œÜÜHY]O™Ù]˜[œÜÜ
+
+NÂˆ˜[œÜÜœÙ]ÛÜ˜[™ÙJÈ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊÝ\ÙXÛÛ™ÊKˆ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊÝ\ÙXÛÛ™È
+È[™ÝÙXÛÛ™ÊHJNÂˆ˜[œÜÜ›ÛÜ[™ÈHÛÜ[˜X›YÂˆYˆ
+›Ú™XÝœÙ]ÛÜÙ][™ÜÊÝ\˜\‹[™Ý˜\œËÛÜ[˜X›Y
+JBˆÂˆ\Ñ\HHYNÂˆ›Ú™XÝ]Z[ËœÙ]^
+”›Ú™XÝˆˆ
+È›Ú™XÝ™Ù]˜[YJ
+H
+Èˆ0­ÈQˆˆ
+È›Ú™XÝ™Ù]›Ú™XÝY
+
+Bˆ
+Èˆ0­È[œØ]™Y‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠBˆ^[\ÝÚ[™ÝËOœÙ]ÛÜ˜[™ÙJÝ\˜\‹[™Ý˜\œËÛÜ[˜X›Y
+NÂˆB‚ˆ›ÚY]Y][Û”Ù[XÝY[œÝ[Y[
+[]Ú›ÛÛ\ÑÝÛŠBˆÂˆÛÛœÝ^ˆ[]Y][ÛÚ[›™[HNÂˆYˆ
+\ÑÝÛŠBˆÂˆ]Y][Û•˜XÚÈH[œÝ[Y[˜XÚÎÂˆYˆ
+]Y][Û•˜XÚÈOH[ŠH™]\›ŽÂˆ
+ÊÛZYP]Y][Û“›ÝSÛœÎÂˆ\ÝZYPXÝ]š]HH’[œÝ[Y[Ù^X›Ø\™]Úˆ
+ÈXÙNŽ”Ýš[™Ê]Ú
+H
+ÈˆÛˆŽÂˆËÈ˜XÚÝ[Ûˆ[™Ú[™HÝ\™\ÜÙ\ÈÝZYK[›ÝH]Y][ÛˆžHY˜][›Ü‚ˆËÈÜÝY\Ëˆ›Ü˜ÙHH›ÝHÛÈHš\ÚX›HÜÝÙ^X›Ø\™ÛÜšÜÂˆËÈ[[YYX][KÚ]Ý]š\œÝÝ\[™È˜[œÜÜÜˆÜ[š[™ÈX[›È›Û‚ˆ]Y][Û•˜XÚËOœ^QÝZYS›ÝJ]ÚNŽ“ZYPÚ[›™[
+]Y][ÛÚ[›™[
+KLYKYK˜[ÙJNÂˆ™]\›ŽÂˆBˆYˆ
+]Y][Û•˜XÚÈOH[ŠBˆÂˆ\ÝZYPXÝ]š]HH’[œÝ[Y[Ù^X›Ø\™]Úˆ
+ÈXÙNŽ”Ýš[™Ê]Ú
+H
+ÈˆÙ™ˆŽÂˆ]Y][Û•˜XÚËO\›“Ù™‘ÝZYS›Ý\ÊNŽ“ZYPÚ[›™[
+]Y][ÛÚ[›™[
+JNÂˆ]Y][Û•˜XÚÈH[ŽÂˆBˆB‚ˆ›ÚYÙ]ÛÜ[˜X›Y
+›ÛÛ[˜X›Y
+BˆÂˆYˆ
+Y]OH[ŠBˆÂˆ\]SÛÜ˜[™ÙJ
+NÂˆY]O™Ù]˜[œÜÜ
+
+K›ÛÜ[™ÈH[˜X›YÂˆBˆÝ]\ËœÙ]^
+[˜X›YÈ“ÛÜ[˜X›Yˆˆˆ“ÛÜ\ØX›Yˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ]Y]›Û›ÛYQ[˜X›Y
+›ÛÛ[˜X›Y
+BˆÂˆYˆ
+Y]OH[ŠBˆÂˆY]O˜ÛXÚÕ˜XÚÑ[˜X›YH[˜X›YÂˆY]O˜ÛXÚÕ˜XÚÑ[\\Ú\ÙP˜\œÈHYNÂˆ\Ñ\HHYNÂˆBˆÝ]\ËœÙ]^
+[˜X›YÈ“Y]›Û›ÛYH[˜X›Yˆˆˆ“Y]›Û›ÛYH\ØX›Yˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆÝ]XÈ›ÚYÛÛ™šYÝ\™P]ÛŠXÙNŽ•^]Û‰ˆ]Û‹ÛÛœÝXÙNŽ”Ýš[™Éˆ^ÝŽ™[˜Ý[Û›ÚY
+
+OˆXÝ[ÛŠBˆÂˆ]Û‹œÙ]]Û•^
+^
+NÂˆ]Û‹›ÛÛXÚÈHÝŽ›[Ý™JXÝ[ÛŠNÂˆB‚ˆÝ]XÈXÙNŽ”Ýš[™Ð\œ˜^HXZÙT]Ú˜[Y\Ê
+BˆÂˆXÙNŽ”Ýš[™Ð\œ˜^H˜[Y\ÎÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ˜[Y\Ë˜Y
+]Ú˜[YJ]Ú
+JNÂˆ™]\›ˆ˜[Y\ÎÂˆB‚ˆÝ]XÈXÙNŽ”Ýš[™È]Ú˜[YJ[ZYS›ÝJBˆÂˆÝ]XÈÛÛœÝÚ\Šˆ›ÝS˜[Y\Ö×HHÈÈ‹ÈÈ‹‘‹‘È‹‘H‹‘ˆ‹‘ˆÈ‹‘È‹‘ÈÈ‹H‹HÈ‹ˆˆNÂˆ™]\›ˆXÙNŽ”Ýš[™Ê›ÝS˜[Y\ÖÛZYS›ÝH	HL—JH
+ÈXÙNŽ”Ýš[™ÊZYS›ÝHÈLˆHJNÂˆB‚ˆÝ]XÈ[]ÚÒ][RY
+[ZYS›ÝJHÈ™]\›ˆZYS›ÝHHZ[š[][T]Ú
+ÈNÈBˆ[Ù[XÝY]Ú
+
+HÛÛœÝÈ™]\›ˆZ[š[][T]Ú
+È]ÚÙ[XÝÜ‹™Ù]Ù[XÝYY
+
+HHNÈB‚ˆ›ÚYØYÙ[XÝY]ÚÝ\Ê
+BˆÂˆÛÛœÝ]]È]ÚHÙ[XÝY]Ú
+
+NÂˆ›Üˆ
+[HHÈHMŽÈ
+ÊÚJBˆÝ\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]J›ÝQÜšYÜÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠJWKˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÛœÝ]]È]U^HÙ]Ù[XÝY]\›•]J
+NÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]^
+]U^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›•]KœÙ]^
+ßKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™Yœ™\Ú]\›“[™Ý\Ü^J
+NÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+]U^
+NÂˆB‚ˆXÙNŽ”Ýš[™ÈÙ]Ù[XÝY]\›•]J
+HÛÛœÝˆÂˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆÛÛœÝ]]È]\›“X™[HXÙNŽ”Ýš[™ÎŽ˜Ú\•ÔÝš[™ÊˆÝ]X×ØØ\ÝXÙNŽšXÙWÝØÚ\Š	ÐIÈ
+È]\›’[™^È
+JH
+ÈXÙNŽ”Ýš[™Ê]\›’[™^	H
+ÈJNÂˆÛÛœÝ]]ÈÙ[™\˜]Ü“˜[YHH[œÝ[Y[˜XÚÈOH[ˆÈ[œÝ[Y[˜XÚËO™Ù]˜[YJ
+HˆXÙNŽ”Ýš[™Ê‘Ù[™\˜]ÜˆŠNÂˆ™]\›ˆÙ[™\˜]Ü“˜[YH
+Èˆ0­È]\›ˆˆ
+È]\›“X™[ÂˆB‚ˆ[Ù[XÝY]\›“[™Ý
+
+HÛÛœÝˆÂˆ™]\›ˆXÙNŽš›[Z]
+K›Ú™XÝ™Ù]]\›“[™ÝÝ\ÊÙ[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+JJNÂˆB‚ˆ›ÚY™Yœ™\Ú]\›“[™Ý\Ü^J
+BˆÂˆÛÛœÝ]]È[™ÝHÙ[XÝY]\›“[™Ý
+
+NÂˆ]\›“[™Ý\Ü^KœÙ]^
+XÙNŽ”Ýš[™Ê[™Ý
+KœYYY
+	Ì	ËÊKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›“[™Ý\Ü^KœÙ]ÛÛ\
+”]\›ˆ[™Ýˆˆ
+ÈXÙNŽ”Ýš[™Ê[™Ý
+H
+ÈˆÝ\Ëˆ\ÙH
+È[™8¢$ˆÈY\ÝˆŠNÂˆB‚ˆ›ÚYY\Ý]\›“[™Ý
+[[JBˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È™^[™ÝHXÙNŽš›[Z]
+KÙ[XÝY]\›“[™Ý
+
+H
+È[JNÂˆYˆ
+™^[™ÝOHÙ[XÝY]\›“[™Ý
+
+JH™]\›ŽÂˆ™[Y[X™\•[™ÊÚ[™ÙH]\›ˆ[™ÝŠNÂˆ›Ú™XÝœÙ]]\›“[™ÝÝ\ÊÙ[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+K™^[™Ý
+NÂˆ\Ñ\HHYNÂˆ™Yœ™\Ú]\›“[™Ý\Ü^J
+NÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+Ù]Ù[XÝY]\›•]J
+JNÂˆ™XZ[]\›Û\
+
+NÂˆÝ]\ËœÙ]^
+”]\›ˆ[™Ýˆˆ
+ÈXÙNŽ”Ýš[™Ê™^[™Ý
+H
+ÈˆÝ\Ëˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÚÝÔX[›Ô›Û
+
+BˆÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ˆ[œÝ[Y[˜XÚÈOH[ŠH™]\›ŽÂˆYˆ
+X[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JBˆÂˆÛÜÙTX[›Ô›ÛšY]Ê
+NÂˆ™]\›ŽÂˆBˆYˆ
+Ù[™\˜]ÜÛÛ\ÙY
+BˆÂˆÙ[™\˜]ÜÛÛ\ÙYH˜[ÙNÂˆYˆ
+Y^[™YÙ[™\˜]Ü›Ý[™Ëš\Ñ[\J
+JHÙ[™\˜]Ü”[™[›Ý[™ÈH^[™YÙ[™\˜]Ü›Ý[™ÎÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]]Û•^
+¸¢$ˆŠNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]ÛÛ\
+“Z[š[Z^™H\ÈÙ[™\˜]ÜˆŠNÂˆX[›Ô›ÛØ\Õš\ÚX›UÚ[ÛÛ\ÙYH˜[ÙNÂˆBˆ[Ù[™\˜]ÜœÓZ[š[Z^™YH˜[ÙNÂˆX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+Ù]Ù[XÝY]\›•]J
+JNÂˆX[›Ô›Û™\ÝÜ™P›Ý[™ÈHÙ[™\˜]Ü”[™[›Ý[™ÎÂˆX[›Ô›ÛX^[Z^™YHYNÂˆÙ[™\˜]Ü”[™[›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJL
+Kœ™YXÙY
+ML
+NÂˆX[›Ô›Û]Û‹œÙ]]Û•^
+’S”Õ•SQS•ŠNÂˆX[›Ô›Û]Û‹œÙ]ÛÛ\
+”™]\›ˆÈH”ÕÜˆZ[Z[ˆ[œÝ[Y[ŠNÂˆX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›JYJNÂˆYˆ
+XÝ]™R[œÝ[Y[Y]ÜˆOH[ŠHXÝ]™R[œÝ[Y[Y]Ü‹OœÙ]š\ÚX›J˜[ÙJNÂˆ™\Ú^™Y
+
+NÂˆœš[™ÑÙ[™\˜]Ü•Ñœ›Û
+
+NÂˆÝ]\ËœÙ]^
+”X[›È›Û^[™YXÜ›ÜÜÈHÙ[™\˜]ÜˆÛÜšÜÜXÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÛÜÙTX[›Ô›ÛšY]Ê
+BˆÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆYˆ
+X[›Ô›ÛX^[Z^™Y	‰ˆ\X[›Ô›Û™\ÝÜ™P›Ý[™Ëš\Ñ[\J
+JBˆÙ[™\˜]Ü”[™[›Ý[™ÈHX[›Ô›Û™\ÝÜ™P›Ý[™ÎÂˆX[›Ô›ÛX^[Z^™YH˜[ÙNÂˆX[›Ô›Û]Û‹œÙ]]Û•^
+”PS“È“ÓŠNÂˆX[›Ô›Û]Û‹œÙ]ÛÛ\
+“Ü[ˆHÙ[XÝY]\›ˆ[ˆHX[›È›ÛŠNÂˆ™\Ú^™Y
+
+NÂˆYˆ
+XÝ]™R[œÝ[Y[Y]ÜˆOH[ˆ	‰ˆ[œÝ[Y[˜XÚÈOH[ˆ	‰ˆYÙ[™\˜]ÜÛÛ\ÙY
+BˆXÝ]™R[œÝ[Y[Y]Ü‹OœÙ]š\ÚX›JYJNÂˆœš[™ÑÙ[™\˜]Ü•Ñœ›Û
+
+NÂˆB‚ˆ›ÚYÙÙÛQÙ[™\˜]ÜÛÛ\ÙY
+
+BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠH™]\›ŽÂˆYˆ
+YÙ[™\˜]ÜÛÛ\ÙY
+BˆÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ˆ	‰ˆX[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JHÛÜÙTX[›Ô›ÛšY]Ê
+NÂˆ^[™YÙ[™\˜]Ü›Ý[™ÈHÙ[™\˜]Ü”[™[›Ý[™ÎÂˆX[›Ô›ÛØ\Õš\ÚX›UÚ[ÛÛ\ÙYH˜[ÙNÂˆÙ[™\˜]ÜÛÛ\ÙYHYNÂˆ[Ù[™\˜]ÜœÓZ[š[Z^™YHYNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆBˆ[ÙBˆÂˆÙ[™\˜]ÜÛÛ\ÙYH˜[ÙNÂˆ[Ù[™\˜]ÜœÓZ[š[Z^™YH˜[ÙNÂˆYˆ
+Y^[™YÙ[™\˜]Ü›Ý[™Ëš\Ñ[\J
+JHÙ[™\˜]Ü”[™[›Ý[™ÈH^[™YÙ[™\˜]Ü›Ý[™ÎÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]]Û•^
+¸¢$ˆŠNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]ÛÛ\
+“Z[š[Z^™H\ÈÙ[™\˜]ÜˆŠNÂˆBˆ™\Ú^™Y
+
+NÂˆYˆ
+Ù[™\˜]ÜÛÛ\ÙY
+BˆÝ]\ËœÙ]^
+‘Ù[™\˜]ÜˆZ[š[Z^™Yˆ\ÙH]ÈXˆ]H›ÝÛHÈ™\ÝÜ™H]ÜˆÝÚ]ÚÙ[™\˜]ÜœËˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[ÙBˆÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ˆ	‰ˆX[›Ô›ÛØ\Õš\ÚX›UÚ[ÛÛ\ÙY
+BˆÂˆX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+Ù]Ù[XÝY]\›•]J
+JNÂˆX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›JYJNÂˆX[›Ô›ÛÚ[™ÝËOÑœ›Û
+˜[ÙJNÂˆBˆX[›Ô›ÛØ\Õš\ÚX›UÚ[ÛÛ\ÙYH˜[ÙNÂˆÝ]\ËœÙ]^
+‘Ù[™\˜]Üˆ™\ÝÜ™Yˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ™\Z[
+
+NÂˆB‚ˆ›ÚYÙÙÛTX[›Ô›Û›ÝJ[]Ú[Ý\›ÛÛ\˜\ÙJBˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆ]ÚZ[š[][T]Ú]ÚˆX^[][T]ÚˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÝ\
+JH™]\›ŽÂˆYˆ
+Z\Ô]\›ŠBˆÂˆ›Ú™XÝœÙ]]\›Ü™X]Y
+Ù[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+KYJNÂˆ\Ô]\›ˆHYNÂˆBˆÛÛœÝ]]È›ÝÈHÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+NÂˆÛÛœÝ]]ÈÛÛ[[ˆHÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+NÂˆÛÛœÝ›ÛÛ[˜X›YHY\˜\ÙNÂˆYˆ
+›ÝQÜšYÜ›Ý×VØÛÛ[[—HOH[˜X›Y
+H™]\›ŽÂˆ[›Ý\ÔÙ[XÝYH˜[ÙNÂˆ›ÝQÜšYÜ›Ý×VØÛÛ[[—HH[˜X›YÂˆ›Ú™XÝœÙ]]\›“›ÝJÙ[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+K]ÚÝ\[˜X›Y
+NÂˆYˆ
+]ÚOHÙ[XÝY]Ú
+
+H	‰ˆÝ\Ý]X×ØØ\Ý[ŠÝ\ËœÚ^™J
+JJBˆÝ\ÖØÛÛ[[—KOœÙ]ÙÙÛTÝ]J[˜X›YXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ\Ñ\HHYNÂˆYˆ
+X[›Ô›ÛÙ\Ý\™PXÝ]™JBˆÂˆX[›Ô›ÛÙ\Ý\™PÚ[™ÙYHYNÂˆÝ]\ËœÙ]^
+\˜\ÙHÈ”X[›È›Û›ÝH™[[Ý™Yˆˆˆ”X[›È›Û›ÝHYYˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆÝ]\ËœÙ]^
+\˜\ÙHÈ”X[›È›Û›ÝH™[[Ý™Yˆˆˆ”X[›È›Û›ÝHYYˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+Ù]Ù[XÝY]\›•]J
+JNÂˆ™XZ[]\›Û\
+
+NÂˆB‚ˆ›ÚYÙ]X[›Ô›Û›ÝS[™Ý
+[]Ú[Ý\[[™Ý
+BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÝ\
+JH™]\›ŽÂˆ›Ú™XÝœÙ]]\›“›ÝS[™Ý
+Ù[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+K]ÚÝ\[™Ý
+NÂˆ\Ñ\HHYNÂˆYˆ
+X[›Ô›ÛÙ\Ý\™PXÝ]™JBˆÂˆX[›Ô›ÛÙ\Ý\™PÚ[™ÙYHYNÂˆ™]\›ŽÂˆBˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+Ù]Ù[XÝY]\›•]J
+JNÂˆ™XZ[]\›Û\
+
+NÂˆB‚ˆ›ÚYÜ™X]T›Ú™XÝ
+
+BˆÂˆYˆ
+\Ô›Ú™XÝ	‰ˆ\Ñ\JBˆÂˆ]]ÊˆX[ÙÈH™]ÈXÙNŽ[\Ú[™ÝÊÜ™X]H™]È›Ú™XÝÈ‹ˆ‘\ØØ\™HÝ\œ™[[œØ]™Y›Ú™XÝ[™Ý\H™]ÈÛ™OÈ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ•Ø\›š[™ÒXÛÛ‹\ÊNÂˆX[ÙËO˜Y]ÛŠ‘\ØØ\™‹JNÂˆX[ÙËO˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^JJNÂˆX[ÙËO˜Ù[™P\›Ý[™ÛÛ\Û™[
+\ËŒML
+NÂˆX[ÙËO™[\“[Ù[Ý]JYKXÙNŽ“[Ù[Ø[˜XÚÑ[˜Ý[ÛŽŽ˜Ü™X]JˆÜØY™U\ÈHXÙNŽÛÛ\Û™[Ž”ØY™TÚ[\›Ú™XÝšY]ÏŠ\ÊWJ[™\Ý[
+BˆÂˆYˆ
+ØY™U\ÈOH[ˆ	‰ˆ™\Ý[OHJBˆØY™U\ËO˜Ü™X]T›Ú™XÝ\ØØ\™[™ÐÝ\œ™[
+
+NÂˆJKYJNÂˆ™]\›ŽÂˆBˆÜ™X]T›Ú™XÝ\ØØ\™[™ÐÝ\œ™[
+
+NÂˆB‚ˆ›ÚYÜ™X]T›Ú™XÝ\ØØ\™[™ÐÝ\œ™[
+
+BˆÂˆËÈ™[X\ÙH™Y™\™[˜Ù\È[ÈHÝ\œ™[Y]™Y›Ü™H™\XÚ[™È]ˆ˜XÚÝ[Û‚ˆËÈÝÛœÈH˜XÚÜË[™™[X\Ú[™È[ˆ]Y[Õ˜XÚÈY\ˆ]ÈY]\ÈÛÛ™H\È[œØY™K‚ˆ™\Ù]]\›]ÛœÊ
+NÂˆ›Ú™XÝH›Ú™XÝØÝ[Y[Ž˜Ü™X]S™]Ê
+NÂˆY]HNŽ›ØYY]œ›ÛTÝ]J[™Ú[™KNŽ˜Ü™X]Q[\QY]
+[™Ú[™JJNÂˆ\Ô›Ú™XÝHY]OH[ŽÂˆ\Ñ\HHYNÂˆ[™Ò\ÝÜžK˜ÛX\Š
+NÂˆ™YÒ\ÝÜžK˜ÛX\Š
+NÂˆ™Yœ™\Ú˜XÚÔÙ[XÝÜŠ
+NÂˆ™Yœ™\ÚZ^\ÛÛ›ÛÊ
+NÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+LJNÂˆ™Yœ™\Ú›Ú™XÝšY]Ê\Ô›Ú™XÝÈ“™]È›Ú™XÝÜ™X]YˆY[ˆ[œÝ[Y[[™H]\›‹ˆˆˆ•˜XÚÝ[ÛˆÛÝ[›ÝÜ™X]H[ˆY]ˆŠNÂˆB‚ˆ›ÚYÜ[”›Ú™XÝ
+
+BˆÂˆYˆ
+\Ô›Ú™XÝ	‰ˆ\Ñ\JBˆÂˆÚÝÑ\œ›ÜŠ•[œØ]™YÚ[™Ù\È‹”Ø]™HHÝ\œ™[›Ú™XÝ™Y›Ü™HÜ[š[™È[›Ý\‹ˆŠNÂˆ™]\›ŽÂˆBˆ]]ÈÝ\ØØ][ÛˆHXÙNŽ‘š[^ßNÂˆYˆ
+]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+JBˆÂˆÛÛœÝ]]ÈÛÛ™šYÝ\™YHÙ][™ÜËO™Ù]˜[YJ™Y˜][›Ú™XÝ]ŠKš[J
+NÂˆYˆ
+ÛÛ™šYÝ\™Yš\Ó›Ý[\J
+JBˆÂˆÛÛœÝXÙNŽ‘š[HÛÛ™šYÝ\™Yš[JÛÛ™šYÝ\™Y
+NÂˆÝ\ØØ][ÛˆHÛÛ™šYÝ\™Yš[Kš\Ñ\™XÝÜžJ
+HÈÛÛ™šYÝ\™Yš[HˆÛÛ™šYÝ\™Yš[K™Ù]\™[\™XÝÜžJ
+NÂˆBˆBˆš[PÚÛÜÙ\ˆHÝŽ›XZÙWÝ[š\]YOXÙNŽ‘š[PÚÛÜÙ\Š“Ü[ˆ[ˆÜ˜š]›Ú™XÝ‹Ý\ØØ][Û‹Š‹›Ü˜š]ŠNÂˆš[PÚÛÜÙ\‹O›][˜Ú\Þ[˜ÊXÙNŽ‘š[Pœ›ÝÜÙ\ÛÛ\Û™[Ž›Ü[“[ÙHXÙNŽ‘š[Pœ›ÝÜÙ\ÛÛ\Û™[Ž˜Ø[”Ù[XÝš[\ËˆÝ\×JÛÛœÝXÙNŽ‘š[PÚÛÜÙ\‰ˆÚÛÜÙ\ŠBˆÂˆÛÛœÝ]]Èš[HHÚÛÜÙ\‹™Ù]™\Ý[
+
+NÂˆYˆ
+š[HOHXÙNŽ‘š[^ßJH™]\›ŽÂˆXÙNŽ”Ýš[™È\œ›ÜŽÂˆ]]ÈØYYH›Ú™XÝØÝ[Y[Ž›ØYœ›ÛQš[Jš[K\œ›ÜŠNÂˆYˆ
+[ØYY
+BˆÂˆÚÝÑ\œ›ÜŠÛÝ[›ÝÜ[ˆ›Ú™XÝ‹\œ›ÜŠNÂˆ™]\›ŽÂˆBˆ]]È[™Ú[™TÝ]HHØYYO™Ù]˜XÚÝ[Û‘Y]Ý]J
+NÂˆYˆ
+Y[™Ú[™TÝ]Kš\Õ˜[Y
+
+JBˆÂˆÚÝÑ\œ›ÜŠ“Û\ˆ›Ú™XÝ›Ü›X]‹•\È›Ú™XÝ\È›ÈØ]™Y]Y[ËY[™Ú[™HÝ]HY]ˆÜ™X]HH™]È›Ú™XÝ›ÜˆH[œÝ[Y[ÛÜšÙ›ÝËˆŠNÂˆ™]\›ŽÂˆBˆ]]È™\ÝÜ™YY]HNŽ›ØYY]œ›ÛTÝ]J[™Ú[™K[™Ú[™TÝ]JNÂˆYˆ
+™\ÝÜ™YY]OH[ŠBˆÂˆÚÝÑ\œ›ÜŠÛÝ[›ÝÜ[ˆ]Y[ÈÙ\ÜÚ[Ûˆ‹•˜XÚÝ[Ûˆ[™Ú[™HÛÝ[›Ý™\ÝÜ™H\È›Ú™XÝ	ÜÈ]Y[ÈÝ]KˆŠNÂˆ™]\›ŽÂˆBˆ™\Ù]]\›]ÛœÊ
+NÂˆY]HÝŽ›[Ý™J™\ÝÜ™YY]
+NÂˆ›Ú™XÝHÝŽ›[Ý™J
+›ØYY
+NÂˆ\Ô›Ú™XÝHYNÂˆ\Ñ\HH˜[ÙNÂˆ[™Ò\ÝÜžK˜ÛX\Š
+NÂˆ™YÒ\ÝÜžK˜ÛX\Š
+NÂˆZYÜ˜]T^[\ÝÝ]J
+NÂˆ[œÝ\™Q^\Ý[™Ñž™]\›œÊ
+NÂˆš[™š\œÝ[œÝ[Y[˜XÚÊ
+NÂˆ\]PXÝ]™R[œÝ[Y[Y]ÜŠ
+NÂˆ™Yœ™\Ú˜XÚÔÙ[XÝÜŠ
+NÂˆ™XY]\›”Ý\Ê
+NÂˆ™Yœ™\ÚZ^\ÛÛ›ÛÊ
+NÂˆ™Yœ™\Ú›Ú™XÝšY]Ê“Ü[™Y›Ú™XÝ[™™\ÝÜ™Y]È˜XÚÝ[ÛˆÙ\ÜÚ[Û‹ˆŠNÂˆJNÂˆB‚ˆ›ÚYØ]™T›Ú™XÝ
+
+BˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]ÈÝ\œ™[š[HH›Ú™XÝ™Ù]š[J
+NÂˆYˆ
+Ý\œ™[š[K™^\ÝÐ\Ñš[J
+JHÈØ]™UÑš[JÝ\œ™[š[JNÈ™]\›ŽÈBˆ]]ÈÝYÙÙ\ÝYš[HHXÙNŽ‘š[NŽ™Ù]ÜXÚX[ØØ][ÛŠXÙNŽ‘š[NŽ\Ù\‘ØÝ[Y[Ñ\™XÝÜžJBˆ™Ù]Ú[š[J•[]Y›Ú™XÝ›Ü˜š]ŠNÂˆYˆ
+]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+JBˆÂˆÛÛœÝ]]ÈÛÛ™šYÝ\™YHÙ][™ÜËO™Ù]˜[YJ™Y˜][›Ú™XÝ]ŠKš[J
+NÂˆYˆ
+ÛÛ™šYÝ\™Yš\Ó›Ý[\J
+JBˆÂˆ]]ÈÛÛ™šYÝ\™Yš[HHXÙNŽ‘š[JÛÛ™šYÝ\™Y
+NÂˆYˆ
+ÛÛ™šYÝ\™Yš[Kš\Ñ\™XÝÜžJ
+JHÛÛ™šYÝ\™Yš[HHÛÛ™šYÝ\™Yš[K™Ù]Ú[š[J•[]Y›Ú™XÝ›Ü˜š]ŠNÂˆYˆ
+ÛÛ™šYÝ\™Yš[K™Ù]š[S˜[YJ
+Kš\Ó›Ý[\J
+JHÝYÙÙ\ÝYš[HHÛÛ™šYÝ\™Yš[NÂˆBˆBˆš[PÚÛÜÙ\ˆHÝŽ›XZÙWÝ[š\]YOXÙNŽ‘š[PÚÛÜÙ\Š”Ø]™HÜ˜š]›Ú™XÝ‹ÝYÙÙ\ÝYš[KŠ‹›Ü˜š]ŠNÂˆš[PÚÛÜÙ\‹O›][˜Ú\Þ[˜ÊXÙNŽ‘š[Pœ›ÝÜÙ\ÛÛ\Û™[ŽœØ]™S[ÙHXÙNŽ‘š[Pœ›ÝÜÙ\ÛÛ\Û™[Ž˜Ø[”Ù[XÝš[\ËˆÝ\×JÛÛœÝXÙNŽ‘š[PÚÛÜÙ\‰ˆÚÛÜÙ\ŠBˆÂˆ]]Èš[HHÚÛÜÙ\‹™Ù]™\Ý[
+
+NÂˆYˆ
+š[HOHXÙNŽ‘š[^ßJH™]\›ŽÂˆYˆ
+Yš[Kš\Ñš[Q^[œÚ[ÛŠ›Ü˜š]ŠJHš[HHš[KÚ]š[Q^[œÚ[ÛŠ›Ü˜š]ŠNÂˆØ]™UÑš[Jš[JNÂˆJNÂˆB‚ˆ›ÚY^ÜZYJ
+BˆÂˆYˆ
+Z\Ô]\›ˆ]\›Û\OH[ˆY]OH[ŠBˆÂˆÚÝÑ\œ›ÜŠ“›ÈRQH]\›ˆ‹Ü™X]HÜˆÜ[ˆH›Ú™XÝÚ]HRQH]\›ˆ™Y›Ü™H^Ü[™ËˆŠNÂˆ™]\›ŽÂˆB‚ˆÛÛœÝ]]ÈÝYÙÙ\ÝY˜[YHH›Ú™XÝ™Ù]˜[YJ
+Kš\Ó›Ý[\J
+HÈ›Ú™XÝ™Ù]˜[YJ
+H
+È‹›ZYˆˆ“Ü˜š]]\›‹›ZYŽÂˆš[PÚÛÜÙ\ˆHÝŽ›XZÙWÝ[š\]YOXÙNŽ‘š[PÚÛÜÙ\Š‘^ÜRQH]\›ˆ‹ˆXÙNŽ‘š[NŽ™Ù]ÜXÚX[ØØ][ÛŠXÙNŽ‘š[NŽ\Ù\‘ØÝ[Y[Ñ\™XÝÜžJK™Ù]Ú[š[JÝYÙÙ\ÝY˜[YJKŠ‹›ZYŠNÂˆš[PÚÛÜÙ\‹O›][˜Ú\Þ[˜ÊXÙNŽ‘š[Pœ›ÝÜÙ\ÛÛ\Û™[ŽœØ]™S[ÙHXÙNŽ‘š[Pœ›ÝÜÙ\ÛÛ\Û™[Ž˜Ø[”Ù[XÝš[\ËˆÝ\×JÛÛœÝXÙNŽ‘š[PÚÛÜÙ\‰ˆÚÛÜÙ\ŠBˆÂˆ]]Èš[HHÚÛÜÙ\‹™Ù]™\Ý[
+
+NÂˆYˆ
+š[HOHXÙNŽ‘š[^ßJH™]\›ŽÂˆYˆ
+Yš[Kš\Ñš[Q^[œÚ[ÛŠ›ZYŠJHš[HHš[KÚ]š[Q^[œÚ[ÛŠ›ZYŠNÂ‚ˆ]]È›Ý\ÈH]\›Û\O™Ù]Ù\]Y[˜ÙJ
+K™^ÜÔ^X˜XÚÓZYTÙ\]Y[˜ÙJˆ
+œ]\›Û\NŽ“ZYS\ÝŽ•[YP˜\ÙNŽ˜™X]Ô˜]Ë˜[ÙJNÂˆYˆ
+›Ý\Ë™Ù][Q]™[Ê
+HOH
+BˆÂˆÚÝÑ\œ›ÜŠ“›Ý[™ÈÈ^Ü‹•H]\›ˆÛÛZ[œÈ›ÈRQH›Ý\ËˆŠNÂˆ™]\›ŽÂˆB‚ˆ›Üˆ
+[HHÈH›Ý\Ë™Ù][Q]™[Ê
+NÈ
+ÊÚJBˆÂˆ]]Êˆ]™[H›Ý\Ë™Ù]]™[Ú[\ŠJNÂˆ]™[O›Y\ÜØYÙKœÙ][YTÝ[\
+]™[O›Y\ÜØYÙK™Ù][YTÝ[\
+
+H
+ˆNŽ‘Y]ŽXÚÜÔ\”]X\\“›ÝJNÂˆBˆ›Ý\Ë\]SX]ÚYZ\œÊ
+NÂ‚ˆXÙNŽ“ZYSY\ÜØYÙTÙ\]Y[˜ÙH[\ÎÂˆ]]È[\Ñ]™[HXÙNŽ“ZYSY\ÜØYÙNŽ[\ÓY]Q]™[
+XÙNŽœ›Ý[™Ò[
+ŒŒÈ›Ú™XÝ™Ù][š]X[[\ÐœJ
+JJNÂˆ[\Ñ]™[œÙ][YTÝ[\
+Œ
+NÂˆ[\Ë˜Y]™[
+[\Ñ]™[
+NÂˆÛÛœÝ]]ÈY]\ˆH›Ú™XÝ™Ù][š]X[[YTÚYÛ˜]\™J
+NÂˆ]]ÈY]\‘]™[HXÙNŽ“ZYSY\ÜØYÙNŽ[YTÚYÛ˜]\™SY]Q]™[
+Y]\‹›[Y\˜]Ü‹Y]\‹™[›ÛZ[˜]ÜŠNÂˆY]\‘]™[œÙ][YTÝ[\
+Œ
+NÂˆ[\Ë˜Y]™[
+Y]\‘]™[
+NÂ‚ˆXÙNŽ“ZYQš[HZYQš[NÂˆZYQš[K˜Y˜XÚÊ[\ÊNÂˆZYQš[K˜Y˜XÚÊ›Ý\ÊNÂˆZYQš[KœÙ]XÚÜÔ\”]X\\“›ÝJNŽ‘Y]ŽXÚÜÔ\”]X\\“›ÝJNÂˆXÙNŽ‘š[SÝ]]Ý™X[HÝ]]
+š[JNÂˆYˆ
+[Ý]]›Ü[™YÚÊ
+H[ZYQš[KÜš]UÊÝ]]
+JBˆÂˆÚÝÑ\œ›ÜŠ“RQH^Ü˜Z[Y‹“Ü˜š]ÛÝ[›ÝÜš]HHRQHš[KˆŠNÂˆ™]\›ŽÂˆBˆÝ]]™›\Ú
+
+NÂˆÝ]\ËœÙ]^
+‘^ÜYRQH]\›Žˆˆ
+Èš[K™Ù]š[S˜[YJ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆJNÂˆB‚ˆ›ÚYØ]™UÑš[JÛÛœÝXÙNŽ‘š[Iˆš[JBˆÂˆ›Ú™XÝœÙ]˜[YJš[K™Ù]š[S˜[YUÚ]Ý]^[œÚ[ÛŠ
+JNÂˆ›Üˆ
+]]Êˆ˜XÚÈˆÙ]Z^\•˜XÚÜÊ
+JHÞ[˜Õ˜XÚÓZ^\”Ý]J˜XÚÊNÂˆÞ[˜ÓX\Ý\“Z^\”Ý]J
+NÂˆY]O™›\ÚÝ]J
+NÂˆ›Ú™XÝœÙ]˜XÚÝ[Û‘Y]Ý]JY]OœÝ]JNÂˆXÙNŽ”Ýš[™È\œ›ÜŽÂˆYˆ
+\›Ú™XÝœØ]™UÑš[Jš[K\œ›ÜŠJHÈÚÝÑ\œ›ÜŠÛÝ[›ÝØ]™H›Ú™XÝ‹\œ›ÜŠNÈ™]\›ŽÈBˆ\Ñ\HH˜[ÙNÂˆ™Yœ™\Ú›Ú™XÝšY]Ê”Ø]™Y›Ú™XÝÚ][œÝ[Y[[™RQHÝ]Nˆˆ
+Èš[K™Ù]š[S˜[YJ
+JNÂˆB‚ˆ›ÚYY[œÝ[Y[˜XÚÊ
+BˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ŠH™]\›ŽÂˆ™[Y[X™\•[™Ê’[œÙ\[œÝ[Y[ŠNÂˆÛÛœÝ]]È˜XÚÓ˜[YHH’[œÝ[Y[ˆ
+ÈXÙNŽ”Ýš[™Ê›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+H
+ÈJNÂˆ›Ú™XÝ˜Y[œÝ[Y[˜XÚÊ
+NÂˆÛÛœÝ]]È^\Ý[™Õ˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆNŽ]Y[Õ˜XÚÊˆ˜XÚÈH^\Ý[™Õ˜XÚÜËœÚ^™J
+HOHH	‰ˆ›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+HOHBˆÈ^\Ý[™Õ˜XÚÜÖÌBˆˆ[ŽÂˆYˆ
+˜XÚÈOH[ŠBˆÂˆ]]È[œÙ\Y˜XÚÈHY]Oš[œÙ\™]Ð]Y[Õ˜XÚÊNŽ•˜XÚÒ[œÙ\Ú[Ž™Ù][™Ù•˜XÚÜÊ
+™Y]
+K[ŠNÂˆ˜XÚÈH[œÙ\Y˜XÚË™Ù]
+
+NÂˆBˆYˆ
+˜XÚÈOH[ŠHÈÚÝÑ\œ›ÜŠÛÝ[›ÝY˜XÚÈ‹•˜XÚÝ[Ûˆ[™Ú[™HÛÝ[›ÝÜ™X]H[ˆ[œÝ[Y[˜XÚËˆŠNÈ™]\›ŽÈBˆ˜XÚËOœÙ]˜[YJ˜XÚÓ˜[YJNÂˆYˆ
+]]ÈÞ[HY]O™Ù]YÚ[ØXÚJ
+K˜Ü™X]S™]ÔYÚ[ŠNŽ‘›Ý\“ÜØÔYÚ[ŽŽž[\S˜[YKßJJBˆ˜XÚËOœYÚ[“\Ýš[œÙ\YÚ[Š
+œÞ[[ŠNÂˆY]Oœ™\Ý\^X˜XÚÊ
+NÂˆ[œÝ[Y[˜XÚÈH˜XÚÎÂˆ™Yœ™\Ú˜XÚÔÙ[XÝÜŠ
+NÂˆ™XY]\›”Ý\Ê
+NÂˆ™Yœ™\ÚZ^\ÛÛ›ÛÊ
+NÂˆ\Ñ\HHYNÂˆ™Yœ™\Ú›Ú™XÝšY]ÊYYH˜XÚÝ[Ûˆ[œÝ[Y[˜XÚÈÚ]HZ[Z[ˆÔÐÈÞ[ˆŠNÂˆB‚ˆ›ÚYY]\›Š
+BˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ŠH™]\›ŽÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠHš[™š\œÝ[œÝ[Y[˜XÚÊ
+NÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠHÈÚÝÑ\œ›ÜŠY[ˆ[œÝ[Y[š\œÝ‹Ü™X]H[ˆ[œÝ[Y[˜XÚÈ™Y›Ü™HY[™ÈHRQH]\›‹ˆŠNÈ™]\›ŽÈBˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆ›Ú™XÝœÙ]]\›Ü™X]Y
+˜XÚÒY]\›’[™^YJNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+Bˆ›Ú™XÝœÙ]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\˜[ÙJNÂˆ›Üˆ
+]]Éˆ]ÚÝ\Èˆ›ÝQÜšY
+H]ÚÝ\Ë™š[
+˜[ÙJNÂˆ]ÚÙ[XÝÜ‹œÙ]Ù[XÝYY
+]ÚÒ][RY
+Œ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]ÚÙ[XÝÜ‹œÙ][˜X›Y
+YJNÂˆX[›Ô›Û]Û‹œÙ][˜X›Y
+YJNÂˆ›Üˆ
+[HHÈHMŽÈ
+ÊÚJBˆÂˆÛÛœÝ›ÛÛ[˜X›YHHOHHOHHOHHOHLŽÂˆ›ÝQÜšYÜÝ]X×ØØ\ÝÚ^™WÝŠŒHZ[š[][T]Ú
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠJWHH[˜X›YÂˆ›Ú™XÝœÙ]]\›“›ÝJ˜XÚÒY]\›’[™^ŒK[˜X›Y
+NÂˆBˆ›Ú™XÝœÙ]]\›Ü™X]Y
+˜XÚÒY]\›’[™^YJNÂˆ\Ô]\›ˆHYNÂˆ›Üˆ
+]]ÉˆÝ\ˆÝ\ÊHÝ\OœÙ][˜X›Y
+YJNÂˆØYÙ[XÝY]ÚÝ\Ê
+NÂˆ™XZ[]\›Û\
+
+NÂˆ\Ñ\HHYNÂˆ™Yœ™\Ú›Ú™XÝšY]Ê”]\›ˆÜ™X]YˆÜ[ˆ^[\Ý[™ÛXÚÈH[Y[[™HÙ[ÈXÙH]ÈX™[YÛ\ˆŠNÂˆB‚ˆ›ÚY\]T]\›”Ý\
+[[™^›ÛÛ[˜X›Y
+BˆÂˆYˆ
+Z\Ô]\›ˆ[™^[™^HMŠH™]\›ŽÂˆ›ÝQÜšYÜÝ]X×ØØ\ÝÚ^™WÝŠÙ[XÝY]Ú
+
+HHZ[š[][T]Ú
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠ[™^
+WHH[˜X›YÂˆ›Ú™XÝœÙ]]\›“›ÝJÙ[XÝY›Ú™XÝ˜XÚÒY
+
+KÙ[XÝY]\›’[™^
+
+KÙ[XÝY]Ú
+
+K[™^[˜X›Y
+NÂˆ™XZ[]\›Û\
+
+NÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+”]\›ˆY]YˆØ]™HÈÙY\HÚ[™Ù\Ëˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY™XZ[]\›Û\
+
+BˆÂˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆB‚ˆ›ÚY™Yœ™\Ú[™Ú[™T^[\Ý
+
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆ]\›Û\H[ŽÂˆÛÛœÝ]]È[™Ú[™U˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆÛÛœÝ]]ÈÙXÛÛ™Ô\”Ý\HMKŒÈXÙNŽš›X^
+ŒŒ›Ú™XÝ™Ù][š]X[[\ÐœJ
+JNÂˆÛÛœÝ]]ÈÙXÛÛ™Ô\˜\ˆHÙXÛÛ™Ô\”Ý\
+ˆM‹ŒÂˆ›Üˆ
+[˜XÚÒ[™^HÈ˜XÚÒ[™^[™Ú[™U˜XÚÜËœÚ^™J
+H	‰ˆ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÝ˜XÚÒ[™^
+BˆÂˆ]]Êˆ˜XÚÈH[™Ú[™U˜XÚÜË™Ù][˜ÚXÚÙY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÝŽ™XÝÜNŽ“ZYPÛ\
+ˆÛÛ\ÎÂˆ›Üˆ
+[][HHÈ][H˜XÚËO™Ù][U˜XÚÒ][\Ê
+NÈ
+ÊÚ][JBˆYˆ
+]]ÊˆÛ\H[˜[ZX×ØØ\ÝNŽ“ZYPÛ\
+Š˜XÚËO™Ù]˜XÚÒ][J][JJJBˆÛÛ\Ëœ\ÚØ˜XÚÊÛ\
+NÂˆ›Üˆ
+]]ÊˆÛ\ˆÛÛ\ÊBˆ˜XÚËO™[]T™YÚ[Û“ÙÛ\
+Û\Û\O™Ù]Y][YT˜[™ÙJ
+K[ŠNÂ‚ˆ›Üˆ
+[˜\ˆHÈ˜\ˆ^[\ÝÜšYŽ˜˜\ÛÝ[È
+ÊØ˜\ŠBˆÂˆÛÛœÝ]]È]\›’YH›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠNÂˆÛÛœÝ]]È]\›’[™^H›Ú™XÝ™Ù]]\›’[™^›Ü’Y
+˜XÚÒY]\›’Y
+NÂˆYˆ
+]\›’[™^\›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒY]\›’[™^
+JHÛÛ[YNÂˆÛÛœÝ]]È˜[YHH›Ú™XÝ™Ù]]\›“˜[YJ˜XÚÒY]\›’[™^
+NÂˆÛÛœÝ]]ÈÝ\H˜\ˆ
+ˆÙXÛÛ™Ô\˜\ŽÂˆÛÛœÝ]]È]\›“[™ÝH›Ú™XÝ™Ù]]\›“[™ÝÝ\Ê˜XÚÒY]\›’[™^
+NÂˆÛÛœÝ]]ÈÛ\ÙXÛÛ™ÈHXÙNŽš›X^
+ÙXÛÛ™Ô\˜\‹]\›“[™Ý
+ˆÙXÛÛ™Ô\”Ý\
+NÂˆ]]È[œÙ\YH˜XÚËOš[œÙ\RQPÛ\
+˜[YKÈ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊÝ\
+Kˆ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊÝ\
+ÈÛ\ÙXÛÛ™ÊHK[ŠNÂˆ]]ÊˆÛ\H[œÙ\Y™Ù]
+
+NÂˆYˆ
+Û\OH[ŠHÛÛ[YNÂˆÛ\OœÙ]ÛÜ˜[™ÙP™X]ÊÈ˜XÚÝ[ÛŽŽ™X]ÜÚ][ÛŽŽ™œ›ÛP™X]ÊŒ
+K˜XÚÝ[ÛŽŽ™X]ÜÚ][ÛŽŽ™œ›ÛP™X]Ê]\›“[™Ý
+ˆŒJHJNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\]\›“[™ÝÈ
+ÊÜÝ\
+BˆYˆ
+›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\
+JBˆÛ\O™Ù]Ù\]Y[˜ÙJ
+K˜Y›ÝJ]Ú˜XÚÝ[ÛŽŽ™X]ÜÚ][ÛŽŽ™œ›ÛP™X]ÊÝ\
+ˆŒJKˆ˜XÚÝ[ÛŽŽ™X]\˜][ÛŽŽ™œ›ÛP™X]Ê›Ú™XÝ™Ù]]\›“›ÝS[™Ý
+˜XÚÒY]\›’[™^]ÚÝ\
+H
+ˆŒJKˆ›Ú™XÝ™Ù]]\›“›ÝU™[ØÚ]J˜XÚÒY]\›’[™^]ÚÝ\
+K[ŠNÂˆYˆ
+˜XÚÈOH[œÝ[Y[˜XÚÈ	‰ˆ]\›’[™^OHÙ[XÝY]\›’[™^
+
+JBˆ]\›Û\HÛ\ÂˆBˆBˆYˆ
+]Y][Û”]\›”^X˜XÚÊBˆÂˆ›Üˆ
+[˜XÚÒ[™^HÈ˜XÚÒ[™^[™Ú[™U˜XÚÜËœÚ^™J
+H	‰ˆ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÝ˜XÚÒ[™^
+BˆÂˆ]]Êˆ˜XÚÈH[™Ú[™U˜XÚÜË™Ù][˜ÚXÚÙY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È]\›’[™^H›Ú™XÝ™Ù]˜XÚÔÙ[XÝY]\›’[™^
+˜XÚÒY
+NÂˆYˆ
+\]\›’\Ó›Ý\Ê˜XÚÒY]\›’[™^
+JHÛÛ[YNÂ‚ˆÛÛœÝ]]È]\›“[™ÝH›Ú™XÝ™Ù]]\›“[™ÝÝ\Ê˜XÚÒY]\›’[™^
+NÂˆÛÛœÝ]]È[™Ý™X]ÈHXÙNŽš›X^
+K]\›“[™Ý
+H
+ˆŒNÂˆÛÛœÝ]]ÈÛ\ÙXÛÛ™ÈHXÙNŽš›X^
+ŒLK[™Ý™X]È
+ˆŒŒÈ›Ú™XÝ™Ù][š]X[[\ÐœJ
+JNÂˆÛÛœÝ]]È˜[YHH›Ú™XÝ™Ù]]\›“˜[YJ˜XÚÒY]\›’[™^
+NÂˆ]]È[œÙ\YH˜XÚËOš[œÙ\RQPÛ\
+˜[YKˆÈ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊŒ
+Kˆ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊÛ\ÙXÛÛ™ÊHK[ŠNÂˆ]]ÊˆÛ\H[œÙ\Y™Ù]
+
+NÂˆYˆ
+Û\OH[ŠBˆÂˆÛ\OœÙ]ÛÜ˜[™ÙP™X]ÊÈ˜XÚÝ[ÛŽŽ™X]ÜÚ][ÛŽŽ™œ›ÛP™X]ÊŒ
+Kˆ˜XÚÝ[ÛŽŽ™X]ÜÚ][ÛŽŽ™œ›ÛP™X]Ê[™Ý™X]ÊHJNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\]\›“[™ÝÈ
+ÊÜÝ\
+BˆYˆ
+›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\
+JBˆÛ\O™Ù]Ù\]Y[˜ÙJ
+K˜Y›ÝJ]Úˆ˜XÚÝ[ÛŽŽ™X]ÜÚ][ÛŽŽ™œ›ÛP™X]ÊÝ\
+ˆŒJKˆ˜XÚÝ[ÛŽŽ™X]\˜][ÛŽŽ™œ›ÛP™X]Êˆ›Ú™XÝ™Ù]]\›“›ÝS[™Ý
+˜XÚÒY]\›’[™^]ÚÝ\
+H
+ˆŒJKˆ›Ú™XÝ™Ù]]\›“›ÝU™[ØÚ]J˜XÚÒY]\›’[™^]ÚÝ\
+K[ŠNÂˆYˆ
+˜XÚÈOH[œÝ[Y[˜XÚÊBˆ]\›Û\HÛ\ÂˆBˆBˆBˆ\]Q[™Ú[™P]]ÛX][ÛŠ
+NÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆB‚ˆÝ]XÈ›Ø]]˜[X]P]]ÛX][Û“[™JÛÛœÝ›Ú™XÝØÝ[Y[Ž]]ÛX][Û“[™Iˆ[™K[ÜÚ][ÛŠBˆÂˆYˆ
+[™KœÚ[Ëš\Ñ[\J
+JH™]\›ˆYŽÂˆÛÛœÝ›Ú™XÝØÝ[Y[Ž]]ÛX][Û”Ú[
+ˆ™Y›Ü™HH[ŽÂˆÛÛœÝ›Ú™XÝØÝ[Y[Ž]]ÛX][Û”Ú[
+ˆY\ˆH[ŽÂˆ›Üˆ
+ÛÛœÝ]]ÉˆÚ[ˆ[™KœÚ[ÊBˆÂˆYˆ
+Ú[œÜÚ][ÛˆHÜÚ][Ûˆ	‰ˆ
+™Y›Ü™HOH[ˆÚ[œÜÚ][Ûˆˆ™Y›Ü™KOœÜÚ][ÛŠJH™Y›Ü™HH	œÚ[ÂˆYˆ
+Ú[œÜÚ][ÛˆHÜÚ][Ûˆ	‰ˆ
+Y\ˆOH[ˆÚ[œÜÚ][ÛˆY\‹OœÜÚ][ÛŠJHY\ˆH	œÚ[ÂˆBˆYˆ
+™Y›Ü™HOH[ŠH™]\›ˆY\‹O˜[YNÂˆYˆ
+Y\ˆOH[ŠH™]\›ˆ™Y›Ü™KO˜[YNÂˆYˆ
+™Y›Ü™KOœÜÚ][ÛˆOHY\‹OœÜÚ][ÛŠH™]\›ˆ™Y›Ü™KO˜[YNÂˆÛÛœÝ]]È[[Ý[HÝ]X×ØØ\Ý›Ø]ŠÜÚ][ÛˆH™Y›Ü™KOœÜÚ][ÛŠBˆÈÝ]X×ØØ\Ý›Ø]ŠY\‹OœÜÚ][ÛˆH™Y›Ü™KOœÜÚ][ÛŠNÂˆ™]\›ˆ™Y›Ü™KO˜[YH
+È[[Ý[
+ˆ
+Y\‹O˜[YHH™Y›Ü™KO˜[YJNÂˆB‚ˆ›ÚY™Yœ™\ÚX[›Ô›Û]]ÛX][Û•\™Ù]Ê
+BˆÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠH™]\›ŽÂˆXÙNŽ”Ýš[™Ð\œ˜^HX™[ËYÎÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠBˆÂˆ›Üˆ
+]]ÊˆYÚ[ˆˆ[œÝ[Y[˜XÚËOœYÚ[“\Ý
+BˆÂˆYˆ
+YÚ[ˆOH[ŠHÛÛ[YNÂˆ›Üˆ
+]]Êˆ\˜[Y]\ˆˆYÚ[‹O™Ù]]]ÛX]X›T\˜[Y]\œÊ
+JBˆÂˆYˆ
+\˜[Y]\ˆOH[ŠHÛÛ[YNÂˆÛÛœÝ]]È\˜[Y]\“˜[YHH\˜[Y]\‹O™Ù]\˜[Y]\“˜[YJ
+NÂˆX™[Ë˜Y
+YÚ[‹O™Ù]˜[YJ
+H
+ÈˆÈˆ
+È\˜[Y]\“˜[YJNÂˆYË˜Y
+YÚ[‹O™Ù]˜[YJ
+H
+È—ˆˆ
+È\˜[Y]\‹Oœ\˜[RQ
+È—ˆˆ
+È\˜[Y]\“˜[YJNÂˆBˆBˆBˆX[›Ô›ÛÚ[™ÝËOœÙ]]]ÛX][Û•\™Ù]ÊX™[ËYÊNÂˆB‚ˆ›ÚY\]Q[™Ú[™P]]ÛX][ÛŠ
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆÛÛœÝ]]ÈœHHXÙNŽš›X^
+ŒŒ›Ú™XÝ™Ù][š]X[[\ÐœJ
+JNÂˆÛÛœÝ]]ÈÙXÛÛ™Ô\”Ý\HMKŒÈœNÂˆ›Üˆ
+[˜XÚÒ[™^HÈ˜XÚÒ[™^˜XÚÜËœÚ^™J
+H	‰ˆ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÝ˜XÚÒ[™^
+BˆÂˆ]]Êˆ˜XÚÈH˜XÚÜË™Ù][˜ÚXÚÙY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆ›Üˆ
+]]ÊˆYÚ[ˆˆ˜XÚËOœYÚ[“\Ý
+BˆÂˆYˆ
+YÚ[ˆOH[ŠHÛÛ[YNÂˆ›Üˆ
+]]Êˆ\˜[Y]\ˆˆYÚ[‹O™Ù]]]ÛX]X›T\˜[Y]\œÊ
+JBˆÂˆYˆ
+\˜[Y]\ˆOH[ŠHÛÛ[YNÂˆ›Ú™XÝØÝ[Y[Ž]]ÛX][Û“[™H]\›“[™KÛÛ™Ó[™NÂˆ›ÛÛ\Ô]\›“[™HH˜[ÙK\ÔÛÛ™Ó[™HH˜[ÙNÂˆ›Üˆ
+[HHÈH›Ú™XÝ™Ù]ÛÛ™Ð]]ÛX][Û“[™PÛÝ[
+˜XÚÒY
+NÈ
+ÊÚJBˆÂˆ]]ÈØ[™Y]HH›Ú™XÝ™Ù]ÛÛ™Ð]]ÛX][Û“[™J˜XÚÒYJNÂˆYˆ
+Ø[™Y]KœYÚ[“˜[YHOHYÚ[‹O™Ù]˜[YJ
+H	‰ˆØ[™Y]Kœ\˜[Y]\’YOH\˜[Y]\‹Oœ\˜[RQ
+BˆÈÛÛ™Ó[™HHÝŽ›[Ý™JØ[™Y]JNÈ\ÔÛÛ™Ó[™HHYNÈœ™XZÎÈBˆBˆÛÛœÝ]]È]\›’[™^H›Ú™XÝ™Ù]˜XÚÔÙ[XÝY]\›’[™^
+˜XÚÒY
+NÂˆ›Üˆ
+[HHÈH›Ú™XÝ™Ù]]\›]]ÛX][Û“[™PÛÝ[
+˜XÚÒY]\›’[™^
+NÈ
+ÊÚJBˆÂˆ]]ÈØ[™Y]HH›Ú™XÝ™Ù]]\›]]ÛX][Û“[™J˜XÚÒY]\›’[™^JNÂˆYˆ
+Ø[™Y]KœYÚ[“˜[YHOHYÚ[‹O™Ù]˜[YJ
+H	‰ˆØ[™Y]Kœ\˜[Y]\’YOH\˜[Y]\‹Oœ\˜[RQ
+BˆÈ]\›“[™HHÝŽ›[Ý™JØ[™Y]JNÈ\Ô]\›“[™HHYNÈœ™XZÎÈBˆB‚ˆËÈÛ›H™\XÙHÝ\™\ÈÝÛ™YžHÜ˜š]	ÜÈ]]ÛX][ÛˆY]Ü‹ˆX]š[™ÂˆËÈ[œ™[]Y˜XÚÝ[ÛˆÝ\™\È[ÝXÚY]›ÚYÈ[][™ÈÜÝÜYÚ[ˆ]]ÛX][Û‹‚ˆYˆ
+Z\Ô]\›“[™H	‰ˆZ\ÔÛÛ™Ó[™JHÛÛ[YNÂˆ]]ÉˆÝ\™HH\˜[Y]\‹O™Ù]Ý\™J
+NÂˆÝ\™K˜ÛX\Š
+NÂˆÛÛœÝ]]Éˆ[™HH^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœÛÛ™ÈÈÛÛ™Ó[™Hˆ]\›“[™NÂˆÛÛœÝ›ÛÛ\ÐXÝ]™S[™HH^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœÛÛ™ÈÈ\ÔÛÛ™Ó[™Hˆ\Ô]\›“[™NÂˆYˆ
+Z\ÐXÝ]™S[™JHÛÛ[YNÂˆ›Üˆ
+ÛÛœÝ]]ÉˆÚ[ˆ[™KœÚ[ÊBˆÂˆÛÛœÝ]]ÈÙXÛÛ™ÈHÚ[œÜÚ][Ûˆ
+ˆÙXÛÛ™Ô\”Ý\ÂˆÝ\™K˜YÚ[
+˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊÙXÛÛ™ÊKˆ\˜[Y]\‹O˜[YT˜[™ÙK˜ÛÛ™\œ›ÛLÌJXÙNŽš›[Z]
+Œ‹KŒ‹Ú[˜[YJJKŒŠNÂˆBˆBˆBˆBˆB‚ˆ›ÚYÚÝÔ^[\Ý
+
+BˆÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH™]\›ŽÂˆ^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆ^[\ÝÚ[™ÝËOœÙ]š\ÚX›JYJNÂˆ^[\ÝÚ[™ÝËOÑœ›Û
+˜[ÙJNÂˆB‚ˆ›ÚYÙÙÛT^[\ÝšY]Ê
+BˆÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH™]\›ŽÂˆYˆ
+^[\ÝÚ[™ÝËOš\Õš\ÚX›J
+JH^[\ÝÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆ[ÙHÚÝÔ^[\Ý
+
+NÂˆB‚ˆ›ÚYØ\ØØYSÜ[•Ú[™ÝÜÊ
+BˆÂˆÛÛœÝ]]ÈXZ[›Ý[™ÈHÙ]ØÜ™Y[›Ý[™Ê
+NÂˆ[Ù™œÙ]HÂˆ›Üˆ
+]]ÊˆÚ[™ÝÈˆÈÝ]X×ØØ\ÝXÙNŽ‘ØÝ[Y[Ú[™ÝÊŠ\]X[\Ù\•Ú[™ÝË™Ù]
+
+JKˆÝ]X×ØØ\ÝXÙNŽ‘ØÝ[Y[Ú[™ÝÊŠ]Y[ÔÙ][™ÜÕÚ[™ÝË™Ù]
+
+JHJBˆÂˆYˆ
+Ú[™ÝÈOH[ˆ]Ú[™ÝËOš\Õš\ÚX›J
+JHÛÛ[YNÂˆÚ[™ÝËOœÙ]Z[š[Z\ÙY
+˜[ÙJNÂˆÚ[™ÝËOœÙ]ÜYÜÚ][ÛŠXZ[›Ý[™Ë™Ù]
+
+H
+ÈÌ
+ÈÙ™œÙ]XZ[›Ý[™Ë™Ù]J
+H
+ÈL
+ÈÙ™œÙ]
+NÂˆÚ[™ÝËOÑœ›Û
+˜[ÙJNÂˆÙ™œÙ]
+ÏHŽÂˆBˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ˆ	‰ˆX[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JBˆX[›Ô›ÛÚ[™ÝËOÑœ›Û
+˜[ÙJNÂˆB‚ˆ›ÚYÝÜ^X˜XÚÊ
+BˆÂˆYˆ
+Y]OH[ˆ	‰ˆ^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœÛÛ™ÊBˆ™[Y[X™\”ÛÛ™Ô]\›œÐ]
+Y]O™Ù]˜[œÜÜ
+
+K™Ù]ÜÚ][ÛŠ
+Kš[”ÙXÛÛ™Ê
+JNÂˆYˆ
+Y]OH[ŠHY]O™Ù]˜[œÜÜ
+
+KœÝÜ
+˜[ÙK˜[ÙJNÂˆYˆ
+]Y][Û”]\›”^X˜XÚÊBˆÂˆ]Y][Û”]\›”^X˜XÚÈH˜[ÙNÂˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆBˆ^P]Û‹œÙ]]Û•^
+”^HŠNÂˆÝ]\ËœÙ]^
+”ÝÜYˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÚÝÓZ^\Š›ÛÛ›ØÝ\ÓX\Ý\ˆH˜[ÙJBˆÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆZ^\•Ú[™ÝËOœÙ]X\Ý\”ÙXÝ[Û“[ÙJ›ØÝ\ÓX\Ý\ŠNÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆZ^\•Ú[™ÝËOœ™Yœ™\Ú
+˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆ[š]X[\ÙSZ^\”[™[›Ý[™Ê
+NÂˆZ^\•Ú[™ÝËOœÙ]Z[š[Z^™Y
+˜[ÙJNÂˆÛÛœÝ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆÛÛœÝ]]ÈÝš\ÛÝ[HZ^\•Ú[™ÝËO™Ù]š\ÚX›U˜XÚÐÛÝ[
+
+NÂˆÛÛœÝ]]ÈÛÛ[ÚYH
+Ýš\ÛÝ[
+ÈJH
+ˆLMˆ
+ÈŽÂˆÛÛœÝ]]ÈÚYHXÙNŽš›[Z]
+XÙNŽš›Z[ŠŒŒ\™XK™Ù]ÚY
+
+JK\™XK™Ù]ÚY
+
+KÛÛ[ÚY
+NÂˆZ^\”[™[›Ý[™ËœÙ]Ú^™JÚY\™XK™Ù]ZYÚ
+
+JNÂˆZ^\”[™[›Ý[™ËœÙ]ÜÚ][ÛŠXÙNŽš›X^
+\™XK™Ù]
+
+K\™XK™Ù]šYÚ
+
+HHÚY
+K\™XK™Ù]J
+JNÂˆZ^\•Ú[™ÝËOœÙ]š\ÚX›JYJNÂˆ™\Ú^™Y
+
+NÂˆËÈ™\Ú^™Y
+
+H˜Z\Ù\ÈHÙ[™\˜]Ü‹]XˆØÚÈÛÈ]™[XZ[œÈ]˜Z[X›BˆËÈX›Ý™HHÛÜšÜÜXÙKˆ™K\˜Z\ÙHH›ØÝ\ÙYZ^\ˆY\Ø\™ÛÈBˆËÈØÚÈØ[››ÝÛÝ™\ˆHÚ[›™[›Ý][™È]ÛœÈ]H›ÝÛK‚ˆZ^\•Ú[™ÝËOÑœ›Û
+˜[ÙJNÂˆYˆ
+›ØÝ\ÓX\Ý\ŠHZ^\•Ú[™ÝËO™›ØÝ\ÓX\Ý\Š
+NÂˆB‚ˆ›ÚY[š]X[\ÙSZ^\”[™[›Ý[™Ê
+BˆÂˆYˆ
+Z^\›Ý[™Ò[š]X[\ÙYZ^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆÛÛœÝ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆÛÛœÝ]]ÈÝš\ÛÝ[HZ^\•Ú[™ÝËO™Ù]˜XÚÐÛÝ[ÈZ^\•Ú[™ÝËO™Ù]˜XÚÐÛÝ[
+
+HˆÂˆÛÛœÝ]]ÈÝš\ÛÛ[ÚYH
+Ýš\ÛÝ[
+ÈJH
+ˆLMŽÂˆÛÛœÝ]]ÈY˜][ÚYHXÙNŽš›[Z]
+XÙNŽš›Z[ŠÌ\™XK™Ù]ÚY
+
+JK\™XK™Ù]ÚY
+
+KˆXÙNŽš›X^
+ÍŒÝš\ÛÛ[ÚY
+ÈÎ
+JNÂˆZ^\”[™[›Ý[™ÈHÈXÙNŽš›X^
+\™XK™Ù]
+
+K\™XK™Ù]šYÚ
+
+HHY˜][ÚY
+K\™XK™Ù]J
+KˆY˜][ÚY\™XK™Ù]ZYÚ
+
+HNÂ‚ˆYˆ
+]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+NÂˆÙ][™ÜÈOH[ˆ	‰ˆÙ][™ÜËO™Ù]›ÛÛ˜[YJ›Z^\”[™[›Ý[™ÔÙ]‹˜[ÙJJBˆÂˆZ^\”[™[›Ý[™ËœÙ]ÜÚ][ÛŠÙ][™ÜËO™Ù][˜[YJ›Z^\”[™[‹\™XK™Ù]
+
+JKˆÙ][™ÜËO™Ù][˜[YJ›Z^\”[™[H‹\™XK™Ù]J
+JJNÂˆZ^\”[™[›Ý[™ËœÙ]Ú^™JÙ][™ÜËO™Ù][˜[YJ›Z^\”[™[ÚY‹Y˜][ÚY
+KˆÙ][™ÜËO™Ù][˜[YJ›Z^\”[™[ZYÚ‹\™XK™Ù]ZYÚ
+
+JJNÂˆBˆZ^\›Ý[™Ò[š]X[\ÙYHYNÂˆ™\Ú^™Y
+
+NÂˆB‚ˆ›ÚY^[Ý]Z^\’[™\Ê
+BˆÂˆËÈZ^\ˆ[Ý™[Y[\È[™YžH]ÈÛÛ\XÝ]H˜\‹ˆÙY\HYØXÞBˆËÈÝ™\›^H[™\ÈY[ˆÛÈ^HØ[››ÝÛÝ™\ˆÙ[™\˜]ÜˆÛÛ›ÛË‚ˆZ^\“[Ý™R[™KœÙ]š\ÚX›J˜[ÙJNÂˆZ^\”™\Ú^™R[™KœÙ]š\ÚX›J˜[ÙJNÂˆB‚ˆ›ÚY[Ý™SZ^\”[™[
+XÙNŽ”Ú[[ˆÚ[
+BˆÂˆYˆ
+Y˜YÙÚ[™ÓZ^\ˆZ^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆÛÛœÝ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆZ^\”[™[›Ý[™ËœÙ]ÜÚ][ÛŠˆXÙNŽš›[Z]
+\™XK™Ù]
+
+KXÙNŽš›X^
+\™XK™Ù]
+
+K\™XK™Ù]šYÚ
+
+HHZ^\”[™[›Ý[™Ë™Ù]ÚY
+
+JKˆÚ[žHZ^\‘˜YÓÙ™œÙ]ž
+KˆXÙNŽš›[Z]
+\™XK™Ù]J
+KXÙNŽš›X^
+\™XK™Ù]J
+K\™XK™Ù]›ÝÛJ
+HHZ^\”[™[›Ý[™Ë™Ù]ZYÚ
+
+JKˆÚ[žHHZ^\‘˜YÓÙ™œÙ]žJJNÂˆZ^\•Ú[™ÝËOœÙ]›Ý[™ÊZ^\”[™[›Ý[™ÊNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆB‚ˆ›ÚY™\Ú^™SZ^\”[™[
+XÙNŽ”Ú[[ˆÚ[
+BˆÂˆYˆ
+\™\Ú^š[™ÓZ^\ˆZ^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆÛÛœÝ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆÛÛœÝ]]È[HHÚ[HZ^\”™\Ú^™TÝ\ÂˆZ^\”[™[›Ý[™ËœÙ]Ú^™JˆXÙNŽš›[Z]
+XÙNŽš›Z[ŠÌ\™XK™Ù]ÚY
+
+JK\™XK™Ù]ÚY
+
+KZ^\”™\Ú^™TÝ\›Ý[™Ë™Ù]ÚY
+
+H
+È[Kž
+KˆXÙNŽš›[Z]
+XÙNŽš›Z[ŠŒ\™XK™Ù]ZYÚ
+
+JK\™XK™Ù]ZYÚ
+
+KZ^\”™\Ú^™TÝ\›Ý[™Ë™Ù]ZYÚ
+
+H
+È[KžJJNÂˆZ^\•Ú[™ÝËOœÙ]›Ý[™ÊZ^\”[™[›Ý[™ÊNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆB‚ˆ›ÚY[™Z^\‘˜YÊ
+BˆÂˆ˜YÙÚ[™ÓZ^\ˆH˜[ÙNÂˆØ]™SZ^\”[™[›Ý[™Ê
+NÂˆÝ]\ËœÙ]^
+“Z^\ˆ[Ý™Yˆ]ÈÚ^™H[™ÜÚ][Ûˆ\™HØ]™Yˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY[™Z^\”™\Ú^™J
+BˆÂˆ™\Ú^š[™ÓZ^\ˆH˜[ÙNÂˆØ]™SZ^\”[™[›Ý[™Ê
+NÂˆÝ]\ËœÙ]^
+“Z^\ˆ™\Ú^™Yˆ]ÈÚ^™H[™ÜÚ][Ûˆ\™HØ]™Yˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYØ]™SZ^\”[™[›Ý[™Ê
+BˆÂˆYˆ
+]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+JBˆÂˆÙ][™ÜËOœÙ]˜[YJ›Z^\”[™[›Ý[™ÔÙ]‹YJNÂˆÙ][™ÜËOœÙ]˜[YJ›Z^\”[™[‹Z^\”[™[›Ý[™Ë™Ù]
+
+JNÂˆÙ][™ÜËOœÙ]˜[YJ›Z^\”[™[H‹Z^\”[™[›Ý[™Ë™Ù]J
+JNÂˆÙ][™ÜËOœÙ]˜[YJ›Z^\”[™[ÚY‹Z^\”[™[›Ý[™Ë™Ù]ÚY
+
+JNÂˆÙ][™ÜËOœÙ]˜[YJ›Z^\”[™[ZYÚ‹Z^\”[™[›Ý[™Ë™Ù]ZYÚ
+
+JNÂˆÙ][™ÜËOœØ]™RY“™YYY
+
+NÂˆBˆB‚ˆ›ÚYÙÙÛSZ^\•šY]Ê
+BˆÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆYˆ
+Z^\•Ú[™ÝËOš\Õš\ÚX›J
+JBˆÂˆYˆ
+Z^\•Ú[™ÝËOš\ÓX\Ý\”ÙXÝ[Û“[ÙJ
+JBˆÂˆÚÝÓZ^\Š˜[ÙJNÂˆ™]\›ŽÂˆBˆZ^\•Ú[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆ™\Z[
+
+NÂˆ™]\›ŽÂˆBˆÚÝÓZ^\Š
+NÂˆB‚ˆ›ÚYÙ]Z^\”[™[Ú^™J›ÛÛ^[™Y
+BˆÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆÛÛœÝ]]È\™XHHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJŒŠKœ™YXÙY
+ML
+NÂˆ[š]X[\ÙSZ^\”[™[›Ý[™Ê
+NÂˆÛÛœÝ]]ÈÝš\ÛÝ[HZ^\•Ú[™ÝËO™Ù]˜XÚÐÛÝ[ÈZ^\•Ú[™ÝËO™Ù]˜XÚÐÛÝ[
+
+HˆÂˆÛÛœÝ]]ÈÚYHXÙNŽš›[Z]
+XÙNŽš›Z[ŠŒŒ\™XK™Ù]ÚY
+
+JK\™XK™Ù]ÚY
+
+Kˆ
+Ýš\ÛÝ[
+ÈJH
+ˆLMˆ
+ÈŠNÂˆÛÛœÝ]]ÈZYÚH^[™YÈ\™XK™Ù]ZYÚ
+
+HˆXÙNŽš›Z[Š\™XK™Ù]ZYÚ
+
+KLŒ
+NÂˆZ^\”[™[›Ý[™ÈHÈXÙNŽš›X^
+\™XK™Ù]
+
+K\™XK™Ù]šYÚ
+
+HHÚY
+Kˆ^[™YÈ\™XK™Ù]J
+Hˆ\™XK™Ù]›ÝÛJ
+HHZYÚÚYZYÚNÂˆZ^\•Ú[™ÝËOœÙ]Z[š[Z^™Y
+˜[ÙJNÂˆZ^\•Ú[™ÝËOœÙ]š\ÚX›JYJNÂˆZ^\•Ú[™ÝËOœÙ]›Ý[™ÊZ^\”[™[›Ý[™ÊNÂˆ^[Ý]Z^\’[™\Ê
+NÂˆZ^\•Ú[™ÝËOÑœ›Û
+˜[ÙJNÂˆZ^\“[Ý™R[™KÑœ›Û
+˜[ÙJNÂˆZ^\”™\Ú^™R[™KÑœ›Û
+˜[ÙJNÂˆØ]™SZ^\”[™[›Ý[™Ê
+NÂˆÝ]\ËœÙ]^
+^[™YÈ“Z^\ˆ^[™Y[œÚYHÜ˜š]ˆˆˆ“Z^\ˆ™\ÝÜ™YÈÛÛ\XÝšY]Ëˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊˆÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HÛÛœÝˆÂˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊˆ™\Ý[ÂˆYˆ
+Y]OH[ŠH™]\›ˆ™\Ý[Âˆ›Üˆ
+]]Êˆ˜XÚÈˆNŽ™Ù]]Y[Õ˜XÚÜÊ
+™Y]
+JBˆYˆ
+Ý]X×ØØ\Ý[Š˜XÚËOœÝ]K™Ù]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]ž™]\›\ÈŠKLJJHˆ	‰ˆÝ]X×ØØ\Ý[Š˜XÚËOœÝ]K™Ù]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]Z^\\ÈŠKLJJH
+Bˆ™\Ý[˜Y
+˜XÚÊNÂˆ™]\›ˆ™\Ý[ÂˆB‚ˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊˆÙ]Z^\•˜XÚÜÊ
+HÛÛœÝˆÂˆ]]È™\Ý[HÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆYˆ
+]]Êˆ™]\›•˜XÚÈHÙ]ž™]\›•˜XÚÊ\ÊJBˆ™\Ý[˜Y
+™]\›•˜XÚÊNÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆYˆ
+]]ÊˆÝ]]\ÈHÙ]Ý]]\Õ˜XÚÊ\ÊJBˆ™\Ý[˜Y
+Ý]]\ÊNÂˆ™]\›ˆ™\Ý[ÂˆB‚ˆNŽ]Y[Õ˜XÚÊˆÙ]Ý]]\Õ˜XÚÊ[\ÊHÛÛœÝˆÂˆYˆ
+Y]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ë
+JH™]\›ˆ[ŽÂˆ›Üˆ
+]]Êˆ˜XÚÈˆNŽ™Ù]]Y[Õ˜XÚÜÊ
+™Y]
+JBˆYˆ
+Ý]X×ØØ\Ý[Š˜XÚËOœÝ]K™Ù]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]Z^\\ÈŠKLJJHOH\ÊBˆ™]\›ˆ˜XÚÎÂˆ™]\›ˆ[ŽÂˆB‚ˆNŽ]Y[Õ˜XÚÊˆ[œÝ\™SÝ]]\Õ˜XÚÊ[\ÊBˆÂˆYˆ
+Y]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ë
+JH™]\›ˆ[ŽÂˆYˆ
+]]Êˆ^\Ý[™ÈHÙ]Ý]]\Õ˜XÚÊ\ÊJH™]\›ˆ^\Ý[™ÎÂˆ]]È\Õ˜XÚÈHY]Oš[œÙ\™]Ð]Y[Õ˜XÚÊNŽ•˜XÚÒ[œÙ\Ú[Ž™Ù][™Ù•˜XÚÜÊ
+™Y]
+K[‹YJNÂˆYˆ
+\Õ˜XÚÈOH[ŠH™]\›ˆ[ŽÂˆ\Õ˜XÚËOœÙ]˜[YJ\Èˆ
+ÈXÙNŽ”Ýš[™Ê\È
+ÈJJNÂˆ\Õ˜XÚËOœÝ]KœÙ]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]Z^\\ÈŠK\Ë	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂˆ\Õ˜XÚËOœÝ]KœÙ]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]Z^\Ú[›™[YŠKXÙNŽ•]ZY
+
+KÔÝš[™Ê
+Kˆ	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂˆ™]\›ˆ\Õ˜XÚË™Ù]
+
+NÂˆB‚ˆNŽ]Y[Õ˜XÚÊˆÙ]ž™]\›•˜XÚÊ[\ÊHÛÛœÝˆÂˆYˆ
+Y]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ë
+JH™]\›ˆ[ŽÂˆ›Üˆ
+]]Êˆ˜XÚÈˆNŽ™Ù]]Y[Õ˜XÚÜÊ
+™Y]
+JBˆYˆ
+Ý]X×ØØ\Ý[Š˜XÚËOœÝ]K™Ù]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]ž™]\›\ÈŠKLJJHOH\ÊBˆ™]\›ˆ˜XÚÎÂˆ™]\›ˆ[ŽÂˆB‚ˆNŽ]Y[Õ˜XÚÊˆ[œÝ\™Qž™]\›•˜XÚÊ[\ÊBˆÂˆYˆ
+Y]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ë
+JH™]\›ˆ[ŽÂˆYˆ
+]]Êˆ^\Ý[™ÈHÙ]ž™]\›•˜XÚÊ\ÊJH™]\›ˆ^\Ý[™ÎÂ‚ˆÛÛœÝ]]È\Ó˜[YHH‘–ˆ
+ÈXÙNŽ”Ýš[™Ê\È
+ÈJNÂˆY]OœÙ]]^\Ó˜[YJ\Ë\Ó˜[YJNÂ‚ˆËÈ™[[Ý™HYØXÞH™]\›œÈœ›ÛHHX\Ý\ˆÚZ[ˆ™Y›Ü™HZYÜ˜][™ÈÈ[‚ˆËÈ\ÛÛ]Y]Y[È™]\›ˆ˜XÚËÛÈ™]\›ˆY™™XÝÈ™]™\ˆ›ØÙ\ÜÈHžHZ^‚ˆÝŽ™XÝÜXÙNŽ•˜[YU™YOˆYØXÞT™]\›œÎÂˆ›Üˆ
+]]ÊˆYÚ[ˆˆY]O™Ù]X\Ý\”YÚ[“\Ý
+
+JBˆYˆ
+]]Êˆ]^™]\›ˆH[˜[ZX×ØØ\ÝNŽ]^™]\›”YÚ[ŠŠYÚ[ŠJBˆYˆ
+Ý]X×ØØ\Ý[Š]^™]\›‹O˜\Ó[X™\ŠHOH\ÊBˆYØXÞT™]\›œËœ\ÚØ˜XÚÊ]^™]\›‹OœÝ]JNÂˆ›Üˆ
+]]ÉˆÝ]HˆYØXÞT™]\›œÊBˆYˆ
+Ý]K™Ù]\™[
+
+Kš\Õ˜[Y
+
+JBˆÝ]K™Ù]\™[
+
+Kœ™[[Ý™PÚ[
+Ý]K	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂ‚ˆ]]È™]\›•˜XÚÈHY]Oš[œÙ\™]Ð]Y[Õ˜XÚÊNŽ•˜XÚÒ[œÙ\Ú[Ž™Ù][™Ù•˜XÚÜÊ
+™Y]
+K[‹YJNÂˆYˆ
+™]\›•˜XÚÈOH[ŠH™]\›ˆ[ŽÂˆ™]\›•˜XÚËOœÙ]˜[YJ\Ó˜[YH
+Èˆ™]\›ˆŠNÂˆ™]\›•˜XÚËOœÝ]KœÙ]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]ž™]\›\ÈŠK\Ë	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂˆ™]\›•˜XÚËOœÝ]KœÙ]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]Z^\Ú[›™[YŠKXÙNŽ•]ZY
+
+KÔÝš[™Ê
+Kˆ	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂ‚ˆ]]È™]\›”YÚ[ˆHY]O™Ù]YÚ[ØXÚJ
+K˜Ü™X]S™]ÔYÚ[ŠNŽ]^™]\›”YÚ[ŽŽž[\S˜[YKßJNÂˆ]]Êˆ]^™]\›ˆH[˜[ZX×ØØ\ÝNŽ]^™]\›”YÚ[ŠŠ™]\›”YÚ[‹™Ù]
+
+JNÂˆYˆ
+]^™]\›ˆOH[ŠH™]\›ˆ™]\›•˜XÚË™Ù]
+
+NÂˆ]^™]\›‹O˜\Ó[X™\ˆH\ÎÂˆ™]\›•˜XÚËOœYÚ[“\Ýš[œÙ\YÚ[Š
+˜]^™]\›‹[ŠNÂ‚ˆÛÛœÝÝŽ˜\œ˜^OXÙNŽ”Ýš[™ËˆY™™XÝ\\ÈÂˆNŽ”™]™\˜”YÚ[ŽŽž[\S˜[YKNŽ‘[^TYÚ[ŽŽž[\S˜[YKˆNŽÚÜ\ÔYÚ[ŽŽž[\S˜[YKNŽ”\Ù\”YÚ[ŽŽž[\S˜[YKˆNŽ”™]™\˜”YÚ[ŽŽž[\S˜[YKNŽ‘[^TYÚ[ŽŽž[\S˜[YKˆNŽÚÜ\ÔYÚ[ŽŽž[\S˜[YKNŽ”\Ù\”YÚ[ŽŽž[\S˜[YBˆNÂˆÛÛœÝ]]ÈY™™XÝ\HHY™™XÝ\\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\ÊWNÂˆ]]ÈY™™XÝHY]O™Ù]YÚ[ØXÚJ
+K˜Ü™X]S™]ÔYÚ[ŠY™™XÝ\KßJNÂˆYˆ
+Y™™XÝOH[ŠBˆ™]\›•˜XÚËOœYÚ[“\Ýš[œÙ\YÚ[Š
+™Y™™XÝK[ŠNÂˆ™]\›ˆ™]\›•˜XÚË™Ù]
+
+NÂˆB‚ˆ›ÚY[œÝ\™Q^\Ý[™Ñž™]\›œÊ
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆÛÛœÝ]]ÈÙ[™\˜]Ü•˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÂˆYˆ
+]]Êˆ^\Ý[™Ô™]\›ˆHÙ]ž™]\›•˜XÚÊ\ÊJBˆÂˆÞ[˜Õ˜XÚÓZ^\”Ý]J^\Ý[™Ô™]\›ŠNÂˆÛÛ[YNÂˆBˆÛÛœÝ›ÛÛ\ÐXÝ]™TÙ[™HÝŽ˜[žWÛÙŠÙ[™\˜]Ü•˜XÚÜË˜™YÚ[Š
+KÙ[™\˜]Ü•˜XÚÜË™[™
+
+KØ\×JNŽ]Y[Õ˜XÚÊˆ˜XÚÊBˆÂˆ]]ÊˆÙ[™H˜XÚËO™Ù]]^Ù[™YÚ[Š\ÊNÂˆ™]\›ˆÙ[™OH[ˆ	‰ˆÙ[™Oš\Ñ[˜X›Y
+
+H	‰ˆÙ[™O™Ù]ØZ[‘Š
+HˆMNKŽYŽÂˆJNÂˆYˆ
+\ÐXÝ]™TÙ[™	‰ˆ[œÝ\™Qž™]\›•˜XÚÊ\ÊHOH[ŠBˆ\Ñ\HHYNÂˆBˆB‚ˆNŽ”YÚ[ŽŽ”ˆÙ]ž™]\›‘Y™™XÝ
+[\ÊHÛÛœÝˆÂˆ]]Êˆ˜XÚÈHÙ]ž™]\›•˜XÚÊ\ÊNÂˆYˆ
+˜XÚÈOH[ŠH™]\›ˆßNÂˆ›Üˆ
+]]ÊˆYÚ[ˆˆ˜XÚËOœYÚ[“\Ý
+BˆYˆ
+[˜[ZX×ØØ\ÝNŽ]^™]\›”YÚ[ŠŠYÚ[ŠHOH[‚ˆ	‰ˆ[˜[ZX×ØØ\ÝNŽ•›Û[YP[™[”YÚ[ŠŠYÚ[ŠHOH[‚ˆ	‰ˆ[˜[ZX×ØØ\ÝNŽ“]™[Y]\”YÚ[ŠŠYÚ[ŠHOH[ŠBˆ™]\›ˆYÚ[ŽÂˆ™]\›ˆßNÂˆB‚ˆ›ÚYÜ[‘ž™]\›‘Y]ÜŠ[\ÊBˆÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆ]]ÈY™™XÝHÙ]ž™]\›‘Y™™XÝ
+\ÊNÂˆYˆ
+Y™™XÝOH[ŠBˆÂˆÝ]\ËœÙ]^
+”˜Z\ÙHH–ˆ
+ÈXÙNŽ”Ýš[™Ê\È
+ÈJH
+ÈˆÙ[™ÈÜ™X]H]È™]\›ˆY™™XÝˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆZ^\•Ú[™ÝËOœÚÝÑY™™XÝY]ÜŠY™™XÝÝ\Ë\×BˆÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+‘–ˆ
+ÈXÙNŽ”Ýš[™Ê\È
+ÈJH
+Èˆ™]\›ˆY™™XÝÚ[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆJNÂˆB‚ˆÝX›HÙ]˜XÚÑØZ[‘Š[[™^
+HÛÛœÝˆÂˆYˆ
+Y]OH[ŠH™]\›ˆŒÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Z^\•˜XÚÜÊ
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ˆŒÂˆÛÛœÝ]]ÊˆYÚ[ˆH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]›Û[YTYÚ[Š
+NÂˆ™]\›ˆYÚ[ˆOH[ˆÈYÚ[‹O™Ù]›Û[YQŠ
+HˆŒÂˆB‚ˆÝX›HÙ]˜XÚÔ[Š[[™^
+HÛÛœÝˆÂˆYˆ
+Y]OH[ŠH™]\›ˆŒÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Z^\•˜XÚÜÊ
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ˆŒÂˆÛÛœÝ]]ÊˆYÚ[ˆH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]›Û[YTYÚ[Š
+NÂˆ™]\›ˆYÚ[ˆOH[ˆÈYÚ[‹Oœ[‹™Ù]
+
+HˆŒÂˆB‚ˆ›ÛÛÙ]˜XÚÓ]]J[[™^
+HÛÛœÝˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆ™]\›ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JH	‰ˆ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KOš\Ó]]Y
+˜[ÙJNÂˆB‚ˆ›ÛÛÙ]˜XÚÔÛÛÊ[[™^
+HÛÛœÝˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆ™]\›ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JH	‰ˆ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KOš\ÔÛÛÊ˜[ÙJNÂˆB‚ˆ›ÚYÞ[˜Õ˜XÚÓZ^\”Ý]JNŽ]Y[Õ˜XÚÊˆ˜XÚÊBˆÂˆYˆ
+˜XÚÈOH[ˆY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]ÈÙ[™\˜]ÜœÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆÛÛœÝ]]È›Ú™XÝ[™^HÙ[™\˜]ÜœËš[™^ÙŠ˜XÚÊNÂˆ]]Êˆ›Û[YHH˜XÚËO™Ù]›Û[YTYÚ[Š
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ›Ú™XÝ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JJBˆÂˆÛÛœÝ]]È\ÈHÝ]X×ØØ\Ý[Š˜XÚËOœÝ]K™Ù]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]ž™]\›\ÈŠKLJJNÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ë
+JH™]\›ŽÂ‚ˆ]]ÈÚ[›™[YH˜XÚËOœÝ]K™Ù]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]Z^\Ú[›™[YŠJKÔÝš[™Ê
+NÂˆYˆ
+Ú[›™[Yš\Ñ[\J
+JBˆÂˆÚ[›™[YHXÙNŽ•]ZY
+
+KÔÝš[™Ê
+NÂˆ˜XÚËOœÝ]KœÙ]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]Z^\Ú[›™[YŠKÚ[›™[Y	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂˆ\Ñ\HHYNÂˆB‚ˆYˆ
+›Ú™XÝœÙ]ž™]\›“Z^\”Ý]J\ËÚ[›™[Y˜XÚËO™Ù]˜[YJ
+Kˆ›Û[YHOH[ˆÈ›Û[YKO™Ù]›Û[YQŠ
+HˆŒˆ›Û[YHOH[ˆÈ›Û[YKOœ[‹™Ù]
+
+HˆŒˆ˜XÚËOš\Ó]]Y
+˜[ÙJK˜XÚËOš\ÔÛÛÊ˜[ÙJJJBˆ\Ñ\HHYNÂˆ™]\›ŽÂˆB‚ˆ›Ú™XÝœÙ]˜XÚÓZ^\”Ý]J›Ú™XÝ[™^ˆ›Û[YHOH[ˆÈ›Û[YKO™Ù]›Û[YQŠ
+HˆŒˆ›Û[YHOH[ˆÈ›Û[YKOœ[‹™Ù]
+
+HˆŒˆ˜XÚËOš\Ó]]Y
+˜[ÙJK˜XÚËOš\ÔÛÛÊ˜[ÙJJNÂˆ›Üˆ
+[\ÈHÈ\ÈÈ
+ÊØ\ÊBˆÂˆ]]ÊˆÙ[™H˜XÚËO™Ù]]^Ù[™YÚ[Š\ÊNÂˆ›Ú™XÝœÙ]˜XÚÔÙ[™ØZ[Š›Ú™XÝ[™^\ËÙ[™OH[ˆÈÙ[™O™Ù]ØZ[‘Š
+HˆMŒŒ
+NÂˆBˆB‚ˆ›ÚYÞ[˜ÓX\Ý\“Z^\”Ý]J
+BˆÂˆYˆ
+Y]OH[ˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+HOH[ŠH™]\›ŽÂˆ›Ú™XÝœÙ]X\Ý\“Z^\”Ý]JÙ]X\Ý\‘ØZ[‘Š
+KY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+KO™Ù][Š
+K\ÓX\Ý\“]]Y
+
+JNÂˆB‚ˆ›ÚYÙ]˜XÚÑØZ[‘Š[[™^ÝX›H˜[YJBˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Z^\•˜XÚÜÊ
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ŽÂˆYˆ
+]]ÊˆYÚ[ˆH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]›Û[YTYÚ[Š
+JBˆÂˆYÚ[‹OœÙ]›Û[YQŠÝ]X×ØØ\Ý›Ø]Š˜[YJJNÂˆÞ[˜Õ˜XÚÓZ^\”Ý]J˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+JNÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+“Z^\ˆ]™[Ú[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆB‚ˆ›ÚYÙ]˜XÚÔ[Š[[™^ÝX›H˜[YJBˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Z^\•˜XÚÜÊ
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ŽÂˆYˆ
+]]ÊˆYÚ[ˆH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]›Û[YTYÚ[Š
+JBˆÂˆYÚ[‹OœÙ][ŠÝ]X×ØØ\Ý›Ø]Š˜[YJJNÂˆÞ[˜Õ˜XÚÓZ^\”Ý]J˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+JNÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+“Z^\ˆ[ˆÚ[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆB‚ˆ›ÚYÙ]˜XÚÓ]]J[[™^›ÛÛ˜[YJBˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ŽÂˆ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KOœÙ]]]J˜[YJNÂˆÞ[˜Õ˜XÚÓZ^\”Ý]J˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+JNÂˆ\Ñ\HHYNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆÝ]\ËœÙ]^
+˜[YHÈ•˜XÚÈ]]YˆØ]™HÈÙY\HÚ[™ÙKˆˆˆ•˜XÚÈ[›]]YˆØ]™HÈÙY\HÚ[™ÙKˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ]˜XÚÔÛÛÊ[[™^›ÛÛ˜[YJBˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ŽÂˆ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KOœÙ]ÛÛÊ˜[YJNÂˆÞ[˜Õ˜XÚÓZ^\”Ý]J˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+JNÂˆ\Ñ\HHYNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆÝ]\ËœÙ]^
+˜[YHÈ‘Ù[™\˜]ÜˆÛÛÈ[˜X›YˆØ]™HÈÙY\HÚ[™ÙKˆˆˆ‘Ù[™\˜]ÜˆÛÛÈ\ØX›YˆØ]™HÈÙY\HÚ[™ÙKˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆNŽ‘\]X[\Ù\”YÚ[ŠˆÙ]˜XÚÑ\]X[\Ù\Š[[™^
+HÛÛœÝˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆYˆ
+Y]OH[ˆ	‰ˆ[™^OH˜XÚÜËœÚ^™J
+JBˆ›Üˆ
+]]ÊˆYÚ[ˆˆY]O™Ù]X\Ý\”YÚ[“\Ý
+
+JBˆYˆ
+]]Êˆ\HH[˜[ZX×ØØ\ÝNŽ‘\]X[\Ù\”YÚ[ŠŠYÚ[ŠJH™]\›ˆ\NÂˆ™]\›ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JHÈ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]\]X[\Ù\”YÚ[Š
+Hˆ[ŽÂˆB‚ˆNŽ‘\]X[\Ù\”YÚ[Šˆ[œÝ\™U˜XÚÑ\]X[\Ù\Š[[™^
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ˆ[ŽÂˆ]]È˜XÚÜÈHÙ]Z^\•˜XÚÜÊ
+NÂˆYˆ
+[™^OH˜XÚÜËœÚ^™J
+JBˆÂˆ›Üˆ
+]]ÊˆYÚ[ˆˆY]O™Ù]X\Ý\”YÚ[“\Ý
+
+JBˆYˆ
+]]Êˆ\HH[˜[ZX×ØØ\ÝNŽ‘\]X[\Ù\”YÚ[ŠŠYÚ[ŠJH™]\›ˆ\NÂˆ]]ÈYÚ[ˆHY]O™Ù]YÚ[ØXÚJ
+K˜Ü™X]S™]ÔYÚ[ŠNŽ‘\]X[\Ù\”YÚ[ŽŽž[\S˜[YKßJNÂˆYˆ
+YÚ[ˆOH[ŠH™]\›ˆ[ŽÂˆ]]ÉˆX\Ý\”YÚ[œÈHY]O™Ù]X\Ý\”YÚ[“\Ý
+
+NÂˆÛÛœÝ]]Êˆ›Û[YHHY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+K™Ù]
+
+NÂˆ]]È[œÙ\[™^H›Û[YHOH[ˆÈX\Ý\”YÚ[œËš[™^ÙŠ›Û[YJHˆX\Ý\”YÚ[œËœÚ^™J
+NÂˆYˆ
+[œÙ\[™^
+H[œÙ\[™^HX\Ý\”YÚ[œËœÚ^™J
+NÂˆX\Ý\”YÚ[œËš[œÙ\YÚ[Š
+œYÚ[‹[œÙ\[™^[ŠNÂˆ\Ñ\HHYNÂˆ™]\›ˆ[˜[ZX×ØØ\ÝNŽ‘\]X[\Ù\”YÚ[ŠŠYÚ[‹™Ù]
+
+JNÂˆBˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ˆ[ŽÂˆ]]Êˆ˜XÚÈH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+NÂˆYˆ
+]]Êˆ^\Ý[™ÈH˜XÚËO™Ù]\]X[\Ù\”YÚ[Š
+JH™]\›ˆ^\Ý[™ÎÂˆ]]ÈYÚ[ˆHY]O™Ù]YÚ[ØXÚJ
+K˜Ü™X]S™]ÔYÚ[ŠNŽ‘\]X[\Ù\”YÚ[ŽŽž[\S˜[YKßJNÂˆYˆ
+YÚ[ˆOH[ŠH™]\›ˆ[ŽÂˆÛÛœÝ]]Êˆ›Û[YHH˜XÚËO™Ù]›Û[YTYÚ[Š
+NÂˆÛÛœÝ]]È[œÙ\[™^H›Û[YHOH[ˆÈ˜XÚËOœYÚ[“\Ýš[™^ÙŠ›Û[YJHˆ˜XÚËOœYÚ[“\ÝœÚ^™J
+NÂˆ˜XÚËOœYÚ[“\Ýš[œÙ\YÚ[Š
+œYÚ[‹[œÙ\[™^[ŠNÂˆ\Ñ\HHYNÂˆ™]\›ˆ˜XÚËO™Ù]\]X[\Ù\”YÚ[Š
+NÂˆB‚ˆ›Ø]Ù]˜XÚÑ\T\˜[Y]\Š[[™^[\˜[Y]\ŠHÛÛœÝˆÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\˜[Y]\‹LŠJH™]\›ˆŒŽÂˆ]]Êˆ\HHÙ]˜XÚÑ\]X[\Ù\Š[™^
+NÂˆÛÛœÝ]]È˜[™H\˜[Y]\ˆÈÎÂˆÛÛœÝ]]ÈÚ[™H\˜[Y]\ˆ	HÎÂˆYˆ
+\HOH[ŠBˆÂˆÝ]XÈÛÛœÝ^ˆÝŽ˜\œ˜^O›Ø]ˆY˜][œ™\]Y[˜ÚY\ÈÈŒ‹ÌŒ‹LŒ‹MÌŒˆNÂˆYˆ
+Ú[™OH
+H™]\›ˆY˜][œ™\]Y[˜ÚY\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ˜[™
+WNÂˆYˆ
+Ú[™OHŠH™]\›ˆYŽÂˆ™]\›ˆŒŽÂˆBˆYˆ
+˜[™OH
+H™]\›ˆÚ[™OHÈ\KO›Ñœ™\U˜[YK™Ù]
+
+HˆÚ[™OHHÈ\KO›ÑØZ[•˜[YK™Ù]
+
+Hˆ\KO›ÔU˜[YK™Ù]
+
+NÂˆYˆ
+˜[™OHJH™]\›ˆÚ[™OHÈ\KO›ZYœ™\U˜[YLK™Ù]
+
+HˆÚ[™OHHÈ\KO›ZYØZ[•˜[YLK™Ù]
+
+Hˆ\KO›ZYU˜[YLK™Ù]
+
+NÂˆYˆ
+˜[™OHŠH™]\›ˆÚ[™OHÈ\KO›ZYœ™\U˜[YL‹™Ù]
+
+HˆÚ[™OHHÈ\KO›ZYØZ[•˜[YL‹™Ù]
+
+Hˆ\KO›ZYU˜[YL‹™Ù]
+
+NÂˆ™]\›ˆÚ[™OHÈ\KOšQœ™\U˜[YK™Ù]
+
+HˆÚ[™OHHÈ\KOšQØZ[•˜[YK™Ù]
+
+Hˆ\KOšTU˜[YK™Ù]
+
+NÂˆB‚ˆ›Ø]Ù]˜XÚÑ\T™\ÜÛœÙJ[[™^›Ø]œ™\]Y[˜ÞJHÛÛœÝˆÂˆ]]Êˆ\HHÙ]˜XÚÑ\]X[\Ù\Š[™^
+NÂˆ™]\›ˆ\HOH[ˆÈ\KO™Ù]‘ØZ[]œ™\]Y[˜ÞJœ™\]Y[˜ÞJHˆŒŽÂˆB‚ˆ›ÚYÙ]˜XÚÑ\Q[˜X›Y
+[[™^›ÛÛ[˜X›Y
+BˆÂˆ]]Êˆ\HH[˜X›YÈ[œÝ\™U˜XÚÑ\]X[\Ù\Š[™^
+HˆÙ]˜XÚÑ\]X[\Ù\Š[™^
+NÂˆYˆ
+\HOH[ŠH™]\›ŽÂˆYˆ
+\KOš\Ñ[˜X›Y
+
+HOH[˜X›Y
+BˆÂˆ\KOœÙ][˜X›Y
+[˜X›Y
+NÂˆ\Ñ\HHYNÂˆBˆYˆ
+Z^\•Ú[™ÝÈOH[ŠBˆZ^\•Ú[™ÝËOœ™Yœ™\Ú
+Ù]Z^\•˜XÚÜÊ
+Kš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆÝ]\ËœÙ]^
+[˜X›YÈ‘\]X[\Ù\ˆ[˜X›YˆØ]™HÈÙY\HÚ[™ÙKˆ‚ˆˆ‘\]X[\Ù\ˆž\\ÜÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ]˜XÚÑ\T\˜[Y]\Š[[™^[\˜[Y]\‹›Ø]˜[YJBˆÂˆ]]Êˆ\HH[œÝ\™U˜XÚÑ\]X[\Ù\Š[™^
+NÂˆYˆ
+\HOH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\˜[Y]\‹LŠJH™]\›ŽÂˆÛÛœÝ]]È˜[™H\˜[Y]\ˆÈÎÂˆÛÛœÝ]]ÈÚ[™H\˜[Y]\ˆ	HÎÂˆYˆ
+˜[™OH
+HÈYˆ
+Ú[™OH
+H\KOœÙ]ÝÑœ™\J˜[YJNÈ[ÙHYˆ
+Ú[™OHJH\KOœÙ]ÝÑØZ[Š˜[YJNÈ[ÙH\KOœÙ]ÝÔJ˜[YJNÈBˆ[ÙHYˆ
+˜[™OHJHÈYˆ
+Ú[™OH
+H\KOœÙ]ZYœ™\LJ˜[YJNÈ[ÙHYˆ
+Ú[™OHJH\KOœÙ]ZYØZ[ŒJ˜[YJNÈ[ÙH\KOœÙ]ZYLJ˜[YJNÈBˆ[ÙHYˆ
+˜[™OHŠHÈYˆ
+Ú[™OH
+H\KOœÙ]ZYœ™\LŠ˜[YJNÈ[ÙHYˆ
+Ú[™OHJH\KOœÙ]ZYØZ[ŒŠ˜[YJNÈ[ÙH\KOœÙ]ZYLŠ˜[YJNÈBˆ[ÙHÈYˆ
+Ú[™OH
+H\KOœÙ]YÚœ™\J˜[YJNÈ[ÙHYˆ
+Ú[™OHJH\KOœÙ]YÚØZ[Š˜[YJNÈ[ÙH\KOœÙ]YÚJ˜[YJNÈBˆ\Ñ\HHYNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠBˆÂˆZ^\•Ú[™ÝËOœ™Yœ™\Ú\PÛÛ›ÛÊ
+NÂˆZ^\•Ú[™ÝËOœ™\Z[\QÜ˜\Ê
+NÂˆBˆÝ]\ËœÙ]^
+‘\]X[\Ù\ˆÚ[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ]˜XÚÑ\P˜[™
+[[™^[˜[™›Ø]œ™\]Y[˜ÞK›Ø]ØZ[ŠBˆÂˆ]]Êˆ\HH[œÝ\™U˜XÚÑ\]X[\Ù\Š[™^
+NÂˆYˆ
+\HOH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜[™
+JH™]\›ŽÂˆÛÛœÝ]]ÈØY™Qœ™\]Y[˜ÞHHXÙNŽš›[Z]
+ŒŒ‹ŒŒ‹œ™\]Y[˜ÞJNÂˆÛÛœÝ]]ÈØY™QØZ[ˆHXÙNŽš›[Z]
+LŒŒ‹ŒŒ‹ØZ[ŠNÂˆYˆ
+˜[™OH
+HÈ\KOœÙ]ÝÑœ™\JØY™Qœ™\]Y[˜ÞJNÈ\KOœÙ]ÝÑØZ[ŠØY™QØZ[ŠNÈBˆ[ÙHYˆ
+˜[™OHJHÈ\KOœÙ]ZYœ™\LJØY™Qœ™\]Y[˜ÞJNÈ\KOœÙ]ZYØZ[ŒJØY™QØZ[ŠNÈBˆ[ÙHYˆ
+˜[™OHŠHÈ\KOœÙ]ZYœ™\LŠØY™Qœ™\]Y[˜ÞJNÈ\KOœÙ]ZYØZ[ŒŠØY™QØZ[ŠNÈBˆ[ÙHÈ\KOœÙ]YÚœ™\JØY™Qœ™\]Y[˜ÞJNÈ\KOœÙ]YÚØZ[ŠØY™QØZ[ŠNÈBˆ\Ñ\HHYNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠBˆÂˆZ^\•Ú[™ÝËOœ™Yœ™\Ú\PÛÛ›ÛÊ
+NÂˆZ^\•Ú[™ÝËOœ™\Z[\QÜ˜\Ê
+NÂˆBˆYˆ
+\]X[\Ù\•Ú[™ÝÈOH[ŠH\]X[\Ù\•Ú[™ÝËOœ™Yœ™\Ú\˜[Y]\•˜[Y\Ê[™^
+NÂˆÝ]\ËœÙ]^
+‘\]X[\Ù\ˆ˜[™Ú[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÜ[•˜XÚÑ\]X[\Ù\Š[[™^
+BˆÂˆYˆ
+[œÝ\™U˜XÚÑ\]X[\Ù\Š[™^
+HOH[ˆ\]X[\Ù\•Ú[™ÝÈOH[ŠH™]\›ŽÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+Ù]Z^\•˜XÚÜÊ
+Kš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆ\]X[\Ù\•Ú[™ÝËO›Ü[‘›Ü•˜XÚÊ[™^
+NÂˆB‚ˆXÙNŽ\œ˜^ONŽ”YÚ[ŠˆÙ][œÙ\YÚ[œÊ[[™^
+HÛÛœÝˆÂˆXÙNŽ\œ˜^ONŽ”YÚ[Šˆ™\Ý[ÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆYˆ
+Y]OH[ˆ
+[™^OH˜XÚÜËœÚ^™J
+H	‰ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJJH™]\›ˆ™\Ý[ÂˆÛÛœÝ]]ÉˆYÚ[“\ÝH[™^OH˜XÚÜËœÚ^™J
+HÈY]O™Ù]X\Ý\”YÚ[“\Ý
+
+Hˆ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KOœYÚ[“\ÝÂˆ›Üˆ
+]]ÊˆYÚ[ˆˆYÚ[“\Ý
+BˆYˆ
+[˜[ZX×ØØ\ÝNŽ‘›Ý\“ÜØÔYÚ[ŠŠYÚ[ŠHOH[‚ˆ	‰ˆ[˜[ZX×ØØ\ÝNŽ•›Û[YP[™[”YÚ[ŠŠYÚ[ŠHOH[‚ˆ	‰ˆ[˜[ZX×ØØ\ÝNŽ“]™[Y]\”YÚ[ŠŠYÚ[ŠHOH[‚ˆ	‰ˆ[˜[ZX×ØØ\ÝNŽ‘\]X[\Ù\”YÚ[ŠŠYÚ[ŠHOH[‚ˆ	‰ˆ[˜[ZX×ØØ\ÝNŽ”Ø[\\”YÚ[ŠŠYÚ[ŠHOH[‚ˆ	‰ˆ[˜[ZX×ØØ\ÝNŽ]^™]\›”YÚ[ŠŠYÚ[ŠHOH[‚ˆ	‰ˆ[˜[ZX×ØØ\ÝNŽ]^Ù[™YÚ[ŠŠYÚ[ŠHOH[ŠBˆ™\Ý[˜Y
+YÚ[ŠNÂˆ™]\›ˆ™\Ý[ÂˆB‚ˆXÙNŽ”Ýš[™Ð\œ˜^HÙ][œÙ\˜[Y\Ê[[™^
+HÛÛœÝˆÂˆXÙNŽ”Ýš[™Ð\œ˜^H˜[Y\ÎÂˆ›Üˆ
+]]ÊˆYÚ[ˆˆÙ][œÙ\YÚ[œÊ[™^
+JH˜[Y\Ë˜Y
+YÚ[‹O™Ù]˜[YJ
+JNÂˆ™]\›ˆ˜[Y\ÎÂˆB‚ˆ›ÛÛÙ][œÙ\[˜X›Y
+[[™^[ÛÝ
+HÛÛœÝˆÂˆÛÛœÝ]]ÈYÚ[œÈHÙ][œÙ\YÚ[œÊ[™^
+NÂˆ™]\›ˆXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÛÝYÚ[œËœÚ^™J
+JH	‰ˆYÚ[œË™Ù][˜ÚXÚÙY
+ÛÝ
+KOš\Ñ[˜X›Y
+
+NÂˆB‚ˆ›ÚYÙÙÛR[œÙ\
+[[™^[ÛÝ
+BˆÂˆÛÛœÝ]]ÈYÚ[œÈHÙ][œÙ\YÚ[œÊ[™^
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÛÝYÚ[œËœÚ^™J
+JJH™]\›ŽÂˆ]]ÊˆYÚ[ˆHYÚ[œË™Ù][˜ÚXÚÙY
+ÛÝ
+NÂˆYÚ[‹OœÙ][˜X›Y
+\YÚ[‹Oš\Ñ[˜X›Y
+
+JNÂˆ\Ñ\HHYNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+Ù]Z^\•˜XÚÜÊ
+Kš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆÝ]\ËœÙ]^
+YÚ[‹O™Ù]˜[YJ
+H
+È
+YÚ[‹Oš\Ñ[˜X›Y
+
+HÈˆ[˜X›Yˆˆˆˆž\\ÜÙYˆŠKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÜ[’[œÙ\Y]ÜŠ[[™^[ÛÝ
+BˆÂˆYˆ
+Z^\•Ú[™ÝÈOH[ˆY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]ÈYÚ[œÈHÙ][œÙ\YÚ[œÊ[™^
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÛÝYÚ[œËœÚ^™J
+JJH™]\›ŽÂˆNŽ”YÚ[ŽŽ”ˆYÚ[”™YˆHYÚ[œË™Ù][˜ÚXÚÙY
+ÛÝ
+NÂˆZ^\•Ú[™ÝËOœÚÝÑY™™XÝY]ÜŠYÚ[”™Y‹Ý\×BˆÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+‘Y™™XÝ\˜[Y]\ˆÚ[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆJNÂˆB‚ˆ›ÚY™[[Ý™R[œÙ\
+[[™^[ÛÝ
+BˆÂˆÛÛœÝ]]ÈYÚ[œÈHÙ][œÙ\YÚ[œÊ[™^
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÛÝYÚ[œËœÚ^™J
+JHY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È[œÙ\˜[YHHYÚ[œË™Ù][˜ÚXÚÙY
+ÛÝ
+KO™Ù]˜[YJ
+NÂˆÛÛœÝ]]ÈÝ]HHYÚ[œË™Ù][˜ÚXÚÙY
+ÛÝ
+KOœÝ]NÂˆYˆ
+Ý]K™Ù]\™[
+
+Kš\Õ˜[Y
+
+JBˆÝ]K™Ù]\™[
+
+Kœ™[[Ý™PÚ[
+Ý]K	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂˆ\Ñ\HHYNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+Ù]Z^\•˜XÚÜÊ
+Kš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆÝ]\ËœÙ]^
+”™[[Ý™Yˆ
+È[œÙ\˜[YH
+È‹ˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYY[œÙ\
+[[™^[Ú[™
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆ]]È˜XÚÜÈHÙ]Z^\•˜XÚÜÊ
+NÂˆÛÛœÝ›ÛÛ\ÓX\Ý\ˆH[™^OH˜XÚÜËœÚ^™J
+NÂˆYˆ
+Z\ÓX\Ý\ˆ	‰ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ŽÂˆYˆ
+Ù][œÙ\YÚ[œÊ[™^
+KœÚ^™J
+HHÊBˆÂˆÝ]\ËœÙ]^
+•\ÈZ^\ˆÝš\\È™YH[œÙ\ÛÝËˆ™[[Ý™HÛ™H™Y›Ü™HY[™È[›Ý\‹ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆÛÛœÝÚ\ŠˆYÚ[•\HH[ŽÂˆYˆ
+Ú[™OHJHYÚ[•\HHNŽÛÛ\™\ÜÛÜ”YÚ[ŽŽž[\S˜[YNÂˆ[ÙHYˆ
+Ú[™OHŠHYÚ[•\HHNŽ”™]™\˜”YÚ[ŽŽž[\S˜[YNÂˆ[ÙHYˆ
+Ú[™OHÊHYÚ[•\HHNŽ‘[^TYÚ[ŽŽž[\S˜[YNÂˆ[ÙHYˆ
+Ú[™OH
+HYÚ[•\HHNŽÚÜ\ÔYÚ[ŽŽž[\S˜[YNÂˆ[ÙHYˆ
+Ú[™OHJHYÚ[•\HHNŽ”\Ù\”YÚ[ŽŽž[\S˜[YNÂˆ[ÙHYˆ
+Ú[™OHŠHYÚ[•\HHNŽ“ÝÔ\ÜÔYÚ[ŽŽž[\S˜[YNÂˆYˆ
+YÚ[•\HOH[ŠH™]\›ŽÂ‚ˆ]]Êˆ˜XÚÈH\ÓX\Ý\ˆÈ[ˆˆ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+NÂˆ]]ÈYÚ[ˆHY]O™Ù]YÚ[ØXÚJ
+K˜Ü™X]S™]ÔYÚ[ŠYÚ[•\KßJNÂˆYˆ
+YÚ[ˆOH[ŠH™]\›ŽÂˆ]]ÉˆYÚ[“\ÝH\ÓX\Ý\ˆÈY]O™Ù]X\Ý\”YÚ[“\Ý
+
+Hˆ˜XÚËOœYÚ[“\ÝÂˆÛÛœÝ]]Êˆ›Û[YHH\ÓX\Ý\ˆÈY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+K™Ù]
+
+Hˆ˜XÚËO™Ù]›Û[YTYÚ[Š
+NÂˆ]]È[œÙ\[™^H›Û[YHOH[ˆÈYÚ[“\Ýš[™^ÙŠ›Û[YJHˆYÚ[“\ÝœÚ^™J
+NÂˆYˆ
+[œÙ\[™^
+H[œÙ\[™^HYÚ[“\ÝœÚ^™J
+NÂˆYÚ[“\Ýš[œÙ\YÚ[Š
+œYÚ[‹[œÙ\[™^[ŠNÂˆ\Ñ\HHYNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆÛÛœÝ]]È[œÙ\ÛÝ[HÙ][œÙ\YÚ[œÊ[™^
+KœÚ^™J
+NÂˆÝ]\ËœÙ]^
+YYˆ
+ÈYÚ[‹O™Ù]˜[YJ
+H
+ÈˆÈˆ
+È
+\ÓX\Ý\ˆÈXÙNŽ”Ýš[™Ê“X\Ý\ˆŠHˆ˜XÚËO™Ù]˜[YJ
+JBˆ
+Èˆ
+ˆ
+ÈXÙNŽ”Ýš[™Ê[œÙ\ÛÝ[
+H
+Èˆ[œÙ\ˆ
+È
+[œÙ\ÛÝ[OHHÈŠHˆˆœÊHŠBˆ
+È‹ˆØ]™HÈÙY\HÚ[™ÙKˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆÝX›HÙ]˜XÚÔÙ[™ØZ[‘Š[[™^[\ÊHÛÛœÝˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JHZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ë
+JH™]\›ˆMŒŒÂˆYˆ
+]]ÊˆÙ[™H˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]]^Ù[™YÚ[Š\ÊJBˆ™]\›ˆÙ[™O™Ù]ØZ[‘Š
+NÂˆ™]\›ˆMŒŒÂˆB‚ˆ[Ù]˜XÚÓÝ]]\Ê[[™^
+HÛÛœÝˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Z^\•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆÛÛœÝ]]ÈÙ[™\˜]ÜÛÝ[HÙ]Ù[™\˜]Ü•˜XÚÜÊ
+KœÚ^™J
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^Ù[™\˜]ÜÛÝ[
+BˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ˆLNÂˆ]]Êˆ\Ý[˜][ÛˆH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]Ý]]
+
+K™Ù]\Ý[˜][Û•˜XÚÊ
+NÂˆ™]\›ˆ\Ý[˜][ÛˆOH[‚ˆÈÝ]X×ØØ\Ý[Š\Ý[˜][Û‹OœÝ]K™Ù]›Ü\JXÙNŽ’Y[YšY\Š›Ü˜š]Z^\\ÈŠKLJJBˆˆLNÂˆB‚ˆ›ÚYÙ]˜XÚÓÝ]]\Ê[[™^[\ÊBˆÂˆ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆYˆ
+Y]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JBˆ\ÈLH\ÈH
+H™]\›ŽÂˆ]]Êˆ˜XÚÈH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+NÂˆYˆ
+\È
+Bˆ˜XÚËO™Ù]Ý]]
+
+KœÙ]Ý]]ÑY˜][]šXÙJ˜[ÙJNÂˆ[ÙBˆÂˆ]]Êˆ\Ý[˜][ÛˆH[œÝ\™SÝ]]\Õ˜XÚÊ\ÊNÂˆYˆ
+\Ý[˜][ÛˆOH[ŠH™]\›ŽÂˆ˜XÚËO™Ù]Ý]]
+
+KœÙ]Ý]]Õ˜XÚÊ\Ý[˜][ÛŠNÂˆBˆ\Ñ\HHYNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+Ù]Ù[™\˜]Ü•˜XÚÜÊ
+Kš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆÝ]\ËœÙ]^
+\ÈÈÚ[›™[›Ý]YÈX\Ý\‹ˆˆˆÚ[›™[›Ý]YÈ\Èˆ
+ÈXÙNŽ”Ýš[™Ê\È
+ÈJH
+È‹ˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ]˜XÚÔÙ[™ØZ[‘Š[[™^[\ËÝX›H˜[YJBˆÂˆYˆ
+Y]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ë
+JH™]\›ŽÂˆ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ[™^˜XÚÜËœÚ^™J
+JJH™]\›ŽÂˆ]]Êˆ˜XÚÈH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+NÂˆ]]ÊˆÙ[™H˜XÚËO™Ù]]^Ù[™YÚ[Š\ÊNÂˆÛÛœÝ›ÛÛž™]\›•Ø\ÓZ\ÜÚ[™ÈHÙ]ž™]\›•˜XÚÊ\ÊHOH[ŽÂˆYˆ
+Ù[™OH[ˆ	‰ˆž™]\›•Ø\ÓZ\ÜÚ[™È	‰ˆ[œÝ\™Qž™]\›•˜XÚÊ\ÊHOH[ŠBˆ™]\›ŽÂ‚ˆYˆ
+Ù[™OH[ˆ	‰ˆ˜[YHˆMNKŽJBˆÂˆÛÛœÝ]]È\Ó˜[YHH‘–ˆ
+ÈXÙNŽ”Ýš[™Ê\È
+ÈJNÂˆYˆ
+[œÝ\™Qž™]\›•˜XÚÊ\ÊHOH[ŠH™]\›ŽÂ‚ˆ]]ÈÙ[™YÚ[ˆHY]O™Ù]YÚ[ØXÚJ
+K˜Ü™X]S™]ÔYÚ[ŠNŽ]^Ù[™YÚ[ŽŽž[\S˜[YKßJNÂˆYˆ
+]]Êˆ]^Ù[™H[˜[ZX×ØØ\ÝNŽ]^Ù[™YÚ[ŠŠÙ[™YÚ[‹™Ù]
+
+JJBˆÂˆ]^Ù[™O˜\Ó[X™\ˆH\ÎÂˆ]^Ù[™OœÙ]ØZ[‘ŠÝ]X×ØØ\Ý›Ø]Š˜[YJJNÂˆÛÛœÝ]]ÊˆY]\ˆH˜XÚËO™Ù]]™[Y]\”YÚ[Š
+NÂˆ]]È[œÙ\[™^HY]\ˆOH[ˆÈ˜XÚËOœYÚ[“\Ýš[™^ÙŠY]\ŠHˆ˜XÚËOœYÚ[“\ÝœÚ^™J
+NÂˆYˆ
+[œÙ\[™^
+H[œÙ\[™^H˜XÚËOœYÚ[“\ÝœÚ^™J
+NÂˆ˜XÚËOœYÚ[“\Ýš[œÙ\YÚ[Š
+˜]^Ù[™[œÙ\[™^[ŠNÂˆÙ[™H]^Ù[™ÂˆBˆBˆ[ÙHYˆ
+Ù[™OH[ŠBˆÂˆÙ[™OœÙ]ØZ[‘ŠÝ]X×ØØ\Ý›Ø]Š˜[YJJNÂˆB‚ˆYˆ
+Ù[™OH[ŠBˆÂˆÞ[˜Õ˜XÚÓZ^\”Ý]J˜XÚÊNÂˆ\Ñ\HHYNÂˆYˆ
+ž™]\›•Ø\ÓZ\ÜÚ[™È	‰ˆZ^\•Ú[™ÝÈOH[ŠBˆZ^\•Ú[™ÝËOœ™Yœ™\Ú
+Ù]Ù[™\˜]Ü•˜XÚÜÊ
+Kš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆÝ]XÈÛÛœÝÝŽ˜\œ˜^OÛÛœÝÚ\Š‹ˆž˜[Y\ÈÈœ™]™\˜ˆ‹™[^H‹˜ÚÜ\È‹œ\Ù\ˆˆNÂˆÝ]\ËœÙ]^
+‘–ˆ
+ÈXÙNŽ”Ýš[™Ê\È
+ÈJH
+ÈˆÙ[™›Ý]YÈ]ÈÚ\™Y‚ˆ
+Èž˜[Y\ÖÜÝ]X×ØØ\ÝÚ^™WÝŠ\È	H
+WH
+Èˆ™]\›‹ˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆB‚ˆÝ]XÈÛÛœÝXÙNŽ’Y[YšY\‰ˆX\Ý\“]]T›Ü\J
+BˆÂˆÝ]XÈÛÛœÝXÙNŽ’Y[YšY\ˆ›Ü\J›Ü˜š]X\Ý\“]]YŠNÂˆ™]\›ˆ›Ü\NÂˆB‚ˆÝ]XÈÛÛœÝXÙNŽ’Y[YšY\‰ˆX\Ý\”™S]]QØZ[”›Ü\J
+BˆÂˆÝ]XÈÛÛœÝXÙNŽ’Y[YšY\ˆ›Ü\J›Ü˜š]X\Ý\”™S]]QØZ[‘ˆŠNÂˆ™]\›ˆ›Ü\NÂˆB‚ˆ›ÛÛ\ÓX\Ý\“]]Y
+
+HÛÛœÝˆÂˆ™]\›ˆY]OH[ˆ	‰ˆÝ]X×ØØ\Ý›ÛÛŠY]OœÝ]K™Ù]›Ü\JX\Ý\“]]T›Ü\J
+K˜[ÙJJNÂˆB‚ˆÝX›HÙ]X\Ý\‘ØZ[‘Š
+HÛÛœÝˆÂˆYˆ
+Y]OH[ˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+HOH[ŠH™]\›ˆŒÂˆYˆ
+\ÓX\Ý\“]]Y
+
+JBˆ™]\›ˆÝ]X×ØØ\ÝÝX›OŠY]OœÝ]K™Ù]›Ü\JX\Ý\”™S]]QØZ[”›Ü\J
+KŒ
+JNÂˆ™]\›ˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+KO™Ù]›Û[YQŠ
+NÂˆB‚ˆ›ÚYÙ]X\Ý\“]]Y
+›ÛÛÚÝ[]]JBˆÂˆYˆ
+Y]OH[ˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+HOH[ˆ\ÓX\Ý\“]]Y
+
+HOHÚÝ[]]JH™]\›ŽÂˆ]]Êˆ›Û[YHHY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+K™Ù]
+
+NÂˆYˆ
+ÚÝ[]]JBˆÂˆY]OœÝ]KœÙ]›Ü\JX\Ý\”™S]]QØZ[”›Ü\J
+K›Û[YKO™Ù]›Û[YQŠ
+K	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂˆ›Û[YKOœÙ]›Û[YQŠLLŒŠNÂˆBˆ[ÙBˆÂˆÛÛœÝ]]È™]š[Ý\ÑØZ[ˆHÝ]X×ØØ\Ý›Ø]ŠY]OœÝ]K™Ù]›Ü\JX\Ý\”™S]]QØZ[”›Ü\J
+KŒ
+JNÂˆ›Û[YKOœÙ]›Û[YQŠ™]š[Ý\ÑØZ[ŠNÂˆBˆY]OœÝ]KœÙ]›Ü\JX\Ý\“]]T›Ü\J
+KÚÝ[]]K	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂˆÞ[˜ÓX\Ý\“Z^\”Ý]J
+NÂˆ\Ñ\HHYNÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËOœ™Yœ™\Ú
+Ù]Z^\•˜XÚÜÊ
+KœÚ^™J
+JNÂˆÝ]\ËœÙ]^
+ÚÝ[]]HÈ“X\Ý\ˆÝ]]]]YˆØ]™HÈÙY\HÚ[™ÙKˆˆˆ“X\Ý\ˆÝ]][›]]YˆØ]™HÈÙY\HÚ[™ÙKˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ]X\Ý\”[ŠÝX›H˜[YJBˆÂˆYˆ
+Y]OH[ˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+HOH[ŠH™]\›ŽÂˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+KOœÙ][ŠÝ]X×ØØ\Ý›Ø]Š˜[YJJNÂˆÞ[˜ÓX\Ý\“Z^\”Ý]J
+NÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+“X\Ý\ˆ[ˆÚ[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ]X\Ý\‘ØZ[‘ŠÝX›H˜[YJBˆÂˆYˆ
+Y]OH[ˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+HOH[ŠH™]\›ŽÂˆYˆ
+\ÓX\Ý\“]]Y
+
+JBˆÂˆY]OœÝ]KœÙ]›Ü\JX\Ý\”™S]]QØZ[”›Ü\J
+K˜[YK	™Y]O™Ù][™ÓX[˜YÙ\Š
+JNÂˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+KOœÙ]›Û[YQŠLLŒŠNÂˆBˆ[ÙBˆÂˆY]O™Ù]X\Ý\•›Û[YTYÚ[Š
+KOœÙ]›Û[YQŠÝ]X×ØØ\Ý›Ø]Š˜[YJJNÂˆBˆÞ[˜ÓX\Ý\“Z^\”Ý]J
+NÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+“X\Ý\ˆ]™[Ú[™ÙYˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ[XÝ˜XÚÐžR[™^
+[[™^
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆ˜XÚÔÙ[XÝÜ‹œÙ]Ù[XÝYY
+[™^
+ÈKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[XÝ[œÝ[Y[˜XÚÊ
+NÂˆB‚ˆXÙNŽ”Ýš[™ÈÙ]^[\ÝÛ\X™[
+[˜XÚÒ[™^[˜\ŠHÛÛœÝˆÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È]\›’YH›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠNÂˆÛÛœÝ]]È]\›’[™^H›Ú™XÝ™Ù]]\›’[™^›Ü’Y
+˜XÚÒY]\›’Y
+NÂˆ™]\›ˆ]\›’[™^HÈ›Ú™XÝ™Ù]]\›“˜[YJ˜XÚÒY]\›’[™^
+HˆXÙNŽ”Ýš[™ÞßNÂˆB‚ˆÝŽ™XÝÜXÙNŽ”Ú[[ˆÙ]^[\Ý™]šY]Ó›Ý\Ê[˜XÚÒ[™^[˜\ŠHÛÛœÝˆÂˆÝŽ™XÝÜXÙNŽ”Ú[[ˆ›Ý\ÎÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JBˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜\‹^[\ÝÜšYŽ˜˜\ÛÝ[
+JH™]\›ˆ›Ý\ÎÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È]\›’[™^H›Ú™XÝ™Ù]]\›’[™^›Ü’Y
+˜XÚÒY›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠJNÂˆYˆ
+]\›’[™^
+H™]\›ˆ›Ý\ÎÂˆÛÛœÝ]]È[™ÝH›Ú™XÝ™Ù]]\›“[™ÝÝ\Ê˜XÚÒY]\›’[™^
+NÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\[™ÝÈ
+ÊÜÝ\
+BˆYˆ
+›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\
+JBˆ›Ý\Ë™[\XÙWØ˜XÚÊÝ\
+ˆÈXÙNŽš›X^
+K[™Ý
+K]ÚHZ[š[][T]Ú
+NÂˆ™]\›ˆ›Ý\ÎÂˆB‚ˆ›ÛÛÙ]˜XÚÔ™XÛÜ™\›J[˜XÚÒ[™^
+HÛÛœÝˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆYˆ
+Y]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^˜XÚÜËœÚ^™J
+JJH™]\›ˆ˜[ÙNÂˆ›Üˆ
+]]Êˆ[œ]ˆY]O™Ù][[œ]]šXÙ\Ê
+JBˆYˆ
+[œ]OH[ˆ	‰ˆ[œ]Oš\Ô™XÛÜ™[™Ñ[˜X›Y
+˜XÚÜË™Ù][˜ÚXÚÙY
+˜XÚÒ[™^
+KOš][RQ
+JH™]\›ˆYNÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆ›ÚYÙ]˜XÚÔ™XÛÜ™\›J[˜XÚÒ[™^›ÛÛ\›YY
+BˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆYˆ
+Y]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^˜XÚÜËœÚ^™J
+JJH™]\›ŽÂˆÛÛœÝ]]È]šXÙ\ÈHY]O™Ù][[œ]]šXÙ\Ê
+NÂˆYˆ
+]šXÙ\Ëš\Ñ[\J
+JBˆÂˆÝ]\ËœÙ]^
+“›ÈRQH[œ]\È]˜Z[X›HÈ\›H›Üˆ™XÛÜ™[™Ëˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆ™]\›ŽÂˆBˆ›Üˆ
+]]Êˆ[œ]ˆ]šXÙ\ÊBˆYˆ
+[œ]OH[ŠH[œ]OœÙ]™XÛÜ™[™Ñ[˜X›Y
+˜XÚÜË™Ù][˜ÚXÚÙY
+˜XÚÒ[™^
+KOš][RQ\›YY
+NÂˆ\Ñ\HHYNÂˆÝ]\ËœÙ]^
+\›YYÈ‘Ù[™\˜]Üˆ\›YY›Üˆ™XÛÜ™[™Ëˆˆˆ‘Ù[™\˜]Üˆ\Ø\›YYˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆB‚ˆ›ÚYZ[^[\ÝÛ\
+[˜XÚÒ[™^[˜\ŠBˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JBˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜\‹^[\ÝÜšYŽ˜˜\ÛÝ[
+JH™]\›ŽÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆËÈ\ÙHHÝ\œ™[LKRÛÝ\ÈH˜]Ú[™ÈÛÛÛˆHÛXÚÙY[™NÂˆËÈXXÚ\Ý[˜][ÛˆÙ[™\˜]Üˆ™]Z[œÈ]ÈÝÛˆ›ÝH]H›Üˆ]ÛÝ‚ˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆÛÛœÝ›ÛÛÜ™X]Y]\›ˆH\›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒY]\›’[™^
+NÂˆÛÛœÝ]]È]\›’YH›Ú™XÝ™Ù]]\›’Y
+˜XÚÒY]\›’[™^
+NÂˆÛÛœÝ]]ÈÝ\œ™[]\›’YH›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠNÂˆYˆ
+XÜ™X]Y]\›ˆ	‰ˆÝ\œ™[]\›’YOH]\›’Y
+Bˆ™]\›ŽÂ‚ˆYˆ
+\^[\ÝZ[Ù\Ý\™PXÝ]™JBˆÂˆ™[Y[X™\•[™Ê‘˜]È^[\Ý]\›ˆŠNÂˆ^[\ÝZ[Ù\Ý\™PXÝ]™HHYNÂˆBˆYˆ
+Ü™X]Y]\›ŠBˆ›Ú™XÝœÙ]]\›Ü™X]Y
+˜XÚÒY]\›’[™^YJNÂˆ›Ú™XÝœÙ]^[\ÝÛ\
+˜XÚÒY]\›’Y˜\‹KYJNÂˆ™XZ[]\›Û\
+
+NÂˆ\Ñ\HHYNÂˆYˆ
+Ü™X]Y]\›ŠH™XY]\›”Ý\Ê
+NÂˆÝ]\ËœÙ]^
+‘™]Èˆ
+È›Ú™XÝ™Ù]]\›“˜[YJ˜XÚÒY]\›’[™^
+Bˆ
+Èˆ[ˆ^[\Ý˜\ˆˆ
+ÈXÙNŽ”Ýš[™Ê˜\ˆ
+ÈJH
+È‹ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙÙÛT^[\ÝÛ\
+[˜XÚÒ[™^[˜\ŠBˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ˆ˜XÚÒ[™^˜XÚÒ[™^H›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JH™]\›ŽÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜\‹^[\ÝÜšYŽ˜˜\ÛÝ[
+JH™]\›ŽÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]ÈÝ\œ™[H›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠNÂˆYˆ
+Ý\œ™[š\Ó›Ý[\J
+JBˆÂˆÛÛœÝ]]È]\›’[™^H›Ú™XÝ™Ù]]\›’[™^›Ü’Y
+˜XÚÒYÝ\œ™[
+NÂˆYˆ
+]\›’[™^H
+BˆÂˆ˜XÚÔÙ[XÝÜ‹œÙ]Ù[XÝYY
+˜XÚÒ[™^
+ÈKXÙNŽœÙ[™›ÝYšXØ][Û”Þ[˜ÊNÂˆÙ[XÝ]\›˜[šÊ]\›’[™^È›Ú™XÝØÝ[Y[Žœ]\›œÔ\˜[šÊNÂˆÙ[XÝ]\›”ÛÝ
+]\›’[™^	H›Ú™XÝØÝ[Y[Žœ]\›œÔ\˜[šÊNÂˆÝ]\ËœÙ]^
+”Ù[XÝYˆ
+È›Ú™XÝ™Ù]]\›“˜[YJ˜XÚÒY]\›’[™^
+Bˆ
+È‹ˆØÜ›ÛÝ™\ˆHÛ\ÈÞXÛH]\›œËÜˆÝX›KXÛXÚÈ›ÜˆH]˜Z[X›H]\›œËˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ™]\›ŽÂˆBˆÝ]\ËœÙ]^
+“[Ý™H[ÙHÙ[XÝYˆÝÚ]ÚÈ˜]ÈÈXÙHHÙ[XÝY]\›‹ˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY[]T^[\ÝÛ\
+[˜XÚÒ[™^[˜\ŠBˆÂˆYˆ
+Z\Ô›Ú™XÝZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JBˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜\‹^[\ÝÜšYŽ˜˜\ÛÝ[
+JH™]\›ŽÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È]\›’YH›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠNÂˆYˆ
+]\›’Yš\Ñ[\J
+JH™]\›ŽÂˆ™[Y[X™\•[™Ê‘[]H^[\ÝÛ\ŠNÂˆ›Ú™XÝœÙ]^[\ÝÛ\
+˜XÚÒYßK˜\‹K˜[ÙJNÂˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆ\Ñ\HHYNÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆÝ]\ËœÙ]^
+‘[]YH^[\ÝÛ\]˜\ˆˆ
+ÈXÙNŽ”Ýš[™Ê˜\ˆ
+ÈJH
+È‹ˆØ]™HÈÙY\HÚ[™ÙKˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ]^[\Ý]\›Š[˜XÚÒ[™^[˜\‹[]\›’[™^
+BˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JBˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜\‹^[\ÝÜšYŽ˜˜\ÛÝ[
+BˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ]\›’[™^›Ú™XÝØÝ[Y[Žœ]\›”ÛÝÛÝ[
+JH™]\›ŽÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆYˆ
+\›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒY]\›’[™^
+JH™]\›ŽÂˆÛÛœÝ]]ÈÝ\œ™[YH›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠNÂˆÛÛœÝ]]È]\›’YH›Ú™XÝ™Ù]]\›’Y
+˜XÚÒY]\›’[™^
+NÂˆYˆ
+Ý\œ™[YOH]\›’Y
+H™]\›ŽÂ‚ˆ™[Y[X™\•[™ÊÚÛÜÙH^[\Ý]\›ˆŠNÂˆ›Ú™XÝœÙ]^[\ÝÛ\
+˜XÚÒY]\›’Y˜\‹KYJNÂˆ˜XÚÔÙ[XÝÜ‹œÙ]Ù[XÝYY
+˜XÚÒ[™^
+ÈKXÙNŽœÙ[™›ÝYšXØ][Û”Þ[˜ÊNÂˆÙ[XÝ]\›˜[šÊ]\›’[™^È›Ú™XÝØÝ[Y[Žœ]\›œÔ\˜[šÊNÂˆÙ[XÝ]\›”ÛÝ
+]\›’[™^	H›Ú™XÝØÝ[Y[Žœ]\›œÔ\˜[šÊNÂˆ™XZ[]\›Û\
+
+NÂˆ\Ñ\HHYNÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆÝ]\ËœÙ]^
+”Ù[XÝYˆ
+È›Ú™XÝ™Ù]]\›“˜[YJ˜XÚÒY]\›’[™^
+Bˆ
+Èˆ›Üˆ^[\Ý˜\ˆˆ
+ÈXÙNŽ”Ýš[™Ê˜\ˆ
+ÈJH
+È‹ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÚÝÔ^[\Ý]\›“Y[J[˜XÚÒ[™^[˜\‹XÙNŽÛÛ\Û™[
+ˆ\™Ù]
+BˆÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JBˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜\‹^[\ÝÜšYŽ˜˜\ÛÝ[
+JH™]\›ŽÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]ÈÝ\œ™[[™^H›Ú™XÝ™Ù]]\›’[™^›Ü’Y
+˜XÚÒY›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠJNÂˆXÙNŽ”Ü\Y[H]\›œÎÂˆ[]˜Z[X›HHÂˆ›Üˆ
+[[™^HÈ[™^›Ú™XÝØÝ[Y[Žœ]\›”ÛÝÛÝ[È
+ÊÚ[™^
+BˆÂˆYˆ
+\›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒY[™^
+JHÛÛ[YNÂˆÛÛœÝ]]È˜[šÈHXÙNŽ”Ýš[™ÎŽ˜Ú\•ÔÝš[™ÊÝ]X×ØØ\ÝXÙNŽšXÙWÝØÚ\Š	ÐIÈ
+È[™^È
+JNÂˆ]\›œË˜Y][J[™^
+ÈK˜[šÈ
+ÈXÙNŽ”Ýš[™Ê[™^	H
+ÈJH
+Èˆ0­È‚ˆ
+È›Ú™XÝ™Ù]]\›“˜[YJ˜XÚÒY[™^
+KYK[™^OHÝ\œ™[[™^
+NÂˆ
+ÊØ]˜Z[X›NÂˆBˆYˆ
+]˜Z[X›HOH
+BˆÂˆÝ]\ËœÙ]^
+•\ÈÙ[™\˜]Üˆ\È›ÈÜ™X]Y]\›œÈY]ˆ˜]È]ÈXÝ]™H]\›ˆš\œÝˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆ]\›œËœÚÝÓY[P\Þ[˜ÊXÙNŽ”Ü\Y[NŽ“Ü[ÛœÊ
+KÚ]\™Ù]ÛÛ\Û™[
+\™Ù]OH[ˆÈ\™Ù]ˆ^[\ÝÚ[™ÝË™Ù]
+
+JKˆÝ\Ë˜XÚÒ[™^˜\—J[™\Ý[
+BˆÂˆYˆ
+™\Ý[ˆ
+HÙ]^[\Ý]\›Š˜XÚÒ[™^˜\‹™\Ý[HJNÂˆJNÂˆB‚ˆ›ÚYØÜ›Û^[\Ý]\›Š[˜XÚÒ[™^[˜\‹[\™XÝ[ÛŠBˆÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JBˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜\‹^[\ÝÜšYŽ˜˜\ÛÝ[
+JH™]\›ŽÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]ÈÝ\œ™[[™^H›Ú™XÝ™Ù]]\›’[™^›Ü’Y
+˜XÚÒY›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠJNÂˆÝŽ™XÝÜ[ˆ]˜Z[X›NÂˆ›Üˆ
+[[™^HÈ[™^›Ú™XÝØÝ[Y[Žœ]\›”ÛÝÛÝ[È
+ÊÚ[™^
+BˆYˆ
+›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒY[™^
+JH]˜Z[X›Kœ\ÚØ˜XÚÊ[™^
+NÂˆYˆ
+]˜Z[X›KœÚ^™J
+HŠH™]\›ŽÂˆÛÛœÝ]]ÈÝ\œ™[HÝŽ™š[™
+]˜Z[X›K˜™YÚ[Š
+K]˜Z[X›K™[™
+
+KÝ\œ™[[™^
+NÂˆ]]ÈÜÚ][ÛˆHÝ\œ™[OH]˜Z[X›K™[™
+
+HÈˆÝ]X×ØØ\Ý[ŠÝ\œ™[H]˜Z[X›K˜™YÚ[Š
+JNÂˆÛÛœÝ]]ÈÛÝ[HÝ]X×ØØ\Ý[Š]˜Z[X›KœÚ^™J
+JNÂˆÜÚ][ÛˆH
+ÜÚ][Ûˆ
+È\™XÝ[Ûˆ
+ÈÛÝ[
+H	HÛÝ[ÂˆÙ]^[\Ý]\›Š˜XÚÒ[™^˜\‹]˜Z[X›VÜÝ]X×ØØ\ÝÚ^™WÝŠÜÚ][ÛŠWJNÂˆB‚ˆ›ÚYÚÝÔ^[\Ý˜XÚÐÛÛ^Y[J[ÛÝ\˜ÙR[™^XÙNŽÛÛ\Û™[
+ˆ\™Ù]
+BˆÂˆYˆ
+Z\Ô›Ú™XÝZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÛÝ\˜ÙR[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JJH™]\›ŽÂˆÛÛœÝ]]ÈÛÝ\˜ÙU˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+ÛÝ\˜ÙR[™^
+NÂˆXÙNŽ”Ü\Y[HY[KÛÛ™SY[KÛÛÝ\“Y[NÂˆÝŽ™XÝÜXÙNŽ”Ýš[™Ïˆ\Ý[˜][ÛœÎÂˆ›Üˆ
+[[™^HÈ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÚ[™^
+BˆÂˆYˆ
+[™^OHÛÝ\˜ÙR[™^
+HÛÛ[YNÂˆÛÛ™SY[K˜Y][JÝ]X×ØØ\Ý[Š\Ý[˜][ÛœËœÚ^™J
+JH
+ÈK›Ú™XÝ™Ù]˜XÚÓ˜[YJ[™^
+JNÂˆ\Ý[˜][ÛœËœ\ÚØ˜XÚÊ›Ú™XÝ™Ù]˜XÚÒY
+[™^
+JNÂˆBˆY[K˜Y][JLK”ÚÝÈÙ[™\˜]ÜˆŠNÂˆY[K˜Y][JL‹”™[˜[YHÙ[™\˜]Ü‹‹‹ˆŠNÂˆY[K˜Y][JLË‘[]HÙ[™\˜]Ü‹‹‹ˆŠNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂˆY[K˜YÝX“Y[JÛÛ™H˜XÚÈÈ‹ÛÛ™SY[KY\Ý[˜][ÛœË™[\J
+JNÂˆY[K˜Y][JL‘Y]ÛÛ™È]™[ÈŠNÂˆY[K˜YÙ\\˜]ÜŠ
+NÂ‚ˆÛÛœÝÝŽ˜\œ˜^OÝŽœZ\ÛÛœÝÚ\Š‹XÙNŽÛÛÝ\‹Lˆ[]HÞÂˆÈ”™Y‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒLÍËÍÊHKˆÈ“Ü˜[™ÙH‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒKLÌËMJHKˆÈ–Y[ÝÈ‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒËMÍŒJHKˆÈ“[YH‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLÍËNKÌ
+HKˆÈ‘Ü™Y[ˆ‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠKM‹LŠHKˆÈ•X[‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËMÍM
+HKˆÈÞX[ˆ‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠNMÌKŒJHKˆÈ›YH‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŽLŽŒLJHKˆÈ’[™YÛÈ‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠLËLNMÊHKˆÈ•š[Û]‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠMNLKNN
+HKˆÈ“XYÙ[H‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒKËMŒJHKˆÈ”[šÈ‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒLM‹MÊHBˆ_NÂˆÛÛœÝ]]ÈÝ\œ™[ÛÛÝ\ˆH›Ú™XÝ™Ù]˜XÚÐÛÛÝ\ŠÛÝ\˜ÙR[™^
+NÂˆÛÛÝ\“Y[K˜Y][JL‘Y˜][‹YKÝ\œ™[ÛÛÝ\‹š\Õ˜[œÜ\™[
+
+JNÂˆ›Üˆ
+[HHÈHÝ]X×ØØ\Ý[Š[]KœÚ^™J
+JNÈ
+ÊÚJBˆÛÛÝ\“Y[K˜Y][JLH
+ÈK[]VÜÝ]X×ØØ\ÝÚ^™WÝŠJWK™š\œÝˆYKÝ\œ™[ÛÛÝ\ˆOH[]VÜÝ]X×ØØ\ÝÚ^™WÝŠJWKœÙXÛÛ™
+NÂˆY[K˜YÝX“Y[J•˜XÚÈÛÛÜˆ‹ÛÛÝ\“Y[JNÂ‚ˆY[KœÚÝÓY[P\Þ[˜ÊXÙNŽ”Ü\Y[NŽ“Ü[ÛœÊ
+KÚ]\™Ù]ÛÛ\Û™[
+\™Ù]OH[ˆÈ\™Ù]ˆ^[\ÝÚ[™ÝË™Ù]
+
+JKˆÝ\ËÛÝ\˜ÙR[™^ÛÝ\˜ÙU˜XÚÒY\Ý[˜][ÛœÈHÝŽ›[Ý™J\Ý[˜][ÛœÊK[]WJ[™\Ý[
+BˆÂˆ]]Èš[™ÛÝ\˜ÙR[™^HÝ\ËÛÝ\˜ÙU˜XÚÒYBˆÂˆ›Üˆ
+[HHÈH›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÚJBˆYˆ
+›Ú™XÝ™Ù]˜XÚÒY
+JHOHÛÝ\˜ÙU˜XÚÒY
+H™]\›ˆNÂˆ™]\›ˆLNÂˆNÂˆ]]ÈÝ\œ™[ÛÝ\˜ÙR[™^Hš[™ÛÝ\˜ÙR[™^
+
+NÂˆYˆ
+Ý\œ™[ÛÝ\˜ÙR[™^
+H™]\›ŽÂˆYˆ
+™\Ý[OHLJBˆÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊÝ\œ™[ÛÝ\˜ÙR[™^˜XÚÜËœÚ^™J
+JJBˆÂˆ˜XÚÔÙ[XÝÜ‹œÙ]Ù[XÝYY
+Ý\œ™[ÛÝ\˜ÙR[™^
+ÈKXÙNŽœÙ[™›ÝYšXØ][Û”Þ[˜ÊNÂˆÛÜÙTX[›Ô›ÛšY]Ê
+NÂˆ[Ù[™\˜]ÜœÓZ[š[Z^™YH˜[ÙNÂˆÙ[™\˜]ÜÛÛ\ÙYH˜[ÙNÂˆœš[™ÑÙ[™\˜]Ü•Ñœ›Û
+
+NÂˆÝ]\ËœÙ]^
+”ÚÝÚ[™Èˆ
+È›Ú™XÝ™Ù]˜XÚÓ˜[YJÝ\œ™[ÛÝ\˜ÙR[™^
+H
+È‹ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ™]\›ŽÂˆBˆYˆ
+™\Ý[OHLŠBˆÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ”™[˜[YHÙ[™\˜]Üˆ‹‘[\ˆH™]ÈÙ[™\˜]Üˆ˜[YKˆ‹XÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y^Y]ÜŠ›˜[YH‹›Ú™XÝ™Ù]˜XÚÓ˜[YJÝ\œ™[ÛÝ\˜ÙR[™^
+JNÂˆX[ÙË˜Y]ÛŠ”™[˜[YH‹KXÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽœ™]\›’Ù^K
+JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^K
+JNÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆÛÛœÝ]]È™]Ó˜[YHHX[ÙË™Ù]^Y]ÜÛÛ[Ê›˜[YHŠKš[J
+NÂˆYˆ
+™]Ó˜[YKš\Ñ[\J
+JH™]\›ŽÂˆ™[Y[X™\•[™Ê”™[˜[YHÙ[™\˜]ÜˆŠNÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆ›Ú™XÝœÙ]˜XÚÓ˜[YJÝ\œ™[ÛÝ\˜ÙR[™^™]Ó˜[YJNÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊÝ\œ™[ÛÝ\˜ÙR[™^˜XÚÜËœÚ^™J
+JJBˆ˜XÚÜË™Ù][˜ÚXÚÙY
+Ý\œ™[ÛÝ\˜ÙR[™^
+KOœÙ]˜[YJ™]Ó˜[YJNÂˆ\Ñ\HHYNÂˆ™Yœ™\Ú˜XÚÔÙ[XÝÜŠ
+NÂˆ™Yœ™\ÚZ^\ÛÛ›ÛÊ
+NÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆÝ]\ËœÙ]^
+”™[˜[YYÙ[™\˜]ÜˆÈˆ
+È™]Ó˜[YH
+È‹ˆØ]™HÈÙY\HÚ[™ÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆYˆ
+™\Ý[OHLÊBˆÂˆÛÛœÝ]]È˜XÚÓ˜[YHH›Ú™XÝ™Ù]˜XÚÓ˜[YJÝ\œ™[ÛÝ\˜ÙR[™^
+NÂˆXÙNŽ[\Ú[™ÝÈX[ÙÊ‘[]HÙ[™\˜]Üˆ‹‘[]Hˆ
+È˜XÚÓ˜[YH
+Èˆ[™]È]\›œÈ[™^[\ÝÛ\ÏÈ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y]ÛŠ‘[]H‹KXÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽœ™]\›’Ù^K
+JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^K
+JNÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆYˆ
+ZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÝ\œ™[ÛÝ\˜ÙR[™^˜XÚÜËœÚ^™J
+JJH™]\›ŽÂˆ™[Y[X™\•[™Ê‘[]HÙ[™\˜]ÜˆŠNÂˆ]]Êˆ™[[Ý™Y˜XÚÈH˜XÚÜË™Ù][˜ÚXÚÙY
+Ý\œ™[ÛÝ\˜ÙR[™^
+NÂˆÛÜÙTX[›Ô›ÛšY]Ê
+NÂˆYˆ
+[œÝ[Y[˜XÚÈOH™[[Ý™Y˜XÚÊBˆÂˆ[œÝ[Y[˜XÚÈH[ŽÂˆ]\›Û\H[ŽÂˆBˆY]O™[]U˜XÚÊ™[[Ý™Y˜XÚÊNÂˆ›Ú™XÝœ™[[Ý™U˜XÚÊÝ\œ™[ÛÝ\˜ÙR[™^
+NÂˆš[™š\œÝ[œÝ[Y[˜XÚÊ
+NÂˆ™Yœ™\Ú˜XÚÔÙ[XÝÜŠ
+NÂˆ™XY]\›”Ý\Ê
+NÂˆ™Yœ™\ÚZ^\ÛÛ›ÛÊ
+NÂˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆ\]PXÝ]™R[œÝ[Y[Y]ÜŠ
+NÂˆ\Ñ\HHYNÂˆ™Yœ™\Ú›Ú™XÝšY]Ê‘[]Yˆ
+È˜XÚÓ˜[YH
+È‹ˆØ]™HÈÙY\HÚ[™ÙKˆŠNÂˆ™]\›ŽÂˆBˆYˆ
+™\Ý[OHL
+BˆÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊÝ\œ™[ÛÝ\˜ÙR[™^˜XÚÜËœÚ^™J
+JJBˆÂˆ˜XÚÔÙ[XÝÜ‹œÙ]Ù[XÝYY
+Ý\œ™[ÛÝ\˜ÙR[™^
+ÈKXÙNŽœÙ[™›ÝYšXØ][Û”Þ[˜ÊNÂˆÚÝÔ^[\Ý
+
+NÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœÙ]]]ÛX][Û“[ÙJYJNÂˆÝ]\ËœÙ]^
+”ÛÛ™È]™[ÎˆÙ[XÝH\˜[Y]\ˆ[ˆHX[›È›Û[ˆ˜]È]]ÛX][Ûˆ[ˆH^[\Ýˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ™]\›ŽÂˆBˆYˆ
+™\Ý[HL	‰ˆ™\Ý[HLLŠBˆÂˆÛÛœÝ]]ÈÛÛÝ\ˆH™\Ý[OHLÈXÙNŽÛÛÝ\žßBˆˆ[]VÜÝ]X×ØØ\ÝÚ^™WÝŠ™\Ý[HLJWKœÙXÛÛ™Âˆ›Ú™XÝœÙ]˜XÚÐÛÛÝ\ŠÝ\œ™[ÛÝ\˜ÙR[™^ÛÛÝ\ŠNÂˆ\Ñ\HHYNÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆÝ]\ËœÙ]^
+ÛÛÝ\‹š\Õ˜[œÜ\™[
+
+HÈ•˜XÚÈÛÛÜˆ™\Ù]ˆˆˆ•˜XÚÈÛÛÜˆ\]YˆØ]™HÈÙY\HÚ[™ÙKˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆYˆ
+™\Ý[H™\Ý[ˆÝ]X×ØØ\Ý[Š\Ý[˜][ÛœËœÚ^™J
+JJH™]\›ŽÂˆÛÛœÝ]]È\Ý[˜][Û’YH\Ý[˜][ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ™\Ý[HJWNÂˆÛÛœÝ]]ÈÛÝ\˜ÙS˜[YHH›Ú™XÝ™Ù]˜XÚÓ˜[YJÝ\œ™[ÛÝ\˜ÙR[™^
+NÂˆÛÛœÝ]]È\Ý[˜][Û’[™^HÉ—BˆÂˆ›Üˆ
+[HHÈH›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÚJBˆYˆ
+›Ú™XÝ™Ù]˜XÚÒY
+JHOH\Ý[˜][Û’Y
+H™]\›ˆNÂˆ™]\›ˆLNÂˆJ
+NÂˆYˆ
+\Ý[˜][Û’[™^
+H™]\›ŽÂ‚ˆXÙNŽ[\Ú[™ÝÈX[ÙÊÛÛ™HÜ[ÛœÈ‹ˆÛÜH[]\›œÈ[™^[\Ý\œ˜[™Ù[Y[œ›ÛHˆ
+ÈÛÝ\˜ÙS˜[YH
+ÈˆÈ‚ˆ
+È›Ú™XÝ™Ù]˜XÚÓ˜[YJ\Ý[˜][Û’[™^
+H
+ÈÈ^\Ý[™È\Ý[˜][Ûˆ]\›œÈ[™Û\ÈÚ[™H™\XÙYˆ‹ˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛŠNÂˆX[ÙË˜Y]ÛŠÛÛ™H‹KXÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽœ™]\›’Ù^K
+JNÂˆX[ÙË˜Y]ÛŠØ[˜Ù[‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^K
+JNÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJH™]\›ŽÂ‚ˆ™[Y[X™\•[™ÊÛÛ™H]\›œÈ[™\œ˜[™Ù[Y[ŠNÂˆYˆ
+\›Ú™XÝ˜ÛÛ™U˜XÚÔ]\›œÐ[™\œ˜[™Ù[Y[
+ÛÝ\˜ÙU˜XÚÒY\Ý[˜][Û’Y
+JBˆÂˆÝ]\ËœÙ]^
+ÛÛ™HØ[˜Ù[Yˆ›ÝÙ[™\˜]ÜœÈ]\Ý™H[œÝ[Y[˜XÚÜËˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆ™XZ[]\›Û\
+
+NÂˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆ\Ñ\HHYNÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆ™Yœ™\Ú›Ú™XÝšY]ÊÛÛ™Y]\›œÈ[™^[\Ý\œ˜[™Ù[Y[È‚ˆ
+È›Ú™XÝ™Ù]˜XÚÓ˜[YJ\Ý[˜][Û’[™^
+H
+È‹ˆØ]™HÈÙY\HÚ[™ÙKˆŠNÂˆJNÂˆB‚ˆ›ÚY[Ý™T^[\ÝÛ\
+[˜XÚÒ[™^[ÛÝ\˜ÙP˜\‹[\Ý[˜][Û•˜XÚÒ[™^[\Ý[˜][Û˜\ŠBˆÂˆYˆ
+Z\Ô›Ú™XÝY]OH[ˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JBˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ý[˜][Û•˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JBˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÛÝ\˜ÙP˜\‹^[\ÝÜšYŽ˜˜\ÛÝ[
+BˆZXÙNŽš\ÔÜÚ]]™P[™™[ÝÊ\Ý[˜][Û˜\‹^[\ÝÜšYŽ˜˜\ÛÝ[
+Bˆ
+ÛÝ\˜ÙP˜\ˆOH\Ý[˜][Û˜\ˆ	‰ˆ˜XÚÒ[™^OH\Ý[˜][Û•˜XÚÒ[™^
+JBˆ™]\›ŽÂ‚ˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È]\›’YH›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒYÛÝ\˜ÙP˜\ŠNÂˆYˆ
+]\›’Yš\Ñ[\J
+JH™]\›ŽÂ‚ˆ]]È\Ý[˜][Û”]\›’YH]\›’YÂˆÛÛœÝ[ÛÝ\˜ÙT]\›’[™^H›Ú™XÝ™Ù]]\›’[™^›Ü’Y
+˜XÚÒY]\›’Y
+NÂˆYˆ
+ÛÝ\˜ÙT]\›’[™^
+H™]\›ŽÂˆÛÛœÝ]]È\Ý[˜][Û•˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+\Ý[˜][Û•˜XÚÒ[™^
+NÂˆ[\Ý[˜][Û”]\›’[™^HÛÝ\˜ÙT]\›’[™^ÂˆYˆ
+\Ý[˜][Û•˜XÚÒ[™^OH˜XÚÒ[™^
+BˆÂˆÛÛœÝ]]ÈØØÝ\YYH›Ú™XÝ™Ù]^[\Ý]\›’Y
+\Ý[˜][Û•˜XÚÒY\Ý[˜][Û˜\ŠNÂˆYˆ
+ØØÝ\YYš\Ó›Ý[\J
+JBˆÂˆÝ]\ËœÙ]^
+“[Ý™HØ[˜Ù[YˆH\Ý[˜][Ûˆ^[\ÝÙ[[™XYHÛÛZ[œÈH]\›‹ˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆ\Ý[˜][Û”]\›’[™^HLNÂˆ›Üˆ
+[Ø[™Y]HHÈØ[™Y]H›Ú™XÝØÝ[Y[Žœ]\›”ÛÝÛÝ[È
+ÊØØ[™Y]JBˆYˆ
+\›Ú™XÝš\Ô]\›Ü™X]Y
+\Ý[˜][Û•˜XÚÒYØ[™Y]JJBˆÂˆ\Ý[˜][Û”]\›’[™^HØ[™Y]NÂˆœ™XZÎÂˆBˆYˆ
+\Ý[˜][Û”]\›’[™^
+BˆÂˆÝ]\ËœÙ]^
+“[Ý™HØ[˜Ù[YˆH\Ý[˜][ÛˆÙ[™\˜]Üˆ\È›È[\H]\›ˆÛÝˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆBˆ[ÙHYˆ
+›Ú™XÝ™Ù]^[\Ý]\›’Y
+\Ý[˜][Û•˜XÚÒY\Ý[˜][Û˜\ŠKš\Ó›Ý[\J
+JBˆÂˆÝ]\ËœÙ]^
+“[Ý™HØ[˜Ù[YˆH\Ý[˜][Ûˆ^[\ÝÙ[[™XYHÛÛZ[œÈH]\›‹ˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆB‚ˆ™[Y[X™\•[™Ê“[Ý™H^[\Ý]\›ˆŠNÂˆYˆ
+\Ý[˜][Û•˜XÚÒ[™^OH˜XÚÒ[™^
+BˆÂˆ›Ú™XÝœÙ]]\›Ü™X]Y
+\Ý[˜][Û•˜XÚÒY\Ý[˜][Û”]\›’[™^YJNÂˆ›Ú™XÝœÙ]]\›“[™ÝÝ\Ê\Ý[˜][Û•˜XÚÒY\Ý[˜][Û”]\›’[™^ˆ›Ú™XÝ™Ù]]\›“[™ÝÝ\Ê˜XÚÒYÛÝ\˜ÙT]\›’[™^
+JNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+BˆÂˆÛÛœÝ›ÛÛÛˆH›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒYÛÝ\˜ÙT]\›’[™^]ÚÝ\
+NÂˆ›Ú™XÝœÙ]]\›“›ÝJ\Ý[˜][Û•˜XÚÒY\Ý[˜][Û”]\›’[™^]ÚÝ\ÛŠNÂˆYˆ
+ÛŠBˆÂˆ›Ú™XÝœÙ]]\›“›ÝS[™Ý
+\Ý[˜][Û•˜XÚÒY\Ý[˜][Û”]\›’[™^]ÚÝ\ˆ›Ú™XÝ™Ù]]\›“›ÝS[™Ý
+˜XÚÒYÛÝ\˜ÙT]\›’[™^]ÚÝ\
+JNÂˆ›Ú™XÝœÙ]]\›“›ÝU™[ØÚ]J\Ý[˜][Û•˜XÚÒY\Ý[˜][Û”]\›’[™^]ÚÝ\ˆ›Ú™XÝ™Ù]]\›“›ÝU™[ØÚ]J˜XÚÒYÛÝ\˜ÙT]\›’[™^]ÚÝ\
+JNÂˆBˆBˆ\Ý[˜][Û”]\›’YH›Ú™XÝ™Ù]]\›’Y
+\Ý[˜][Û•˜XÚÒY\Ý[˜][Û”]\›’[™^
+NÂˆBˆ›Ú™XÝœÙ]^[\ÝÛ\
+˜XÚÒYßKÛÝ\˜ÙP˜\‹K˜[ÙJNÂˆ›Ú™XÝœÙ]^[\ÝÛ\
+\Ý[˜][Û•˜XÚÒY\Ý[˜][Û”]\›’Y\Ý[˜][Û˜\‹KYJNÂˆ™XZ[]\›Û\
+
+NÂˆ\Ñ\HHYNÂˆÛÛœÝ]]È\Ý[˜][Û”]\›ˆH›Ú™XÝ™Ù]]\›’[™^›Ü’Y
+\Ý[˜][Û•˜XÚÒY\Ý[˜][Û”]\›’Y
+NÂˆÛÛœÝXÙNŽ”Ýš[™È˜[YHH\Ý[˜][Û”]\›ˆHÈ›Ú™XÝ™Ù]]\›“˜[YJ\Ý[˜][Û•˜XÚÒY\Ý[˜][Û”]\›ŠHˆXÙNŽ”Ýš[™Êœ]\›ˆŠNÂˆ™Yœ™\Ú›Ú™XÝšY]Ê“[Ý™Yˆ
+È˜[YH
+ÈˆÈÙ[™\˜]Üˆˆ
+ÈXÙNŽ”Ýš[™Ê\Ý[˜][Û•˜XÚÒ[™^
+ÈJBˆ
+È‹^[\Ý˜\ˆˆ
+ÈXÙNŽ”Ýš[™Ê\Ý[˜][Û˜\ˆ
+ÈJH
+È‹ˆŠNÂˆB‚ˆ›ÚYš[š\Ú^[\ÝZ[Ù\Ý\™J
+BˆÂˆYˆ
+^[\ÝZ[Ù\Ý\™PXÝ]™JBˆÂˆ^[\ÝZ[Ù\Ý\™PXÝ]™HH˜[ÙNÂˆ™Yœ™\Ú›Ú™XÝšY]Ê”^[\Ý]\›ˆXÙ[Y[\]YˆØ]™HÈÙY\HÚ[™ÙKˆŠNÂˆBˆ[ÙHYˆ
+^[\ÝÚ[™ÝÈOH[ŠBˆ^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆB‚ˆ›ÚYÙ]^X˜XÚÓ[ÙJ^X˜XÚÓ[ÙH[ÙJBˆÂˆYˆ
+^X˜XÚÓ[ÙHOH[ÙJH™]\›ŽÂˆYˆ
+Y]OH[ˆ	‰ˆY]O™Ù]˜[œÜÜ
+
+Kš\Ô^Z[™Ê
+JBˆÂˆYˆ
+^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœÛÛ™ÊBˆ™[Y[X™\”ÛÛ™Ô]\›œÐ]
+Y]O™Ù]˜[œÜÜ
+
+K™Ù]ÜÚ][ÛŠ
+Kš[”ÙXÛÛ™Ê
+JNÂˆY]O™Ù]˜[œÜÜ
+
+KœÝÜ
+˜[ÙK˜[ÙJNÂˆBˆYˆ
+]Y][Û”]\›”^X˜XÚÊBˆÂˆ]Y][Û”]\›”^X˜XÚÈH˜[ÙNÂˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆBˆ^X˜XÚÓ[ÙHH[ÙNÂˆ\]T^X˜XÚÓ[ÙP]ÛœÊ
+NÂˆ\]Q[™Ú[™P]]ÛX][ÛŠ
+NÂˆ^P]Û‹œÙ]]Û•^
+”^HŠNÂˆÝ]\ËœÙ]^
+[ÙHOH^X˜XÚÓ[ÙNŽœ]\›‚ˆÈ”]\›ˆ[ÙNˆ^HÛÜÈXXÚÙ[™\˜]Ü‰ÜÈ™[Y[X™\™Y]\›‹ˆ‚ˆˆ”ÛÛ™È[ÙNˆ^H[œÈÛ\È\œ˜[™ÙY[ˆH^[\Ýˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY\]T^X˜XÚÓ[ÙP]ÛœÊ
+BˆÂˆ]\›“[ÙP]Û‹œÙ]ÙÙÛTÝ]J^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœ]\›‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÛ™Ó[ÙP]Û‹œÙ]ÙÙÛTÝ]J^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœÛÛ™ËXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›“[ÙP]Û‹œ™\Z[
+
+NÂˆÛÛ™Ó[ÙP]Û‹œ™\Z[
+
+NÂˆB‚ˆ›ÛÛ]\›’\Ó›Ý\ÊÛÛœÝXÙNŽ”Ýš[™Éˆ˜XÚÒY[]\›’[™^
+HÛÛœÝˆÂˆYˆ
+˜XÚÒYš\Ñ[\J
+H\›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒY]\›’[™^
+JH™]\›ˆ˜[ÙNÂˆÛÛœÝ]]È]\›“[™ÝH›Ú™XÝ™Ù]]\›“[™ÝÝ\Ê˜XÚÒY]\›’[™^
+NÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\]\›“[™ÝÈ
+ÊÜÝ\
+BˆYˆ
+›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒY]\›’[™^]ÚÝ\
+JH™]\›ˆYNÂˆ™]\›ˆ˜[ÙNÂˆB‚ˆ›ÚY™[Y[X™\”ÛÛ™Ô]\›œÐ]
+ÝX›HÙXÛÛ™ÊBˆÂˆYˆ
+ÙXÛÛ™ÈŒ
+H™]\›ŽÂˆÛÛœÝ]]È˜\ˆHXÙNŽš›[Z]
+^[\ÝÜšYŽ˜˜\ÛÝ[HKˆÝ]X×ØØ\Ý[ŠÙXÛÛ™È
+ˆ›Ú™XÝ™Ù][š]X[[\ÐœJ
+HÈŒŒÈŒ
+JNÂˆÛÛœÝ]]ÈÙ[™\˜]Ü•˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆÛÛœÝ]]ÈXÝ]™QÙ[™\˜]Ü’[™^HÙ[™\˜]Ü•˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆ›Üˆ
+[˜XÚÒ[™^HÈ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÝ˜XÚÒ[™^
+BˆÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È]\›’YH›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠNÂˆÛÛœÝ]]È]\›’[™^H›Ú™XÝ™Ù]]\›’[™^›Ü’Y
+˜XÚÒY]\›’Y
+NÂˆYˆ
+]\›’[™^\›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒY]\›’[™^
+JHÛÛ[YNÂˆYˆ
+›Ú™XÝ™Ù]˜XÚÔÙ[XÝY]\›’[™^
+˜XÚÒY
+HOH]\›’[™^
+BˆÂˆ›Ú™XÝœÙ]˜XÚÔÙ[XÝY]\›’[™^
+˜XÚÒY]\›’[™^
+NÂˆ\Ñ\HHYNÂˆBˆYˆ
+˜XÚÒ[™^OHXÝ]™QÙ[™\˜]Ü’[™^
+BˆÂˆÙ[XÝY˜[šÒ[™^H]\›’[™^È›Ú™XÝØÝ[Y[Žœ]\›œÔ\˜[šÎÂˆÙ[XÝYÛÝ[™^H]\›’[™^	H›Ú™XÝØÝ[Y[Žœ]\›œÔ\˜[šÎÂˆ›Üˆ
+[HHÈHÈ
+ÊÚJBˆÂˆ]\›˜[šÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]JHOHÙ[XÝY˜[šÒ[™^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›”ÛÝ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]JHOHÙ[XÝYÛÝ[™^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ™XY]\›”Ý\Ê
+NÂˆBˆBˆB‚ˆ›ÚYÙÙÛT^X˜XÚÊ
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆ]]ÊˆXÝ]™Q]šXÙHH[™Ú[™K™Ù]]šXÙSX[˜YÙ\Š
+K™]šXÙSX[˜YÙ\‹™Ù]Ý\œ™[]Y[Ñ]šXÙJ
+NÂˆYˆ
+XÝ]™Q]šXÙHOH[ŠBˆÂˆÝ]\ËœÙ]^
+“›ÈXÝ]™H]Y[ÈÝ]]ˆÚÛÜÙHH]šXÙH[ˆ]Y[ÈÙ][™ÜËˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆ]]Éˆ˜[œÜÜHY]O™Ù]˜[œÜÜ
+
+NÂˆYˆ
+˜[œÜÜš\Ô^Z[™Ê
+JBˆÂˆYˆ
+^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœÛÛ™ÊBˆ™[Y[X™\”ÛÛ™Ô]\›œÐ]
+˜[œÜÜ™Ù]ÜÚ][ÛŠ
+Kš[”ÙXÛÛ™Ê
+JNÂˆ˜[œÜÜœÝÜ
+˜[ÙK˜[ÙJNÂˆYˆ
+]Y][Û”]\›”^X˜XÚÊBˆÂˆ]Y][Û”]\›”^X˜XÚÈH˜[ÙNÂˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆBˆ^P]Û‹œÙ]]Û•^
+”^HŠNÂˆ™]\›ŽÂˆBˆ]Y][Û”]\›”^X˜XÚÈH^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœ]\›ŽÂˆYˆ
+]Y][Û”]\›”^X˜XÚÊBˆÂˆ›ÛÛ[žTÙ[XÝY]\›’\Ó›Ý\ÈH˜[ÙNÂˆÛÛœÝ]]È˜XÚÐÛÝ[HXÙNŽš›Z[Š›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+KÙ]Ù[™\˜]Ü•˜XÚÜÊ
+KœÚ^™J
+JNÂˆ›Üˆ
+[[™^HÈ[™^˜XÚÐÛÝ[	‰ˆX[žTÙ[XÝY]\›’\Ó›Ý\ÎÈ
+ÊÚ[™^
+BˆÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+[™^
+NÂˆ[žTÙ[XÝY]\›’\Ó›Ý\ÈH]\›’\Ó›Ý\Ê˜XÚÒY›Ú™XÝ™Ù]˜XÚÔÙ[XÝY]\›’[™^
+˜XÚÒY
+JNÂˆBˆYˆ
+X[žTÙ[XÝY]\›’\Ó›Ý\ÊBˆÂˆ]Y][Û”]\›”^X˜XÚÈH˜[ÙNÂˆÝ]\ËœÙ]^
+Y›Ý\ÈÈHÙ[™\˜]Ü‰ÜÈÙ[XÝY]\›ˆ™Y›Ü™H]\›ˆ[ÙH^X˜XÚËˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆBˆ[ÙBˆÂˆ›ÛÛ\Ô^[\ÝÛÛ[H˜[ÙNÂˆ›Üˆ
+[˜XÚÒ[™^HÈ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+H	‰ˆZ\Ô^[\ÝÛÛ[È
+ÊÝ˜XÚÒ[™^
+Bˆ›Üˆ
+[˜\ˆHÈ˜\ˆ^[\ÝÜšYŽ˜˜\ÛÝ[È
+ÊØ˜\ŠBˆ\Ô^[\ÝÛÛ[H›Ú™XÝ™Ù]^[\Ý]\›’Y
+›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+K˜\ŠKš\Ó›Ý[\J
+NÂˆYˆ
+Z\Ô^[\ÝÛÛ[
+BˆÂˆÝ]\ËœÙ]^
+”ÛÛ™È[ÙNˆXÙHÛ™HÜˆ[Ü™H]\›ˆÛ\È[ˆH^[\Ý™Y›Ü™H^X˜XÚËˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆBˆYˆ
+]Y][Û”]\›”^X˜XÚÊBˆÂˆÝX›HÛ™Ù\Ý]\›™X]ÈHKŒÂˆÛÛœÝ]]È˜XÚÐÛÝ[HXÙNŽš›Z[Š›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+KÙ]Ù[™\˜]Ü•˜XÚÜÊ
+KœÚ^™J
+JNÂˆ›Üˆ
+[[™^HÈ[™^˜XÚÐÛÝ[È
+ÊÚ[™^
+BˆÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+[™^
+NÂˆÛÛœÝ]]È]\›’[™^H›Ú™XÝ™Ù]˜XÚÔÙ[XÝY]\›’[™^
+˜XÚÒY
+NÂˆYˆ
+]\›’\Ó›Ý\Ê˜XÚÒY]\›’[™^
+JBˆÛ™Ù\Ý]\›™X]ÈHXÙNŽš›X^
+Û™Ù\Ý]\›™X]Ëˆ›Ú™XÝ™Ù]]\›“[™ÝÝ\Ê˜XÚÒY]\›’[™^
+H
+ˆŒJNÂˆBˆÛÛœÝ]]È[™ÙXÛÛ™ÈHXÙNŽš›X^
+ŒLKÛ™Ù\Ý]\›™X]È
+ˆŒŒÈ›Ú™XÝ™Ù][š]X[[\ÐœJ
+JNÂˆ˜[œÜÜœÙ]ÛÜ˜[™ÙJÈ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™ÊŒ
+Kˆ˜XÚÝ[ÛŽŽ•[YTÜÚ][ÛŽŽ™œ›ÛTÙXÛÛ™Ê[™ÙXÛÛ™ÊHJNÂˆ˜[œÜÜ›ÛÜ[™ÈHYNÂˆBˆ[ÙBˆÂˆ]Y][Û”]\›”^X˜XÚÈH˜[ÙNÂˆ\]SÛÜ˜[™ÙJ
+NÂˆ˜[œÜÜ›ÛÜ[™ÈHÛÜ]Û‹™Ù]ÙÙÛTÝ]J
+NÂˆBˆ˜[œÜÜœ^Qœ›ÛTÝ\
+˜[ÙJNÂˆ^P]Û‹œÙ]]Û•^
+”ÝÜŠNÂˆÝ]\ËœÙ]^
+]Y][Û”]\›”^X˜XÚÂˆÈ”]\›ˆ[ÙNˆ^Z[™ÈXXÚÙ[™\˜]Ü‰ÜÈ™[Y[X™\™Y]\›ˆ›ÝYÚˆ
+ÈXÝ]™Q]šXÙKO™Ù]˜[YJ
+H
+È‹ˆ™\ÜÈÝÜÈš[š\Úˆ‚ˆˆ”^Z[™ÈH^[\Ý›ÝYÚˆ
+ÈXÝ]™Q]šXÙKO™Ù]˜[YJ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÚÝÐ]Y[ÔÙ][™ÜÊ
+BˆÂˆYˆ
+]Y[ÔÙ][™ÜÕÚ[™ÝÈOH[ŠBˆ]Y[ÔÙ][™ÜÕÚ[™ÝÈHÝŽ›XZÙWÝ[š\]YO]Y[ÔÙ][™ÜÕÚ[™ÝÏŠ[™Ú[™K™Ù]]šXÙSX[˜YÙ\Š
+K™]šXÙSX[˜YÙ\ŠNÂˆ]Y[ÔÙ][™ÜÕÚ[™ÝËOœÙ]š\ÚX›JYJNÂˆ]Y[ÔÙ][™ÜÕÚ[™ÝËOÑœ›Û
+YJNÂˆB‚ˆ›ÚYÚÝÐ]Y[ÑXYÛ›ÜÝXÜÊ
+BˆÂˆ]]Êˆ]šXÙHH[™Ú[™K™Ù]]šXÙSX[˜YÙ\Š
+K™]šXÙSX[˜YÙ\‹™Ù]Ý\œ™[]Y[Ñ]šXÙJ
+NÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆÛÛœÝ]]È˜XÚÒ[™^H˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆ[]\›“›Ý\ÈHÂˆYˆ
+˜XÚÒYš\Ó›Ý[\J
+JBˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\›Ú™XÝ™Ù]]\›“[™ÝÝ\Ê˜XÚÒYÙ[XÝY]\›’[™^
+
+JNÈ
+ÊÜÝ\
+Bˆ]\›“›Ý\È
+ÏH›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒYÙ[XÝY]\›’[™^
+
+K]ÚÝ\
+HÈHˆÂ‚ˆXÙNŽ”Ýš[™È]Z[ÎÂˆ]Z[È]Y[È]šXÙNˆˆ
+]šXÙHOH[ˆÈ]šXÙKO™Ù]˜[YJ
+Hˆ“›ÈXÝ]™HÝ]]ŠH—ˆŽÂˆYˆ
+]šXÙHOH[ŠBˆ]Z[È“Ý]]Ú[›™[Îˆˆ]šXÙKO™Ù]XÝ]™SÝ]]Ú[›™[Ê
+K˜ÛÝ[[X™\“Ù”Ù]š]Ê
+BˆˆØ[\H˜]NˆˆXÙNŽ”Ýš[™Ê]šXÙKO™Ù]Ý\œ™[Ø[\T˜]J
+K
+Hˆ—ˆŽÂˆ]Z[È•˜[œÜÜˆˆ
+Y]OH[ˆ	‰ˆY]O™Ù]˜[œÜÜ
+
+Kš\Ô^Z[™Ê
+HÈ”^Z[™Èˆˆ”ÝÜYŠBˆˆÜÚ][ÛŽˆˆ
+Y]OH[‚ˆÈXÙNŽ”Ýš[™ÊY]O™Ù]˜[œÜÜ
+
+K™Ù]ÜÚ][ÛŠ
+Kš[”ÙXÛÛ™Ê
+KŠHˆXÙNŽ”Ýš[™Ê›‹ØHŠJHˆ×ˆŽÂˆ]Z[È“[ÙNˆˆ
+^X˜XÚÓ[ÙHOH^X˜XÚÓ[ÙNŽœ]\›ˆÈ”]\›ˆˆˆ”ÛÛ™ÈŠBˆˆÙ[XÝYÙ[™\˜]ÜŽˆˆ
+[œÝ[Y[˜XÚÈOH[ˆÈ[œÝ[Y[˜XÚËO™Ù]˜[YJ
+Hˆ“›Û™HŠH—ˆŽÂˆ]Z[È‘Ù[™\˜]ÜˆX\[™Îˆ[™Ú[™Hˆ
+˜XÚÒ[™^HÈXÙNŽ”Ýš[™Ê˜XÚÒ[™^
+ÈJHˆ[›X\YŠBˆˆÙˆˆ˜XÚÜËœÚ^™J
+HˆÜ˜š]›Ú™XÝ˜XÚÜÎˆˆ›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+H—ˆŽÂˆ]Z[È”Ù[XÝY]\›ŽˆˆÙ]Ù[XÝY]\›•]J
+Hˆ›Ý\Îˆˆ]\›“›Ý\È—ˆŽÂˆ]Z[È•˜XÚÈY]\Žˆˆ
+˜XÚÓY]\ˆOH[‚ˆÈ
+\Ü^YYY]\”XZÑˆˆNLŒˆÈXÙNŽ”Ýš[™Ê\Ü^YYY]\”XZÑ‹JH
+Èˆ‘”Èˆˆ››È™XÙ[ÚYÛ˜[ŠBˆˆ››Ý]XÚYŠH—ˆŽÂˆ]Z[È”X[›ËZÙ^H›ÝK[ÛœÈ\ÈÙ\ÜÚ[ÛŽˆˆZYP]Y][Û“›ÝSÛœÂˆˆ\ÝÙ^H]™[ˆˆ
+\ÝZYPXÝ]š]Kš\Ó›Ý[\J
+HÈ\ÝZYPXÝ]š]Hˆ››Û™HŠNÂ‚ˆXÙNŽ[\Ú[™ÝÈX[ÙÊ]Y[ÈÈRQHXYÛ›ÜÝXÜÈ‹]Z[ËˆXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ“›ÒXÛÛ‹\ÊNÂˆX[ÙË˜Y]ÛŠ”^H\Ý›ÝH‹KXÙNŽ’Ù^T™\ÜÊ
+JNÂˆX[ÙË˜Y]ÛŠÛÜÙH‹XÙNŽ’Ù^T™\ÜÊXÙNŽ’Ù^T™\ÜÎŽ™\ØØ\RÙ^JJNÂˆX[ÙË˜Ù[™P\›Ý[™ÛÛ\Û™[
+\ËMŒŽL
+NÂˆYˆ
+X[ÙËœ[“[Ù[ÛÜ
+
+HOHJBˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠBˆÂˆÝ]\ËœÙ]^
+•\Ý›ÝH[˜]˜Z[X›NˆÙ[XÝ[ˆ[œÝ[Y[Ù[™\˜]Üˆš\œÝˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆ
+ÊÛZYP]Y][Û“›ÝSÛœÎÂˆ\ÝZYPXÝ]š]HH‘XYÛ›ÜÝXÜÎˆÍ\Ý›ÝHŽÂˆ[œÝ[Y[˜XÚËOœ^QÝZYS›ÝJŒNŽ“ZYPÚ[›™[
+JKLYKYKYJNÂˆÝ]\ËœÙ]^
+”Ù[HÍ\Ý›ÝHÈˆ
+È[œÝ[Y[˜XÚËO™Ù]˜[YJ
+Bˆ
+È‹ˆÚXÚÈH˜XÚÈY]\ˆ[™Ý]]]šXÙKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆB‚ˆ›ÚY\]P]Y[ÔÝ]\Ê
+BˆÂˆ]]Êˆ]šXÙHH[™Ú[™K™Ù]]šXÙSX[˜YÙ\Š
+K™]šXÙSX[˜YÙ\‹™Ù]Ý\œ™[]Y[Ñ]šXÙJ
+NÂˆYˆ
+]šXÙHOH[ŠBˆÂˆ]Y[Ñ]Z[ËœÙ]^
+]Y[Îˆ›ÈXÝ]™HÝ]]]šXÙH‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆB‚ˆÛÛœÝ]]ÈÝ]]Ú[›™[ÈH]šXÙKO™Ù]XÝ]™SÝ]]Ú[›™[Ê
+K˜ÛÝ[[X™\“Ù”Ù]š]Ê
+NÂˆ]Y[Ñ]Z[ËœÙ]^
+]Y[Îˆˆ
+È]šXÙKO™Ù]˜[YJ
+H
+Èˆ0­È‚ˆ
+ÈXÙNŽ”Ýš[™Ê]šXÙKO™Ù]Ý\œ™[Ø[\T˜]J
+K
+H
+Èˆˆ0­È‚ˆ
+ÈXÙNŽ”Ýš[™ÊÝ]]Ú[›™[ÊH
+ÈˆÝ]]Ú[›™[È‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYZYÜ˜]T^[\ÝÝ]J
+BˆÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆ›Üˆ
+[˜XÚÒ[™^HÈ˜XÚÒ[™^˜XÚÜËœÚ^™J
+H	‰ˆ˜XÚÒ[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+NÈ
+ÊÝ˜XÚÒ[™^
+BˆÂˆ]]Êˆ˜XÚÈH˜XÚÜË™Ù][˜ÚXÚÙY
+˜XÚÒ[™^
+NÂˆÛÛœÝ]]È˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+˜XÚÒ[™^
+NÂˆÝŽ™XÝÜNŽ“ZYPÛ\
+ˆÛ\ÎÂˆ›Üˆ
+[][HHÈ][H˜XÚËO™Ù][U˜XÚÒ][\Ê
+NÈ
+ÊÚ][JBˆYˆ
+]]ÊˆÛ\H[˜[ZX×ØØ\ÝNŽ“ZYPÛ\
+Š˜XÚËO™Ù]˜XÚÒ][J][JJJBˆÛ\Ëœ\ÚØ˜XÚÊÛ\
+NÂˆYˆ
+Û\Ë™[\J
+JHÛÛ[YNÂ‚ˆ]]ÊˆÛÝ\˜ÙHHÛ\Ë™œ›Û
+
+NÂˆ[X]ÚY]\›ˆHLNÂˆ›Üˆ
+[Ø[™Y]HHÈØ[™Y]H›Ú™XÝØÝ[Y[Žœ]\›”ÛÝÛÝ[	‰ˆX]ÚY]\›ˆÈ
+ÊØØ[™Y]JBˆÂˆYˆ
+\›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒYØ[™Y]JJHÛÛ[YNÂˆ›ÛÛX]Ú\ÈHYNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]Ú	‰ˆX]Ú\ÎÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\MŽÈ
+ÊÜÝ\
+BˆÂˆ›ÛÛÛ\\Ó›ÝHH˜[ÙNÂˆ›Üˆ
+[›ÝR[™^HÈ›ÝR[™^ÛÝ\˜ÙKO™Ù]Ù\]Y[˜ÙJ
+K™Ù][S›Ý\Ê
+NÈ
+ÊÛ›ÝR[™^
+BˆYˆ
+]]Êˆ›ÝHHÛÝ\˜ÙKO™Ù]Ù\]Y[˜ÙJ
+K™Ù]›ÝJ›ÝR[™^
+JBˆÛ\\Ó›ÝHH›ÝKO™Ù]›ÝS[X™\Š
+HOH]Úˆ	‰ˆXÙNŽš›[Z]
+MKÝ]X×ØØ\Ý[ŠÝŽœ›Ý[™
+›ÝKO™Ù]Ý\™X]
+
+Kš[™X]Ê
+H
+ˆŒ
+JJHOHÝ\ÂˆYˆ
+Û\\Ó›ÝHOH›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒYØ[™Y]K]ÚÝ\
+JBˆÂˆX]Ú\ÈH˜[ÙNÂˆœ™XZÎÂˆBˆBˆYˆ
+X]Ú\ÊHX]ÚY]\›ˆHØ[™Y]NÂˆB‚ˆYˆ
+X]ÚY]\›ˆ
+BˆÂˆX]ÚY]\›ˆHÂˆ›Üˆ
+[›ÝR[™^HÈ›ÝR[™^ÛÝ\˜ÙKO™Ù]Ù\]Y[˜ÙJ
+K™Ù][S›Ý\Ê
+NÈ
+ÊÛ›ÝR[™^
+BˆYˆ
+]]Êˆ›ÝHHÛÝ\˜ÙKO™Ù]Ù\]Y[˜ÙJ
+K™Ù]›ÝJ›ÝR[™^
+JBˆÂˆÛÛœÝ]]ÈÝ\HXÙNŽš›[Z]
+MKÝ]X×ØØ\Ý[ŠÝŽœ›Ý[™
+›ÝKO™Ù]Ý\™X]
+
+Kš[™X]Ê
+H
+ˆŒ
+JJNÂˆYˆ
+›ÝKO™Ù]›ÝS[X™\Š
+HHZ[š[][T]Ú	‰ˆ›ÝKO™Ù]›ÝS[X™\Š
+HHX^[][T]Ú
+Bˆ›Ú™XÝœÙ]]\›“›ÝJ˜XÚÒYX]ÚY]\›‹›ÝKO™Ù]›ÝS[X™\Š
+KÝ\YJNÂˆBˆ›Ú™XÝœÙ]]\›Ü™X]Y
+˜XÚÒYX]ÚY]\›‹YJNÂˆB‚ˆÛÛœÝ]]È]\›’YH›Ú™XÝ™Ù]]\›’Y
+˜XÚÒYX]ÚY]\›ŠNÂˆ›Üˆ
+]]ÊˆÛ\ˆÛ\ÊBˆÂˆÛÛœÝ]]È˜\ˆHXÙNŽœ›Ý[™Ò[
+Û\O™Ù]Y][YT˜[™ÙJ
+K™Ù]Ý\
+
+Kš[”ÙXÛÛ™Ê
+HÈ‹Œ
+NÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊ˜\‹MŠH	‰ˆ›Ú™XÝ™Ù]^[\Ý]\›’Y
+˜XÚÒY˜\ŠKš\Ñ[\J
+JBˆ›Ú™XÝœÙ]^[\ÝÛ\
+˜XÚÒY]\›’Y˜\‹KYJNÂˆBˆBˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆB‚ˆ›ÚYš[™š\œÝ[œÝ[Y[˜XÚÊ
+BˆÂˆ[œÝ[Y[˜XÚÈH[ŽÂˆ]\›Û\H[ŽÂˆYˆ
+Y]OH[ŠH™]\›ŽÂˆ›Üˆ
+]]Êˆ˜XÚÈˆÙ]Ù[™\˜]Ü•˜XÚÜÊ
+JBˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠH[œÝ[Y[˜XÚÈH˜XÚÎÂˆ›Üˆ
+[HHÈH˜XÚËO™Ù][U˜XÚÒ][\Ê
+NÈ
+ÊÚJBˆYˆ
+]]ÊˆÛ\H[˜[ZX×ØØ\ÝNŽ“ZYPÛ\
+Š˜XÚËO™Ù]˜XÚÒ][JJJJBˆÂˆYˆ
+]\›Û\OH[ŠBˆÂˆ[œÝ[Y[˜XÚÈH˜XÚÎÂˆ]\›Û\HÛ\ÂˆBˆBˆBˆB‚ˆ›ÚY™XY]\›”Ý\Ê
+BˆÂˆ[›Ý\ÔÙ[XÝYH˜[ÙNÂˆ›Üˆ
+]]Éˆ]ÚÝ\Èˆ›ÝQÜšY
+H]ÚÝ\Ë™š[
+˜[ÙJNÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆ\Ô]\›ˆH›Ú™XÝš\Ô]\›Ü™X]Y
+˜XÚÒYÙ[XÝY]\›’[™^
+
+JNÂˆ›Üˆ
+[]ÚHZ[š[][T]ÚÈ]ÚHX^[][T]ÚÈ
+ÊÜ]Ú
+Bˆ›Üˆ
+[Ý\HÈÝ\È
+ÊÜÝ\
+Bˆ›ÝQÜšYÜÝ]X×ØØ\ÝÚ^™WÝŠ]ÚHZ[š[][T]Ú
+WVÜÝ]X×ØØ\ÝÚ^™WÝŠÝ\
+WHBˆ›Ú™XÝ™Ù]]\›“›ÝJ˜XÚÒYÙ[XÝY]\›’[™^
+
+K]ÚÝ\
+NÂˆ]ÚÙ[XÝÜ‹œÙ][˜X›Y
+˜[ÙJNÂˆ]ÚÙ[XÝÜ‹œÙ]š\ÚX›J˜[ÙJNÂˆX[›Ô›Û]Û‹œÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆX[›Ô›Û]Û‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆÙ[™\˜]Ü”™\Ú^™R[™KœÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆ]\›•]KœÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆ›Üˆ
+]]ÉˆÝ\ˆÝ\ÊBˆÂˆÝ\OœÙ][˜X›Y
+˜[ÙJNÂˆÝ\OœÙ]š\ÚX›J˜[ÙJNÂˆBˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›˜[šÐ]ÛœÊBˆÂˆ]Û‹OœÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆ]Û‹OœÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆBˆÙ[™\˜]Ü“]]P]Û‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆÙ[™\˜]Ü”Ù][™ÜÐ]Û‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆÙ[™\˜]Ü”Ù][™ÜÐ]Û‹œÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆÜ[”™\Ù]]Û‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆØ]™T™\Ù]]Û‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆÜ[”™\Ù]]Û‹œÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆØ]™T™\Ù]]Û‹œÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆ]\›”™\Ù]Ù[XÝÜ‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆ]\›”™\Ù]Ù[XÝÜ‹œÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆ]\›“[™Ý\Ü^KœÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆ]\›“[™ÝÝÛ]Û‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆ]\›“[™Ý\]Û‹œÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆ]\›“[™ÝÝÛ]Û‹œÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆ]\›“[™Ý\]Û‹œÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›”ÛÝ]ÛœÊBˆÂˆ]Û‹OœÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆ]Û‹OœÙ]š\ÚX›J[œÝ[Y[˜XÚÈOH[ŠNÂˆBˆ™\Ú^™Y
+
+NÂˆØYÙ[XÝY]ÚÝ\Ê
+NÂˆB‚ˆ[Ù[XÝY]\›’[™^
+
+HÛÛœÝˆÂˆ™]\›ˆÙ[XÝY˜[šÒ[™^
+ˆ›Ú™XÝØÝ[Y[Žœ]\›œÔ\˜[šÈ
+ÈÙ[XÝYÛÝ[™^ÂˆB‚ˆXÙNŽ”Ýš[™ÈÙ[XÝY›Ú™XÝ˜XÚÒY
+
+HÛÛœÝˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆY]OH[ŠBˆ™]\›ˆßNÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆÛÛœÝ]]È[™^H˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆ™]\›ˆ›Ú™XÝ™Ù]˜XÚÒY
+[™^
+NÂˆB‚ˆXÙNŽ”Ýš[™È]]ÛX][Û”YÚ[“˜[YK]]ÛX][Û”\˜[Y]\’Y]]ÛX][Û”\˜[Y]\“˜[YNÂ‚ˆ›ÚYÙ[XÝ]\›˜[šÊ[˜[šÒ[™^
+BˆÂˆÙ[XÝY˜[šÒ[™^HXÙNŽš›[Z]
+Ë˜[šÒ[™^
+NÂˆ›Üˆ
+[HHÈHÈ
+ÊÚJBˆ]\›˜[šÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]JHOHÙ[XÝY˜[šÒ[™^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆØY]\›”Ù[XÝ[ÛŠ
+NÂˆB‚ˆ›ÚYÙ[XÝ]\›”ÛÝ
+[ÛÝ[™^
+BˆÂˆÙ[XÝYÛÝ[™^HXÙNŽš›[Z]
+ËÛÝ[™^
+NÂˆ›Üˆ
+[HHÈHÈ
+ÊÚJBˆ]\›”ÛÝ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]JHOHÙ[XÝYÛÝ[™^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆØY]\›”Ù[XÝ[ÛŠ
+NÂˆB‚ˆ›ÚYØY]\›”Ù[XÝ[ÛŠ
+BˆÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ˆY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È˜XÚÒYHÙ[XÝY›Ú™XÝ˜XÚÒY
+
+NÂˆÛÛœÝ]]È]\›’[™^HÙ[XÝY]\›’[™^
+
+NÂˆYˆ
+›Ú™XÝ™Ù]˜XÚÔÙ[XÝY]\›’[™^
+˜XÚÒY
+HOH]\›’[™^
+BˆÂˆ›Ú™XÝœÙ]˜XÚÔÙ[XÝY]\›’[™^
+˜XÚÒY]\›’[™^
+NÂˆ\Ñ\HHYNÂˆBˆ™XY]\›”Ý\Ê
+NÂˆYˆ
+]Y][Û”]\›”^X˜XÚÈ	‰ˆY]O™Ù]˜[œÜÜ
+
+Kš\Ô^Z[™Ê
+JBˆ™Yœ™\Ú[™Ú[™T^[\Ý
+
+NÂˆÝ]\ËœÙ]^
+\Ô]\›ˆÈ”Ù[XÝY]\›‹ˆÛXÚÈ^[\ÝÈXÙH]ÜˆY]]È›Ý\È[ˆX[›È›Ûˆ‚ˆˆ”Ù[XÝY[\H]\›ˆÛÝˆÛXÚÈ^[\ÝÈXÙH]ÜˆY›Ý\È[ˆX[›È›Ûˆ‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY™\Ù]]\›]ÛœÊ
+BˆÂˆ\Ô]\›ˆH˜[ÙNÂˆYˆ
+XÝ]™R[œÝ[Y[Y]ÜˆOH[ŠBˆÂˆ™[[Ý™PÚ[ÛÛ\Û™[
+XÝ]™R[œÝ[Y[Y]Ü‹™Ù]
+
+JNÂˆXÝ]™R[œÝ[Y[Y]Ü‹œ™\Ù]
+
+NÂˆBˆYˆ
+Z^\•Ú[™ÝÈOH[ŠHZ^\•Ú[™ÝËO™]XÚY]\œÊ
+NÂˆ]XÚ˜XÚÓY]\Š
+NÂˆ[œÝ[Y[˜XÚÈH[ŽÂˆ]\›Û\H[ŽÂˆ™Yœ™\Ú[™Õ˜XÚÔÙ[XÝÜˆHYNÂˆ˜XÚÔÙ[XÝÜ‹˜ÛX\ŠXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ˜XÚÔÙ[XÝÜ‹œÙ][˜X›Y
+˜[ÙJNÂˆ™Yœ™\Ú[™Õ˜XÚÔÙ[XÝÜˆH˜[ÙNÂˆ]™[ÛY\‹œÙ][˜X›Y
+˜[ÙJNÂˆ[”ÛY\‹œÙ][˜X›Y
+˜[ÙJNÂˆ›Üˆ
+]]Éˆ]ÚÝ\Èˆ›ÝQÜšY
+H]ÚÝ\Ë™š[
+˜[ÙJNÂˆ]ÚÙ[XÝÜ‹œÙ][˜X›Y
+˜[ÙJNÂˆ]ÚÙ[XÝÜ‹œÙ]š\ÚX›J˜[ÙJNÂˆX[›Ô›Û]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆX[›Ô›Û]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]ÜÛÛ\ÙYH˜[ÙNÂˆ[Ù[™\˜]ÜœÓZ[š[Z^™YH˜[ÙNÂˆX[›Ô›ÛX^[Z^™YH˜[ÙNÂˆX[›Ô›Û™\ÝÜ™P›Ý[™ÈHßNÂˆX[›Ô›ÛØ\Õš\ÚX›UÚ[ÛÛ\ÙYH˜[ÙNÂˆ^[™YÙ[™\˜]Ü›Ý[™ÈHßNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ]ÙÙÛTÝ]J˜[ÙKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ]ÙÙÛTÝ]J˜[ÙKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü”Ù][™ÜÐ]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆÙ[™\˜]Ü”Ù][™ÜÐ]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÜ[”™\Ù]]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆÜ[”™\Ù]]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆØ]™T™\Ù]]Û‹œÙ][˜X›Y
+˜[ÙJNÂˆØ]™T™\Ù]]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆ]\›”™\Ù]Ù[XÝÜ‹œÙ][˜X›Y
+˜[ÙJNÂˆ]\›”™\Ù]Ù[XÝÜ‹œÙ]š\ÚX›J˜[ÙJNÂˆ]\›“[™Ý\Ü^KœÙ]š\ÚX›J˜[ÙJNÂˆ]\›“[™ÝÝÛ]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆ]\›“[™Ý\]Û‹œÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü‘˜YÒ[™KœÙ]š\ÚX›J˜[ÙJNÂˆÙ[™\˜]Ü”™\Ú^™R[™KœÙ]š\ÚX›J˜[ÙJNÂˆ]\›•]KœÙ]š\ÚX›J˜[ÙJNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›˜[šÐ]ÛœÊHÈ]Û‹OœÙ][˜X›Y
+˜[ÙJNÈ]Û‹OœÙ]š\ÚX›J˜[ÙJNÈBˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›”ÛÝ]ÛœÊHÈ]Û‹OœÙ][˜X›Y
+˜[ÙJNÈ]Û‹OœÙ]š\ÚX›J˜[ÙJNÈBˆ›Üˆ
+]]ÉˆÝ\ˆÝ\ÊBˆÂˆÝ\OœÙ][˜X›Y
+˜[ÙJNÂˆÝ\OœÙ]š\ÚX›J˜[ÙJNÂˆÝ\OœÙ]ÙÙÛTÝ]J˜[ÙKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆÙ[XÝY˜[šÒ[™^HÂˆÙ[XÝYÛÝ[™^HÂˆ™\Ú^™Y
+
+NÂˆ›Üˆ
+[HHÈHÈ
+ÊÚJBˆÂˆ]\›˜[šÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]JHOHXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›”ÛÝ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]JHOHXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœ™Yœ™\Ú
+LHŠNÂˆB‚ˆ›ÚY™Yœ™\ÚZ^\ÛÛ›ÛÊ
+BˆÂˆÛÛœÝ]]Êˆ›Û[YT[ˆH[œÝ[Y[˜XÚÈOH[ˆÈ[œÝ[Y[˜XÚËO™Ù]›Û[YTYÚ[Š
+Hˆ[ŽÂˆÛÛœÝ›ÛÛ]˜Z[X›HH›Û[YT[ˆOH[ŽÂˆ]™[ÛY\‹œÙ][˜X›Y
+]˜Z[X›JNÂˆ[”ÛY\‹œÙ][˜X›Y
+]˜Z[X›JNÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆÛÛœÝ]]ÈÙ[XÝY[™^H˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆÛÛœÝ›ÛÛ˜XÚÐ]˜Z[X›HHXÙNŽš\ÔÜÚ]]™P[™™[ÝÊÙ[XÝY[™^˜XÚÜËœÚ^™J
+JNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ]ÙÙÛTÝ]J˜XÚÐ]˜Z[X›H	‰ˆ˜XÚÜË™Ù][˜ÚXÚÙY
+Ù[XÝY[™^
+KOš\Ó]]Y
+˜[ÙJKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ]ÙÙÛTÝ]J˜XÚÐ]˜Z[X›H	‰ˆ˜XÚÜË™Ù][˜ÚXÚÙY
+Ù[XÝY[™^
+KOš\ÔÛÛÊ˜[ÙJKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[™\˜]Ü“]]P]Û‹œÙ][˜X›Y
+˜XÚÐ]˜Z[X›JNÂˆÙ[™\˜]Ü”ÛÛÐ]Û‹œÙ][˜X›Y
+˜XÚÐ]˜Z[X›JNÂˆ]XÚ˜XÚÓY]\Š
+NÂˆYˆ
+X]˜Z[X›JH™]\›ŽÂˆ]™[ÛY\‹œÙ]˜[YJ›Û[YT[‹O™Ù]›Û[YQŠ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[”ÛY\‹œÙ]˜[YJ›Û[YT[‹Oœ[‹™Ù]
+
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆZ^\•]KœÙ]^
+“Z^\ˆHˆ
+È[œÝ[Y[˜XÚËO™Ù]˜[YJ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY™Yœ™\Ú˜XÚÔÙ[XÝÜŠ
+BˆÂˆ™Yœ™\Ú[™Õ˜XÚÔÙ[XÝÜˆHYNÂˆ˜XÚÔÙ[XÝÜ‹˜ÛX\ŠXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆ›Üˆ
+[HHÈH˜XÚÜËœÚ^™J
+NÈ
+ÊÚJBˆ˜XÚÔÙ[XÝÜ‹˜Y][J˜XÚÜË™Ù][˜ÚXÚÙY
+JKO™Ù]˜[YJ
+KH
+ÈJNÂˆÛÛœÝ]]ÈÙ[XÝYH˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆ˜XÚÔÙ[XÝÜ‹œÙ]Ù[XÝYY
+Ù[XÝYHÈÙ[XÝY
+ÈHˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ˜XÚÔÙ[XÝÜ‹œÙ][˜X›Y
+]˜XÚÜËš\Ñ[\J
+JNÂˆ˜XÚÔÙ[XÝÜ‹œÙ]š\ÚX›J]˜XÚÜËš\Ñ[\J
+JNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›˜[šÐ]ÛœÊH]Û‹OœÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›”ÛÝ]ÛœÊH]Û‹OœÙ][˜X›Y
+[œÝ[Y[˜XÚÈOH[ŠNÂˆ™Yœ™\Ú[™Õ˜XÚÔÙ[XÝÜˆH˜[ÙNÂˆ™Yœ™\ÚÙ[™\˜]Ü‘ØÚÊ
+NÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆB‚ˆ›ÚY™Yœ™\ÚÙ[™\˜]Ü‘ØÚÊ
+BˆÂˆ›Üˆ
+]]Éˆ]ÛˆˆÙ[™\˜]Ü‘ØÚÐ]ÛœÊBˆYˆ
+]ÛˆOH[ŠHÙ[™\˜]Ü‘ØÚÔÝš\œ™[[Ý™PÚ[ÛÛ\Û™[
+]Û‹™Ù]
+
+JNÂˆÙ[™\˜]Ü‘ØÚÐ]ÛœË˜ÛX\Š
+NÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆ›Üˆ
+[[™^HÈ[™^˜XÚÜËœÚ^™J
+NÈ
+ÊÚ[™^
+BˆÂˆ]]È]ÛˆHÝŽ›XZÙWÝ[š\]YOXÙNŽ•^]ÛŠ˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]˜[YJ
+JNÂˆ]Û‹OœÙ]ÛÛ\
+”Ù[XÝ[™™\ÝÜ™Hˆ
+È˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+KO™Ù]˜[YJ
+JNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠÍ‹LË
+JNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ˜]Û“ÛÛÛÝ\’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠ‹LL‹LÎJJNÂˆ]Û‹OœÙ]ÛÛÝ\ŠXÙNŽ•^]ÛŽŽ^ÛÛÝ\“Ù™’YXÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒ‹Œ‹ŒÍŠJNÂˆ]Û‹OœÙ]ÛXÚÚ[™ÕÙÙÛ\ÔÝ]J˜[ÙJNÂˆ]Û‹OœÙ]ÙÙÛTÝ]J[™^OH˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]Û‹O›ÛÛXÚÈHÝ\Ë[™^BˆÂˆYˆ
+˜XÚÔÙ[XÝÜ‹™Ù]Ù[XÝYY
+
+HOH[™^
+ÈJBˆ˜XÚÔÙ[XÝÜ‹œÙ]Ù[XÝYY
+[™^
+ÈKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÙ[XÝ[œÝ[Y[˜XÚÊ
+NÂˆ[Ù[™\˜]ÜœÓZ[š[Z^™YH˜[ÙNÂˆÙ[™\˜]ÜÛÛ\ÙYH˜[ÙNÂˆX[›Ô›ÛX^[Z^™YH˜[ÙNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ŠHX[›Ô›ÛÚ[™ÝËOœÙ]š\ÚX›J˜[ÙJNÂˆYˆ
+\X[›Ô›Û™\ÝÜ™P›Ý[™Ëš\Ñ[\J
+JHÙ[™\˜]Ü”[™[›Ý[™ÈHX[›Ô›Û™\ÝÜ™P›Ý[™ÎÂˆX[›Ô›Û]Û‹œÙ]]Û•^
+”PS“È“ÓŠNÂˆYˆ
+Ù[™\˜]Ü”[™[›Ý[™Ëš\Ñ[\J
+JBˆÙ[™\˜]Ü”[™[›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJL
+Kœ™YXÙY
+ML
+BˆÚ]Ú^™RÙY\[™ÐÙ[™JXÙNŽš›Z[ŠLÙ]ÚY
+
+HHŽ
+KXÙNŽš›Z[ŠMŒÙ]ZYÚ
+
+HHML
+JNÂˆ™\Ú^™Y
+
+NÂˆœš[™ÑÙ[™\˜]Ü•Ñœ›Û
+
+NÂˆNÂˆÙ[™\˜]Ü‘ØÚÔÝš\˜Y[™XZÙUš\ÚX›J
+˜]ÛŠNÂˆÙ[™\˜]Ü‘ØÚÐ]ÛœËœ\ÚØ˜XÚÊÝŽ›[Ý™J]ÛŠJNÂˆBˆÙ[™\˜]Ü‘ØÚÕšY]ÜÜœÙ]š\ÚX›JYÙ[™\˜]Ü‘ØÚÐ]ÛœË™[\J
+JNÂˆ™\Ú^™Y
+
+NÂˆB‚ˆ›ÚYœš[™ÑÙ[™\˜]Ü•Ñœ›Û
+
+BˆÂˆYˆ
+XÝ]™R[œÝ[Y[Y]ÜˆOH[ˆ	‰ˆXÝ]™R[œÝ[Y[Y]Ü‹Oš\Õš\ÚX›J
+JBˆXÝ]™R[œÝ[Y[Y]Ü‹OÑœ›Û
+˜[ÙJNÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ˆ	‰ˆX[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JBˆX[›Ô›ÛÚ[™ÝËOÑœ›Û
+˜[ÙJNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›˜[šÐ]ÛœÊH]Û‹OÑœ›Û
+˜[ÙJNÂˆ›Üˆ
+]]Éˆ]Ûˆˆ]\›”ÛÝ]ÛœÊH]Û‹OÑœ›Û
+˜[ÙJNÂˆ›Üˆ
+]]ÊˆÛÛ›ÛˆÝŽ˜\œ˜^OXÙNŽÛÛ\Û™[
+‹MˆÂˆ	œX[›Ô›Û]Û‹	™Ù[™\˜]Ü“]]P]Û‹	™Ù[™\˜]Ü”ÛÛÐ]Û‹	™Ù[™\˜]Ü”Ù][™ÜÐ]Û‹ˆ	œ]\›”™\Ù]Ù[XÝÜ‹	›Ü[”™\Ù]]Û‹	œØ]™T™\Ù]]Û‹	œ]\›“[™ÝÝÛ]Û‹ˆ	œ]\›“[™Ý\Ü^K	œ]\›“[™Ý\]Û‹	˜XÚÔÙ[XÝÜ‹ˆ	™Ù[™\˜]ÜÛÛ\ÙP]Û‹	™Ù[™\˜]Ü‘˜YÒ[™K	™Ù[™\˜]Ü”™\Ú^™R[™HJBˆÛÛ›ÛOÑœ›Û
+˜[ÙJNÂˆB‚ˆ›ÚY\]QÙ[™\˜]Ü‘ØÚÔÙ[XÝ[ÛŠ
+BˆÂˆÛÛœÝ]]È˜XÚÜÈHY]OH[ˆÈÙ]Ù[™\˜]Ü•˜XÚÜÊ
+HˆXÙNŽ\œ˜^ONŽ]Y[Õ˜XÚÊžßNÂˆÛÛœÝ]]ÈÙ[XÝYH˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆ›Üˆ
+[HHÈHÝ]X×ØØ\Ý[ŠÙ[™\˜]Ü‘ØÚÐ]ÛœËœÚ^™J
+JNÈ
+ÊÚJBˆÙ[™\˜]Ü‘ØÚÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠJWKOœÙ]ÙÙÛTÝ]JHOHÙ[XÝYXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚYÙ[XÝ[œÝ[Y[˜XÚÊ
+BˆÂˆYˆ
+™Yœ™\Ú[™Õ˜XÚÔÙ[XÝÜˆY]OH[ŠH™]\›ŽÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆÛÛœÝ]]È[™^H˜XÚÔÙ[XÝÜ‹™Ù]Ù[XÝYY
+
+HHNÂˆYˆ
+[™^[™^H˜XÚÜËœÚ^™J
+JH™]\›ŽÂˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠBˆÂˆÛÛœÝ]]È™]š[Ý\Ò[™^H˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊNÂˆYˆ
+XÙNŽš\ÔÜÚ]]™P[™™[ÝÊ™]š[Ý\Ò[™^›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JJBˆÂˆÛÛœÝ]]È™]š[Ý\Õ˜XÚÒYH›Ú™XÝ™Ù]˜XÚÒY
+™]š[Ý\Ò[™^
+NÂˆYˆ
+›Ú™XÝ™Ù]˜XÚÔÙ[XÝY]\›’[™^
+™]š[Ý\Õ˜XÚÒY
+HOHÙ[XÝY]\›’[™^
+
+JBˆÂˆ›Ú™XÝœÙ]˜XÚÔÙ[XÝY]\›’[™^
+™]š[Ý\Õ˜XÚÒYÙ[XÝY]\›’[™^
+
+JNÂˆ\Ñ\HHYNÂˆBˆBˆBˆ[œÝ[Y[˜XÚÈH˜XÚÜË™Ù][˜ÚXÚÙY
+[™^
+NÂˆÛÛœÝ]]È™[Y[X™\™Y]\›ˆH›Ú™XÝ™Ù]˜XÚÔÙ[XÝY]\›’[™^
+›Ú™XÝ™Ù]˜XÚÒY
+[™^
+JNÂˆÙ[XÝY˜[šÒ[™^H™[Y[X™\™Y]\›ˆÈ›Ú™XÝØÝ[Y[Žœ]\›œÔ\˜[šÎÂˆÙ[XÝYÛÝ[™^H™[Y[X™\™Y]\›ˆ	H›Ú™XÝØÝ[Y[Žœ]\›œÔ\˜[šÎÂˆ›Üˆ
+[]Û’[™^HÈ]Û’[™^È
+ÊØ]Û’[™^
+BˆÂˆ]\›˜[šÐ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ]Û’[™^
+WKOœÙ]ÙÙÛTÝ]J]Û’[™^OHÙ[XÝY˜[šÒ[™^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\›”ÛÝ]ÛœÖÜÝ]X×ØØ\ÝÚ^™WÝŠ]Û’[™^
+WKOœÙ]ÙÙÛTÝ]J]Û’[™^OHÙ[XÝYÛÝ[™^XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆBˆ[Ù[™\˜]ÜœÓZ[š[Z^™YH˜[ÙNÂˆYˆ
+Ù[™\˜]ÜÛÛ\ÙY
+BˆÂˆÙ[™\˜]ÜÛÛ\ÙYH˜[ÙNÂˆYˆ
+Y^[™YÙ[™\˜]Ü›Ý[™Ëš\Ñ[\J
+JHÙ[™\˜]Ü”[™[›Ý[™ÈH^[™YÙ[™\˜]Ü›Ý[™ÎÂˆÙ[™\˜]ÜÛÛ\ÙP]Û‹œÙ]]Û•^
+¸¢$ˆŠNÂˆBˆYˆ
+Ù[™\˜]Ü”[™[›Ý[™Ëš\Ñ[\J
+JBˆÙ[™\˜]Ü”[™[›Ý[™ÈHÙ]ØØ[›Ý[™Ê
+KÚ]š[[YYÜ
+ŠKÚ]š[[YY›ÝÛJL
+Kœ™YXÙY
+ML
+BˆÚ]Ú^™RÙY\[™ÐÙ[™JXÙNŽš›Z[ŠLÙ]ÚY
+
+HHŽ
+KXÙNŽš›Z[ŠMŒÙ]ZYÚ
+
+HHML
+JNÂˆ]\›Û\H[ŽÂˆ›Üˆ
+[HHÈH[œÝ[Y[˜XÚËO™Ù][U˜XÚÒ][\Ê
+NÈ
+ÊÚJBˆYˆ
+]]ÊˆÛ\H[˜[ZX×ØØ\ÝNŽ“ZYPÛ\
+Š[œÝ[Y[˜XÚËO™Ù]˜XÚÒ][JJJJBˆÂˆ]\›Û\HÛ\Âˆœ™XZÎÂˆBˆ\]PXÝ]™R[œÝ[Y[Y]ÜŠ
+NÂˆ™XY]\›”Ý\Ê
+NÂˆ™Yœ™\ÚX[›Ô›Û]]ÛX][Û•\™Ù]Ê
+NÂˆ˜XÚÔÙ[XÝÜ‹œÙ]š\ÚX›JYJNÂˆ™Yœ™\ÚZ^\ÛÛ›ÛÊ
+NÂˆYˆ
+^[\ÝÚ[™ÝÈOH[ŠH^[\ÝÚ[™ÝËOœ™Yœ™\Ú
+
+NÂˆ\]QÙ[™\˜]Ü‘ØÚÔÙ[XÝ[ÛŠ
+NÂˆœš[™ÑÙ[™\˜]Ü•Ñœ›Û
+
+NÂˆÝ]\ËœÙ]^
+”Ù[XÝYˆ
+È[œÝ[Y[˜XÚËO™Ù]˜[YJ
+H
+È‹ˆ]\›ˆ˜[šÈKRKN\È™XYKˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY\]PXÝ]™R[œÝ[Y[Y]ÜŠ
+BˆÂˆYˆ
+XÝ]™R[œÝ[Y[Y]ÜˆOH[ŠBˆÂˆ™[[Ý™PÚ[ÛÛ\Û™[
+XÝ]™R[œÝ[Y[Y]Ü‹™Ù]
+
+JNÂˆXÝ]™R[œÝ[Y[Y]Ü‹œ™\Ù]
+
+NÂˆBˆYˆ
+[œÝ[Y[˜XÚÈOH[ŠH™]\›ŽÂ‚ˆ›Üˆ
+]]ÊˆYÚ[ˆˆ[œÝ[Y[˜XÚËOœYÚ[“\Ý
+BˆÂˆYˆ
+]]Êˆ^\›˜[H[˜[ZX×ØØ\ÝNŽ‘^\›˜[YÚ[ŠŠYÚ[ŠJBˆÂˆXÝ]™R[œÝ[Y[Y]ÜˆHÝŽ›XZÙWÝ[š\]YOÜ˜š]YÚ[‘Y]ÜÛÛ[Š
+™^\›˜[
+NÂˆY[™XZÙUš\ÚX›J
+˜XÝ]™R[œÝ[Y[Y]ÜŠNÂˆXÝ]™R[œÝ[Y[Y]Ü‹O˜Y[Ý\ÙS\Ý[™\Š\ËYJNÂˆ™\Ú^™Y
+
+NÂˆYˆ
+X[›Ô›ÛÚ[™ÝÈOH[ˆ	‰ˆX[›Ô›ÛÚ[™ÝËOš\Õš\ÚX›J
+JBˆX[›Ô›ÛÚ[™ÝËOÑœ›Û
+˜[ÙJNÂˆ™]\›ŽÂˆBˆBˆ™\Ú^™Y
+
+NÂˆB‚ˆ›ÚY]XÚ˜XÚÓY]\Š
+BˆÂˆYˆ
+˜XÚÓY]\ˆOH[ŠBˆ˜XÚÓY]\‹O›YX\Ý\™\‹œ™[[Ý™PÛY[
+˜XÚÓY]\ÛY[
+NÂˆ˜XÚÓY]\ˆH[ŽÂˆ˜XÚÓY]\ÛY[œ™\Ù]
+
+NÂˆB‚ˆ›ÚY]XÚ˜XÚÓY]\Š
+BˆÂˆ]]Êˆ™^Y]\ˆH[œÝ[Y[˜XÚÈOH[ˆÈ[œÝ[Y[˜XÚËO™Ù]]™[Y]\”YÚ[Š
+Hˆ[ŽÂˆYˆ
+™^Y]\ˆOH˜XÚÓY]\ŠH™]\›ŽÂˆ]XÚ˜XÚÓY]\Š
+NÂˆ˜XÚÓY]\ˆH™^Y]\ŽÂˆYˆ
+˜XÚÓY]\ˆOH[ŠBˆ˜XÚÓY]\‹O›YX\Ý\™\‹˜YÛY[
+˜XÚÓY]\ÛY[
+NÂˆB‚ˆ›ÚY\]SY]\”Ý]\Ê
+BˆÂˆYˆ
+˜XÚÓY]\ˆOH[ŠBˆÂˆ\Ü^YYY]\”XZÑˆHLLŒŽÂˆY]\”Ý]\ËœÙ]^
+•˜XÚÈÝ]]ˆ›È[œÝ[Y[Y]\ˆ‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆB‚ˆÛÛœÝ]]ÈYˆH˜XÚÓY]\ÛY[™Ù][™ÛX\]Y[Ó]™[
+
+K™ŽÂˆÛÛœÝ]]ÈšYÚˆH˜XÚÓY]\ÛY[™Ù][™ÛX\]Y[Ó]™[
+JK™ŽÂˆÛÛœÝ]]ÈXZÑˆHXÙNŽš›X^
+Y‹šYÚŠNÂˆ]]ÊˆÙ][™ÜÈH\XØ][Û”›Ü\Y\Ë™Ù]\Ù\”Ù][™ÜÊ
+NÂˆÛÛœÝ]]ÈXØ^HHÙ][™ÜÈOH[ˆÈXÙNŽš›[Z]
+KLÙ][™ÜËO™Ù][˜[YJQXØ^H‹ÍJJHˆÍNÂˆÛÛœÝ]]È\]T˜]HHÙ][™ÜÈOH[ˆÈXÙNŽš›[Z]
+‹ŒÙ][™ÜËO™Ù][˜[YJ\]T˜]Rˆ‹Ì
+JHˆÌÂˆ\Ü^YYY]\”XZÑˆHXÙNŽš›X^
+XZÑ‹\Ü^YYY]\”XZÑˆHŒŒˆ
+ˆ
+XØ^HÈLŒŠHÈ\]T˜]JNÂˆYˆ
+\Ü^YYY]\”XZÑˆˆNLŒŠBˆY]\”Ý]\ËœÙ]^
+•˜XÚÈÝ]]ˆ]Y[ÈÚYÛ˜[]XÝY0­ÈXZÈˆ
+ÈXÙNŽ”Ýš[™Ê\Ü^YYY]\”XZÑ‹JH
+Èˆ‘”È‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ[ÙBˆY]\”Ý]\ËœÙ]^
+•˜XÚÈÝ]]ˆ›È™XÙ[]Y[ÈXÝ]š]H‹XÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆB‚ˆ›ÚY™Yœ™\Ú›Ú™XÝšY]ÊÛÛœÝXÙNŽ”Ýš[™ÉˆY\ÜØYÙJBˆÂˆÝ]\ËœÙ]^
+Y\ÜØYÙKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÛœÝ›ÛÛ™XYHH\Ô›Ú™XÝ	‰ˆY]OH[ŽÂˆØ]™P]Û‹œÙ][˜X›Y
+™XYJNÂˆZYQ^Ü]Û‹œÙ][˜X›Y
+™XYH	‰ˆ\Ô]\›ˆ	‰ˆ]\›Û\OH[ŠNÂˆY˜XÚÐ]Û‹œÙ][˜X›Y
+™XYJNÂˆ]\›]Û‹œÙ][˜X›Y
+™XYJNÂˆ^[\Ý]Û‹œÙ][˜X›Y
+™XYJNÂˆZ^\]Û‹œÙ][˜X›Y
+™XYJNÂˆX\Ý\]Û‹œÙ][˜X›Y
+™XYJNÂˆ[\ÓX™[œÙ][˜X›Y
+™XYJNÂˆ[\ÔÛY\‹œÙ][˜X›Y
+™XYJNÂˆÝÜ]Û‹œÙ][˜X›Y
+™XYJNÂˆÛÜ]Û‹œÙ][˜X›Y
+™XYJNÂˆÛÜÝ\ÛY\‹œÙ][˜X›Y
+™XYJNÂˆÛÜ[™ÝÛY\‹œÙ][˜X›Y
+™XYJNÂˆY]›Û›ÛYP]Û‹œÙ][˜X›Y
+™XYJNÂˆYˆ
+™XYJBˆÂˆ[\ÔÛY\‹œÙ]˜[YJ›Ú™XÝ™Ù][š]X[[\ÐœJ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÜÝ\ÛY\‹œÙ]˜[YJ›Ú™XÝ™Ù]ÛÜÝ\˜\Š
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÜ[™ÝÛY\‹œÙ]˜[YJ›Ú™XÝ™Ù]ÛÜ[™Ý˜\œÊ
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÜ]Û‹œÙ]ÙÙÛTÝ]J›Ú™XÝš\ÓÛÜ[˜X›Y
+
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆY]›Û›ÛYP]Û‹œÙ]ÙÙÛTÝ]JY]O˜ÛXÚÕ˜XÚÑ[˜X›Y™Ù]
+
+KXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆÛÛœÝ]]ÈY]\ˆH›Ú™XÝ™Ù][š]X[[YTÚYÛ˜]\™J
+NÂˆ[YTÚYÛ˜]\™SX™[œÙ]^
+XÙNŽ”Ýš[™ÊY]\‹›[Y\˜]ÜŠH
+È‹Èˆ
+ÈXÙNŽ”Ýš[™ÊY]\‹™[›ÛZ[˜]ÜŠKˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ\]SÛÜ˜[™ÙJ
+NÂˆYˆ
+Z^\•Ú[™ÝÈOH[ŠBˆÂˆÛÛœÝ]]È˜XÚÜÈHÙ]Ù[™\˜]Ü•˜XÚÜÊ
+NÂˆZ^\•Ú[™ÝËOœ™Yœ™\Ú
+˜XÚÜËš[™^ÙŠ[œÝ[Y[˜XÚÊJNÂˆBˆBˆ^P]Û‹œÙ][˜X›Y
+™XYH	‰ˆ[œÝ[Y[˜XÚÈOH[ŠNÂˆYˆ
+\™XYJBˆÂˆ›Ú™XÝ]Z[ËœÙ]^
+ßKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\ÚXØ[]Z[ËœÙ]^
+ßKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™]\›ŽÂˆBˆÛÛœÝ]]ÈY]\ˆH›Ú™XÝ™Ù][š]X[[YTÚYÛ˜]\™J
+NÂˆ›Ú™XÝ]Z[ËœÙ]^
+”›Ú™XÝˆˆ
+È›Ú™XÝ™Ù]˜[YJ
+H
+Èˆ0­ÈQˆˆ
+È›Ú™XÝ™Ù]›Ú™XÝY
+
+Bˆ
+È
+\Ñ\HÈˆ0­È[œØ]™YˆˆˆŠKXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ]\ÚXØ[]Z[ËœÙ]^
+•˜XÚÜÎˆˆ
+ÈXÙNŽ”Ýš[™Ê›Ú™XÝ™Ù]˜XÚÐÛÝ[
+
+JH
+Èˆ0­È‚ˆ
+ÈXÙNŽ”Ýš[™Ê›Ú™XÝ™Ù][š]X[[\ÐœJ
+KJH
+Èˆ”H0­È‚ˆ
+ÈXÙNŽ”Ýš[™ÊY]\‹›[Y\˜]ÜŠH
+È‹Èˆ
+ÈXÙNŽ”Ýš[™ÊY]\‹™[›ÛZ[˜]ÜŠBˆ
+Èˆ0­ÈZ[Z[ˆÔÐÈ0­È]\›ˆÛÝÈ\ˆ[œÝ[Y[
+LKR
+H‹ˆXÙNŽ™ÛÙ[™›ÝYšXØ][ÛŠNÂˆ™\Ú^™Y
+
+NÂˆB‚ˆ›ÚYÚÝÑ\œ›ÜŠÛÛœÝXÙNŽ”Ýš[™Éˆ]U^ÛÛœÝXÙNŽ”Ýš[™ÉˆY\ÜØYÙJBˆÂˆXÙNŽ[\Ú[™ÝÎŽœÚÝÓY\ÜØYÙP›Þ\Þ[˜ÊXÙNŽ“Y\ÜØYÙP›ÞXÛÛ•\NŽ•Ø\›š[™ÒXÛÛ‹]U^Y\ÜØYÙJNÂˆB‚ˆNŽ‘[™Ú[™H[™Ú[™NÂˆXÙNŽ\XØ][Û”›Ü\Y\È\XØ][Û”›Ü\Y\ÎÂˆÝŽ[š\]YWÜXÙNŽ•ÛÛ\Ú[™ÝÏˆÛÛ\Ú[™ÝÎÂˆXÙNŽZ[Ìˆ\Ý]]ÔØ]™S\ÈHÂˆ›Ø]\Ü^YYY]\”XZÑˆHLLŒŽÂˆ[ZYP]Y][Û“›ÝSÛœÈHÂˆXÙNŽ”Ýš[™È\ÝZYPXÝ]š]NÂˆÝŽ[š\]YWÜNŽ‘Y]ˆY]ÂˆNŽ]Y[Õ˜XÚÊˆ[œÝ[Y[˜XÚÈH[ŽÂˆNŽ]Y[Õ˜XÚÊˆ]Y][Û•˜XÚÈH[ŽÂˆNŽ“ZYPÛ\
+ˆ]\›Û\H[ŽÂˆNŽ“]™[Y]\”YÚ[Šˆ˜XÚÓY]\ˆH[ŽÂˆNŽ“]™[YX\Ý\™\ŽŽÛY[˜XÚÓY]\ÛY[Âˆ›Ú™XÝØÝ[Y[›Ú™XÝÂˆ›ÛÛ\Ô›Ú™XÝH˜[ÙNÂˆ›ÛÛ\Ñ\HH˜[ÙNÂˆ›ÛÛX[›Ô›ÛÙ\Ý\™PXÝ]™HH˜[ÙNÂˆ›ÛÛX[›Ô›ÛÙ\Ý\™PÚ[™ÙYH˜[ÙNÂˆ›ÛÛ]Y][Û”]\›”^X˜XÚÈH˜[ÙNÂˆ›ÛÛ\Ô]\›ˆH˜[ÙNÂˆ›ÛÛ™Yœ™\Ú[™Õ˜XÚÔÙ[XÝÜˆH˜[ÙNÂˆ›ÛÛ[›Ý\ÔÙ[XÝYH˜[ÙNÂˆ›ÛÛÙ[™\˜]ÜÛÛ\ÙYH˜[ÙNÂˆ›ÛÛ[Ù[™\˜]ÜœÓZ[š[Z^™YH˜[ÙNÂˆ›ÛÛX[›Ô›ÛØ\Õš\ÚX›UÚ[ÛÛ\ÙYH˜[ÙNÂˆ›ÛÛX[›Ô›ÛX^[Z^™YH˜[ÙNÂˆXÙNŽ”™XÝ[™ÛO[ˆX[›Ô›Û™\ÝÜ™P›Ý[™ÎÂˆXÙNŽ”™XÝ[™ÛO[ˆ^[™YÙ[™\˜]Ü›Ý[™ÎÂˆÝ]XÈÛÛœÝ^ˆ[Z[š[][T]ÚHÈËÈÌÂˆÝ]XÈÛÛœÝ^ˆ[X^[][T]ÚHÈËÈÍ‚ˆÝŽ˜\œ˜^OÝŽ˜\œ˜^O›ÛÛ‹X^[][T]ÚHZ[š[][T]Ú
+ÈOˆ›ÝQÜšYßNÂˆÝŽ˜\œ˜^OÝŽ[š\]YWÜXÙNŽ•^]Û‹MˆÝ\ÎÂˆÝŽ˜\œ˜^OÝŽ[š\]YWÜXÙNŽ•^]Û‹ˆ]\›˜[šÐ]ÛœË]\›”ÛÝ]ÛœÎÂˆÝŽ™XÝÜ[™Ñ[žOˆ[™Ò\ÝÜžK™YÒ\ÝÜžNÂˆ]\›Û\›Ø\™]\›Û\›Ø\™Âˆ[˜[™ÛQ[œÚ]T\˜Ù[HNÂˆ[˜[™ÛT]ÚÝÈHÂˆ[˜[™ÛT]ÚYÚHÂˆ[Ù[XÝY˜[šÒ[™^HÂˆ[Ù[XÝYÛÝ[™^HÂˆ^X˜XÚÓ[ÙH^X˜XÚÓ[ÙHH^X˜XÚÓ[ÙNŽœ]\›ŽÂˆXÙNŽÛÛX›Ð›Þ]ÚÙ[XÝÜŽÂˆX[›Ô›Û]ÛˆX[›Ô›Û]ÛŽÂˆXÙNŽÛÛX›Ð›Þ]\›”™\Ù]Ù[XÝÜŽÂˆXÙNŽ“X™[]\›“[™Ý\Ü^NÂˆXÙNŽ•^]Ûˆ]\›“[™ÝÝÛ]Û‹]\›“[™Ý\]ÛŽÂˆXÙNŽÛÛX›Ð›Þ˜XÚÔÙ[XÝÜŽÂˆXÙNŽ”ÛY\ˆ]™[ÛY\‹[”ÛY\ŽÂˆXÙNŽ”ÛY\ˆ[\ÔÛY\ŽÂˆXÙNŽ”ÛY\ˆÛÜÝ\ÛY\‹ÛÜ[™ÝÛY\ŽÂˆÜ˜š]]Y][Û’Ù^X›Ø\™]Y][Û’Ù^X›Ø\™ÂˆXÙNŽ“X™[]KÝ]\Ë›Ú™XÝ]Z[Ë]\ÚXØ[]Z[Ë]Y[Ñ]Z[Ë]\›•]Kˆ\œ˜[™Ù[Y[]KZ^\•]K]™[X™[[“X™[Y]\”Ý]\ËZ[X™[[\ÓX™[ˆÛÜÝ\X™[ÛÜ[™ÝX™[[YTÚYÛ˜]\™SX™[ÂˆÙ[™\˜]Ü‘˜YÓX™[Ù[™\˜]Ü‘˜YÒ[™NÂˆÙ[™\˜]Ü”™\Ú^™R[™HÙ[™\˜]Ü”™\Ú^™R[™NÂˆZ^\“[Ý™R[™HZ^\“[Ý™R[™NÂˆÙ[™\˜]Ü”™\Ú^™R[™HZ^\”™\Ú^™R[™HÈ”™\Ú^™HZ^\ˆˆNÂˆXÙNŽ•^]ÛˆÙ[™\˜]ÜÛÛ\ÙP]ÛŽÂˆXÙNŽ•šY]ÜÜÙ[™\˜]Ü‘ØÚÕšY]ÜÜÂˆXÙNŽÛÛ\Û™[Ù[™\˜]Ü‘ØÚÔÝš\ÂˆÝŽ™XÝÜÝŽ[š\]YWÜXÙNŽ•^]ÛˆÙ[™\˜]Ü‘ØÚÐ]ÛœÎÂˆ[ÙTÙ[XÝÜ]Ûˆ]\›“[ÙP]Û‹ÛÛ™Ó[ÙP]ÛŽÂˆXÙNŽ•^]Ûˆ™]Ô›Ú™XÝ]Û‹Ü[]Û‹Ø]™P]Û‹ZYQ^Ü]Û‹]Y[ÔÙ][™ÜÐ]Û‹Y˜XÚÐ]Û‹ˆ]\›]Û‹š[SY[P]Û‹Y]Y[P]Û‹šY]ÓY[P]Û‹[œÙ\Y[P]Û‹Ü[ÛœÓY[P]Û‹ˆÚ[™ÝÓY[P]Û‹[Y[P]Û‹ÛÜ]Û‹Y]›Û›ÛYP]ÛŽÂˆÛÛ˜\]Ûˆ^[\Ý]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽœ^[\ÝK^P]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽœ^_KˆÝÜ]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽœÝÜKZ^\]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽ›Z^\ŸKˆX\Ý\]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽ›X\Ý\ŸK™XÛÜ™]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽœ™XÛÜ™Kˆ™]Ú[™]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽœ™]Ú[™K™]š[Ý\Ð]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽœ™]š[Ý\ßKˆ™^]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽ›™^KÙ[™\˜]Ü“]]P]Û‹Ù[™\˜]Ü”ÛÛÐ]Û‹ˆÙ[™\˜]Ü”Ù][™ÜÐ]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽœÙ][™ÜßKÜ[”™\Ù]]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽ›Ü[ŸKˆØ]™T™\Ù]]ÛžÕÛÛ˜\]ÛŽŽ”Þ[X›ÛŽœØ]™_NÂˆÝ]]Y]\‘\Ü^HÝ]]Y]\ŽÂˆÝŽ[š\]YWÜXÙNŽ‘š[PÚÛÜÙ\ˆš[PÚÛÜÙ\ŽÂˆÝŽ[š\]YWÜ]Y[ÔÙ][™ÜÕÚ[™ÝÏˆ]Y[ÔÙ][™ÜÕÚ[™ÝÎÂˆÝŽ[š\]YWÜÙX\˜Ú]ÕÚ[™ÝÏˆØ[\T]ÕÚ[™ÝËœÝ]ÕÚ[™ÝÎÂˆÝŽ[š\]YWÜœÝÒ[œÝ[Y[œ›ÝÜÙ\ˆœÝÒ[œÝ[Y[œ›ÝÜÙ\ŽÂˆXÙNŽ\œ˜^OXÙNŽ”YÚ[‘\ØÜš\[ÛˆœÝÓY[Q\ØÜš\[ÛœÎÂˆÝŽ[š\]YWÜ^[\ÝÚ[™ÝÏˆ^[\ÝÚ[™ÝÎÂˆÝŽ[š\]YWÜZ^\•Ú[™ÝÏˆZ^\•Ú[™ÝÎÂˆÝŽ[š\]YWÜX[›Ô›ÛÚ[™ÝÏˆX[›Ô›ÛÚ[™ÝÎÂˆÝŽ[š\]YWÜNŽ”YÚ[ŽŽ‘Y]ÜÛÛ\Û™[ˆXÝ]™R[œÝ[Y[Y]ÜŽÂˆÝŽ[š\]YWÜ\]X[\Ù\•Ú[™ÝÏˆ\]X[\Ù\•Ú[™ÝÎÂˆXÙNŽ”™XÝ[™ÛO[ˆÙ[™\˜]Ü”[™[›Ý[™ËÙ[™\˜]Ü’[œÝ[Y[›Ý[™ËÙ[™\˜]Ü”™\Ú^™TÝ\ÂˆXÙNŽ”™XÝ[™ÛO[ˆX[›Ô›Û›Ý[™ÎÂˆXÙNŽ”Ú[[ˆÙ[™\˜]Ü‘˜YÓÙ™œÙ]Ù[™\˜]Ü‘˜YÔÝ\Ù[™\˜]Ü‘˜YÔÝ\ÜÚ][ÛŽÂˆXÙNŽ”™XÝ[™ÛO[ˆZ^\”[™[›Ý[™ËZ^\”™\Ú^™TÝ\›Ý[™ÎÂˆXÙNŽ”Ú[[ˆZ^\‘˜YÓÙ™œÙ]Z^\”™\Ú^™TÝ\Âˆ›ÛÛ˜YÙÚ[™ÑÙ[™\˜]ÜˆH˜[ÙK™\Ú^š[™ÑÙ[™\˜]ÜˆH˜[ÙK^[\ÝZ[Ù\Ý\™PXÝ]™HH˜[ÙNÂˆ›ÛÛZ^\›Ý[™Ò[š]X[\ÙYH˜[ÙK˜YÙÚ[™ÓZ^\ˆH˜[ÙK™\Ú^š[™ÓZ^\ˆH˜[ÙNÂˆ›ÛÛÚÝÒ[ÈHYNÂŸNÂ‚˜Û\ÜÈXZ[•Ú[™ÝÈš[˜[ˆX›XÈXÙNŽ‘ØÝ[Y[Ú[™ÝÂžÂœX›XÎ‚ˆ^XÚ]XZ[•Ú[™ÝÊXÙNŽ’•PÑP\XØ][Û‰ˆ\XØ][ÛŠBˆˆØÝ[Y[Ú[™ÝÊ“Ü˜š]‹XÙNŽÛÛÝ\ŽŽ™œ›ÛT‘ÐŠŒŽKÎ
+KXÙNŽ‘ØÝ[Y[Ú[™ÝÎŽ˜[]ÛœÊK\
+\XØ][ÛŠBˆÂˆÙ]\Ú[™Ó˜]]™U]P˜\ŠYJNÂˆÙ]ÛÛ[ÝÛ™Y
+™]È›Ú™XÝšY]Ê
+KYJNÂˆÙ]™\Ú^˜X›JYKYJNÂˆÙ[™UÚ]Ú^™JLŒŒÍŒ
+NÂˆÙ]š\ÚX›JYJNÂˆBˆ›ÚYÛÜÙP]Û”™\ÜÙY
+
+HÝ™\œšYHÈ\œÞ\Ý[T™\]Y\ÝY]Z]
+
+NÈBœš]˜]N‚ˆXÙNŽ’•PÑP\XØ][Û‰ˆ\ÂŸNÂ‚˜Û\ÜÈÜ˜š]\XØ][Ûˆš[˜[ˆX›XÈXÙNŽ’•PÑP\XØ][Û‚žÂœX›XÎ‚ˆÛÛœÝXÙNŽ”Ýš[™ÈÙ]\XØ][Û“˜[YJ
+HÝ™\œšYHÈ™]\›ˆ“Ü˜š]ŽÈBˆÛÛœÝXÙNŽ”Ýš[™ÈÙ]\XØ][Û•™\œÚ[ÛŠ
+HÝ™\œšYHÈ™]\›ˆŒŒËÎHŽÈBˆ›ÚY[š]X[\ÙJÛÛœÝXÙNŽ”Ýš[™ÉŠHÝ™\œšYBˆÂˆ[œÝ[Ü˜š]Ü˜\Ú™\Ü[™\Š
+NÂˆXZ[•Ú[™ÝÈHÝŽ›XZÙWÝ[š\]YOXZ[•Ú[™ÝÏŠ
+\ÊNÂˆBˆ›ÚYÚ]ÝÛŠ
+HÝ™\œšYHÈXZ[•Ú[™ÝËœ™\Ù]
+
+NÈBœš]˜]N‚ˆÝŽ[š\]YWÜXZ[•Ú[™ÝÏˆXZ[•Ú[™ÝÎÂŸNÂŸB‚”ÕT•Ò•PÑWÐTPÐUSÓŠÜ˜š]\XØ][ÛŠB

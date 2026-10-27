@@ -1,93 +1,73 @@
-#pragma once
+YЄзЉxі¬uз%j·ќВ+ar‰м¶л•л_ўєЮjЛ"‚v›•лЪ®&›•лЬYЫXHЫЩB‚€Ъ[ЫYHќXЩRXY\‹љ‚€Ъ[ЫYHЬ[Ы[‚‚‹ЛИЬљ]	ЬИЫ‹Y\ЪИ›Ъ™XЭШЭ[Y[ќ\ИЩ\Щ\\]Hњ›ЫHXЪЭ[Ы€[™Ъ[™IЬВ‹ЛИY][Щ[ЫИH›Ъ™XЭШЪ[XHШ[€™[XZ[€ЭX›HY€H[™Ъ[™HЪ[™Щ\Л‚Ы\ЬИ›Ъ™XЭШЭ[Y[ќћВњX›XО‚€Э]XИЫЫњЭ^€[ќЭ\њ™[ќШЪ[XU™\њЪ[Ы€HВ€Э]XИЫЫњЭ^€[ќXЪЬФ\”]X\ќ\“›ЭHHMЊВ€Э]XИЫЫњЭ^€[ќ]\›ђ[љРЫЭ[ќHВ€Э]XИЫЫњЭ^€[ќ]\›њФ\ђ[љИHВ€Э]XИЫЫњЭ^€[ќ]\›”ЫЭЫЭ[ќH]\›ђ[љРЫЭ[ќ
+€]\›њФ\ђ[љОВ‚€[ќ[HЫ\ЬИXЪТЪ[™€В€[њЭќ[Y[ќ€ZYK€]Y[В€NВ‚€ЭќXЭ[YTЪYЫ]\™B€В€[ќќ[Y\]Ь€HВ€[ќ[›ЫZ[]Ь€HВ€NВ‚€ЭќXЭ]]ЫX][Ы”Ъ[ќ€В€[ќЬЪ][Ы€HИЛИЪ^Y[ќ[›ЭHЭ\И
+]\›€Ь€ЫЫ™И[Y[[™JB€›Ш][YHHЌYЋИЛИ›Ь›X[^™Y‹ЊH\[Y]\€[YB€NВ‚€ЭќXЭ]]ЫX][Ы“[™B€В€ќXЩNЋ”Эљ[™ИYЪ[“[YNВ€ќXЩNЋ”Эљ[™И\[Y]\’YВ€ќXЩNЋ”Эљ[™И\[Y]\“[YNВ€ќXЩNЋђ\њ^O]]ЫX][Ы”Ъ[ќ€Ъ[ќОВ€NВ‚€›Ъ™XЭШЭ[Y[ќ
 
-#include <JuceHeader.h>
-#include <optional>
+NВ€›Ъ™XЭШЭ[Y[ќ
+ЫЫњЭ›Ъ™XЭШЭ[Y[ќ	€Э\ЉNВ€›Ъ™XЭШЭ[Y[ќ	€Ь\]ЬЏJЫЫњЭ›Ъ™XЭШЭ[Y[ќ	€Э\ЉNВ€›Ъ™XЭШЭ[Y[ќ
+›Ъ™XЭШЭ[Y[ќ	‰ЉH›Щ^Щ\HY][В€›Ъ™XЭШЭ[Y[ќ	€Ь\]ЬЏJ›Ъ™XЭШЭ[Y[ќ	‰ЉH›Щ^Щ\HY][В‚€Э]XИ›Ъ™XЭШЭ[Y[ќЬ™X]S™]К
+NВ€Э]XИЭЋ›Ь[Ы[›Ъ™XЭШЭ[Y[ќ€ШYњ›ЫQљ[JЫЫњЭќXЩNЋ‘љ[I€љ[K€ќXЩNЋ”Эљ[™Й€\њ›ЬЉNВ‚€›ЫЫШ]™UСљ[JЫЫњЭќXЩNЋ‘љ[I€љ[KќXЩNЋ”Эљ[™Й€\њ›ЬЉNВ€›ЪYЩ][YJЫЫњЭќXЩNЋ”Эљ[™Й€[YJNВ€ќXЩNЋ”Эљ[™ИYXЪКXЪТЪ[™Ъ[™ЫЫњЭќXЩNЋ”Эљ[™Й€[YHHЯJNВ€›ЪYY[њЭќ[Y[ќXЪК
+NВ€›ЪYЩ]XЪЭ[Ы‘Y]Э]JЫЫњЭќXЩNЋ•[YU™YI€Y]Э]JNВ€ќXЩNЋ•[YU™YHЩ]XЪЭ[Ы‘Y]Э]J
+HЫЫњЭВ‚€ќXЩNЋ”Эљ[™ИЩ][YJ
+HЫЫњЭВ€ќXЩNЋ”Эљ[™ИЩ]›Ъ™XЭY
 
-// Orbit's on-disk project document is kept separate from Tracktion Engine's
-// Edit model so the project schema can remain stable if the engine changes.
-class ProjectDocument
-{
-public:
-    static constexpr int currentSchemaVersion = 2;
-    static constexpr int ticksPerQuarterNote = 960;
-    static constexpr int patternBankCount = 8;
-    static constexpr int patternsPerBank = 8;
-    static constexpr int patternSlotCount = patternBankCount * patternsPerBank;
+HЫЫњЭВ€ќXЩNЋ”Эљ[™ИЩ]\ШЬљ\[ЫЉ
+HЫЫњЭВ€›ЪYЩ]\ШЬљ\[ЫЉЫЫњЭќXЩNЋ”Эљ[™Й€\ШЬљ\[ЫЉNВ€ќXЩNЋ”Эљ[™ИЩ]Ь™X]Ь•\›
 
-    enum class TrackKind
-    {
-        instrument,
-        midi,
-        audio
-    };
+HЫЫњЭВ€›ЪYЩ]Ь™X]Ь•\›
+ЫЫњЭќXЩNЋ”Эљ[™Й€\›
+NВ€ќXЩNЋ‘љ[HЩ]љ[J
+HЫЫњЭИ™]\›€›Ъ™XЭљ[NИB€›ЫЫ\Сљ[J
+HЫЫњЭИ™]\›€›Ъ™XЭљ[K™^\ЭР\Сљ[J
+NИB€[ќЩ]XЪРЫЭ[ќ
 
-    struct TimeSignature
-    {
-        int numerator = 4;
-        int denominator = 4;
-    };
+HЫЫњЭВ€ќXЩNЋ”Эљ[™ИЩ]XЪТY
+[ќ[™^
+HЫЫњЭВ€ќXЩNЋ”Эљ[™ИЩ]XЪУ[YJ[ќ[™^
+HЫЫњЭВ€›ЪYЩ]XЪУ[YJ[ќ[™^ЫЫњЭќXЩNЋ”Эљ[™Й€[YJNВ€›ЫЫ™[[Э™UXЪК[ќ[™^
+NВ€[ќЩ]ЫЬЭ\ќ\Љ
+HЫЫњЭВ€[ќЩ]ЫЬ[™Э\њК
+HЫЫњЭВ€›ЫЫ\УЫЬ[X›Y
 
-    ProjectDocument();
-    ProjectDocument(const ProjectDocument& other);
-    ProjectDocument& operator=(const ProjectDocument& other);
-    ProjectDocument(ProjectDocument&&) noexcept = default;
-    ProjectDocument& operator=(ProjectDocument&&) noexcept = default;
-
-    static ProjectDocument createNew();
-    static std::optional<ProjectDocument> loadFromFile(const juce::File& file,
-                                                        juce::String& error);
-
-    bool saveToFile(const juce::File& file, juce::String& error);
-    void setName(const juce::String& name);
-    juce::String addTrack(TrackKind kind, const juce::String& name = {});
-    void addInstrumentTrack();
-    void setTracktionEditState(const juce::ValueTree& editState);
-    juce::ValueTree getTracktionEditState() const;
-
-    juce::String getName() const;
-    juce::String getProjectId() const;
-    juce::String getDescription() const;
-    void setDescription(const juce::String& description);
-    juce::String getCreatorUrl() const;
-    void setCreatorUrl(const juce::String& url);
-    juce::File getFile() const { return projectFile; }
-    bool hasFile() const { return projectFile.existsAsFile(); }
-    int getTrackCount() const;
-    juce::String getTrackId(int index) const;
-    juce::String getTrackName(int index) const;
-    void setTrackName(int index, const juce::String& name);
-    void setTrackMixerState(int index, double gainDb, double pan, bool muted, bool solo);
-    void setTrackSendGain(int index, int bus, double gainDb);
-    bool setFxReturnMixerState(int bus, const juce::String& channelId,
-                               const juce::String& name, double gainDb, double pan,
-                               bool muted, bool solo);
-    void setMasterMixerState(double gainDb, double pan, bool muted);
-    juce::String getPatternId(const juce::String& trackId, int slotIndex) const;
-    int getPatternIndexForId(const juce::String& trackId, const juce::String& patternId) const;
-    juce::String getPatternName(const juce::String& trackId, int slotIndex) const;
-    bool isPatternCreated(const juce::String& trackId, int slotIndex) const;
-    bool getPatternNote(const juce::String& trackId, int slotIndex, int pitch, int step) const;
-    int getPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step) const;
-    int getPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step) const;
-    int getPatternLengthSteps(const juce::String& trackId, int slotIndex) const;
-    void setPatternCreated(const juce::String& trackId, int slotIndex, bool created);
-    void setPatternNote(const juce::String& trackId, int slotIndex, int pitch, int step, bool enabled);
-    void setPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step, int velocity);
-    void setPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step, int lengthSteps);
-    void setPatternLengthSteps(const juce::String& trackId, int slotIndex, int lengthSteps);
-    void moveTrack(int sourceIndex, int destinationIndex);
-    juce::String getPlaylistPatternId(const juce::String& trackId, int bar) const;
-    void setPlaylistClip(const juce::String& trackId, const juce::String& patternId,
-                         int startBar, int lengthBars, bool enabled);
-    int getTicksPerQuarterNote() const;
-    double getInitialTempoBpm() const;
-    void setInitialTempoBpm(double bpm);
-    TimeSignature getInitialTimeSignature() const;
-    void setInitialTimeSignature(int numerator, int denominator);
-
-private:
-    explicit ProjectDocument(juce::ValueTree state, juce::File file = {});
-
-    juce::ValueTree state;
-    juce::File projectFile;
-};
+HЫЫњЭВ€›ЫЫЩ]ЫЬЩ][™ЬК[ќЭ\ќ\‹[ќ[™Э\њЛ›ЫЫ[X›Y
+NВ€ќXЩNЋђЫЫЭ\€Щ]XЪРЫЫЭ\Љ[ќ[™^
+HЫЫњЭВ€›ЪYЩ]XЪРЫЫЭ\Љ[ќ[™^ќXЩNЋђЫЫЭ\€ЫЫЭ\ЉNВ€›ЫЫЫЫ™UXЪФ]\›њР[™\њ[™Щ[Y[ќ
+ЫЫњЭќXЩNЋ”Эљ[™Й€ЫЭ\ЩUXЪТY€ЫЫњЭќXЩNЋ”Эљ[™Й€\Э[][Ы•XЪТY
+NВ€[ќЩ]XЪФЩ[XЭY]\›’[™^
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY
+HЫЫњЭВ€›ЪYЩ]XЪФЩ[XЭY]\›’[™^
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќ]\›’[™^
+NВ€›ЪYЩ]XЪУZ^\”Э]J[ќ[™^ЭX›HШZ[‘‹ЭX›H[‹›ЫЫ]]Y›ЫЫЫЫКNВ€›ЪYЩ]XЪФЩ[™ШZ[Љ[ќ[™^[ќќ\ЛЭX›HШZ[‘ЉNВ€›ЫЫЩ]ћ™]\›“Z^\”Э]J[ќќ\ЛЫЫњЭќXЩNЋ”Эљ[™Й€Ъ[›™[Y€ЫЫњЭќXЩNЋ”Эљ[™Й€[YKЭX›HШZ[‘‹ЭX›H[‹€›ЫЫ]]Y›ЫЫЫЫКNВ€›ЪYЩ]X\Э\“Z^\”Э]JЭX›HШZ[‘‹ЭX›H[‹›ЫЫ]]Y
+NВ€ќXЩNЋ”Эљ[™ИЩ]]\›’Y
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^
+HЫЫњЭВ€[ќЩ]]\›’[™^›Ь’Y
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТYЫЫњЭќXЩNЋ”Эљ[™Й€]\›’Y
+HЫЫњЭВ€ќXЩNЋ”Эљ[™ИЩ]]\›“[YJЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^
+HЫЫњЭВ€›ЫЫ\Ф]\›ђЬ™X]Y
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^
+HЫЫњЭВ€›ЫЫЩ]]\›“›ЭJЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^[ќ]Ъ[ќЭ\
+HЫЫњЭВ€[ќЩ]]\›“›ЭU™[ШЪ]JЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^[ќ]Ъ[ќЭ\
+HЫЫњЭВ€[ќЩ]]\›“›ЭS[™Э
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^[ќ]Ъ[ќЭ\
+HЫЫњЭВ€[ќЩ]]\›“[™ЭЭ\КЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^
+HЫЫњЭВ€›ЪYЩ]]\›ђЬ™X]Y
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^›ЫЫЬ™X]Y
+NВ€›ЪYЩ]]\›“›ЭJЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^[ќ]Ъ[ќЭ\›ЫЫ[X›Y
+NВ€›ЪYЩ]]\›“›ЭU™[ШЪ]JЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^[ќ]Ъ[ќЭ\[ќ™[ШЪ]JNВ€›ЪYЩ]]\›“›ЭS[™Э
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^[ќ]Ъ[ќЭ\[ќ[™ЭЭ\КNВ€›ЪYЩ]]\›“[™ЭЭ\КЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^[ќ[™ЭЭ\КNВ€[ќЩ]]\›ђ]]ЫX][Ы“[™PЫЭ[ќ
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^
+HЫЫњЭВ€]]ЫX][Ы“[™HЩ]]\›ђ]]ЫX][Ы“[™JЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^[ќ[™R[™^
+HЫЫњЭВ€›ЪYЩ]]\›ђ]]ЫX][Ы•\™Щ]
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^€ЫЫњЭќXЩNЋ”Эљ[™Й€YЪ[“[YKЫЫњЭќXЩNЋ”Эљ[™Й€\[Y]\’Y€ЫЫњЭќXЩNЋ”Эљ[™Й€\[Y]\“[YJNВ€›ЪYЩ]]\›ђ]]ЫX][Ы”Ъ[ќ
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќЫЭ[™^€ЫЫњЭќXЩNЋ”Эљ[™Й€YЪ[“[YKЫЫњЭќXЩNЋ”Эљ[™Й€\[Y]\’Y€ЫЫњЭќXЩNЋ”Эљ[™Й€\[Y]\“[YK[ќЭ\›Ш][YJNВ€[ќЩ]ЫЫ™Р]]ЫX][Ы“[™PЫЭ[ќ
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY
+HЫЫњЭВ€]]ЫX][Ы“[™HЩ]ЫЫ™Р]]ЫX][Ы“[™JЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќ[™R[™^
+HЫЫњЭВ€›ЪYЩ]ЫЫ™Р]]ЫX][Ы”Ъ[ќ
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY€ЫЫњЭќXЩNЋ”Эљ[™Й€YЪ[“[YKЫЫњЭќXЩNЋ”Эљ[™Й€\[Y]\’Y€ЫЫњЭќXЩNЋ”Эљ[™Й€\[Y]\“[YK[ќЫЫ™ФЭ\›Ш][YJNВ€›ЪY[Э™UXЪК[ќЫЭ\ЩR[™^[ќ\Э[][Ы’[™^
+NВ€ќXЩNЋ”Эљ[™ИЩ]^[\Э]\›’Y
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТY[ќ\ЉHЫЫњЭВ€›ЪYЩ]^[\ЭЫ\
+ЫЫњЭќXЩNЋ”Эљ[™Й€XЪТYЫЫњЭќXЩNЋ”Эљ[™Й€]\›’Y€[ќЭ\ќ\‹[ќ[™Э\њЛ›ЫЫ[X›Y
+NВ€[ќЩ]XЪЬФ\”]X\ќ\“›ЭJ
+HЫЫњЭВ€ЭX›HЩ][љ]X[[\РњJ
+HЫЫњЭВ€›ЪYЩ][љ]X[[\РњJЭX›HњJNВ€[YTЪYЫ]\™HЩ][љ]X[[YTЪYЫ]\™J
+HЫЫњЭВ€›ЪYЩ][љ]X[[YTЪYЫ]\™J[ќќ[Y\]Ь‹[ќ[›ЫZ[]ЬЉNВ‚њљ]]N‚€^XЪ]›Ъ™XЭШЭ[Y[ќ
+ќXЩNЋ•[YU™YHЭ]KќXЩNЋ‘љ[Hљ[HHЯJNВ‚€ќXЩNЋ•[YU™YHЭ]NВ€ќXЩNЋ‘љ[H›Ъ™XЭљ[NВџNВ

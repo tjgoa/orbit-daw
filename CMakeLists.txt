@@ -1,58 +1,15 @@
-cmake_minimum_required(VERSION 3.22)
-
-project(OrbitDAW VERSION 0.3.45 LANGUAGES C CXX)
-
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
-
-set(ENGINE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/Dependencies/tracktion_engine")
-if (NOT EXISTS "${ENGINE_ROOT}/modules/juce/CMakeLists.txt")
-    message(FATAL_ERROR
-        "Tracktion Engine/JUCE dependencies are missing. See README.md for setup.")
-endif()
-
-add_subdirectory("${ENGINE_ROOT}/modules/juce" "${CMAKE_BINARY_DIR}/juce")
-add_subdirectory("${ENGINE_ROOT}/modules" "${CMAKE_BINARY_DIR}/tracktion_modules")
-
-juce_add_gui_app(Orbit
-    PRODUCT_NAME "Orbit"
-    VERSION "${PROJECT_VERSION}"
-    BUILD_VERSION "66"
-    COMPANY_NAME "Touch The Universe"
-    BUNDLE_ID "com.touchtheuniverse.orbit"
-    PLUGINHOST_AU TRUE)
-
-juce_generate_juce_header(Orbit)
-
-target_sources(Orbit PRIVATE
-    Source/Main.cpp
-    Source/Project/ProjectDocument.cpp
-    Source/Project/ProjectDocument.h)
-
-target_compile_features(Orbit PRIVATE cxx_std_20)
-
-target_compile_definitions(Orbit PRIVATE
-    JUCE_PLUGINHOST_AU=1
-    JUCE_PLUGINHOST_VST3=1
-    JUCE_USE_CURL=0
-    JUCE_WEB_BROWSER=0
-    JUCE_MODAL_LOOPS_PERMITTED=1)
-
-target_link_libraries(Orbit PRIVATE
-    tracktion::tracktion_core
-    tracktion::tracktion_engine
-    tracktion::tracktion_graph
-    juce::juce_audio_devices
-    juce::juce_audio_processors
-    juce::juce_audio_utils
-    juce::juce_recommended_config_flags
-    juce::juce_recommended_lto_flags
-    juce::juce_recommended_warning_flags)
-
-set_target_properties(Orbit PROPERTIES
-    MACOSX_BUNDLE TRUE
-    MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
-    MACOSX_BUNDLE_BUNDLE_VERSION "66"
-    CXX_VISIBILITY_PRESET hidden
-    C_VISIBILITY_PRESET hidden)
+YЄзЉxі¬uз%j·ќВ+ar‰м¶л•л_ўєЮjЛ"‚v›•лЪ®&›•лЫXZЩWЫZ[љ[][WЬ™\]Z\™Y
+‘T”ТSУ€ЛЊЊЉB‚њ›Ъ™XЭ
+Ьљ]UИ‘T”ТSУ€ЊЛЌОHS‘ХPQСTИИЦ
+B‚њЩ]
+УPRСWРЦФХS‘T‘Њ
+BњЩ]
+УPRСWРЦФХS‘T‘Ф‘TURT‘QУЉBњЩ]
+УPRСWРЦСVS”ТSУ”ИС‘ЉB‚њЩ]
+S‘ТS‘WФ“УХ‰РУPRСWРХT”‘S•ФУХTђСWСTџKС\[™[ЪY\ЛЭXЪЭ[Ы—Щ[™Ъ[™HЉBљY€
+“ХVTХИ‰СS‘ТS‘WФ“УХKЫ[Щ[\ЛЪќXЩKРУXZЩS\ЭЛќЉB€Y\ЬШYЩJђUSСT”“Ф‚€•XЪЭ[Ы€[™Ъ[™KТ•PСH\[™[ЪY\И\™HZ\ЬЪ[™Л€ЩYH‘PQQK›Y›Ь€Щ]\€ЉB™[™YЉ
+B‚YЬЭX™\™XЭЬћJ‰СS‘ТS‘WФ“УХKЫ[Щ[\ЛЪќXЩH€‰РУPRСWР’SђT–WСTџKЪќXЩHЉBYЬЭX™\™XЭЬћJ‰СS‘ТS‘WФ“УХKЫ[Щ[\И€‰РУPRСWР’SђT–WСTџKЭXЪЭ[Ы—Ы[Щ[\ИЉB‚љќXЩWШYЩЭZWШ\
+Ьљ]€“СPХУђSQH“Ьљ]‚€‘T”ТSУ€‰Ф“Т‘PХХ‘T”ТSУџH‚€•RSХ‘T”ТSУ€ЊL‚€УУTS–WУђSQH•ЭXЪH[љ]™\њЩH‚€•S‘WТQЫЫKќЭXЪ][љ]™\њЩK›Ьљ]‚€QТS’ФХРUH•QJB‚љќXЩWЩЩ[™\]WЪќXЩWЪXY\ЉЬљ]
+B‚ќ\™Щ]ЬЫЭ\Щ\КЬљ]’UђUB€ЫЭ\ЩKУXZ[‹Ь€ЫЭ\ЩKФ›Ъ™XЭФ›Ъ™XЭШЭ[Y[ќЬ€ЫЭ\ЩKФ›Ъ™XЭФ›Ъ™XЭШЭ[Y[ќљ
+B‚ќ\™Щ]ШЫЫ\[WЩ™X]\™\КЬљ]’UђUHЮЬЭМЊ
+B‚ќ\™Щ]ШЫЫ\[WЩYљ[љ][ЫњКЬљ]’UђUB€•PСWФQТS’ФХРUOLB€•PСWФQТS’ФХХ”ХПLB€•PСWХTСWРХT“L€•PСWХСP—Р”“ХФСTЏL€•PСWУSСSУУФЧФT“RUQLJB‚ќ\™Щ]Ы[љЧЫXњ\љY\КЬљ]’UђUB€XЪЭ[ЫЋЋќXЪЭ[Ы—ШЫЬ™B€XЪЭ[ЫЋЋќXЪЭ[Ы—Щ[™Ъ[™B€XЪЭ[ЫЋЋќXЪЭ[Ы—ЩЬ\€ќXЩNЋљќXЩWШ]Y[ЧЩ]љXЩ\В€ќXЩNЋљќXЩWШ]Y[ЧЬ›ШЩ\ЬЫЬњВ€ќXЩNЋљќXЩWШ]Y[ЧЭ][В€ќXЩNЋљќXЩWЬ™XЫЫ[Y[™YШЫЫ™љYЧЩ›YЬВ€ќXЩNЋљќXЩWЬ™XЫЫ[Y[™YЫЧЩ›YЬВ€ќXЩNЋљќXЩWЬ™XЫЫ[Y[™YЭШ\›љ[™ЧЩ›YЬКB‚њЩ]Э\™Щ]Ь›Ь\ќY\КЬљ]“ФT•QTВ€PPУФЦР•S‘H•QB€PPУФЦР•S‘WФТФ•Х‘T”ТSУ—ФХ’S‘И‰Ф“Т‘PХХ‘T”ТSУџH‚€PPУФЦР•S‘WР•S‘WХ‘T”ТSУ€ЊL‚€ЦХ’TТP’SUWФ‘TСUY[‚€ЧХ’TТP’SUWФ‘TСUY[ЉB

@@ -1,50 +1,16 @@
-# Orbit DAW
-
-Orbit is a standalone DAW inspired by Orion's generator â†’ pattern â†’ playlist â†’ mixer workflow. The application is being developed as original software under AGPLv3.
-
-## Current state
-
-Orbit is an early, actively changing DAW foundation rather than a finished Orion-style workflow. The current public source corresponds to product **Build 66 / version 0.3.45**, with local development iteration **128**. It includes a Tracktion Engine-backed built-in 4OSC instrument, an editable piano roll, generator-owned A1â€“H8 pattern banks, a 64-bar Playlist with direct pattern painting, clip pattern cycling by mouse wheel, available-pattern menus on double-click, MIDI export, and `.orbit` project save/reopen. The Mixer is an in-app view with blue channel strips, gain, pan, mute, solo, four-band EQ with response graph, insert effects, four send controls, eight output-bus assignments, and a Master route. It stays embedded in the Orbit workspace, sizes its width to visible strips, remains hidden when instruments are added, and uses a compact draggable Mixing Desk header with minimize and close controls. Clicking Mixer/Master or a generator brings that surface forward. The Piano Roll has a keyboard icon and settings for grid subdivisions, emphasis, velocity lane, colored keys, and pitch labels. Playlist clips support right-click deletion, the pattern picker opens beside the clicked cell, MIDI previews appear behind clips, and the grid is less prominent. The app has a tempo and transport toolbar with Playlist, Mixer, and Master controls. VST3 instruments scan JUCE's platform-standard locations automatically on first use, with optional extra folders; discovered instruments are inserted as generator tracks with their plugin GUIs embedded below persistent pattern controls. The VST Paths window contains the scan-at-startup option, and scans write Desktop reports. Fatal macOS/Linux signals write a Desktop crash report identifying the plugin being scanned. Missing-plugin recovery, AU/VST2 support, richer playlist editing, undo, and portable media relinking remain in progress. Orbit has not been verified as a finished production DAW. See `BUILD_HISTORY.md` for product checkpoints and `Source/Project/PROJECT_FORMAT.md` for the project format.
-
-See [`PROGRESS.md`](PROGRESS.md) for a dated development update and current focus.
-
-### Load a VST3 instrument
-
-Orbit opens with a fresh, ready-to-use project. Choose **Insert > VST Instruments > Scan / Manage VST3 Instrumentsâ€¦** to find a plugin; the first browser opening scans the standard VST3 folders for the current platform automatically. Select an instrument and choose **Insert** to add it as a generator and open its plugin editor. Discovered VST3 instruments appear under **VST Instruments** in the Insert menu; Orbit's built-in instrument remains under **Synths**. The menu follows Orion's sections and uses the same text styling for both. Each instrument track has its own embedded plugin GUI, and the generator header selector switches the active instrument while its pattern controls remain attached above the GUI. Starting a new project with unsaved changes offers Discard or Cancel. Add nonstandard folders and set **Scan VST3 plugins at startup** in **Options > VST Pathsâ€¦**; startup scanning is off by default. Scan progress shows the plugin currently being checked. Each completed scan writes `Orbit-VST3-Scan-*.log` to the Desktop; fatal signals write `Orbit-Crash-Report-*.log` there with the signal and plugin being scanned.
-
-Orbit is a working name and has not had final product-name clearance. Images used as Orion and mixer design references are intentionally kept out of this source repository.
-
-## Build on macOS
-
-Requirements: Xcode, CMake 3.22 or newer, and a macOS SDK supported by the checked-out JUCE/Tracktion Engine revisions. Orbit's application source is C++; CMake is the build configuration that generates Xcode projects, and JUCE/Tracktion Engine are C++ libraries.
-
-Clone Orbit and fetch the pinned dependencies:
-
-```sh
-git clone https://github.com/tjgoa/orbit-daw.git
-cd orbit-daw
-git -c url.https://github.com/.insteadOf=git@github.com: submodule update --init --recursive --depth 1
-```
-
-Tracktion Engine's JUCE submodule uses SSH; the HTTPS rewrite above allows fetching it without setting up GitHub SSH keys. Keep upstream dependency license files and notices intact. Exact revisions are listed in `DEPENDENCIES.md`.
-
-Generate an Xcode project and run the app:
-
-```sh
-cmake -S . -B build/xcode -G Xcode
-open build/xcode/OrbitDAW.xcodeproj
-```
-
-In Xcode, select the **Orbit** scheme and press **Run**. The build can also be run from Terminal with `cmake --build build/xcode --config Debug --target Orbit`.
-
-## Development builds
-
-`Tools/build-orbit-dev.sh` rebuilds the app and copies changed output to `Builds/Current/Orbit.app`. Each changed successful local development build gets an incremental source-only ZIP under `Builds/Source Archives/`; these local build products and archives are ignored by Git. The helper scripts and iteration counter are included for contributors. A source archive does not contain compiled applications or vendored JUCE/Tracktion sources.
-
-## Dependencies
-
-The project records Tracktion Engine as a submodule at v3.2.0; that engine revision pins its JUCE submodule. Do not track a moving development branch for product builds.
-
-## Licensing
-
-Orbit application code is released under GNU AGPLv3 (see `LICENSE`). JUCE is used under AGPLv3 and Tracktion Engine under GPLv3, subject to their respective license files and notices. Third-party dependencies inside either repository may have additional licenses; preserve those notices when distributing builds. This repository publishes source code; it does not include a compiled application bundle.
+YªçŠx³¬uç%j·Â+ar‰ì¶ë•ë_¢ºŞjË"‚v›•ëÚ®&›•ëÈÜ˜š]UÂ‚“Ü˜š]\ÈHİ[™[Û™HUÈ[œÜ\™YHÜš[Û‰ÜÈÙ[™\˜]Üˆ8¡¤ˆ]\›ˆ8¡¤ˆ^[\İ8¡¤ˆZ^\ˆÛÜšÙ›İËˆH\XØ][Ûˆ\È™Z[™È]™[ÜY\ÈÜšYÚ[˜[ÛÙØ\™H[™\ˆQÔŒË‚‚ˆÈÈİ\œ™[İ]B‚“Ü˜š]\È[ˆXİ]™[HÚ[™Ú[™ÈUÈ›İ[™][Ûˆ˜]\ˆ[ˆHš[š\ÚYÜš[Û‹\İ[HÛÜšÙ›İËˆHİ\œ™[Ûİ\˜ÙHÚXÚÜÚ[\ÈZ[LÈŒŒËÎKÚ]ØØ[]™[ÜY[]\˜][Ûˆ
+ŠŒMMJŠ‹ˆ][˜ÛY\ÈH˜XÚİ[Ûˆ[™Ú[™KX˜XÚÙYZ[Z[ˆÔĞÈ[œİ[Y[”ÕÈ[œİ[Y[ËY]X›HX[›È›ÛÙ[™\˜]Ü‹[İÛ™YLx $Ò]\›ˆ˜[šÜËHLL‹X˜\ˆ^[\İRQH^Ü[™›Ü˜š]›Ú™XİØ]™KÜ™[Ü[‹ˆ]\›ˆ[ÙH^\ÈXXÚÙ[™\˜]Ü‰ÜÈ™[Y[X™\™Y]\›ˆÙÙ]\ÈÛÛ™È[ÙH›ÛİÜÈ^[\İÛ\È[™™\Ù\™\ÈHİ\ˆÙ[™\˜]ÜœÉÈ™[Y[X™\™YÜÚ][ÛœËˆ]]ÛX][Ûˆ\ÈÙ\\˜]H]\›‹][YH[™\È[ˆHX[›È›Û[™ÛÛ™Ë][YH[™\È[ˆH^[\İˆ^[\İÙ[™\˜]ÜˆÛÛ^Xİ[ÛœÈ[˜ÛYHÚİË™[˜[YK[]KÛÛ™H˜XÚÈËY]ÛÛ™È]™[Ë[™˜XÚÈÛÛÜÈ]\›œËØ\œ˜[™Ù[Y[ÛÛ™H[™\œÚ\İ[˜XÚÈÛÛÜœÈ\™H[\[Y[YˆÛÜİ\Û[™İÙ[˜X›Yİ]H\œÚ\İÈ[™\È˜]ÛˆÛˆH^[\İ[\‹ˆHZ^\ˆÛÛZ[œÈÙ[™\˜]Üˆİš\ÈÚ]Ù[™È[™İ]]X\È\ÜÚYÛ›Y[ÈHÙ\\˜]HX\İ\ˆÙXİ[ÛˆÛÛZ[œÈ\ËÜ™]\›ˆİš\È[™HX\İ\ˆİš\Ú]›İ\ˆ[œÙ\È[™›ÈÙ[™Ëˆ›İ]Y\Ù\È\X\ˆ\™H]]ÛX]XØ[KˆHZ^\ˆİ^\È[ˆHÜ˜š]ÛÜšÜÜXÙH[™Ø[ˆ™H[İ™YZ[š[Z^™YÜˆÛÜÙYˆ”ÕÈØØ[ˆ[™Ü˜\Ú™\ÜÈ\™HÜš][ˆÈH\ÚİÜˆİ\œ™[›ÛİË]\ÛÜšÈ[˜ÛY\È[[YYX]H[œİ[Y[ZÙ^H]Y][Û‹^[\İ™\ÜÛœÚ]™[™\ÜÈ[™ÛÛ›ÛËZ^\ˆÙ][™ÜËÑY™™XİÈÛÛš[™Ë[™[[YH™\šYšXØ][ÛˆÙˆÛÜ^X˜XÚË]]ÛX][Û‹\È›İ][™Ë[™ÛÛ^Xİ[ÛœËˆÙYHÔ’SÓ—ÓPT“—ÕÑË›Y›Üˆ™[XZ[š[™ÈÛÜšËÔ’SÓ—ÓUU‘WÑQ‘‘PÕ×ĞÓÓTUP’SUK›Y›ÜˆHØœÙ\™YÜš[ÛˆY™™Xİ[™[ÜH[™ZYÜ˜][Ûˆ[‹•RSÒTÕÔ–K›Y›Üˆ›ÙXİÚXÚÜÚ[Ë[™Ûİ\˜ÙKÔ›Ú™XİÔ“Ò‘PÕÑ“Ô“PU›Y›ÜˆH›Ú™Xİ›Ü›X]ˆÜ˜š]\È›İY]™\šYšYY\ÈHš[š\ÚY›ÙXİ[ÛˆUË‚‚”ÙYHØ“ÑÔ‘TÔË›YJ“ÑÔ‘TÔË›Y
+H›ÜˆH]Y]™[ÜY[\]H[™İ\œ™[›Øİ\Ë‚‚ˆÈÈÈØYH”ÕÈ[œİ[Y[‚“Ü˜š]Ü[œÈÚ]Hœ™\Ú™XYK]Ë]\ÙH›Ú™XİˆÚÛÜÙH
+Š’[œÙ\ˆ”Õ[œİ[Y[ÈˆØØ[ˆÈX[˜YÙH”ÕÈ[œİ[Y[ø )ŠŠˆÈš[™HYÚ[ÈHš\œİœ›İÜÙ\ˆÜ[š[™ÈØØ[œÈHİ[™\™”ÕÈ›Û\œÈ›ÜˆHİ\œ™[]›Ü›H]]ÛX]XØ[KˆÙ[Xİ[ˆ[œİ[Y[[™ÚÛÜÙH
+Š’[œÙ\
+ŠˆÈY]\ÈHÙ[™\˜]Üˆ[™Ü[ˆ]ÈYÚ[ˆY]Ü‹ˆ\ØÛİ™\™Y”ÕÈ[œİ[Y[È\X\ˆ[™\ˆ
+Š•”Õ[œİ[Y[ÊŠˆ[ˆH[œÙ\Y[NÈÜ˜š]	ÜÈZ[Z[ˆ[œİ[Y[™[XZ[œÈ[™\ˆ
+Š”Ş[ÊŠ‹ˆHY[H›ÛİÜÈÜš[Û‰ÜÈÙXİ[ÛœÈ[™\Ù\ÈHØ[YH^İ[[™È›Üˆ›İˆXXÚ[œİ[Y[˜XÚÈ\È]ÈİÛˆ[X™YYYÚ[ˆÕRK[™HÙ[™\˜]ÜˆXY\ˆÙ[XİÜˆİÚ]Ú\ÈHXİ]™H[œİ[Y[Ú[H]È]\›ˆÛÛ›ÛÈ™[XZ[ˆ]XÚYX›İ™HHÕRKˆİ\[™ÈH™]È›Ú™XİÚ][œØ]™YÚ[™Ù\ÈÙ™™\œÈ\ØØ\™ÜˆØ[˜Ù[ˆY›Ûœİ[™\™›Û\œÈ[™Ù]
+Š”ØØ[ˆ”ÕÈYÚ[œÈ]İ\\
+Šˆ[ˆ
+Š“Ü[ÛœÈˆ”Õ]ø )ŠŠÈİ\\ØØ[›š[™È\ÈÙ™ˆHY˜][ˆØØ[ˆ›ÙÜ™\ÜÈÚİÜÈHYÚ[ˆİ\œ™[H™Z[™ÈÚXÚÙYˆXXÚÛÛ\]YØØ[ˆÜš]\ÈÜ˜š]U”ÕËTØØ[‹J‹›ÙØÈH\ÚİÜÈ˜][ÚYÛ˜[ÈÜš]HÜ˜š]PÜ˜\ÚT™\ÜJ‹›ÙØ\™HÚ]HÚYÛ˜[[™YÚ[ˆ™Z[™ÈØØ[›™Y‚‚“Ü˜š]\ÈHÛÜšÚ[™È˜[YH[™\È›İYš[˜[›ÙXİ[˜[YHÛX\˜[˜ÙKˆ[XYÙ\È\ÙY\ÈÜš[Ûˆ[™Z^\ˆ\ÚYÛˆ™Y™\™[˜Ù\È\™H[[[Û˜[HÙ\İ]Ùˆ\ÈÛİ\˜ÙH™\ÜÚ]ÜK‚‚ˆÈÈZ[ÛˆXXÓÔÂ‚”™\]Z\™[Y[ÎˆÛÙKÓXZÙHËŒŒˆÜˆ™]Ù\‹[™HXXÓÔÈÑÈİ\ÜYHHÚXÚÙY[İ]•PÑKÕ˜XÚİ[Ûˆ[™Ú[™H™]š\Ú[ÛœËˆÜ˜š]	ÜÈ\XØ][ÛˆÛİ\˜ÙH\ÈÊÊÎÈÓXZÙH\ÈHZ[ÛÛ™šYİ\˜][Ûˆ]Ù[™\˜]\ÈÛÙH›Ú™XİË[™•PÑKÕ˜XÚİ[Ûˆ[™Ú[™H\™HÊÊÈXœ˜\šY\Ë‚‚ÛÛ™HÜ˜š][™™]ÚH[›™Y\[™[˜ÚY\Î‚‚˜Ú™Ú]ÛÛ™HÎ‹ËÙÚ]X‹˜ÛÛKİ™ÛØKÛÜ˜š]Y]Ë™Ú]˜ÙÜ˜š]Y]Â™Ú]XÈ\›šÎ‹ËÙÚ]X‹˜ÛÛKËš[œİXYÙYÚ]Ú]X‹˜ÛÛNˆİX›[Ù[H\]HKZ[š]K\™Xİ\œÚ]™HKY\B˜‚•˜XÚİ[Ûˆ[™Ú[™IÜÈ•PÑHİX›[Ù[H\Ù\ÈÔÒÈHÈ™]Üš]HX›İ™H[İÜÈ™]Ú[™È]Ú]İ]Ù][™È\Ú]XˆÔÒÙ^\ËˆÙY\\İ™X[H\[™[˜ŞHXÙ[œÙHš[\È[™›İXÙ\È[Xİˆ^Xİ™]š\Ú[ÛœÈ\™H\İY[ˆTS‘SÒQTË›Y‚‚‘Ù[™\˜]H[ˆÛÙH›Ú™Xİ[™[ˆH\‚‚˜Ú˜ÛXZÙHTÈˆPˆZ[ŞÛÙHQÈÛÙB›Ü[ˆZ[ŞÛÙKÓÜ˜š]UËÛÙ\›Ú‚˜‚’[ˆÛÙKÙ[XİH
+Š“Ü˜š]
+ŠˆØÚ[YH[™™\ÜÈ
+Š”[ŠŠ‹ˆHZ[Ø[ˆ[ÛÈ™H[ˆœ›ÛH\›Z[˜[Ú]ÛXZÙHKXZ[Z[ŞÛÙHKXÛÛ™šYÈXYÈK]\™Ù]Ü˜š]‚‚ˆÈÈ]™[ÜY[Z[Â‚˜ÛÛËØZ[[Ü˜š]Y]‹œÚ™XZ[ÈH\[™ÛÜY\ÈÚ[™ÙYİ]]ÈZ[ËĞİ\œ™[ÓÜ˜š]˜\ˆXXÚÚ[™ÙYİXØÙ\ÜÙ[ØØ[]™[ÜY[Z[Ù]È[ˆ[˜Ü™[Y[[Ûİ\˜ÙK[Û›H’T[™\ˆZ[ËÔÛİ\˜ÙH\˜Ú]™\ËØÈ\ÙHØØ[Z[›ÙXİÈ[™\˜Ú]™\È\™HYÛ›Ü™YHÚ]ˆH[\ˆØÜš\È[™]\˜][ÛˆÛİ[\ˆ\™H[˜ÛYY›ÜˆÛÛšX]ÜœËˆHÛİ\˜ÙH\˜Ú]™HÙ\È›İÛÛZ[ˆÛÛ\[Y\XØ][ÛœÈÜˆ™[™Ü™Y•PÑKÕ˜XÚİ[ÛˆÛİ\˜Ù\Ë‚‚ˆÈÈ\[™[˜ÚY\Â‚•H›Ú™Xİ™XÛÜ™È˜XÚİ[Ûˆ[™Ú[™H\ÈHİX›[Ù[H]ŒËŒ‹ŒÈ][™Ú[™H™]š\Ú[Ûˆ[œÈ]È•PÑHİX›[Ù[KˆÈ›İ˜XÚÈH[İš[™È]™[ÜY[œ˜[˜Ú›Üˆ›ÙXİZ[Ë‚‚ˆÈÈXÙ[œÚ[™Â‚“Ü˜š]\XØ][ÛˆÛÙH\È™[X\ÙY[™\ˆÓ•HQÔŒÈ
+ÙYHPÑS”ÑX
+Kˆ•PÑH\È\ÙY[™\ˆQÔŒÈ[™˜XÚİ[Ûˆ[™Ú[™H[™\ˆÔŒËİXš™XİÈZ\ˆ™\ÜXİ]™HXÙ[œÙHš[\È[™›İXÙ\Ëˆ\™\\H\[™[˜ÚY\È[œÚYHZ]\ˆ™\ÜÚ]ÜHX^H]™HY][Û˜[XÙ[œÙ\ÎÈ™\Ù\™HÜÙH›İXÙ\ÈÚ[ˆ\İšX][™ÈZ[Ëˆ\È™\ÜÚ]ÜHX›\Ú\ÈÛİ\˜ÙHÛÙNÈ]Ù\È›İ[˜ÛYHHÛÛ\[Y\XØ][Ûˆ[™K‚

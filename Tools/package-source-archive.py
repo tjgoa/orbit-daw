@@ -1,131 +1,101 @@
-#!/usr/bin/env python3
-"""Create source-only Orbit checkpoint or incremental development archives."""
+YªçŠx³¬uç%j·Â+ar‰ì¶ë•ë_¢ºÞjË"‚v›•ëÚ®&›•ëÈKÝ\Ü‹Øš[‹Ù[ˆ]ÛŒÂˆˆˆÜ™X]HÛÝ\˜ÙK[Û›HÜ˜š]ÚXÚÜÚ[Üˆ[˜Ü™[Y[[]™[ÜY[\˜Ú]™\Ëˆˆˆ‚‚™œ›ÛH×Ù]\™W×È[\Ü[››Ý][ÛœÂ‚š[\Ü\™Ü\œÙBš[\Ü\ÚX‚š[\ÜœÛÛ‚š[\Ü]X‚š[\Ü™Bš[\Üš\š[B™œ›ÛH]][YH[\Ü]][YK[Y^›Û™B‚”“ÓÕH]X‹”]
+×Ùš[W×ÊKœ™\ÛÛ™J
+Kœ\™[ÖÌWBTÒU‘WÑTˆH“ÓÕÈZ[ÈˆÈ”ÛÝ\˜ÙH\˜Ú]™\È‚”ÕUWÑ’SHHTÒU‘WÑTˆÈ‹œÛÝ\˜ÙKX\˜Ú]™K\Ý]KšœÛÛˆ‚‚‚™Yˆ[YÚX›WÙš[\Ê
+HOˆ\ÝÜ]X‹”]N‚ˆš[\ÎˆÙ]Ü]X‹”]HHÙ]
 
-from __future__ import annotations
+Bˆ›Üˆ˜[YH[ˆ
+ˆÓXZÙS\ÝË‹ˆ”‘PQQK›Y‹ˆ”“ÑÔ‘TÔË›Y‹ˆ“PÑS”ÑH‹ˆ‘TS‘SÒQTË›Y‹ˆ‹™Ú][Ù[\È‹ˆ•RSÒTÕÔ–K›Y‹ˆ“Ô’UÑU×Ñ“ÕS‘USÓ—ÔS—ÌK›Y‹ˆ“Ô’SÓ—ÓPT“—ÕÑË›Y‹ˆ“Ô’SÓ—ÓUU‘WÑQ‘‘PÕ×ÐÓÓTUP’SUK›Y‹ˆ“Ô’SÓ—Õ’TÕPSÕT‘ÑUË›Y‹ˆ‘U—Ð•RSÐÓÕS•T‹šœÛÛˆ‹ˆ
+N‚ˆ]H“ÓÕÈ˜[YBˆYˆ]š\×Ùš[J
+N‚ˆš[\Ë˜Y
+]
+Bˆ›Üˆ›Û\ˆ[ˆ
+”ÛÝ\˜ÙH‹•ÛÛÈŠN‚ˆ›Üˆ][ˆ
+“ÓÕÈ›Û\ŠKœ™ÛØŠŠˆŠN‚ˆYˆ›Ý]š\×Ùš[J
+HÜˆ]›˜[YHOH—×ÜXØXÚW×ÈŽ‚ˆÛÛ[YBˆYˆ]œÝY™š^[ˆÈ‹˜Ü‹‹š‹‹š‹‹›[H‹‹›H‹‹œH‹‹œÚ‹‹›Y‹‹šœÛÛˆŸN‚ˆš[\Ë˜Y
+]
+Bˆ™]\›ˆÛÜY
+š[\ËÙ^O[[X™Hˆœ™[]]™WÝÊ“ÓÕ
+K˜\×ÜÜÚ^
 
-import argparse
-import hashlib
-import json
-import pathlib
-import re
-import zipfile
-from datetime import datetime, timezone
+K›ÝÙ\Š
+JB‚‚™YˆYÙ\Ý
+]ˆ]X‹”]
+HOˆÝŽ‚ˆ™]\›ˆ\ÚX‹œÚLMŠ]œ™XYØž]\Ê
+JKš^YÙ\Ý
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-ARCHIVE_DIR = ROOT / "Builds" / "Source Archives"
-STATE_FILE = ARCHIVE_DIR / ".source-archive-state.json"
+B‚‚™YˆÛ˜\ÚÝ
 
+HOˆXÝÜÝ‹Ý—N‚ˆ™]\›ˆÜ]œ™[]]™WÝÊ“ÓÕ
+K˜\×ÜÜÚ^
 
-def eligible_files() -> list[pathlib.Path]:
-    files: set[pathlib.Path] = set()
-    for name in (
-        "CMakeLists.txt",
-        "README.md",
-        "LICENSE",
-        "DEPENDENCIES.md",
-        ".gitmodules",
-        "BUILD_HISTORY.md",
-        "ORBIT_DAW_FOUNDATION_PLAN_001.md",
-        "ORION_LEARN_TODO.md",
-        "ORION_VISUAL_TARGETS.md",
-        "DEV_BUILD_COUNTER.json",
-    ):
-        path = ROOT / name
-        if path.is_file():
-            files.add(path)
-    for folder in ("Source", "Tools"):
-        for path in (ROOT / folder).rglob("*"):
-            if not path.is_file() or path.name == "__pycache__":
-                continue
-            if path.suffix in {".cpp", ".h", ".hpp", ".mm", ".m", ".py", ".sh", ".md", ".json"}:
-                files.add(path)
-    return sorted(files, key=lambda p: p.relative_to(ROOT).as_posix().lower())
+NˆYÙ\Ý
+]
+H›Üˆ][ˆ[YÚX›WÙš[\Ê
+_B‚‚™YˆØY™WÛ˜[YJ˜[YNˆÝŠHOˆÝŽ‚ˆ™]\›ˆ™KœÝXŠˆ–×KV˜K^ŒNWË‹WJÈ‹—È‹˜[YJB‚‚™YˆÜš]WØ\˜Ú]™J˜[YNˆÝ‹š[\Îˆ\ÝÜ]X‹”]KÝ[[X\žNˆÝ‹˜\Ù[[™NˆÝŠHOˆ]X‹”]‚ˆTÒU‘WÑT‹›ZÙ\Š\™[ÏUYK^\ÝÛÚÏUYJBˆ\™Ù]HTÒU‘WÑTˆÈ˜[YBˆYˆ\™Ù]™^\ÝÊ
+N‚ˆ˜Z\ÙHÞ\Ý[Q^]
+ˆ”™Y\Ú[™ÈÈÝ™\Üš]HÛÝ\˜ÙH\˜Ú]™NˆÝ\™Ù]HŠBˆÚ]š\š[K–š\š[J\™Ù]ž‹ÛÛ\™\ÜÚ[Û^š\š[K–’TÑQ“UQÛÛ\™\ÜÛ]™[N
+H\È\˜Ú]™N‚ˆ›Üˆ][ˆš[\Î‚ˆ\˜Ú]™KÜš]J]]œ™[]]™WÝÊ“ÓÕ
+K˜\×ÜÜÚ^
 
+JBˆ\˜Ú]™KÜš]\ÝŠÒS‘ÑWÔÕSSPT–K›Y‹Ý[[X\žKœœÝš\
 
-def digest(path: pathlib.Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+H
+È—ˆŠBˆ\˜Ú]™KÜš]\ÝŠTÑSS‘K‹˜\Ù[[™KœœÝš\
 
+H
+È—ˆŠBˆ™]\›ˆ\™Ù]‚‚™YˆXZ[Š
+HOˆ›Û™N‚ˆ\œÙ\ˆH\™Ü\œÙK\™Ý[Y[\œÙ\Š
+BˆÜ›Ý\H\œÙ\‹˜YÛ]]X[WÙ^Û\Ú]™WÙÜ›Ý\
+™\]Z\™YUYJBˆÜ›Ý\˜YØ\™Ý[Y[
+‹KXÚXÚÜÚ[‹XÝ[ÛHœÝÜ™WÝYH‹[H”Ø]™HHÛÛ\]HÛÝ\˜ÙHÚXÚÜÚ[[™™\Ù]H[˜Ü™[Y[[˜\Ù[[™HŠBˆÜ›Ý\˜YØ\™Ý[Y[
+‹KY]‹Z]\˜][Ûˆ‹XÝ[ÛHœÝÜ™WÝYH‹[H”Ø]™HÛ›HÚ[™Ù\ÈÚ[˜ÙHH\ÝÛÝ\˜ÙHÚXÚÜÚ[Ú]\˜][ÛˆŠBˆ\œÙ\‹˜YØ\™Ý[Y[
+‹K[X™[‹[H“Ü[Û˜[ÚXÚÜÚ[X™[K™ËˆZ[ÌHŠBˆ\™ÜÈH\œÙ\‹œ\œÙWØ\™ÜÊ
+B‚ˆš[\ÈH[YÚX›WÙš[\Ê
+BˆÝ\œ™[HÛ˜\ÚÝ
 
-def snapshot() -> dict[str, str]:
-    return {path.relative_to(ROOT).as_posix(): digest(path) for path in eligible_files()}
+BˆÛÝ[\ˆHœÛÛ‹›ØYÊ
+“ÓÕÈ‘U—Ð•RSÐÓÕS•T‹šœÛÛˆŠKœ™XYÝ^
 
+JBˆZ[H[
+ÛÝ[\–Èœ›ÙXÝØÚXÚÜÚ[ØZ[—JBˆ™\œÚ[ÛˆHÛÝ[\–Èœ›ÙXÝØÚXÚÜÚ[Ý™\œÚ[Ûˆ—BˆYˆ\™ÜË˜ÚXÚÜÚ[‚ˆX™[HØY™WÛ˜[YJ\™ÜË›X™[ÜˆˆZ[ÞØZ[ŒÙHŠBˆ˜[YHHˆ“Ü˜š]ÞÛX™[WÔÛÝ\˜ÙKžš\‚ˆÙ[XÝYHš[\ÂˆÝ[[X\žHH
+ˆˆˆÈÜ˜š]ÛX™[HÛÝ\˜ÙHÚXÚÜÚ[—ˆ‚ˆˆÛÛ\]HÜ˜š][ÝÛ™YÛÝ\˜ÙKØÛÛ™šYÝ\˜][ÛˆÚXÚÜÚ[›Üˆ›ÙXÝZ[ØZ[K™\œÚ[ÛˆÝ™\œÚ[ÛŸKˆ‚ˆ•\È\˜Ú]™HÛÛZ[œÈ›ÈÛÛ\[Y\^XÝ]X›KZ[Ý]]ØXÚKÜˆ™[™Ü™Y•PÑKÕ˜XÚÝ[Ûˆ\[™[˜ÞHÛÝ\˜ÙK——ˆ‚ˆ•H›Ú™XÝ\Ù\ÈÓXZÙHÚ]•PÑH[™˜XÚÝ[Ûˆ[™Ú[™H\È[›™Y^\›˜[\[™[˜ÚY\ÎÈÙYHTS‘SÒQTË›Y[™‘PQQK›Y—ˆ‚ˆ
+Bˆ˜\Ù[[™HHˆÛÛ\]HÛÝ\˜ÙHÚXÚÜÚ[ˆ›ÙXÝZ[ØZ[K™\œÚ[ÛˆÝ™\œÚ[ÛŸKˆÜ™X]YÙ]][YK››ÝÊ[Y^›Û™K]ÊKš\ÛÙ›Ü›X]
+[Y\ÜXÏIÜÙXÛÛ™ÉÊ_Kˆ‚ˆ[ÙN‚ˆÝ]HHœÛÛ‹›ØYÊÕUWÑ’SKœ™XYÝ^
 
-def safe_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+JHYˆÕUWÑ’SK™^\ÝÊ
+H[ÙHÈ™š[\ÈŽˆßK˜\˜Ú]™HŽˆŠ›È˜\Ù[[™JHŸBˆ™]š[Ý\ÈHÝ]K™Ù]
+™š[\È‹ßJBˆÚ[™ÙYÛ˜[Y\ÈHÜ]›Üˆ]ÚH[ˆÝ\œ™[š][\Ê
+HYˆ™]š[Ý\Ë™Ù]
+]
+HOHÚWBˆ™[[Ý™YÛ˜[Y\ÈHÛÜY
+Ù]
+™]š[Ý\ÊHHÙ]
+Ý\œ™[
+JBˆYˆ›ÝÚ[™ÙYÛ˜[Y\È[™›Ý™[[Ý™YÛ˜[Y\Î‚ˆš[
+“›ÈÛÝ\˜ÙHÚ[™Ù\ÈÚ[˜ÙHH\Ý\˜Ú]™NÈ›È’TÜ™X]YˆŠBˆ™]\›‚ˆ]\˜][ÛˆH[
+ÛÝ[\‹™Ù]
+œÝXØÙ\ÜÙ[Ù]—Ú]\˜][ÛœÈ‹
+JBˆ˜[YHHˆ“Ü˜š]Ñ]—Ò]\˜][Û—ÞÚ]\˜][ÛŽŒÙWÔÛÝ\˜ÙKžš\‚ˆžWÛ˜[YHHÜ]œ™[]]™WÝÊ“ÓÕ
+K˜\×ÜÜÚ^
 
+Nˆ]›Üˆ][ˆš[\ßBˆÙ[XÝYHØžWÛ˜[YVÚ][WH›Üˆ][H[ˆÚ[™ÙYÛ˜[Y\×BˆÝ[[X\žWÛ[™\ÈHÂˆˆˆÈÜ˜š]]™[ÜY[]\˜][ÛˆÚ]\˜][ÛŽŒÙH‹ˆˆ‹ˆˆ’[˜Ü™[Y[[ÛÝ\˜ÙH\˜Ú]™H›Üˆ›ÙXÝZ[ØZ[K™\œÚ[ÛˆÝ™\œÚ[ÛŸKˆ‹ˆˆ˜\Ù[[™H\˜Ú]™NˆÜÝ]K™Ù]
+	Ø\˜Ú]™IË	Ê›È˜\Ù[[™JIÊ_Kˆ‹ˆˆ‹ˆÚ[™ÙYÜˆYYš[\Îˆ‹ˆ
+Šˆ‹HÚ][_Xˆ›Üˆ][H[ˆÚ[™ÙYÛ˜[Y\ÊKˆBˆYˆ™[[Ý™YÛ˜[Y\Î‚ˆÝ[[X\žWÛ[™\Ë™^[™
+Èˆ‹”™[[Ý™YÚ[˜ÙH˜\Ù[[™H
+\ÝY›ÜˆÛÛ^È›Èš[H^[ØY
+Nˆ‹
+Šˆ‹HÚ][_Xˆ›Üˆ][H[ˆ™[[Ý™YÛ˜[Y\ÊWJBˆÝ[[X\žHH—ˆ‹š›Ú[ŠÝ[[X\žWÛ[™\ÊBˆ˜\Ù[[™HHˆ’[˜Ü™[Y[[YØZ[œÝÜÝ]K™Ù]
+	Ø\˜Ú]™IË	Ê›È˜\Ù[[™JIÊ_Kˆš[\È[ˆ\È’T\ÙH›Ú™XÝ\™[]]™H]ËˆÜ™X]YÙ]][YK››ÝÊ[Y^›Û™K]ÊKš\ÛÙ›Ü›X]
+[Y\ÜXÏIÜÙXÛÛ™ÉÊ_Kˆ‚‚ˆ\™Ù]HÜš]WØ\˜Ú]™J˜[YKÙ[XÝYÝ[[X\žK˜\Ù[[™JBˆÝ]WÙ]HHÈ˜\˜Ú]™HŽˆ˜[YK™š[\ÈŽˆÝ\œ™[Bˆ[\Ü˜\žHHÕUWÑ’SKÚ]ÜÝY™š^
+‹\ŠBˆ[\Ü˜\žKÜš]WÝ^
+œÛÛ‹™[\ÊÝ]WÙ]K[™[LŠH
+È—ˆŠBˆ[\Ü˜\žKœ™\XÙJÕUWÑ’SJBˆš[
+ˆ”ÛÝ\˜ÙH\˜Ú]™NˆÝ\™Ù]HŠBˆš[
+ˆ‘š[\ÎˆÛ[ŠÙ[XÝY
+_H›Ú™XÝš[\È
+ÈÒS‘ÑWÔÕSSPT–K›Y
+ÈTÑSS‘KŠBˆš[
+ˆ”Ú^™NˆÝ\™Ù]œÝ]
 
-def write_archive(name: str, files: list[pathlib.Path], summary: str, baseline: str) -> pathlib.Path:
-    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    target = ARCHIVE_DIR / name
-    if target.exists():
-        raise SystemExit(f"Refusing to overwrite source archive: {target}")
-    with zipfile.ZipFile(target, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=8) as archive:
-        for path in files:
-            archive.write(path, path.relative_to(ROOT).as_posix())
-        archive.writestr("CHANGE_SUMMARY.md", summary.rstrip() + "\n")
-        archive.writestr("BASELINE.txt", baseline.rstrip() + "\n")
-    return target
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--checkpoint", action="store_true", help="Save a complete source checkpoint and reset the incremental baseline")
-    group.add_argument("--dev-iteration", action="store_true", help="Save only changes since the last source checkpoint/iteration")
-    parser.add_argument("--label", help="Optional checkpoint label, e.g. Build_025")
-    args = parser.parse_args()
-
-    files = eligible_files()
-    current = snapshot()
-    counter = json.loads((ROOT / "DEV_BUILD_COUNTER.json").read_text())
-    build = int(counter["product_checkpoint_build"])
-    version = counter["product_checkpoint_version"]
-    if args.checkpoint:
-        label = safe_name(args.label or f"Build_{build:03d}")
-        name = f"Orbit_{label}_Source.zip"
-        selected = files
-        summary = (
-            f"# Orbit {label} source checkpoint\n\n"
-            f"Complete Orbit-owned source/configuration checkpoint for product Build {build}, version {version}. "
-            "This archive contains no compiled app, executable, build output, cache, or vendored JUCE/Tracktion dependency source.\n\n"
-            "The project uses CMake with JUCE and Tracktion Engine as pinned external dependencies; see DEPENDENCIES.md and README.md.\n"
-        )
-        baseline = f"Complete source checkpoint. Product Build {build}, version {version}. Created {datetime.now(timezone.utc).isoformat(timespec='seconds')}."
-    else:
-        state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {"files": {}, "archive": "(no baseline)"}
-        previous = state.get("files", {})
-        changed_names = [path for path, sha in current.items() if previous.get(path) != sha]
-        removed_names = sorted(set(previous) - set(current))
-        if not changed_names and not removed_names:
-            print("No source changes since the last archive; no ZIP created.")
-            return
-        iteration = int(counter.get("successful_dev_iterations", 0))
-        name = f"Orbit_Dev_Iteration_{iteration:03d}_Source.zip"
-        by_name = {path.relative_to(ROOT).as_posix(): path for path in files}
-        selected = [by_name[item] for item in changed_names]
-        summary_lines = [
-            f"# Orbit development iteration {iteration:03d}",
-            "",
-            f"Incremental source archive for product Build {build}, version {version}.",
-            f"Baseline archive: {state.get('archive', '(no baseline)')}.",
-            "",
-            "Changed or added files:",
-            *(f"- `{item}`" for item in changed_names),
-        ]
-        if removed_names:
-            summary_lines.extend(["", "Removed since baseline (listed for context; no file payload):", *(f"- `{item}`" for item in removed_names)])
-        summary = "\n".join(summary_lines)
-        baseline = f"Incremental against {state.get('archive', '(no baseline)')}. Files in this ZIP use project-relative paths. Created {datetime.now(timezone.utc).isoformat(timespec='seconds')}."
-
-    target = write_archive(name, selected, summary, baseline)
-    state_data = {"archive": name, "files": current}
-    temporary = STATE_FILE.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state_data, indent=2) + "\n")
-    temporary.replace(STATE_FILE)
-    print(f"Source archive: {target}")
-    print(f"Files: {len(selected)} project files + CHANGE_SUMMARY.md + BASELINE.txt")
-    print(f"Size: {target.stat().st_size:,} bytes")
-
-
-if __name__ == "__main__":
-    main()
+KœÝÜÚ^™N‹Hž]\ÈŠB‚‚šYˆ×Û˜[YW×ÈOH—×ÛXZ[—×ÈŽ‚ˆXZ[Š
+B
