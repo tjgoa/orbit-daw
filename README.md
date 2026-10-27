@@ -4,6 +4,11 @@ Orbit is a standalone DAW inspired by Orion's generator → pattern → playlist
 
 ## Current state
 
+<img width="1680" height="963" alt="2" src="https://github.com/user-attachments/assets/11df3ec9-8955-4cdb-98cd-75fc7600b400" />
+
+<img width="1680" height="967" alt="1" src="https://github.com/user-attachments/assets/4776994d-c6af-47f6-abd9-23b55acf3dc6" />
+
+
 Orbit is an actively changing DAW foundation rather than a finished Orion-style workflow. The current source checkpoint is Build 131 / v0.3.110, with local development iteration **181**. It includes a Tracktion Engine-backed built-in 4OSC instrument, VST3 instruments, editable Piano Roll, generator-owned A1–H8 pattern banks, a 512-bar Playlist, MIDI export, and `.orbit` project save/reopen. Pattern mode plays each generator's remembered pattern together; Song mode follows Playlist clips and preserves the other generators' remembered positions. Automation has separate pattern-time lanes in the Piano Roll and song-time lanes in the Playlist. Playlist generator context actions include Show, Rename, Delete, Clone Track To, Edit Song Events, and Track Color; patterns/arrangement clone and persistent track colors are implemented. Loop start/length/enabled state persists and is drawn on the Playlist ruler. The Mixer contains generator strips with sends and output-bus assignment; the separate Master Section contains bus/return strips and a Master strip with four inserts and no sends. Routed buses appear there automatically. The Mixer stays in the Orbit workspace and can be moved, minimized, or closed. VST3 scan and crash reports are written to the Desktop. Current follow-up work includes immediate instrument-key audition, Playlist responsiveness and controls, Mixer Settings/Effects cloning, and runtime verification of loop playback, automation, bus routing, and context actions. See `ORION_LEARN_TODO.md` for remaining work, `ORION_NATIVE_EFFECTS_COMPATIBILITY.md` for the observed Orion effect inventory and migration plan, `BUILD_HISTORY.md` for product checkpoints, and `Source/Project/PROJECT_FORMAT.md` for the project format. Orbit is not yet verified as a finished production DAW.
 
 See [`PROGRESS.md`](PROGRESS.md) for a dated development update and current focus.
