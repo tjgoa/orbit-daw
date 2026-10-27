@@ -1,73 +1,131 @@
-YªçŠx³¬uç%j·Â+ar‰ì¶ë•ë_¢ºŞjË"‚v›•ëÚ®&›•ëÜ˜YÛXHÛ˜ÙB‚ˆÚ[˜ÛYHXÙRXY\‹š‚ˆÚ[˜ÛYHÜ[Û˜[‚‚‹ËÈÜ˜š]	ÜÈÛ‹Y\ÚÈ›Ú™XİØİ[Y[\ÈÙ\Ù\\˜]Hœ›ÛH˜XÚİ[Ûˆ[™Ú[™IÜÂ‹ËÈY][Ù[ÛÈH›Ú™XİØÚ[XHØ[ˆ™[XZ[ˆİX›HYˆH[™Ú[™HÚ[™Ù\Ë‚˜Û\ÜÈ›Ú™XİØİ[Y[ÂœX›XÎ‚ˆİ]XÈÛÛœİ^ˆ[İ\œ™[ØÚ[XU™\œÚ[ÛˆHÂˆİ]XÈÛÛœİ^ˆ[XÚÜÔ\”]X\\“›İHHMŒÂˆİ]XÈÛÛœİ^ˆ[]\›˜[šĞÛİ[HÂˆİ]XÈÛÛœİ^ˆ[]\›œÔ\˜[šÈHÂˆİ]XÈÛÛœİ^ˆ[]\›”ÛİÛİ[H]\›˜[šĞÛİ[
-ˆ]\›œÔ\˜[šÎÂ‚ˆ[[HÛ\ÜÈ˜XÚÒÚ[™ˆÂˆ[œİ[Y[ˆZYKˆ]Y[ÂˆNÂ‚ˆİXİ[YTÚYÛ˜]\™BˆÂˆ[[Y\˜]ÜˆHÂˆ[[›ÛZ[˜]ÜˆHÂˆNÂ‚ˆİXİ]]ÛX][Û”Ú[ˆÂˆ[ÜÚ][ÛˆHÈËÈÚ^Y[[›İHİ\È
-]\›ˆÜˆÛÛ™È[Y[[™JBˆ›Ø]˜[YHHYÈËÈ›Ü›X[^™Y‹ŒH\˜[Y]\ˆ˜[YBˆNÂ‚ˆİXİ]]ÛX][Û“[™BˆÂˆXÙN”İš[™ÈYÚ[“˜[YNÂˆXÙN”İš[™È\˜[Y]\’YÂˆXÙN”İš[™È\˜[Y]\“˜[YNÂˆXÙN\œ˜^O]]ÛX][Û”Ú[ˆÚ[ÎÂˆNÂ‚ˆ›Ú™XİØİ[Y[
+#pragma once
 
-NÂˆ›Ú™XİØİ[Y[
-ÛÛœİ›Ú™XİØİ[Y[	ˆİ\ŠNÂˆ›Ú™XİØİ[Y[	ˆÜ\˜]ÜJÛÛœİ›Ú™XİØİ[Y[	ˆİ\ŠNÂˆ›Ú™XİØİ[Y[
-›Ú™XİØİ[Y[	‰ŠH›Ù^Ù\HY˜][Âˆ›Ú™XİØİ[Y[	ˆÜ\˜]ÜJ›Ú™XİØİ[Y[	‰ŠH›Ù^Ù\HY˜][Â‚ˆİ]XÈ›Ú™XİØİ[Y[Ü™X]S™]Ê
-NÂˆİ]XÈİ›Ü[Û˜[›Ú™XİØİ[Y[ˆØYœ›ÛQš[JÛÛœİXÙN‘š[Iˆš[KˆXÙN”İš[™Éˆ\œ›ÜŠNÂ‚ˆ›ÛÛØ]™UÑš[JÛÛœİXÙN‘š[Iˆš[KXÙN”İš[™Éˆ\œ›ÜŠNÂˆ›ÚYÙ]˜[YJÛÛœİXÙN”İš[™Éˆ˜[YJNÂˆXÙN”İš[™ÈY˜XÚÊ˜XÚÒÚ[™Ú[™ÛÛœİXÙN”İš[™Éˆ˜[YHHßJNÂˆ›ÚYY[œİ[Y[˜XÚÊ
-NÂˆ›ÚYÙ]˜XÚİ[Û‘Y]İ]JÛÛœİXÙN•˜[YU™YIˆY]İ]JNÂˆXÙN•˜[YU™YHÙ]˜XÚİ[Û‘Y]İ]J
-HÛÛœİÂ‚ˆXÙN”İš[™ÈÙ]˜[YJ
-HÛÛœİÂˆXÙN”İš[™ÈÙ]›Ú™XİY
+#include <JuceHeader.h>
+#include <optional>
 
-HÛÛœİÂˆXÙN”İš[™ÈÙ]\ØÜš\[ÛŠ
-HÛÛœİÂˆ›ÚYÙ]\ØÜš\[ÛŠÛÛœİXÙN”İš[™Éˆ\ØÜš\[ÛŠNÂˆXÙN”İš[™ÈÙ]Ü™X]Ü•\›
+// Orbit's on-disk project document is kept separate from Tracktion Engine's
+// Edit model so the project schema can remain stable if the engine changes.
+class ProjectDocument
+{
+public:
+    static constexpr int currentSchemaVersion = 4;
+    static constexpr int ticksPerQuarterNote = 960;
+    static constexpr int patternBankCount = 8;
+    static constexpr int patternsPerBank = 8;
+    static constexpr int patternSlotCount = patternBankCount * patternsPerBank;
 
-HÛÛœİÂˆ›ÚYÙ]Ü™X]Ü•\›
-ÛÛœİXÙN”İš[™Éˆ\›
-NÂˆXÙN‘š[HÙ]š[J
-HÛÛœİÈ™]\›ˆ›Ú™Xİš[NÈBˆ›ÛÛ\Ñš[J
-HÛÛœİÈ™]\›ˆ›Ú™Xİš[K™^\İĞ\Ñš[J
-NÈBˆ[Ù]˜XÚĞÛİ[
+    enum class TrackKind
+    {
+        instrument,
+        midi,
+        audio
+    };
 
-HÛÛœİÂˆXÙN”İš[™ÈÙ]˜XÚÒY
-[[™^
-HÛÛœİÂˆXÙN”İš[™ÈÙ]˜XÚÓ˜[YJ[[™^
-HÛÛœİÂˆ›ÚYÙ]˜XÚÓ˜[YJ[[™^ÛÛœİXÙN”İš[™Éˆ˜[YJNÂˆ›ÛÛ™[[İ™U˜XÚÊ[[™^
-NÂˆ[Ù]ÛÜİ\˜\Š
-HÛÛœİÂˆ[Ù]ÛÜ[™İ˜\œÊ
-HÛÛœİÂˆ›ÛÛ\ÓÛÜ[˜X›Y
+    struct TimeSignature
+    {
+        int numerator = 4;
+        int denominator = 4;
+    };
 
-HÛÛœİÂˆ›ÛÛÙ]ÛÜÙ][™ÜÊ[İ\˜\‹[[™İ˜\œË›ÛÛ[˜X›Y
-NÂˆXÙNÛÛİ\ˆÙ]˜XÚĞÛÛİ\Š[[™^
-HÛÛœİÂˆ›ÚYÙ]˜XÚĞÛÛİ\Š[[™^XÙNÛÛİ\ˆÛÛİ\ŠNÂˆ›ÛÛÛÛ™U˜XÚÔ]\›œĞ[™\œ˜[™Ù[Y[
-ÛÛœİXÙN”İš[™ÉˆÛİ\˜ÙU˜XÚÒYˆÛÛœİXÙN”İš[™Éˆ\İ[˜][Û•˜XÚÒY
-NÂˆ[Ù]˜XÚÔÙ[XİY]\›’[™^
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY
-HÛÛœİÂˆ›ÚYÙ]˜XÚÔÙ[XİY]\›’[™^
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[]\›’[™^
-NÂˆ›ÚYÙ]˜XÚÓZ^\”İ]J[[™^İX›HØZ[‘‹İX›H[‹›ÛÛ]]Y›ÛÛÛÛÊNÂˆ›ÚYÙ]˜XÚÔÙ[™ØZ[Š[[™^[\ËİX›HØZ[‘ŠNÂˆ›ÛÛÙ]™]\›“Z^\”İ]J[\ËÛÛœİXÙN”İš[™ÉˆÚ[›™[YˆÛÛœİXÙN”İš[™Éˆ˜[YKİX›HØZ[‘‹İX›H[‹ˆ›ÛÛ]]Y›ÛÛÛÛÊNÂˆ›ÚYÙ]X\İ\“Z^\”İ]JİX›HØZ[‘‹İX›H[‹›ÛÛ]]Y
-NÂˆXÙN”İš[™ÈÙ]]\›’Y
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
-HÛÛœİÂˆ[Ù]]\›’[™^›Ü’Y
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒYÛÛœİXÙN”İš[™Éˆ]\›’Y
-HÛÛœİÂˆXÙN”İš[™ÈÙ]]\›“˜[YJÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
-HÛÛœİÂˆ›ÛÛ\Ô]\›Ü™X]Y
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
-HÛÛœİÂˆ›ÛÛÙ]]\›“›İJÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\
-HÛÛœİÂˆ[Ù]]\›“›İU™[ØÚ]JÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\
-HÛÛœİÂˆ[Ù]]\›“›İS[™İ
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\
-HÛÛœİÂˆ[Ù]]\›“[™İİ\ÊÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
-HÛÛœİÂˆ›ÚYÙ]]\›Ü™X]Y
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^›ÛÛÜ™X]Y
-NÂˆ›ÚYÙ]]\›“›İJÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\›ÛÛ[˜X›Y
-NÂˆ›ÚYÙ]]\›“›İU™[ØÚ]JÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\[™[ØÚ]JNÂˆ›ÚYÙ]]\›“›İS[™İ
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[]Ú[İ\[[™İİ\ÊNÂˆ›ÚYÙ]]\›“[™İİ\ÊÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[[™İİ\ÊNÂˆ[Ù]]\›]]ÛX][Û“[™PÛİ[
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^
-HÛÛœİÂˆ]]ÛX][Û“[™HÙ]]\›]]ÛX][Û“[™JÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^[[™R[™^
-HÛÛœİÂˆ›ÚYÙ]]\›]]ÛX][Û•\™Ù]
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^ˆÛÛœİXÙN”İš[™ÉˆYÚ[“˜[YKÛÛœİXÙN”İš[™Éˆ\˜[Y]\’YˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\“˜[YJNÂˆ›ÚYÙ]]\›]]ÛX][Û”Ú[
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[Ûİ[™^ˆÛÛœİXÙN”İš[™ÉˆYÚ[“˜[YKÛÛœİXÙN”İš[™Éˆ\˜[Y]\’YˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\“˜[YK[İ\›Ø]˜[YJNÂˆ[Ù]ÛÛ™Ğ]]ÛX][Û“[™PÛİ[
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY
-HÛÛœİÂˆ]]ÛX][Û“[™HÙ]ÛÛ™Ğ]]ÛX][Û“[™JÛÛœİXÙN”İš[™Éˆ˜XÚÒY[[™R[™^
-HÛÛœİÂˆ›ÚYÙ]ÛÛ™Ğ]]ÛX][Û”Ú[
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒYˆÛÛœİXÙN”İš[™ÉˆYÚ[“˜[YKÛÛœİXÙN”İš[™Éˆ\˜[Y]\’YˆÛÛœİXÙN”İš[™Éˆ\˜[Y]\“˜[YK[ÛÛ™Ôİ\›Ø]˜[YJNÂˆ›ÚY[İ™U˜XÚÊ[Ûİ\˜ÙR[™^[\İ[˜][Û’[™^
-NÂˆXÙN”İš[™ÈÙ]^[\İ]\›’Y
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒY[˜\ŠHÛÛœİÂˆ›ÚYÙ]^[\İÛ\
-ÛÛœİXÙN”İš[™Éˆ˜XÚÒYÛÛœİXÙN”İš[™Éˆ]\›’Yˆ[İ\˜\‹[[™İ˜\œË›ÛÛ[˜X›Y
-NÂˆ[Ù]XÚÜÔ\”]X\\“›İJ
-HÛÛœİÂˆİX›HÙ][š]X[[\ĞœJ
-HÛÛœİÂˆ›ÚYÙ][š]X[[\ĞœJİX›HœJNÂˆ[YTÚYÛ˜]\™HÙ][š]X[[YTÚYÛ˜]\™J
-HÛÛœİÂˆ›ÚYÙ][š]X[[YTÚYÛ˜]\™J[[Y\˜]Ü‹[[›ÛZ[˜]ÜŠNÂ‚œš]˜]N‚ˆ^XÚ]›Ú™XİØİ[Y[
-XÙN•˜[YU™YHİ]KXÙN‘š[Hš[HHßJNÂ‚ˆXÙN•˜[YU™YHİ]NÂˆXÙN‘š[H›Ú™Xİš[NÂŸNÂ
+    struct AutomationPoint
+    {
+        int position = 0;       // sixteenth-note steps (pattern or song timeline)
+        float value = 0.5f;     // normalized 0..1 parameter value
+    };
+
+    struct AutomationLane
+    {
+        juce::String pluginName;
+        juce::String parameterId;
+        juce::String parameterName;
+        juce::Array<AutomationPoint> points;
+    };
+
+    ProjectDocument();
+    ProjectDocument(const ProjectDocument& other);
+    ProjectDocument& operator=(const ProjectDocument& other);
+    ProjectDocument(ProjectDocument&&) noexcept = default;
+    ProjectDocument& operator=(ProjectDocument&&) noexcept = default;
+
+    static ProjectDocument createNew();
+    static std::optional<ProjectDocument> loadFromFile(const juce::File& file,
+                                                        juce::String& error);
+
+    bool saveToFile(const juce::File& file, juce::String& error);
+    void setName(const juce::String& name);
+    juce::String addTrack(TrackKind kind, const juce::String& name = {});
+    void addInstrumentTrack();
+    void setTracktionEditState(const juce::ValueTree& editState);
+    juce::ValueTree getTracktionEditState() const;
+
+    juce::String getName() const;
+    juce::String getProjectId() const;
+    juce::String getDescription() const;
+    void setDescription(const juce::String& description);
+    juce::String getCreatorUrl() const;
+    void setCreatorUrl(const juce::String& url);
+    juce::File getFile() const { return projectFile; }
+    bool hasFile() const { return projectFile.existsAsFile(); }
+    int getTrackCount() const;
+    juce::String getTrackId(int index) const;
+    juce::String getTrackName(int index) const;
+    void setTrackName(int index, const juce::String& name);
+    bool removeTrack(int index);
+    int getLoopStartBar() const;
+    int getLoopLengthBars() const;
+    bool isLoopEnabled() const;
+    bool setLoopSettings(int startBar, int lengthBars, bool enabled);
+    juce::Colour getTrackColour(int index) const;
+    void setTrackColour(int index, juce::Colour colour);
+    bool cloneTrackPatternsAndArrangement(const juce::String& sourceTrackId,
+                                         const juce::String& destinationTrackId);
+    int getTrackSelectedPatternIndex(const juce::String& trackId) const;
+    void setTrackSelectedPatternIndex(const juce::String& trackId, int patternIndex);
+    void setTrackMixerState(int index, double gainDb, double pan, bool muted, bool solo);
+    void setTrackSendGain(int index, int bus, double gainDb);
+    bool setFxReturnMixerState(int bus, const juce::String& channelId,
+                               const juce::String& name, double gainDb, double pan,
+                               bool muted, bool solo);
+    void setMasterMixerState(double gainDb, double pan, bool muted);
+    juce::String getPatternId(const juce::String& trackId, int slotIndex) const;
+    int getPatternIndexForId(const juce::String& trackId, const juce::String& patternId) const;
+    juce::String getPatternName(const juce::String& trackId, int slotIndex) const;
+    bool isPatternCreated(const juce::String& trackId, int slotIndex) const;
+    bool getPatternNote(const juce::String& trackId, int slotIndex, int pitch, int step) const;
+    int getPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step) const;
+    int getPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step) const;
+    int getPatternLengthSteps(const juce::String& trackId, int slotIndex) const;
+    void setPatternCreated(const juce::String& trackId, int slotIndex, bool created);
+    void setPatternNote(const juce::String& trackId, int slotIndex, int pitch, int step, bool enabled);
+    void setPatternNoteVelocity(const juce::String& trackId, int slotIndex, int pitch, int step, int velocity);
+    void setPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step, int lengthSteps);
+    void setPatternLengthSteps(const juce::String& trackId, int slotIndex, int lengthSteps);
+    int getPatternAutomationLaneCount(const juce::String& trackId, int slotIndex) const;
+    AutomationLane getPatternAutomationLane(const juce::String& trackId, int slotIndex, int laneIndex) const;
+    void setPatternAutomationTarget(const juce::String& trackId, int slotIndex,
+                                    const juce::String& pluginName, const juce::String& parameterId,
+                                    const juce::String& parameterName);
+    void setPatternAutomationPoint(const juce::String& trackId, int slotIndex,
+                                   const juce::String& pluginName, const juce::String& parameterId,
+                                   const juce::String& parameterName, int step, float value);
+    int getSongAutomationLaneCount(const juce::String& trackId) const;
+    AutomationLane getSongAutomationLane(const juce::String& trackId, int laneIndex) const;
+    void setSongAutomationPoint(const juce::String& trackId,
+                                const juce::String& pluginName, const juce::String& parameterId,
+                                const juce::String& parameterName, int songStep, float value);
+    void moveTrack(int sourceIndex, int destinationIndex);
+    juce::String getPlaylistPatternId(const juce::String& trackId, int bar) const;
+    void setPlaylistClip(const juce::String& trackId, const juce::String& patternId,
+                         int startBar, int lengthBars, bool enabled);
+    int getTicksPerQuarterNote() const;
+    double getInitialTempoBpm() const;
+    void setInitialTempoBpm(double bpm);
+    TimeSignature getInitialTimeSignature() const;
+    void setInitialTimeSignature(int numerator, int denominator);
+
+private:
+    explicit ProjectDocument(juce::ValueTree state, juce::File file = {});
+
+    juce::ValueTree state;
+    juce::File projectFile;
+};

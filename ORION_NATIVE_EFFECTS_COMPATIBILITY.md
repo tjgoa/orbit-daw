@@ -1,2 +1,76 @@
-YªçŠx³¬uç%j·Â+ar‰ì¶ë•ë_¢ºŞjË"‚v›•ëÚ®&›•ëÈÜš[Ûˆ˜]]™HY™™XİÛÛ\]Xš[]H[™[ÜB‚”\İK\™XYH™Y™\™[˜ÙH›ÜˆHÜ˜š]›Ú™XİZYÜ˜][ÛˆÛÜšËˆ˜[Y\È™[İÈÙ\™H™XYœ›ÛHH\Ù\‰ÜÈ[˜]]™HÜİ›\Üš[Ûˆ[œÙ\Y[H™XÛÜ™[™È
-Œ‹LLLŠKˆ\È\È[ˆØœÙ\™YY[H[™[ÜK›İHÛZ[H]Ü˜š]İ\œ™[H[\[Y[È\ÙHY™™XİË‚‚ˆÈÈ–[˜[ZXÜÂ‹HœšXÚİØ[[Z]\‚‹HÛÛ\™\ÜÛÜˆÕ‹N‚‹HÛÛ\™\ÜÛÜˆKLMŒ‹H][[H[Z]\‚‹H›ÙÜ˜[[XX›HØ]B‹H˜[œÚY[Ú\\‚‚ˆÈÈ–XÚËÑ[^B‹H‹U\Q[^B‹HY™\ÙH[^B‹Hš[\ˆ[^B‹H][HXÚÂ‹HÚ[\H[^B‹Hİ\™[È[^B‹H[š][^B‹HQ[^B‚ˆÈÈ–™]™\˜‚‹HÚ[X™\‹Ô›ÛÛB‹HÛÛ˜Ù\[‹H˜]ÜXÙB‹H\™ÙH[‹H]H™]™\˜‚‹H[\[ÙH™\ÜÛœÙH›ØÙ\ÜÛÜ‚‚ˆÈÈ–š[\‚‹H[˜[ÙÈİ]XÈËP˜[™TB‹H]]È˜XÚÚ[™ÈTKL‚‹H]]È˜XÚÚ[™ÈTKM‹H\›[ÛšXÈ™\ÛÛ˜]Ü‚‹HİÈİ]‹H\˜[Y]šXÈTB‹H™[[İ™H›Ú\ÙB‹HÚYXÚZ[ˆÛÛ›ÛYš[\‚‹H˜\šXX›Hš[\‚‹Hš[YÙHTB‚ˆÈÈ–Z\ØÂ‹H[˜[ÙÈ\İÜ[ÛˆQLB‹H[˜[ÙÈ\Ù\ˆTM‚‹HÚÜ\ËÑ›[™Ù\‚‹HÑšKÓ›Ú\ÙB‹H\Ù\‚‹Hš[™È[Ù[]Ü‚‹H›İ\HÜXZÙ\‚‹HØ]\˜][Û‚‹HÔĞˆ[Ù[]Ü‚‹Hİ\™[È[‹ÕÚY‹Hİ\™[ÈÚY[ˆ›Â‹H™[[ÛÂ‹HX™H\İÜ[Û‚‹HÛËP˜[™Q\İÜ[Û‚‹Hš[YÙHÚÜ\Â‚ˆÈÈ–Û\‚‹H˜[™–ÛÛ›Û‹H][Q–ÛÛ›Û‹Hİ\™[Ñ–ÛÛ›Û‚ˆÈÈÛÛ\]Xš[]HÛÜšÈÈ˜XÚÂ‹H\œÙHÜš[Ûˆ›Ú™XİY™™XİY[YšY\œÈ[™\˜[Y]\œÈ™Y›Ü™H\ÚYÛš[™È™\XÙ[Y[ÎÈY[HX™[È[Û™HX^H›İX]ÚHÙ\šX[^™Y˜[Y\Ë‚‹HYHZYÜ˜][ÛˆX\œ›ÛHXXÚÜš[ÛˆY™™XİY[YšY\ˆÈ[ˆÜ˜š]˜]]™HY™™XİHÜ˜\\‹ÜÙ]YËYY™™XİÜˆHÛX\›H™\ÜY[œİ\ÜYY™™Xİ‚‹HÙY\XXÚ™\XÙ[Y[	ÜÈ\˜[Y]\ˆX\[™[š]ÛÛ™\œÚ[ÛœÈ™\ÚYH]ÈY™™Xİ[\[Y[][Û‹‚‹HÛÛ\\™H™\™\Ù[]]™HÙ][™ÜÈ[™]Y[È™[™\œÈÛÈ™\XÙ[Y[ÈÛİ[™™X\ÛÛ˜X›HÛÜÙKÚ[HØİ[Y[[™È[˜]›ÚYX›HY™™\™[˜Ù\Ë‚‹H™\Ù\™HHÜšYÚ[˜[Y™™Xİİ]H[ˆ›Ú™XİY]Y]HÚ[ˆ›È™\XÙ[Y[Ø[ˆ™HÜ™X]YÛÈH]\ˆZYÜ˜][Ûˆ\ÜÈØ[ˆ™XÛİ™\ˆ]‚‹HÛÛ™š\›HÚ]\ˆHÛÜš[Ûˆ›Ú™Xİ›Ü›X]Ù\šX[^™\È™\Ù]Ë[\[ÙH™\ÜÛœÙ\ËÚYKXÚZ[ˆ[šÜËÜˆ^\›˜[™\Ûİ\˜ÙH]ÈÙ\\˜][K‚‚ˆÈÈ™\šYšXØ][Ûˆİ]\Â‹HH–XÚËÑ[^K™]™\˜‹š[\‹Z\ØÈ[™Û\ˆ\İÈ\™HYÚX›H[ˆHİ\YYšY[Èœ˜[Y\Ë‚‹HH[˜[ZXÜÈİX›Y[HØ\Èš\ÚX›HœšYY›H]›İYÚX›H[ˆH^˜XİYœ˜[YNÈ]ÈÚ^˜[Y\ÈX›İ™H™YYHÚ\œ\ˆœ˜[YHÜˆH›Ú™XİY›Ü›X][™[ÜH\ÜÈ™Y›Ü™Hš[˜[^š[™ÈÛÛ\]Xš[]HQË‚‹H›ÈÙ]YËYY™™XİÈ\™H[\[Y[YH\È[™[ÜH›İKˆ]™XÛÜ™ÈHZYÜ˜][ÛˆØÛÜH›Üˆ]\ˆ[\[Y[][Û‹‚
+# Orion native effect compatibility inventory
+
+Paste-ready reference for the Orbit project migration work. Names below were read from the user's `all native host fx.mp4` Orion Insert menu recording (2026-10-26). This is an observed menu inventory, not a claim that Orbit currently implements these effects.
+
+## FX Dynamics
+- Brickwall Limiter
+- Compressor CV-82
+- Compressor DNA-160
+- Platinum Limiter
+- Programmable Gate
+- Transient Shaper
+
+## FX Echo/Delay
+- 2-Tap-Delay
+- Diffuse Delay
+- Filter Delay
+- Multi Echo
+- Simple Delay
+- Stereo Delay
+- Unit Delay
+- X-Delay
+
+## FX Reverb
+- Chamber/Room
+- Concert Hall
+- Fat Space
+- Large Hall
+- Plate Reverb
+- Impulse Response Processor
+
+## FX Filter
+- Analog Static 3-Band EQ
+- Auto Tracking EQ-2
+- Auto Tracking EQ-4
+- Harmonic Resonator
+- Low Cut
+- Parametric EQ
+- Remove Noise
+- Sidechain Controlled Filter
+- Variable Filter
+- Vintage EQ
+
+## FX Misc
+- Analog Distortion AD-1
+- Analog Phaser AP-6
+- Chorus/Flanger
+- LoFi/Noise
+- Phaser
+- Ring Modulator
+- Rotary Speaker
+- Saturation
+- SSB Modulator
+- Stereo Pan/Width
+- Stereo Widen Pro
+- Tremolo
+- Tube Distortion
+- Two-Band-Distortion
+- Vintage Chorus
+
+## FX Holder
+- BandFX Control
+- MultiFX Control
+- StereoFX Control
+
+## Compatibility work to track
+- Parse Orion project effect identifiers and parameters before designing replacements; menu labels alone may not match the serialized names.
+- Add a migration map from each Orion effect identifier to an Orbit native effect, a wrapper/pseudo-effect, or a clearly reported unsupported effect.
+- Keep each replacement's parameter map and unit conversions beside its effect implementation.
+- Compare representative settings and audio renders so replacements sound reasonably close, while documenting unavoidable differences.
+- Preserve the original effect state in project metadata when no replacement can be created, so a later migration pass can recover it.
+- Confirm whether the old Orion project format serializes presets, impulse responses, side-chain links, or external resource paths separately.
+
+## Verification status
+- The FX Echo/Delay, Reverb, Filter, Misc and Holder lists are legible in the supplied video frames.
+- The Dynamics submenu was visible briefly but not legible in the extracted frame; its six names above need a sharper frame or a project-format inventory pass before finalizing compatibility IDs.
+- No pseudo-effects are implemented by this inventory note. It records the migration scope for later implementation.

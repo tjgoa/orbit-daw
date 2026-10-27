@@ -1,16 +1,50 @@
-YªçŠx³¬uç%j·Â+ar‰ì¶ë•ë_¢ºÞjË"‚v›•ëÚ®&›•ëÈÜ˜š]UÂ‚“Ü˜š]\ÈHÝ[™[Û™HUÈ[œÜ\™YžHÜš[Û‰ÜÈÙ[™\˜]Üˆ8¡¤ˆ]\›ˆ8¡¤ˆ^[\Ý8¡¤ˆZ^\ˆÛÜšÙ›ÝËˆH\XØ][Ûˆ\È™Z[™È]™[ÜY\ÈÜšYÚ[˜[ÛÙØ\™H[™\ˆQÔŒË‚‚ˆÈÈÝ\œ™[Ý]B‚“Ü˜š]\È[ˆXÝ]™[HÚ[™Ú[™ÈUÈ›Ý[™][Ûˆ˜]\ˆ[ˆHš[š\ÚYÜš[Û‹\Ý[HÛÜšÙ›ÝËˆHÝ\œ™[ÛÝ\˜ÙHÚXÚÜÚ[\ÈZ[LÈŒŒËÎKÚ]ØØ[]™[ÜY[]\˜][Ûˆ
-ŠŒMMJŠ‹ˆ][˜ÛY\ÈH˜XÚÝ[Ûˆ[™Ú[™KX˜XÚÙYZ[Z[ˆÔÐÈ[œÝ[Y[”ÕÈ[œÝ[Y[ËY]X›HX[›È›ÛÙ[™\˜]Ü‹[ÝÛ™YLx $Ò]\›ˆ˜[šÜËHLL‹X˜\ˆ^[\ÝRQH^Ü[™›Ü˜š]›Ú™XÝØ]™KÜ™[Ü[‹ˆ]\›ˆ[ÙH^\ÈXXÚÙ[™\˜]Ü‰ÜÈ™[Y[X™\™Y]\›ˆÙÙ]\ŽÈÛÛ™È[ÙH›ÛÝÜÈ^[\ÝÛ\È[™™\Ù\™\ÈHÝ\ˆÙ[™\˜]ÜœÉÈ™[Y[X™\™YÜÚ][ÛœËˆ]]ÛX][Ûˆ\ÈÙ\\˜]H]\›‹][YH[™\È[ˆHX[›È›Û[™ÛÛ™Ë][YH[™\È[ˆH^[\Ýˆ^[\ÝÙ[™\˜]ÜˆÛÛ^XÝ[ÛœÈ[˜ÛYHÚÝË™[˜[YK[]KÛÛ™H˜XÚÈËY]ÛÛ™È]™[Ë[™˜XÚÈÛÛÜŽÈ]\›œËØ\œ˜[™Ù[Y[ÛÛ™H[™\œÚ\Ý[˜XÚÈÛÛÜœÈ\™H[\[Y[YˆÛÜÝ\Û[™ÝÙ[˜X›YÝ]H\œÚ\ÝÈ[™\È˜]ÛˆÛˆH^[\Ý[\‹ˆHZ^\ˆÛÛZ[œÈÙ[™\˜]ÜˆÝš\ÈÚ]Ù[™È[™Ý]]X\È\ÜÚYÛ›Y[ÈHÙ\\˜]HX\Ý\ˆÙXÝ[ÛˆÛÛZ[œÈ\ËÜ™]\›ˆÝš\È[™HX\Ý\ˆÝš\Ú]›Ý\ˆ[œÙ\È[™›ÈÙ[™Ëˆ›Ý]Y\Ù\È\X\ˆ\™H]]ÛX]XØ[KˆHZ^\ˆÝ^\È[ˆHÜ˜š]ÛÜšÜÜXÙH[™Ø[ˆ™H[Ý™YZ[š[Z^™YÜˆÛÜÙYˆ”ÕÈØØ[ˆ[™Ü˜\Ú™\ÜÈ\™HÜš][ˆÈH\ÚÝÜˆÝ\œ™[›ÛÝË]\ÛÜšÈ[˜ÛY\È[[YYX]H[œÝ[Y[ZÙ^H]Y][Û‹^[\Ý™\ÜÛœÚ]™[™\ÜÈ[™ÛÛ›ÛËZ^\ˆÙ][™ÜËÑY™™XÝÈÛÛš[™Ë[™[[YH™\šYšXØ][ÛˆÙˆÛÜ^X˜XÚË]]ÛX][Û‹\È›Ý][™Ë[™ÛÛ^XÝ[ÛœËˆÙYHÔ’SÓ—ÓPT“—ÕÑË›Y›Üˆ™[XZ[š[™ÈÛÜšËÔ’SÓ—ÓUU‘WÑQ‘‘PÕ×ÐÓÓTUP’SUK›Y›ÜˆHØœÙ\™YÜš[ÛˆY™™XÝ[™[ÜžH[™ZYÜ˜][Ûˆ[‹•RSÒTÕÔ–K›Y›Üˆ›ÙXÝÚXÚÜÚ[Ë[™ÛÝ\˜ÙKÔ›Ú™XÝÔ“Ò‘PÕÑ“Ô“PU›Y›ÜˆH›Ú™XÝ›Ü›X]ˆÜ˜š]\È›ÝY]™\šYšYY\ÈHš[š\ÚY›ÙXÝ[ÛˆUË‚‚”ÙYHØ“ÑÔ‘TÔË›YJ“ÑÔ‘TÔË›Y
-H›ÜˆH]Y]™[ÜY[\]H[™Ý\œ™[›ØÝ\Ë‚‚ˆÈÈÈØYH”ÕÈ[œÝ[Y[‚“Ü˜š]Ü[œÈÚ]Hœ™\Ú™XYK]Ë]\ÙH›Ú™XÝˆÚÛÜÙH
-Š’[œÙ\ˆ”Õ[œÝ[Y[ÈˆØØ[ˆÈX[˜YÙH”ÕÈ[œÝ[Y[ø )ŠŠˆÈš[™HYÚ[ŽÈHš\œÝœ›ÝÜÙ\ˆÜ[š[™ÈØØ[œÈHÝ[™\™”ÕÈ›Û\œÈ›ÜˆHÝ\œ™[]›Ü›H]]ÛX]XØ[KˆÙ[XÝ[ˆ[œÝ[Y[[™ÚÛÜÙH
-Š’[œÙ\
-ŠˆÈY]\ÈHÙ[™\˜]Üˆ[™Ü[ˆ]ÈYÚ[ˆY]Ü‹ˆ\ØÛÝ™\™Y”ÕÈ[œÝ[Y[È\X\ˆ[™\ˆ
-Š•”Õ[œÝ[Y[ÊŠˆ[ˆH[œÙ\Y[NÈÜ˜š]	ÜÈZ[Z[ˆ[œÝ[Y[™[XZ[œÈ[™\ˆ
-Š”Þ[ÊŠ‹ˆHY[H›ÛÝÜÈÜš[Û‰ÜÈÙXÝ[ÛœÈ[™\Ù\ÈHØ[YH^Ý[[™È›Üˆ›ÝˆXXÚ[œÝ[Y[˜XÚÈ\È]ÈÝÛˆ[X™YYYÚ[ˆÕRK[™HÙ[™\˜]ÜˆXY\ˆÙ[XÝÜˆÝÚ]Ú\ÈHXÝ]™H[œÝ[Y[Ú[H]È]\›ˆÛÛ›ÛÈ™[XZ[ˆ]XÚYX›Ý™HHÕRKˆÝ\[™ÈH™]È›Ú™XÝÚ][œØ]™YÚ[™Ù\ÈÙ™™\œÈ\ØØ\™ÜˆØ[˜Ù[ˆY›ÛœÝ[™\™›Û\œÈ[™Ù]
-Š”ØØ[ˆ”ÕÈYÚ[œÈ]Ý\\
-Šˆ[ˆ
-Š“Ü[ÛœÈˆ”Õ]ø )ŠŠŽÈÝ\\ØØ[›š[™È\ÈÙ™ˆžHY˜][ˆØØ[ˆ›ÙÜ™\ÜÈÚÝÜÈHYÚ[ˆÝ\œ™[H™Z[™ÈÚXÚÙYˆXXÚÛÛ\]YØØ[ˆÜš]\ÈÜ˜š]U”ÕËTØØ[‹J‹›ÙØÈH\ÚÝÜÈ˜][ÚYÛ˜[ÈÜš]HÜ˜š]PÜ˜\ÚT™\ÜJ‹›ÙØ\™HÚ]HÚYÛ˜[[™YÚ[ˆ™Z[™ÈØØ[›™Y‚‚“Ü˜š]\ÈHÛÜšÚ[™È˜[YH[™\È›ÝYš[˜[›ÙXÝ[˜[YHÛX\˜[˜ÙKˆ[XYÙ\È\ÙY\ÈÜš[Ûˆ[™Z^\ˆ\ÚYÛˆ™Y™\™[˜Ù\È\™H[[[Û˜[HÙ\Ý]Ùˆ\ÈÛÝ\˜ÙH™\ÜÚ]ÜžK‚‚ˆÈÈZ[ÛˆXXÓÔÂ‚”™\]Z\™[Y[ÎˆÛÙKÓXZÙHËŒŒˆÜˆ™]Ù\‹[™HXXÓÔÈÑÈÝ\ÜYžHHÚXÚÙY[Ý]•PÑKÕ˜XÚÝ[Ûˆ[™Ú[™H™]š\Ú[ÛœËˆÜ˜š]	ÜÈ\XØ][ÛˆÛÝ\˜ÙH\ÈÊÊÎÈÓXZÙH\ÈHZ[ÛÛ™šYÝ\˜][Ûˆ]Ù[™\˜]\ÈÛÙH›Ú™XÝË[™•PÑKÕ˜XÚÝ[Ûˆ[™Ú[™H\™HÊÊÈXœ˜\šY\Ë‚‚ÛÛ™HÜ˜š][™™]ÚH[›™Y\[™[˜ÚY\Î‚‚˜Ú™Ú]ÛÛ™HÎ‹ËÙÚ]X‹˜ÛÛKÝ™ÛØKÛÜ˜š]Y]Ë™Ú]˜ÙÜ˜š]Y]Â™Ú]XÈ\›šÎ‹ËÙÚ]X‹˜ÛÛKËš[œÝXYÙYÚ]Ú]X‹˜ÛÛNˆÝX›[Ù[H\]HKZ[š]K\™XÝ\œÚ]™HKY\B˜‚•˜XÚÝ[Ûˆ[™Ú[™IÜÈ•PÑHÝX›[Ù[H\Ù\ÈÔÒÈHÈ™]Üš]HX›Ý™H[ÝÜÈ™]Ú[™È]Ú]Ý]Ù][™È\Ú]XˆÔÒÙ^\ËˆÙY\\Ý™X[H\[™[˜ÞHXÙ[œÙHš[\È[™›ÝXÙ\È[XÝˆ^XÝ™]š\Ú[ÛœÈ\™H\ÝY[ˆTS‘SÒQTË›Y‚‚‘Ù[™\˜]H[ˆÛÙH›Ú™XÝ[™[ˆH\‚‚˜Ú˜ÛXZÙHTÈˆPˆZ[ÞÛÙHQÈÛÙB›Ü[ˆZ[ÞÛÙKÓÜ˜š]UËžÛÙ\›Ú‚˜‚’[ˆÛÙKÙ[XÝH
-Š“Ü˜š]
-ŠˆØÚ[YH[™™\ÜÈ
-Š”[ŠŠ‹ˆHZ[Ø[ˆ[ÛÈ™H[ˆœ›ÛH\›Z[˜[Ú]ÛXZÙHKXZ[Z[ÞÛÙHKXÛÛ™šYÈXYÈK]\™Ù]Ü˜š]‚‚ˆÈÈ]™[ÜY[Z[Â‚˜ÛÛËØZ[[Ü˜š]Y]‹œÚ™XZ[ÈH\[™ÛÜY\ÈÚ[™ÙYÝ]]ÈZ[ËÐÝ\œ™[ÓÜ˜š]˜\ˆXXÚÚ[™ÙYÝXØÙ\ÜÙ[ØØ[]™[ÜY[Z[Ù]È[ˆ[˜Ü™[Y[[ÛÝ\˜ÙK[Û›H’T[™\ˆZ[ËÔÛÝ\˜ÙH\˜Ú]™\ËØÈ\ÙHØØ[Z[›ÙXÝÈ[™\˜Ú]™\È\™HYÛ›Ü™YžHÚ]ˆH[\ˆØÜš\È[™]\˜][ÛˆÛÝ[\ˆ\™H[˜ÛYY›ÜˆÛÛšX]ÜœËˆHÛÝ\˜ÙH\˜Ú]™HÙ\È›ÝÛÛZ[ˆÛÛ\[Y\XØ][ÛœÈÜˆ™[™Ü™Y•PÑKÕ˜XÚÝ[ÛˆÛÝ\˜Ù\Ë‚‚ˆÈÈ\[™[˜ÚY\Â‚•H›Ú™XÝ™XÛÜ™È˜XÚÝ[Ûˆ[™Ú[™H\ÈHÝX›[Ù[H]ŒËŒ‹ŒÈ][™Ú[™H™]š\Ú[Ûˆ[œÈ]È•PÑHÝX›[Ù[KˆÈ›Ý˜XÚÈH[Ýš[™È]™[ÜY[œ˜[˜Ú›Üˆ›ÙXÝZ[Ë‚‚ˆÈÈXÙ[œÚ[™Â‚“Ü˜š]\XØ][ÛˆÛÙH\È™[X\ÙY[™\ˆÓ•HQÔŒÈ
-ÙYHPÑS”ÑX
-Kˆ•PÑH\È\ÙY[™\ˆQÔŒÈ[™˜XÚÝ[Ûˆ[™Ú[™H[™\ˆÔŒËÝXš™XÝÈZ\ˆ™\ÜXÝ]™HXÙ[œÙHš[\È[™›ÝXÙ\Ëˆ\™\\H\[™[˜ÚY\È[œÚYHZ]\ˆ™\ÜÚ]ÜžHX^H]™HY][Û˜[XÙ[œÙ\ÎÈ™\Ù\™HÜÙH›ÝXÙ\ÈÚ[ˆ\ÝšX][™ÈZ[Ëˆ\È™\ÜÚ]ÜžHX›\Ú\ÈÛÝ\˜ÙHÛÙNÈ]Ù\È›Ý[˜ÛYHHÛÛ\[Y\XØ][Ûˆ[™K‚
+# Orbit DAW
+
+Orbit is a standalone DAW inspired by Orion's generator â†’ pattern â†’ playlist â†’ mixer workflow. The application is being developed as original software under AGPLv3.
+
+## Current state
+
+Orbit is an actively changing DAW foundation rather than a finished Orion-style workflow. The current source checkpoint is Build 100 / v0.3.79, with local development iteration **155**. It includes a Tracktion Engine-backed built-in 4OSC instrument, VST3 instruments, editable Piano Roll, generator-owned A1â€“H8 pattern banks, a 512-bar Playlist, MIDI export, and `.orbit` project save/reopen. Pattern mode plays each generator's remembered pattern together; Song mode follows Playlist clips and preserves the other generators' remembered positions. Automation has separate pattern-time lanes in the Piano Roll and song-time lanes in the Playlist. Playlist generator context actions include Show, Rename, Delete, Clone Track To, Edit Song Events, and Track Color; patterns/arrangement clone and persistent track colors are implemented. Loop start/length/enabled state persists and is drawn on the Playlist ruler. The Mixer contains generator strips with sends and output-bus assignment; the separate Master Section contains bus/return strips and a Master strip with four inserts and no sends. Routed buses appear there automatically. The Mixer stays in the Orbit workspace and can be moved, minimized, or closed. VST3 scan and crash reports are written to the Desktop. Current follow-up work includes immediate instrument-key audition, Playlist responsiveness and controls, Mixer Settings/Effects cloning, and runtime verification of loop playback, automation, bus routing, and context actions. See `ORION_LEARN_TODO.md` for remaining work, `ORION_NATIVE_EFFECTS_COMPATIBILITY.md` for the observed Orion effect inventory and migration plan, `BUILD_HISTORY.md` for product checkpoints, and `Source/Project/PROJECT_FORMAT.md` for the project format. Orbit is not yet verified as a finished production DAW.
+
+See [`PROGRESS.md`](PROGRESS.md) for a dated development update and current focus.
+
+### Load a VST3 instrument
+
+Orbit opens with a fresh, ready-to-use project. Choose **Insert > VST Instruments > Scan / Manage VST3 Instrumentsâ€¦** to find a plugin; the first browser opening scans the standard VST3 folders for the current platform automatically. Select an instrument and choose **Insert** to add it as a generator and open its plugin editor. Discovered VST3 instruments appear under **VST Instruments** in the Insert menu; Orbit's built-in instrument remains under **Synths**. The menu follows Orion's sections and uses the same text styling for both. Each instrument track has its own embedded plugin GUI, and the generator header selector switches the active instrument while its pattern controls remain attached above the GUI. Starting a new project with unsaved changes offers Discard or Cancel. Add nonstandard folders and set **Scan VST3 plugins at startup** in **Options > VST Pathsâ€¦**; startup scanning is off by default. Scan progress shows the plugin currently being checked. Each completed scan writes `Orbit-VST3-Scan-*.log` to the Desktop; fatal signals write `Orbit-Crash-Report-*.log` there with the signal and plugin being scanned.
+
+Orbit is a working name and has not had final product-name clearance. Images used as Orion and mixer design references are intentionally kept out of this source repository.
+
+## Build on macOS
+
+Requirements: Xcode, CMake 3.22 or newer, and a macOS SDK supported by the checked-out JUCE/Tracktion Engine revisions. Orbit's application source is C++; CMake is the build configuration that generates Xcode projects, and JUCE/Tracktion Engine are C++ libraries.
+
+Clone Orbit and fetch the pinned dependencies:
+
+```sh
+git clone https://github.com/tjgoa/orbit-daw.git
+cd orbit-daw
+git -c url.https://github.com/.insteadOf=git@github.com: submodule update --init --recursive --depth 1
+```
+
+Tracktion Engine's JUCE submodule uses SSH; the HTTPS rewrite above allows fetching it without setting up GitHub SSH keys. Keep upstream dependency license files and notices intact. Exact revisions are listed in `DEPENDENCIES.md`.
+
+Generate an Xcode project and run the app:
+
+```sh
+cmake -S . -B build/xcode -G Xcode
+open build/xcode/OrbitDAW.xcodeproj
+```
+
+In Xcode, select the **Orbit** scheme and press **Run**. The build can also be run from Terminal with `cmake --build build/xcode --config Debug --target Orbit`.
+
+## Development builds
+
+`Tools/build-orbit-dev.sh` rebuilds the app and copies changed output to `Builds/Current/Orbit.app`. Each changed successful local development build gets an incremental source-only ZIP under `Builds/Source Archives/`; these local build products and archives are ignored by Git. The helper scripts and iteration counter are included for contributors. A source archive does not contain compiled applications or vendored JUCE/Tracktion sources.
+
+## Dependencies
+
+The project records Tracktion Engine as a submodule at v3.2.0; that engine revision pins its JUCE submodule. Do not track a moving development branch for product builds.
+
+## Licensing
+
+Orbit application code is released under GNU AGPLv3 (see `LICENSE`). JUCE is used under AGPLv3 and Tracktion Engine under GPLv3, subject to their respective license files and notices. Third-party dependencies inside either repository may have additional licenses; preserve those notices when distributing builds. This repository publishes source code; it does not include a compiled application bundle.
