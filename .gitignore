@@ -1,0 +1,8 @@
+# Local builds and IDE-generated files
+/build/
+/DerivedData/
+/Builds/
+/.DS_Store
+
+# Python helper caches
+/Tools/__pycache__/
