@@ -67,6 +67,7 @@ public:
     juce::File getFile() const { return projectFile; }
     bool hasFile() const { return projectFile.existsAsFile(); }
     int getTrackCount() const;
+    TrackKind getTrackKind(int index) const;
     juce::String getTrackId(int index) const;
     juce::String getTrackName(int index) const;
     void setTrackName(int index, const juce::String& name);
@@ -108,6 +109,9 @@ public:
     void setPatternAutomationPoint(const juce::String& trackId, int slotIndex,
                                    const juce::String& pluginName, const juce::String& parameterId,
                                    const juce::String& parameterName, int step, float value);
+    void removePatternAutomationPoint(const juce::String& trackId, int slotIndex,
+                                      const juce::String& pluginName, const juce::String& parameterId,
+                                      int step);
     int getSongAutomationLaneCount(const juce::String& trackId) const;
     AutomationLane getSongAutomationLane(const juce::String& trackId, int laneIndex) const;
     void setSongAutomationPoint(const juce::String& trackId,

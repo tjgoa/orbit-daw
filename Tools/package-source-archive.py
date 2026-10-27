@@ -102,7 +102,8 @@ def main() -> None:
             print("No source changes since the last archive; no ZIP created.")
             return
         iteration = int(counter.get("successful_dev_iterations", 0))
-        name = f"Orbit_Dev_Iteration_{iteration:03d}_Source.zip"
+        suffix = f"_{safe_name(args.label)}" if args.label else ""
+        name = f"Orbit_Dev_Iteration_{iteration:03d}{suffix}_Source.zip"
         by_name = {path.relative_to(ROOT).as_posix(): path for path in files}
         selected = [by_name[item] for item in changed_names]
         summary_lines = [

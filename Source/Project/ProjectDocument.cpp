@@ -513,6 +513,18 @@ int ProjectDocument::getTrackCount() const
     return state.getChildWithName(tracksType).getNumChildren();
 }
 
+ProjectDocument::TrackKind ProjectDocument::getTrackKind(int index) const
+{
+    const auto tracks = state.getChildWithName(tracksType);
+    if (!juce::isPositiveAndBelow(index, tracks.getNumChildren()))
+        return TrackKind::instrument;
+
+    const auto kind = tracks.getChild(index).getProperty("kind").toString();
+    if (kind == "audio") return TrackKind::audio;
+    if (kind == "midi") return TrackKind::midi;
+    return TrackKind::instrument;
+}
+
 juce::String ProjectDocument::getTrackId(int index) const
 {
     const auto tracks = state.getChildWithName(tracksType);
@@ -1068,6 +1080,24 @@ void ProjectDocument::setPatternAutomationPoint(const juce::String& trackId, int
         slot.addChild(lanes, -1, nullptr);
     }
     setAutomationPoint(lanes, pluginName, parameterId, parameterName, step, value, 4095);
+}
+
+void ProjectDocument::removePatternAutomationPoint(const juce::String& trackId, int slotIndex,
+                                                    const juce::String& pluginName,
+                                                    const juce::String& parameterId, int step)
+{
+    auto slot = findPatternSlot(state, trackId, slotIndex);
+    auto lanes = slot.getChildWithName(patternAutomationLanesType);
+    auto lane = findAutomationLane(lanes, pluginName, parameterId);
+    if (!lane.isValid()) return;
+    const auto boundedPosition = juce::jlimit(0, 4095, step);
+    for (int i = lane.getNumChildren(); --i >= 0;)
+    {
+        const auto point = lane.getChild(i);
+        if (point.getType() == automationPointType
+            && static_cast<int>(point.getProperty("position", -1)) == boundedPosition)
+            lane.removeChild(i, nullptr);
+    }
 }
 
 int ProjectDocument::getSongAutomationLaneCount(const juce::String& trackId) const

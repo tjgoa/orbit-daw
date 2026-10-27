@@ -8,9 +8,15 @@ HISTORY_FILE="$PROJECT_ROOT/BUILD_HISTORY.md"
 CURRENT_APP="$PROJECT_ROOT/Builds/Current/Orbit.app"
 STAGING_APP="$PROJECT_ROOT/Builds/Current/Orbit.next.app"
 BUILD_SUMMARY="${1:-Development rebuild; see ORION_LEARN_TODO.md and the source archive.}"
+METADATA_BACKUP="$(mktemp -d)"
+cp "$COUNTER_FILE" "$METADATA_BACKUP/DEV_BUILD_COUNTER.json"
+cp "$HISTORY_FILE" "$METADATA_BACKUP/BUILD_HISTORY.md"
+cp "$PROJECT_ROOT/CMakeLists.txt" "$METADATA_BACKUP/CMakeLists.txt"
+cp "$PROJECT_ROOT/Source/Main.cpp" "$METADATA_BACKUP/Main.cpp"
+cp "$PROJECT_ROOT/README.md" "$METADATA_BACKUP/README.md"
 
-# Reserve a unique product build and advance all visible version metadata
-# before compiling. A failed attempt consumes the reserved number.
+# Prepare the next product build label for compilation. Only a successful,
+# staged app advances the product build number.
 RESERVED_BUILD="$(python3 - "$PROJECT_ROOT" "$BUILD_SUMMARY" <<'PY'
 import datetime
 import json
@@ -50,11 +56,6 @@ if (n1, n2) != (1, 1):
     raise SystemExit("Could not align app build label/version")
 main_path.write_text(main)
 
-counter["product_checkpoint_build"] = build
-counter["product_checkpoint_version"] = version
-counter["last_reserved_product_build"] = build
-counter_path.write_text(json.dumps(counter, indent=2) + "\n")
-
 readme_path = root / "README.md"
 readme = readme_path.read_text()
 readme = re.sub(r"The current source checkpoint is Build [0-9]+ / v[0-9.]+",
@@ -75,25 +76,14 @@ BUILD_RESERVED=1
 finish_build() {
     local result=$?
     if [[ "$BUILD_RESERVED" == "1" ]]; then
-        python3 - "$HISTORY_FILE" "$RESERVED_BUILD" "$result" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-build = int(sys.argv[2])
-result = int(sys.argv[3])
-history = path.read_text()
-old = f"| {build} |"
-lines = history.splitlines()
-for index, line in enumerate(lines):
-    if line.startswith(old) and "Build reserved; compilation in progress." in line:
-        lines[index] = line.replace(
-            "Build reserved; compilation in progress.",
-            "Build failed; reserved number consumed." if result else "Built successfully."
-        )
-        break
-path.write_text("\n".join(lines) + "\n")
-PY
+        if [[ "$result" -ne 0 ]]; then
+            cp "$METADATA_BACKUP/DEV_BUILD_COUNTER.json" "$COUNTER_FILE"
+            cp "$METADATA_BACKUP/BUILD_HISTORY.md" "$HISTORY_FILE"
+            cp "$METADATA_BACKUP/CMakeLists.txt" "$PROJECT_ROOT/CMakeLists.txt"
+            cp "$METADATA_BACKUP/Main.cpp" "$PROJECT_ROOT/Source/Main.cpp"
+            cp "$METADATA_BACKUP/README.md" "$PROJECT_ROOT/README.md"
+        fi
+        rm -rf "$METADATA_BACKUP"
     fi
     return "$result"
 }
@@ -145,7 +135,7 @@ fi
 mv "$STAGING_APP" "$CURRENT_APP"
 touch "$CURRENT_APP"
 
-python3 - "$COUNTER_FILE" <<'PY'
+python3 - "$COUNTER_FILE" "$RESERVED_BUILD" "$(sed -n 's/^project(OrbitDAW VERSION \([0-9.]*\) LANGUAGES.*/\1/p' "$PROJECT_ROOT/CMakeLists.txt")" <<'PY'
 import datetime
 import json
 import pathlib
@@ -154,6 +144,9 @@ import sys
 counter_path = pathlib.Path(sys.argv[1])
 data = json.loads(counter_path.read_text())
 data["successful_dev_iterations"] = int(data.get("successful_dev_iterations", 0)) + 1
+data["product_checkpoint_build"] = int(sys.argv[2])
+data["product_checkpoint_version"] = sys.argv[3]
+data["last_reserved_product_build"] = int(sys.argv[2])
 data["last_successful_build_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 data["artifact_path"] = "Builds/Current/Orbit.app"
 temporary_path = counter_path.with_suffix(counter_path.suffix + ".tmp")
@@ -179,6 +172,7 @@ PY
 
 BUILD_RESERVED=0
 trap - EXIT
+rm -rf "$METADATA_BACKUP"
 python3 - "$PROJECT_ROOT/README.md" "$COUNTER_FILE" <<'PY'
 import json
 import pathlib

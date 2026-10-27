@@ -113,3 +113,34 @@ iteration ZIPs are incremental and name their baseline inside the archive.
 | 98 | 0.3.77 | 2026-10-26 | Correct Playlist ruler event handlers; rebuild embedded Playlist, loop-range zoom and instrument audition keyboard | Built successfully. |
 | 99 | 0.3.78 | 2026-10-26 | Finish 300-bar Playlist zoom, embedded timeline and drag-to-loop workflow; add audition keyboard and hide duplicate editor resize grip | Built successfully. |
 | 100 | 0.3.79 | 2026-10-26 | Fix live instrument keyboard audition, virtualize Playlist rendering, replace garbled controls | Built successfully. |
+| 101 | 0.3.80 | 2026-10-27 | Playlist foreground, readable track labels, and complete timeline tool strip | Built successfully. |
+| 102 | 0.3.81 | 2026-10-27 | Movable resizable Playlist panel and Mixer maximize controls | Built successfully. |
+| 103 | 0.3.82 | 2026-10-27 | Fix mixer strip sizing and controls; keep VST instruments out of inserts; improve Playlist resizing and generator activation. | Build failed; reserved number consumed. |
+| 104 | 0.3.83 | 2026-10-27 | Fix mixer strip sizing and controls; keep VST instruments out of inserts; improve Playlist resizing and generator activation. | Built successfully. |
+| 105 | 0.3.84 | 2026-10-27 | Playlist Orion-style controls, four-corner resizing, uniform background, and visible MIDI clip previews | Build failed; reserved number consumed. |
+| 106 | 0.3.85 | 2026-10-27 | Playlist Orion-style controls, four-corner resizing, uniform background, and visible MIDI clip previews | Built successfully. |
+| 107 | 0.3.86 | 2026-10-27 | Unify Playlist canvas background with its dark timeline theme | Built successfully. |
+| 108 | 0.3.87 | 2026-10-27 | Mixer width follows visible strips; enlarge EQ controls and compact fader section | Build failed; reserved number consumed. |
+| 109 | 0.3.88 | 2026-10-27 | Mixer width follows visible strips; enlarge EQ controls and compact fader section | Built successfully. |
+| 110 | 0.3.89 | 2026-10-27 | Playlist lower-right zoom controls; title-bar minimize/maximize; direct settings toggles | Built successfully. |
+| 111 | 0.3.90 | 2026-10-27 | Compact mixer EQ labels, band panels and rotary controls | Build failed; reserved number consumed. |
+| 112 | 0.3.91 | 2026-10-27 | Compact mixer EQ labels, band panels and rotary controls | Built successfully. |
+| 113 | 0.3.92 | 2026-10-27 | Keep Playlist controls accessible; draw explicit window icons; optimize clip editing and velocity lane reveal | Built successfully. |
+| 114 | 0.3.93 | 2026-10-27 | Mixer layout refinements, panel controls and resize behavior, paste shortcut, and workspace state persistence | Built successfully. |
+| 115 | 0.3.94 | 2026-10-27 | Polished mixer fader artwork on top of Build 114 panel and workspace fixes | Build failed; reserved number consumed. |
+| 116 | 0.3.95 | 2026-10-27 | Finish mixer fader artwork and resolve slider pointer typing after Build 115 compile failure | Built successfully. |
+| 117 | 0.3.96 | 2026-10-27 | Start with blank workspace; allow Open without a false save requirement | Built successfully. |
+| 118 | 0.3.97 | 2026-10-27 | Hide Playlist on startup; smooth mixer dragging and reclaim send-heading space for EQ graph | Built successfully. |
+| 119 | 0.3.98 | 2026-10-27 | Unify generator panel colors; piano roll resizing, note length, and velocity lane fixes | Built successfully. |
+| 120 | 0.3.99 | 2026-10-27 | Compact centered pattern selectors and prevent generator drag repaint artifacts | Built successfully. |
+| 121 | 0.3.100 | 2026-10-27 | Piano roll lane visibility, velocity edit mode, and automation target controls | Built successfully. |
+| 122 | 0.3.101 | 2026-10-27 | Piano roll lane toggles, empty Playlist grid, contrast, and light theme | Built successfully. |
+| 123 | 0.3.102 | 2026-10-27 | Match Orion transport controls: BPM stepper, bar display, loop range steppers, and master volume knob | Built successfully. |
+| 124 | 0.3.103 | 2026-10-27 | Add piano-roll zoom and settings, resizable automation lane, gradient automation drawing tools, and remove confusing note-step selector | Built successfully. |
+| 125 | 0.3.104 | 2026-10-27 | Polish piano-roll settings gear icon | Built successfully. |
+| 126 | 0.3.105 | 2026-10-27 | Add audio tracks and relocate master volume control | Built successfully. |
+| 127 | 0.3.106 | 2026-10-27 | Reposition piano roll zoom controls | Built successfully. |
+| 128 | 0.3.107 | 2026-10-27 | Repaint full generator bounds when switching instrument editor and piano roll | Built successfully. |
+| 129 | 0.3.108 | 2026-10-27 | Add draggable velocity and automation lane height divider | Built successfully. |
+| 130 | 0.3.109 | 2026-10-27 | Audio Playlist click-to-import, continuous clip spans, context actions, and snapped clip moves | Built successfully. |
+| 131 | 0.3.110 | 2026-10-27 | Audio Playlist click-to-import, continuous clip spans, context actions, and snapped clip moves | Built successfully. |

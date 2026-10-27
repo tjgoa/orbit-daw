@@ -802,12 +802,18 @@ public:
             control->setVisible(false);
     }
 
-    int labelWidth() const { return 190; }
+    // Leave enough room for readable generator names and M/S/R controls before
+    // the first Playlist bar begins.
+    int labelWidth() const { return 250; }
     int headerHeight() const { return 34; }
     int rowHeight() const { return juce::roundToInt(46.0f * verticalZoom); }
     int barWidth() const { return juce::jmax(4, juce::roundToInt(92.0f * horizontalZoom)); }
     int contentWidth() const { return labelWidth() + barCount * barWidth(); }
-    int contentHeight() const { return headerHeight() + juce::jmax(1, trackCount ? trackCount() : 0) * rowHeight(); }
+    int contentHeight() const
+    {
+        const auto rows = juce::jmax(1, trackCount ? trackCount() : 0);
+        return juce::jmax(headerHeight() + rows * rowHeight(), headerHeight() + visibleArea.getHeight());
+    }
     float currentHorizontalZoom() const { return horizontalZoom; }
     float currentVerticalZoom() const { return verticalZoom; }
     void setPlayheadPosition(double seconds, double bpm, bool active)
@@ -853,11 +859,22 @@ public:
     void setViewportArea(juce::Rectangle<int> area)
     {
         visibleArea = area;
+        setSize(contentWidth(), contentHeight());
         refreshCellButtons();
     }
     bool pencilActive() const { return pencilTool.getToggleState(); }
     bool isAutomationMode() const { return automationMode; }
     void setAutomationMode(bool enabled) { automationMode = enabled; repaint(); refreshCellButtons(); }
+    bool isSnapToGrid() const { return snapToGrid; }
+    void setSnapToGrid(bool enabled) { snapToGrid = enabled; }
+    bool isLightTheme() const { return lightTheme; }
+    void setLightTheme(bool enabled)
+    {
+        lightTheme = enabled;
+        repaint();
+    }
+    std::function<void(bool)> onAutomationModeChanged;
+    std::function<void(bool)> onThemeChanged;
 
     std::function<void(bool)> onToolChanged;
     std::function<void()> onPaintFinished;
@@ -878,9 +895,14 @@ public:
     std::function<void(int, int)> cellPainted;
     std::function<void(int, int, int, int)> clipDragged;
     std::function<void(int, int, juce::Component*)> showPatternMenu;
+    std::function<void(int)> openGeneratorForTrack;
     std::function<void(int, int)> cellDeleted;
     std::function<void(int, int, int)> scrollPattern;
     std::function<void(int, juce::Component*)> trackContextMenu;
+    std::function<bool(int)> isAudioTrack;
+    std::function<int(int, int)> audioClipStartBar;
+    std::function<int(int, int)> audioClipLengthBars;
+    std::function<void(int, int, juce::Component*)> audioContextMenu;
     std::function<juce::Colour(int)> getTrackColour;
     std::function<float(int, int)> getSongAutomationValue;
     std::function<void(int, int, float)> setSongAutomationPoint;
@@ -912,8 +934,10 @@ public:
         std::function<void()> onActivate;
         std::function<void(int, int)> onDragToCell;
         std::function<void(int, int, juce::Component*)> onPatternMenu;
+        std::function<void(int)> onOpenGenerator;
         std::function<void(int, int)> onDeleteClip;
         std::function<void(int, int, int)> onPatternScroll;
+        std::function<void(int, int, juce::Component*)> onAudioMenu;
         std::function<bool()> pencilMode;
         std::function<void(int, int)> paintCell;
         std::function<void()> paintFinished;
@@ -921,6 +945,7 @@ public:
         std::function<bool()> automationMode;
         std::function<float(int, int)> getAutomationValue;
         std::function<void(int, int, float)> setAutomationValue;
+        bool audioTrack = false;
         int barWidthForDrag = 92;
         int rowHeightForDrag = 46;
 
@@ -998,6 +1023,12 @@ public:
             }
             if (event.mods.isRightButtonDown() || event.mods.isPopupMenu())
             {
+                if (audioTrack && onAudioMenu)
+                {
+                    onAudioMenu(trackIndex, barIndex, this);
+                    rightClickHandled = true;
+                    return;
+                }
                 if (sourceHasClip && sourceHasClip() && onDeleteClip)
                     onDeleteClip(trackIndex, barIndex);
                 rightEraseGesture = true;
@@ -1091,8 +1122,13 @@ public:
 
         void mouseDoubleClick(const juce::MouseEvent& event) override
         {
-            if (sourceHasClip && sourceHasClip() && onPatternMenu)
-                onPatternMenu(trackIndex, barIndex, this);
+            if (audioTrack && onAudioMenu)
+            {
+                onAudioMenu(trackIndex, barIndex, this);
+                return;
+            }
+            if (sourceHasClip && sourceHasClip() && onOpenGenerator)
+                onOpenGenerator(trackIndex);
             juce::TextButton::mouseDoubleClick(event);
         }
 
@@ -1165,8 +1201,10 @@ public:
         const auto headerHeightPx = headerHeight();
         const auto rowHeightPx = rowHeight();
         const auto barWidthPx = barWidth();
-        g.fillAll(juce::Colour::fromRGB(20, 29, 38));
-        g.setColour(juce::Colour::fromRGB(29, 43, 55));
+        g.fillAll(lightTheme ? juce::Colour::fromRGB(177, 187, 202)
+                             : juce::Colour::fromRGB(20, 29, 38));
+        g.setColour(lightTheme ? juce::Colour::fromRGB(42, 53, 63)
+                               : juce::Colour::fromRGB(29, 43, 55));
         g.fillRect(0, 0, getWidth(), headerHeightPx);
         if (loopRangeEnabled)
         {
@@ -1177,10 +1215,13 @@ public:
             g.setColour(juce::Colour::fromRGB(80, 184, 220));
             g.drawRect(rangeX, 1, rangeWidth, headerHeightPx - 2, 2);
         }
-        g.setColour(juce::Colour::fromRGB(178, 198, 211));
+        g.setColour(lightTheme ? juce::Colour::fromRGB(220, 229, 236)
+                               : juce::Colour::fromRGB(178, 198, 211));
         g.setFont(14.0f);
         g.drawText("GENERATOR", 8, 0, labelWidthPx - 112, headerHeightPx, juce::Justification::centredLeft);
-        const auto rulerLabelInterval = barWidthPx < 8 ? 16 : barWidthPx < 20 ? 8 : highlightEveryBars;
+        // Keep a number on every visible bar. The ruler's stronger guide is
+        // controlled separately by highlightEveryBars below.
+        const auto rulerLabelInterval = 1;
         const auto clipBounds = g.getClipBounds();
         const auto firstVisibleBar = juce::jlimit(0, barCount,
             (clipBounds.getX() - labelWidthPx) / juce::jmax(1, barWidthPx));
@@ -1190,14 +1231,19 @@ public:
         {
             if (bar % rulerLabelInterval == 0)
             {
-                g.setColour(juce::Colour::fromRGB(178, 198, 211));
-                const auto label = barWidthPx < 30 ? juce::String(bar + 1) : "Bar " + juce::String(bar + 1);
+                const bool majorBar = highlightEveryBars > 1 && bar % highlightEveryBars == 0;
+                g.setColour(majorBar ? juce::Colour::fromRGB(239, 246, 250)
+                                     : juce::Colour::fromRGB(196, 215, 226));
+                const auto label = juce::String(bar + 1);
+                g.setFont(barWidthPx < 18 ? 8.0f : majorBar ? 11.0f : 10.0f);
                 g.drawText(label, labelWidthPx + bar * barWidthPx, 0, barWidthPx, headerHeightPx,
                            juce::Justification::centred);
             }
         }
 
         const auto count = trackCount ? trackCount() : 0;
+        const auto displayedRowCount = juce::jmax(count,
+            (clipBounds.getBottom() - headerHeightPx + rowHeightPx - 1) / juce::jmax(1, rowHeightPx));
         const auto firstVisibleRow = juce::jlimit(0, count,
             (clipBounds.getY() - headerHeightPx) / juce::jmax(1, rowHeightPx));
         const auto lastVisibleRow = juce::jlimit(firstVisibleRow, count,
@@ -1206,49 +1252,163 @@ public:
         {
             const auto y = headerHeightPx + row * rowHeightPx;
             const auto trackTint = getTrackColour ? getTrackColour(row) : juce::Colour{};
-            const auto rowBase = row % 2 == 0 ? juce::Colour::fromRGB(25, 38, 49) : juce::Colour::fromRGB(22, 33, 43);
+            const auto rowBase = lightTheme
+                ? (row % 2 == 0 ? juce::Colour::fromRGB(169, 181, 196) : juce::Colour::fromRGB(183, 193, 207))
+                : (row % 2 == 0 ? juce::Colour::fromRGB(25, 38, 49) : juce::Colour::fromRGB(22, 33, 43));
             g.setColour(trackTint.isTransparent() ? rowBase : rowBase.overlaidWith(trackTint.withAlpha(0.25f)));
             g.fillRect(0, y, getWidth(), rowHeightPx);
-            g.setColour(juce::Colour::fromRGB(178, 198, 211));
-            g.drawText(juce::String(row + 1) + "   " + (trackName ? trackName(row) : juce::String{}),
-                       8, y, labelWidthPx - 108, rowHeightPx, juce::Justification::centredLeft);
+            g.setColour(lightTheme ? juce::Colour::fromRGB(45, 57, 69)
+                                   : juce::Colour::fromRGB(178, 198, 211));
+            g.drawFittedText(juce::String(row + 1) + "   " + (trackName ? trackName(row) : juce::String{}),
+                             8, y, labelWidthPx - 108, rowHeightPx,
+                             juce::Justification::centredLeft, 1, 0.72f);
             for (int bar = firstVisibleBar; bar < lastVisibleBar; ++bar)
             {
                 const auto x = labelWidthPx + bar * barWidthPx;
-                g.setColour(juce::Colour::fromRGB(43, 61, 74));
+                const bool majorBar = highlightEveryBars > 1 && bar % highlightEveryBars == 0;
+                g.setColour(majorBar
+                    ? (lightTheme ? juce::Colour::fromRGB(247, 249, 251) : juce::Colour::fromRGB(111, 151, 169))
+                    : (lightTheme ? juce::Colour::fromRGB(125, 139, 155) : juce::Colour::fromRGB(68, 88, 101)));
                 g.drawRect(x, y, barWidthPx, rowHeightPx, 1);
                 const auto label = clipName ? clipName(row, bar) : juce::String{};
-                if (showPatternLabels && label.isNotEmpty())
+                const bool audioRow = isAudioTrack && isAudioTrack(row);
+                const int audioStart = audioRow && audioClipStartBar ? audioClipStartBar(row, bar) : bar;
+                if (label.isNotEmpty() && !audioRow)
                 {
-                    if (clipNotes)
-                    {
-                        const auto notes = clipNotes(row, bar);
-                        g.setColour(juce::Colour::fromRGB(78, 166, 198).withAlpha(0.30f));
-                        for (const auto note : notes)
-                        {
-                            const auto noteX = x + 3 + note.x * (barWidthPx - 8) / 64;
-                            const auto noteY = y + rowHeightPx - 7 - note.y * (rowHeightPx - 18) / 36;
-                            g.fillRoundedRectangle(static_cast<float>(noteX), static_cast<float>(noteY),
-                                                   juce::jmax(2.0f, static_cast<float>(barWidthPx) / 64.0f * 2.0f),
-                                                   2.0f, 1.0f);
-                        }
-                    }
+                    const int clipBars = audioRow && audioClipLengthBars
+                        ? juce::jmax(1, audioClipLengthBars(row, bar)) : 1;
+                    const int clipX = labelWidthPx + audioStart * barWidthPx;
+                    const int clipWidth = juce::jmin(contentWidth() - clipX, clipBars * barWidthPx);
                     const auto clipFill = trackTint.isTransparent()
                         ? juce::Colour::fromRGB(39, 125, 165)
                         : trackTint.interpolatedWith(juce::Colour::fromRGB(39, 125, 165), 0.35f);
                     g.setColour(clipFill.withAlpha(0.72f));
-                    g.fillRoundedRectangle(static_cast<float>(x + 3), static_cast<float>(y + 4),
-                                           static_cast<float>(barWidthPx - 6), static_cast<float>(rowHeightPx - 8), 5.0f);
-                    g.setColour(juce::Colours::white);
-                    g.drawText(label, x + 3, y + 4, barWidthPx - 6, rowHeightPx - 8, juce::Justification::centred);
+                    g.fillRoundedRectangle(static_cast<float>(clipX + 3), static_cast<float>(y + 4),
+                                           static_cast<float>(juce::jmax(1, clipWidth - 6)), static_cast<float>(rowHeightPx - 8), 5.0f);
+                    if (audioRow)
+                    {
+                        const auto midY = y + rowHeightPx / 2;
+                        g.setColour(juce::Colour::fromRGB(178, 229, 244).withAlpha(0.85f));
+                        juce::Path waveform;
+                        waveform.startNewSubPath(static_cast<float>(clipX + 8), static_cast<float>(midY));
+                        const int samples = juce::jlimit(8, 80, clipWidth / 4);
+                        for (int sample = 1; sample <= samples; ++sample)
+                        {
+                            const auto px = clipX + 8 + sample * juce::jmax(1, clipWidth - 16) / samples;
+                            const auto phase = static_cast<float>(sample * 2.41 + row * 3.17);
+                            const auto envelope = 0.22f + 0.78f * std::sin(juce::MathConstants<float>::pi
+                                * static_cast<float>(sample) / static_cast<float>(samples));
+                            const auto amplitude = envelope * (0.18f + 0.32f * std::abs(std::sin(phase)));
+                            waveform.lineTo(static_cast<float>(px), static_cast<float>(midY)
+                                + static_cast<float>(rowHeightPx) * amplitude * std::sin(phase * 2.7f));
+                        }
+                        g.strokePath(waveform, juce::PathStrokeType(1.2f));
+                    }
+                    // Draw the MIDI preview after the translucent clip body so
+                    // note marks remain visible, like Orion's Playlist blocks.
+                    if (!audioRow && showPatternNotes && clipNotes)
+                    {
+                        const auto notes = clipNotes(row, bar);
+                        const auto noteWidth = juce::jmax(2.0f, static_cast<float>(barWidthPx) / 64.0f * 2.4f);
+                        g.setColour(juce::Colour::fromRGB(15, 30, 40).withAlpha(0.88f));
+                        for (const auto note : notes)
+                        {
+                            const auto noteX = x + 5 + note.x * (barWidthPx - 12) / 64;
+                            const auto noteY = y + 7 + (36 - note.y) * (rowHeightPx - 17) / 36;
+                            g.fillRect(static_cast<float>(noteX), static_cast<float>(noteY), noteWidth,
+                                       juce::jmax(1.5f, static_cast<float>(rowHeightPx) / 18.0f));
+                        }
+                    }
+                    if (showPatternLabels || audioRow)
+                    {
+                        g.setColour(juce::Colours::white);
+                        g.drawText(label, clipX + 5, y + rowHeightPx - 15, juce::jmax(8, clipWidth - 10), 11,
+                                   juce::Justification::centredLeft);
+                    }
                 }
+            }
+            if (isAudioTrack && isAudioTrack(row) && audioClipStartBar)
+                for (int bar = firstVisibleBar; bar < lastVisibleBar; ++bar)
+                {
+                    const auto startBar = audioClipStartBar(row, bar);
+                    const bool clippedAtLeftEdge = bar == firstVisibleBar && startBar >= 0 && startBar < firstVisibleBar;
+                    if (startBar != bar && !clippedAtLeftEdge) continue;
+                    const auto label = clipName ? clipName(row, bar) : juce::String{};
+                    if (label.isEmpty()) continue;
+                    const auto clipBars = audioClipLengthBars ? juce::jmax(1, audioClipLengthBars(row, bar)) : 1;
+                    const auto clipOriginX = labelWidthPx + startBar * barWidthPx;
+                    const auto clipEndX = juce::jmin(contentWidth(), clipOriginX + clipBars * barWidthPx);
+                    const auto clipX = juce::jmax(labelWidthPx + firstVisibleBar * barWidthPx, clipOriginX);
+                    const auto clipWidth = clipEndX - clipX;
+                    const auto clipFill = trackTint.isTransparent()
+                        ? juce::Colour::fromRGB(39, 125, 165)
+                        : trackTint.interpolatedWith(juce::Colour::fromRGB(39, 125, 165), 0.35f);
+                    g.setColour(clipFill.withAlpha(0.82f));
+                    g.fillRoundedRectangle(static_cast<float>(clipX + 3), static_cast<float>(y + 4),
+                        static_cast<float>(juce::jmax(1, clipWidth - 6)), static_cast<float>(rowHeightPx - 8), 5.0f);
+                    const auto midY = y + rowHeightPx / 2;
+                    g.setColour(juce::Colour::fromRGB(178, 229, 244).withAlpha(0.85f));
+                    juce::Path waveform;
+                    waveform.startNewSubPath(static_cast<float>(clipX + 8), static_cast<float>(midY));
+                    const int samples = juce::jlimit(8, 80, clipWidth / 4);
+                    for (int sample = 1; sample <= samples; ++sample)
+                    {
+                        const auto px = clipX + 8 + sample * juce::jmax(1, clipWidth - 16) / samples;
+                        const auto phase = static_cast<float>(sample * 2.41 + row * 3.17);
+                        const auto envelope = 0.22f + 0.78f * std::sin(juce::MathConstants<float>::pi
+                            * static_cast<float>(sample) / static_cast<float>(samples));
+                        const auto amplitude = envelope * (0.18f + 0.32f * std::abs(std::sin(phase)));
+                        waveform.lineTo(static_cast<float>(px), static_cast<float>(midY)
+                            + static_cast<float>(rowHeightPx) * amplitude * std::sin(phase * 2.7f));
+                    }
+                    g.strokePath(waveform, juce::PathStrokeType(1.2f));
+                    g.setColour(juce::Colours::white);
+                    if (!clippedAtLeftEdge)
+                        g.drawText(label, clipX + 5, y + rowHeightPx - 15, juce::jmax(8, clipWidth - 10), 11,
+                                   juce::Justification::centredLeft);
+                }
+        }
+        // Keep the timeline grid painted below the last generator row so an
+        // empty project still reads as a Playlist, not an unpainted canvas.
+        for (int row = juce::jmax(count, firstVisibleRow); row < displayedRowCount; ++row)
+        {
+            const auto y = headerHeightPx + row * rowHeightPx;
+            const auto rowBase = lightTheme
+                ? (row % 2 == 0 ? juce::Colour::fromRGB(169, 181, 196) : juce::Colour::fromRGB(183, 193, 207))
+                : (row % 2 == 0 ? juce::Colour::fromRGB(25, 38, 49) : juce::Colour::fromRGB(22, 33, 43));
+            g.setColour(rowBase);
+            g.fillRect(0, y, getWidth(), rowHeightPx);
+            for (int bar = firstVisibleBar; bar < lastVisibleBar; ++bar)
+            {
+                const auto x = labelWidthPx + bar * barWidthPx;
+                const bool majorBar = highlightEveryBars > 1 && bar % highlightEveryBars == 0;
+                g.setColour(majorBar
+                    ? (lightTheme ? juce::Colour::fromRGB(247, 249, 251) : juce::Colour::fromRGB(111, 151, 169))
+                    : (lightTheme ? juce::Colour::fromRGB(125, 139, 155) : juce::Colour::fromRGB(68, 88, 101)));
+                g.drawRect(x, y, barWidthPx, rowHeightPx, 1);
+            }
+        }
+        // Extend the configured ruler interval through the track rows after
+        // clips are drawn so the major guides remain easy to see.
+        if (highlightEveryBars > 1)
+        {
+            const auto firstGuide = ((firstVisibleBar + highlightEveryBars - 1) / highlightEveryBars)
+                                    * highlightEveryBars;
+            for (int bar = firstGuide; bar < lastVisibleBar; bar += highlightEveryBars)
+            {
+                const auto x = labelWidthPx + bar * barWidthPx;
+            g.setColour(juce::Colour::fromRGB(177, 207, 222).withAlpha(0.62f));
+                g.drawVerticalLine(x, headerHeightPx, headerHeightPx + displayedRowCount * rowHeightPx);
+                g.setColour(lightTheme ? juce::Colour::fromRGB(255, 255, 255)
+                                       : juce::Colour::fromRGB(205, 225, 236));
+                g.drawVerticalLine(x, 0.0f, static_cast<float>(headerHeightPx));
             }
         }
         if (playheadVisible)
         {
             g.setColour(juce::Colour::fromRGB(232, 72, 68));
             g.fillRect(juce::roundToInt(playheadX) - 1, headerHeightPx, 2,
-                       juce::jmax(0, count * rowHeightPx));
+                       juce::jmax(0, displayedRowCount * rowHeightPx));
         }
         if (automationMode && getSongAutomationValue)
         {
@@ -1399,32 +1559,88 @@ public:
                                  clipDragged, barWidth(), rowHeight(),
                                  [this] { return automationMode; }, getSongAutomationValue, setSongAutomationPoint);
                 button.onPatternMenu = showPatternMenu;
+                button.onOpenGenerator = openGeneratorForTrack;
                 button.onDeleteClip = cellDeleted;
                 button.onPatternScroll = scrollPattern;
+                button.audioTrack = isAudioTrack && isAudioTrack(row);
+                button.onAudioMenu = audioContextMenu;
                 button.setBounds(labelWidth() + bar * barWidth(), headerHeight() + row * rowHeight(), barWidth(), rowHeight());
             }
     }
 
     void showSettings()
     {
-        juce::AlertWindow dialog("Playlist Settings", "Timeline cells are bar-snapped. Draw places the selected pattern; Move drags existing clips.",
+        juce::AlertWindow dialog("Playlist Settings", "Set snapping, pattern previews, and Playlist automation.",
                                  juce::MessageBoxIconType::NoIcon);
-        dialog.addComboBox("barHighlight", { "Every bar", "Every 2 bars", "Every 4 bars", "Every 8 bars" },
-                           "Highlight ruler every:");
-        if (auto* combo = dialog.getComboBoxComponent("barHighlight"))
-            combo->setSelectedId(highlightEveryBars == 1 ? 1 : highlightEveryBars == 2 ? 2 : highlightEveryBars == 8 ? 4 : 3,
-                                 juce::dontSendNotification);
-        dialog.addComboBox("patternLabels", { "Show labels", "Hide labels" }, "Pattern labels:");
-        if (auto* combo = dialog.getComboBoxComponent("patternLabels"))
-            combo->setSelectedId(showPatternLabels ? 1 : 2, juce::dontSendNotification);
+        juce::ToggleButton snapToggle("Snap to grid");
+        juce::ToggleButton followToggle("Follow play cursor");
+        juce::ToggleButton notesToggle("Show notes in patterns");
+        juce::ToggleButton velocitiesToggle("Show note velocities");
+        juce::ToggleButton navigationToggle("Show navigation bar");
+        juce::ToggleButton automationToggle("Song automation mode");
+        juce::ToggleButton lightThemeToggle("Light Playlist grid");
+        std::array<juce::ToggleButton*, 7> toggles {
+            &snapToggle, &followToggle, &notesToggle, &velocitiesToggle, &navigationToggle,
+            &automationToggle, &lightThemeToggle
+        };
+        const std::array<bool, 7> toggleValues {
+            snapToGrid, followPlayCursor, showPatternNotes, showPatternVelocities, showNavigationBar,
+            automationMode, lightTheme
+        };
+        for (size_t i = 0; i < toggles.size(); ++i)
+        {
+            toggles[i]->setBounds(0, 0, 300, 26);
+            toggles[i]->setToggleState(toggleValues[i], juce::dontSendNotification);
+            dialog.addCustomComponent(toggles[i]);
+        }
+        const std::array<int, 4> highlightChoices { 1, 2, 4, 8 };
+        const std::array<int, 5> snapChoices { 1, 2, 4, 8, 16 };
+        int selectedHighlight = highlightEveryBars;
+        int selectedSnap = snapDivision;
+        juce::TextButton highlightButton, snapDivisionButton;
+        const auto updateHighlightText = [&]
+        {
+            highlightButton.setButtonText("Highlight ruler: every " + juce::String(selectedHighlight) + " bars  ›");
+        };
+        const auto updateSnapText = [&]
+        {
+            selectedSnap = juce::jlimit(1, static_cast<int>(snapChoices.size()), selectedSnap);
+            snapDivisionButton.setButtonText("Snap interval: " + juce::String(snapChoices[static_cast<size_t>(selectedSnap - 1)]) + " steps  ›");
+        };
+        highlightButton.setBounds(0, 0, 300, 28);
+        snapDivisionButton.setBounds(0, 0, 300, 28);
+        updateHighlightText();
+        updateSnapText();
+        highlightButton.onClick = [&]
+        {
+            auto found = std::find(highlightChoices.begin(), highlightChoices.end(), selectedHighlight);
+            const auto index = found == highlightChoices.end() ? 0 : static_cast<int>(std::distance(highlightChoices.begin(), found));
+            selectedHighlight = highlightChoices[static_cast<size_t>((index + 1) % static_cast<int>(highlightChoices.size()))];
+            updateHighlightText();
+        };
+        snapDivisionButton.onClick = [&]
+        {
+            selectedSnap = selectedSnap % static_cast<int>(snapChoices.size()) + 1;
+            updateSnapText();
+        };
+        dialog.addCustomComponent(&highlightButton);
+        dialog.addCustomComponent(&snapDivisionButton);
         dialog.addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
         dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
         if (dialog.runModalLoop() != 1) return;
-        if (auto* combo = dialog.getComboBoxComponent("barHighlight"))
-            highlightEveryBars = combo->getSelectedId() == 1 ? 1 : combo->getSelectedId() == 2 ? 2
-                : combo->getSelectedId() == 4 ? 8 : 4;
-        if (auto* combo = dialog.getComboBoxComponent("patternLabels"))
-            showPatternLabels = combo->getSelectedId() != 2;
+        const auto previousAutomation = automationMode;
+        snapToGrid = snapToggle.getToggleState();
+        followPlayCursor = followToggle.getToggleState();
+        showPatternNotes = notesToggle.getToggleState();
+        showPatternVelocities = velocitiesToggle.getToggleState();
+        showNavigationBar = navigationToggle.getToggleState();
+        automationMode = automationToggle.getToggleState();
+        lightTheme = lightThemeToggle.getToggleState();
+        if (previousAutomation != automationMode && onAutomationModeChanged)
+            onAutomationModeChanged(automationMode);
+        if (onThemeChanged) onThemeChanged(lightTheme);
+        highlightEveryBars = selectedHighlight;
+        snapDivision = selectedSnap;
         repaint();
     }
 
@@ -1447,8 +1663,15 @@ private:
     int dragSourceBar = -1;
     bool dragSourceHasClip = false;
     int highlightEveryBars = 4;
+    bool lightTheme = false;
     bool showPatternLabels = true;
     bool automationMode = false;
+    bool snapToGrid = true;
+    bool followPlayCursor = false;
+    bool showPatternNotes = true;
+    bool showPatternVelocities = false;
+    bool showNavigationBar = true;
+    int snapDivision = 5;
     bool playheadVisible = false;
     double playheadX = 0.0;
     int loopStartBar = 1;
@@ -1461,87 +1684,192 @@ private:
     std::vector<std::unique_ptr<TrackControls>> trackControls;
 };
 
+class PlaylistIconButton final : public juce::Button
+{
+public:
+    enum class Kind { draw, select, minus, plus, snap, settings };
+    explicit PlaylistIconButton(Kind buttonKind) : juce::Button("Playlist control"), kind(buttonKind)
+    {
+        setClickingTogglesState(kind == Kind::draw || kind == Kind::select || kind == Kind::snap);
+    }
+    void setKind(Kind buttonKind) { kind = buttonKind; repaint(); }
+    void paintButton(juce::Graphics& g, bool highlighted, bool down) override
+    {
+        auto bounds = getLocalBounds().toFloat().reduced(1.5f);
+        const auto active = getToggleState();
+        g.setColour(active ? juce::Colour::fromRGB(36, 132, 174)
+                           : juce::Colour::fromRGB(35, 51, 62));
+        g.fillRoundedRectangle(bounds, 4.0f);
+        g.setColour(juce::Colour::fromRGB(112, 151, 170));
+        g.drawRoundedRectangle(bounds, 4.0f, 1.0f);
+        g.setColour(juce::Colour::fromRGB(220, 237, 245).withAlpha(down ? 0.65f : highlighted ? 1.0f : 0.9f));
+        const auto cx = bounds.getCentreX(), cy = bounds.getCentreY();
+        const auto stroke = juce::PathStrokeType(1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
+        juce::Path icon;
+        switch (kind)
+        {
+            case Kind::draw:
+                icon.startNewSubPath(cx - 6.0f, cy + 5.0f); icon.lineTo(cx + 4.5f, cy - 5.5f);
+                icon.lineTo(cx + 6.0f, cy - 4.0f); icon.lineTo(cx - 4.5f, cy + 6.5f);
+                g.strokePath(icon, stroke); g.fillEllipse(cx + 3.5f, cy - 7.0f, 4.0f, 4.0f);
+                break;
+            case Kind::select:
+                icon.startNewSubPath(cx - 4.5f, cy - 6.0f); icon.lineTo(cx + 4.5f, cy);
+                icon.lineTo(cx, cy + 1.0f); icon.lineTo(cx - 1.0f, cy + 5.0f); icon.closeSubPath();
+                g.fillPath(icon); break;
+            case Kind::minus:
+                g.drawLine(cx - 5.5f, cy, cx + 5.5f, cy, 2.0f); break;
+            case Kind::plus:
+                g.drawLine(cx - 5.0f, cy, cx + 5.0f, cy, 2.0f);
+                g.drawLine(cx, cy - 5.0f, cx, cy + 5.0f, 2.0f); break;
+            case Kind::snap:
+                for (int i = -1; i <= 1; ++i)
+                {
+                    g.drawLine(cx - 5.0f, cy + i * 4.0f, cx + 5.0f, cy + i * 4.0f, 0.8f);
+                    g.drawLine(cx + i * 4.0f, cy - 5.0f, cx + i * 4.0f, cy + 5.0f, 0.8f);
+                }
+                break;
+            case Kind::settings:
+                icon.startNewSubPath(cx - 5.0f, cy + 5.0f); icon.lineTo(cx + 2.0f, cy - 2.0f);
+                icon.lineTo(cx + 5.0f, cy - 5.0f); icon.lineTo(cx + 7.0f, cy - 3.0f);
+                icon.lineTo(cx + 4.0f, cy); icon.lineTo(cx - 3.0f, cy + 7.0f);
+                g.strokePath(icon, stroke); g.drawEllipse(cx - 6.5f, cy + 3.5f, 3.5f, 3.5f, 1.3f);
+                break;
+        }
+    }
+private:
+    Kind kind;
+};
+
+class PlaylistWindowIconButton final : public juce::Button
+{
+public:
+    enum class Kind { minimize, restore, maximize, close };
+    explicit PlaylistWindowIconButton(Kind buttonKind) : juce::Button("Playlist window control"), kind(buttonKind) {}
+    void setKind(Kind buttonKind) { kind = buttonKind; repaint(); }
+    void paintButton(juce::Graphics& g, bool highlighted, bool down) override
+    {
+        auto bounds = getLocalBounds().toFloat().reduced(2.0f);
+        g.setColour((down ? juce::Colour::fromRGB(48, 113, 143)
+                          : highlighted ? juce::Colour::fromRGB(48, 78, 95)
+                                        : juce::Colour::fromRGB(35, 51, 62)));
+        g.fillRoundedRectangle(bounds, 3.0f);
+        g.setColour(juce::Colour::fromRGB(112, 151, 170));
+        g.drawRoundedRectangle(bounds, 3.0f, 0.8f);
+        g.setColour(juce::Colour::fromRGB(220, 237, 245));
+        const auto cx = bounds.getCentreX(), cy = bounds.getCentreY();
+        if (kind == Kind::minimize || kind == Kind::restore)
+        {
+            g.drawLine(cx - 5.0f, cy, cx + 5.0f, cy, 1.6f);
+            if (kind == Kind::restore)
+                g.drawLine(cx, cy - 5.0f, cx, cy + 5.0f, 1.6f);
+        }
+        else if (kind == Kind::maximize)
+        {
+            g.drawRect(juce::Rectangle<float>(cx - 4.5f, cy - 4.5f, 9.0f, 9.0f), 1.4f);
+        }
+        else
+        {
+            g.drawLine(cx - 4.0f, cy - 4.0f, cx + 4.0f, cy + 4.0f, 1.6f);
+            g.drawLine(cx + 4.0f, cy - 4.0f, cx - 4.0f, cy + 4.0f, 1.6f);
+        }
+    }
+private:
+    Kind kind;
+};
+
+
 class PlaylistSurface final : public juce::Component
 {
 public:
     explicit PlaylistSurface(PlaylistGrid* playlistGrid) : grid(playlistGrid)
     {
+        setOpaque(true);
         viewport.setGrid(grid);
         viewport.setViewedComponent(grid, true);
         addAndMakeVisible(viewport);
-        configure(drawButton, "Draw", "Draw the selected pattern into Playlist cells.", [this]
+        configure(drawButton, PlaylistIconButton::Kind::draw, "Draw pattern", [this]
         {
             grid->setDrawMode(true);
             drawButton.setToggleState(true, juce::dontSendNotification);
             moveButton.setToggleState(false, juce::dontSendNotification);
         });
-        configure(moveButton, "Move", "Move existing clips without painting new ones.", [this]
+        configure(moveButton, PlaylistIconButton::Kind::select, "Select and move clips", [this]
         {
             grid->setDrawMode(false);
             drawButton.setToggleState(false, juce::dontSendNotification);
             moveButton.setToggleState(true, juce::dontSendNotification);
         });
         drawButton.setToggleState(true, juce::dontSendNotification);
-        configure(horizontalOut, "H-", "Zoom out horizontally.", [this] { grid->setHorizontalZoom(horizontalZoom() - 0.1f); });
-        configure(horizontalIn, "H+", "Zoom in horizontally.", [this] { grid->setHorizontalZoom(horizontalZoom() + 0.1f); });
-        configure(verticalOut, "V-", "Reduce track height.", [this] { grid->setVerticalZoom(verticalZoom() - 0.1f); });
-        configure(verticalIn, "V+", "Increase track height.", [this] { grid->setVerticalZoom(verticalZoom() + 0.1f); });
-        configure(settingsButton, "Settings...", "Configure Playlist grid and clip labels.", [this] { grid->showSettings(); });
-        configure(automationButton, "Automation", "Draw song-level parameter automation in the Playlist.", [this]
+        configure(horizontalOut, PlaylistIconButton::Kind::minus, "Zoom out horizontally", [this] { grid->setHorizontalZoom(horizontalZoom() - 0.1f); });
+        configure(horizontalIn, PlaylistIconButton::Kind::plus, "Zoom in horizontally", [this] { grid->setHorizontalZoom(horizontalZoom() + 0.1f); });
+        configure(verticalOut, PlaylistIconButton::Kind::minus, "Reduce track height", [this] { grid->setVerticalZoom(verticalZoom() - 0.1f); });
+        configure(verticalIn, PlaylistIconButton::Kind::plus, "Increase track height", [this] { grid->setVerticalZoom(verticalZoom() + 0.1f); });
+        configure(snapButton, PlaylistIconButton::Kind::snap, "Snap to grid", [this]
         {
-            const auto enabled = !grid->isAutomationMode();
-            grid->setAutomationMode(enabled);
-            automationButton.setToggleState(enabled, juce::dontSendNotification);
-            if (onAutomationModeChanged) onAutomationModeChanged(enabled);
+            grid->setSnapToGrid(snapButton.getToggleState());
         });
-        // Keep controls explicit and ASCII-only: the previous Unicode glyphs
-        // were rendered as broken characters on the user's macOS build.
-        drawButton.setButtonText("Draw");
-        moveButton.setButtonText("Move");
-        horizontalOut.setButtonText("H-");
-        horizontalIn.setButtonText("H+");
-        verticalOut.setButtonText("V-");
-        verticalIn.setButtonText("V+");
-        settingsButton.setButtonText("Set");
-        automationButton.setButtonText("Auto");
-        automationButton.setClickingTogglesState(false);
-        for (auto* button : { &drawButton, &moveButton, &automationButton, &horizontalOut, &horizontalIn, &verticalOut, &verticalIn, &settingsButton })
+        configure(settingsButton, PlaylistIconButton::Kind::settings, "Playlist settings", [this]
+        {
+            grid->showSettings();
+            snapButton.setToggleState(grid->isSnapToGrid(), juce::dontSendNotification);
+        });
+        grid->onAutomationModeChanged = [this](bool enabled)
+        {
+            if (onAutomationModeChanged) onAutomationModeChanged(enabled);
+        };
+        snapButton.setClickingTogglesState(true);
+        snapButton.setToggleState(true, juce::dontSendNotification);
+        grid->setSnapToGrid(true);
+        for (auto* button : { &drawButton, &moveButton, &horizontalOut, &horizontalIn, &snapButton, &settingsButton })
             addAndMakeVisible(*button);
+        addAndMakeVisible(verticalOut);
+        addAndMakeVisible(verticalIn);
     }
 
     void resized() override
     {
         auto area = getLocalBounds();
-        auto footer = area.removeFromBottom(34).reduced(4, 3);
-        settingsButton.setBounds(footer.removeFromRight(34)); footer.removeFromRight(3);
-        automationButton.setBounds(footer.removeFromRight(38)); footer.removeFromRight(3);
-        verticalIn.setBounds(footer.removeFromRight(30)); footer.removeFromRight(3);
-        verticalOut.setBounds(footer.removeFromRight(30)); footer.removeFromRight(8);
-        horizontalIn.setBounds(footer.removeFromRight(30)); footer.removeFromRight(3);
-        horizontalOut.setBounds(footer.removeFromRight(30)); footer.removeFromRight(8);
-        moveButton.setBounds(footer.removeFromRight(42)); footer.removeFromRight(3);
-        drawButton.setBounds(footer.removeFromRight(42));
+        auto footer = area.removeFromBottom(30).reduced(4, 2);
+        settingsButton.setBounds(footer.removeFromRight(26)); footer.removeFromRight(2);
+        snapButton.setBounds(footer.removeFromRight(26)); footer.removeFromRight(2);
+        horizontalIn.setBounds(footer.removeFromRight(26)); footer.removeFromRight(2);
+        horizontalOut.setBounds(footer.removeFromRight(26)); footer.removeFromRight(2);
+        moveButton.setBounds(footer.removeFromRight(26)); footer.removeFromRight(2);
+        drawButton.setBounds(footer.removeFromRight(26));
+        // Place track-height zoom beside the lower-right toolbar, matching
+        // the paired vertical controls in the Orion Playlist.
+        verticalOut.setBounds(getWidth() - 27, juce::jmax(0, getHeight() - 30 - 48), 23, 22);
+        verticalIn.setBounds(getWidth() - 27, juce::jmax(0, getHeight() - 30 - 24), 23, 22);
+        area.removeFromRight(30);
         viewport.setBounds(area);
+    }
+    void paint(juce::Graphics& g) override
+    {
+        // The Playlist is a workspace view; do not let the floating generator
+        // panel beneath it show through unused rows or the bottom toolbar.
+        g.fillAll(lightTheme ? juce::Colour::fromRGB(177, 187, 202)
+                             : juce::Colour::fromRGB(20, 29, 38));
     }
     void setAutomationMode(bool enabled)
     {
         grid->setAutomationMode(enabled);
-        automationButton.setToggleState(enabled, juce::dontSendNotification);
+    }
+    void setLightTheme(bool enabled)
+    {
+        lightTheme = enabled;
+        viewport.setLightTheme(enabled);
+        repaint();
     }
 
 private:
-    static void configure(juce::TextButton& button, const juce::String& text,
+    static void configure(PlaylistIconButton& button, PlaylistIconButton::Kind kind,
                           const juce::String& tooltip, std::function<void()> action)
     {
-        button.setButtonText(text);
-        button.setTitle(text);
+        button.setKind(kind);
         button.setTooltip(tooltip);
         button.setDescription(tooltip);
         button.setClickingTogglesState(false);
-        button.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 51, 62));
-        button.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-        button.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(197, 214, 224));
-        button.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
         button.onClick = std::move(action);
     }
 
@@ -1550,6 +1878,12 @@ private:
     class PlaylistViewport final : public juce::Viewport
     {
     public:
+        void paint(juce::Graphics& g) override
+        {
+            g.fillAll(lightTheme ? juce::Colour::fromRGB(177, 187, 202)
+                                 : juce::Colour::fromRGB(20, 29, 38));
+        }
+        void setLightTheme(bool enabled) { lightTheme = enabled; repaint(); }
         void setGrid(PlaylistGrid* playlistGrid) { grid = playlistGrid; }
         void visibleAreaChanged(const juce::Rectangle<int>& area) override
         {
@@ -1557,17 +1891,51 @@ private:
         }
     private:
         PlaylistGrid* grid = nullptr;
+        bool lightTheme = false;
     };
     PlaylistGrid* grid = nullptr;
     PlaylistViewport viewport;
-    juce::TextButton drawButton, moveButton, automationButton, horizontalOut, horizontalIn, verticalOut, verticalIn, settingsButton;
+    bool lightTheme = false;
+    PlaylistIconButton drawButton { PlaylistIconButton::Kind::draw }, moveButton { PlaylistIconButton::Kind::select },
+        horizontalOut { PlaylistIconButton::Kind::minus }, horizontalIn { PlaylistIconButton::Kind::plus },
+        verticalOut { PlaylistIconButton::Kind::minus }, verticalIn { PlaylistIconButton::Kind::plus },
+        snapButton { PlaylistIconButton::Kind::snap }, settingsButton { PlaylistIconButton::Kind::settings };
 public:
     std::function<void(bool)> onAutomationModeChanged;
 };
 
+
 class PlaylistWindow final : public juce::Component
 {
 public:
+    class ResizeGrip final : public juce::Component
+    {
+    public:
+        enum class Corner { topLeft, topRight, bottomLeft, bottomRight };
+        explicit ResizeGrip(Corner gripCorner) : corner(gripCorner) {}
+        std::function<void()> onStarted;
+        std::function<void(juce::Point<int>)> onDragged;
+        std::function<void()> onEnded;
+        void mouseDown(const juce::MouseEvent&) override { if (onStarted) onStarted(); }
+        void mouseDrag(const juce::MouseEvent& e) override { if (onDragged) onDragged(e.getOffsetFromDragStart()); }
+        void mouseUp(const juce::MouseEvent&) override { if (onEnded) onEnded(); }
+        void paint(juce::Graphics& g) override
+        {
+            g.setColour(juce::Colour::fromRGB(112, 179, 201));
+            const bool left = corner == Corner::topLeft || corner == Corner::bottomLeft;
+            const bool top = corner == Corner::topLeft || corner == Corner::topRight;
+            const float x0 = left ? 0.0f : static_cast<float>(getWidth());
+            const float y0 = top ? 0.0f : static_cast<float>(getHeight());
+            const float sx = left ? 1.0f : -1.0f;
+            const float sy = top ? 1.0f : -1.0f;
+            for (int inset = 5; inset <= 13; inset += 4)
+                g.drawLine(x0 + sx * static_cast<float>(inset), y0,
+                           x0, y0 + sy * static_cast<float>(inset), 1.5f);
+        }
+    private:
+        Corner corner;
+    };
+
     PlaylistWindow(std::function<int()> getTrackCount,
                    std::function<juce::String(int)> getTrackName,
                    std::function<juce::String(int, int)> getClipName,
@@ -1582,9 +1950,59 @@ public:
                    std::function<void(int, bool)> setRecordArm,
                    std::function<void(int, int, int, int)> onClipDragged,
                    std::function<void(int, int, juce::Component*)> onPatternMenu,
+                   std::function<void(int)> onOpenGenerator,
                    std::function<void(int, int)> onCellDeleted,
                    std::function<void(int, int, int)> onPatternScroll)
     {
+        setOpaque(true);
+        title.setText("Playlist", juce::dontSendNotification);
+        title.setFont(juce::FontOptions(13.0f, juce::Font::bold));
+        title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(222, 235, 242));
+        title.setJustificationType(juce::Justification::centred);
+        title.setInterceptsMouseClicks(false, false);
+        addAndMakeVisible(title);
+        for (auto* button : { &minimizeButton, &maximizeButton, &closeButton })
+        {
+            button->setTooltip(button == &closeButton ? "Close Playlist"
+                               : button == &maximizeButton ? "Maximize or restore Playlist" : "Minimize Playlist");
+            addAndMakeVisible(*button);
+        }
+        minimizeButton.onClick = [this] { setMinimized(!minimized); };
+        maximizeButton.onClick = [this] { if (onMaximizeToggled) onMaximizeToggled(); };
+        closeButton.onClick = [this] { if (onClose) onClose(); else setVisible(false); };
+        for (auto corner : { ResizeGrip::Corner::topLeft, ResizeGrip::Corner::topRight,
+                             ResizeGrip::Corner::bottomLeft, ResizeGrip::Corner::bottomRight })
+        {
+            auto grip = std::make_unique<ResizeGrip>(corner);
+            grip->setTitle("Resize Playlist");
+            const auto cursor = (corner == ResizeGrip::Corner::topLeft || corner == ResizeGrip::Corner::bottomRight)
+                ? juce::MouseCursor::TopLeftCornerResizeCursor : juce::MouseCursor::TopRightCornerResizeCursor;
+            grip->setMouseCursor(cursor);
+            grip->onStarted = [this] { resizeStartBounds = getBounds(); };
+            grip->onDragged = [this, corner](juce::Point<int> delta)
+            {
+                if (!onResizedByDrag) return;
+                auto resized = resizeStartBounds;
+                const bool left = corner == ResizeGrip::Corner::topLeft || corner == ResizeGrip::Corner::bottomLeft;
+                const bool top = corner == ResizeGrip::Corner::topLeft || corner == ResizeGrip::Corner::topRight;
+                if (left)
+                {
+                    const auto newLeft = juce::jmin(resizeStartBounds.getRight() - 440, resizeStartBounds.getX() + delta.x);
+                    resized.setLeft(newLeft);
+                }
+                else resized.setWidth(juce::jmax(440, resizeStartBounds.getWidth() + delta.x));
+                if (top)
+                {
+                    const auto newTop = juce::jmin(resizeStartBounds.getBottom() - 250, resizeStartBounds.getY() + delta.y);
+                    resized.setTop(newTop);
+                }
+                else resized.setHeight(juce::jmax(250, resizeStartBounds.getHeight() + delta.y));
+                onResizedByDrag(resized);
+            };
+            grip->onEnded = [] {};
+            addAndMakeVisible(*grip);
+            resizeGrips.push_back(std::move(grip));
+        }
         grid = new PlaylistGrid();
         grid->trackCount = std::move(getTrackCount);
         grid->trackName = std::move(getTrackName);
@@ -1594,6 +2012,7 @@ public:
         grid->onPaintFinished = std::move(onPaintFinished);
         grid->clipDragged = std::move(onClipDragged);
         grid->showPatternMenu = std::move(onPatternMenu);
+        grid->openGeneratorForTrack = std::move(onOpenGenerator);
         grid->cellDeleted = std::move(onCellDeleted);
         grid->scrollPattern = std::move(onPatternScroll);
         grid->getTrackMute = std::move(getMute);
@@ -1610,7 +2029,82 @@ public:
         setVisible(false);
     }
 
-    void resized() override { if (surface != nullptr) surface->setBounds(getLocalBounds()); }
+    std::function<void(juce::Point<int>)> onDragged;
+    std::function<void(juce::Rectangle<int>)> onResizedByDrag;
+    std::function<void(bool)> onMinimizeChanged;
+    std::function<void()> onMaximizeToggled, onClose;
+    bool isMinimized() const { return minimized; }
+    void setMinimized(bool shouldMinimize)
+    {
+        if (minimized == shouldMinimize) return;
+        minimized = shouldMinimize;
+        minimizeButton.setKind(minimized ? PlaylistWindowIconButton::Kind::restore
+                                         : PlaylistWindowIconButton::Kind::minimize);
+        minimizeButton.setTooltip(minimized ? "Restore Playlist" : "Minimize Playlist");
+        if (onMinimizeChanged) onMinimizeChanged(minimized);
+        resized();
+    }
+    void setMaximized(bool shouldMaximize)
+    {
+        maximized = shouldMaximize;
+    }
+    bool isMaximized() const { return maximized; }
+
+    void mouseDown(const juce::MouseEvent& e) override
+    {
+        if (e.eventComponent == this && e.y < titleBarHeight)
+        {
+            dragOrigin = getPosition();
+            if (onDragged) onDragged(dragOrigin);
+        }
+    }
+    void mouseDrag(const juce::MouseEvent& e) override
+    {
+        if (e.eventComponent == this && e.getMouseDownY() < titleBarHeight && onDragged)
+            onDragged(dragOrigin + e.getOffsetFromDragStart());
+    }
+
+    void mouseDoubleClick(const juce::MouseEvent& e) override
+    {
+        if (e.eventComponent == this && e.y < titleBarHeight && onMaximizeToggled)
+            onMaximizeToggled();
+    }
+
+    void resized() override
+    {
+        auto header = getLocalBounds().removeFromTop(titleBarHeight);
+        closeButton.setBounds(getWidth() - 48, 2, 22, titleBarHeight - 4);
+        maximizeButton.setBounds(getWidth() - 72, 2, 22, titleBarHeight - 4);
+        minimizeButton.setBounds(getWidth() - 96, 2, 22, titleBarHeight - 4);
+        header.removeFromRight(100);
+        title.setBounds(header);
+        surface->setVisible(!minimized);
+        for (auto& grip : resizeGrips) grip->setVisible(!minimized && !maximized);
+        if (minimized)
+        {
+            surface->setBounds(0, titleBarHeight, 0, 0);
+            return;
+        }
+        auto content = getLocalBounds().withTrimmedTop(titleBarHeight);
+        surface->setBounds(content);
+        const int gripSize = 16;
+        resizeGrips[0]->setBounds(0, 0, gripSize, gripSize);
+        resizeGrips[1]->setBounds(getWidth() - gripSize, 0, gripSize, gripSize);
+        resizeGrips[2]->setBounds(0, getHeight() - gripSize, gripSize, gripSize);
+        resizeGrips[3]->setBounds(getWidth() - gripSize, getHeight() - gripSize, gripSize, gripSize);
+        // PlaylistSurface owns the full client area and would otherwise sit
+        // above the corner handles, making the lower resize corners inert.
+        for (auto& grip : resizeGrips) grip->toFront(false);
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(juce::Colour::fromRGB(20, 29, 38));
+        g.setColour(juce::Colour::fromRGB(32, 42, 52));
+        g.fillRect(0, 0, getWidth(), titleBarHeight);
+        g.setColour(juce::Colour::fromRGB(151, 194, 216));
+        g.drawRect(getLocalBounds().toFloat().reduced(0.5f), 1.0f);
+    }
 
     void refresh()
     {
@@ -1618,6 +2112,10 @@ public:
         grid->setSize(grid->contentWidth(), grid->contentHeight());
         grid->refreshCellButtons();
         grid->repaint();
+    }
+    void repaintGrid()
+    {
+        if (grid != nullptr) grid->repaint();
     }
 
     void setPlayheadPosition(double seconds, double bpm, bool active)
@@ -1650,6 +2148,19 @@ public:
     {
         if (grid != nullptr) grid->trackContextMenu = std::move(callback);
     }
+    void setAudioClipHandlers(std::function<bool(int)> isAudio,
+                              std::function<int(int, int)> clipStart,
+                              std::function<int(int, int)> clipLength,
+                              std::function<void(int, int, juce::Component*)> contextMenu)
+    {
+        if (grid != nullptr)
+        {
+            grid->isAudioTrack = std::move(isAudio);
+            grid->audioClipStartBar = std::move(clipStart);
+            grid->audioClipLengthBars = std::move(clipLength);
+            grid->audioContextMenu = std::move(contextMenu);
+        }
+    }
     void setTrackColourProvider(std::function<juce::Colour(int)> provider)
     {
         if (grid != nullptr) grid->getTrackColour = std::move(provider);
@@ -1658,12 +2169,32 @@ public:
     {
         if (surface != nullptr) surface->onAutomationModeChanged = std::move(callback);
     }
+
+    void setLightTheme(bool enabled)
+    {
+        if (grid != nullptr) grid->setLightTheme(enabled);
+        if (surface != nullptr) surface->setLightTheme(enabled);
+    }
+
+    void setThemeChangedHandler(std::function<void(bool)> callback)
+    {
+        if (grid != nullptr) grid->onThemeChanged = std::move(callback);
+    }
     void setAutomationMode(bool enabled)
     {
         if (surface != nullptr) surface->setAutomationMode(enabled);
     }
 
 private:
+    static constexpr int titleBarHeight = 28;
+    juce::Label title;
+    PlaylistWindowIconButton minimizeButton { PlaylistWindowIconButton::Kind::minimize },
+                           maximizeButton { PlaylistWindowIconButton::Kind::maximize },
+                           closeButton { PlaylistWindowIconButton::Kind::close };
+    std::vector<std::unique_ptr<ResizeGrip>> resizeGrips;
+    juce::Point<int> dragOrigin;
+    juce::Rectangle<int> resizeStartBounds;
+    bool minimized = false, maximized = false;
     PlaylistGrid* grid = nullptr;
     std::unique_ptr<PlaylistSurface> surface;
 };
@@ -2077,6 +2608,25 @@ private:
 class MixerWindow final : public juce::Component
 {
 public:
+    class ResizeGrip final : public juce::Component
+    {
+    public:
+        std::function<void()> onStarted, onEnded;
+        std::function<void(juce::Point<int>)> onDragged;
+        void mouseDown(const juce::MouseEvent&) override { if (onStarted) onStarted(); }
+        void mouseDrag(const juce::MouseEvent& event) override { if (onDragged) onDragged(event.getOffsetFromDragStart()); }
+        void mouseUp(const juce::MouseEvent&) override { if (onEnded) onEnded(); }
+        void paint(juce::Graphics& g) override
+        {
+            g.setColour(juce::Colour::fromRGB(112, 179, 201));
+            const auto centreX = static_cast<float>(getWidth()) * 0.5f;
+            const auto centreY = static_cast<float>(getHeight()) * 0.5f;
+            for (int offset = -4; offset <= 4; offset += 4)
+                g.drawLine(centreX - 5.0f, centreY + static_cast<float>(offset),
+                           centreX + 5.0f, centreY + static_cast<float>(offset), 1.5f);
+        }
+    };
+
     std::function<int()> getTrackCount;
     std::function<juce::String(int)> getTrackName;
     std::function<void(int, const juce::String&)> renameTrack;
@@ -2097,6 +2647,9 @@ public:
     std::function<void(int, bool)> setTrackEqEnabled;
     std::function<void(int)> onOpenEq;
     std::function<void()> onFocus;
+    std::function<void()> onMaximizeToggled;
+    std::function<void()> onResizeStarted, onResizeEnded;
+    std::function<void(juce::Point<int>)> onResizedByDrag;
     std::function<juce::StringArray(int)> getInsertNames;
     std::function<bool(int, int)> getInsertEnabled;
     std::function<void(int, int)> toggleInsert;
@@ -2120,11 +2673,13 @@ public:
     MixerWindow()
     {
         content.setOpaque(true);
-        minimizeButton.setButtonText("−");
-        closeButton.setButtonText("×");
+        minimizeButton.setKind(PlaylistWindowIconButton::Kind::minimize);
+        maximizeButton.setKind(PlaylistWindowIconButton::Kind::maximize);
+        closeButton.setKind(PlaylistWindowIconButton::Kind::close);
         minimizeButton.setTooltip("Minimize mixer");
+        maximizeButton.setTooltip("Maximize or restore mixer");
         closeButton.setTooltip("Close mixer");
-        for (auto* button : { &minimizeButton, &closeButton })
+        for (auto* button : { &minimizeButton, &maximizeButton, &closeButton })
         {
             button->setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 48, 58));
             button->setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(220, 235, 243));
@@ -2138,9 +2693,16 @@ public:
             if (onMinimizeChanged) onMinimizeChanged(minimized);
             resized();
         };
+        maximizeButton.onClick = [this] { if (onMaximizeToggled) onMaximizeToggled(); };
         closeButton.onClick = [this] { if (onClose) onClose(); };
         addAndMakeVisible(content);
         content.addAndMakeVisible(viewport);
+        resizeGrip.setTitle("Resize mixer");
+        resizeGrip.setMouseCursor(juce::MouseCursor::TopEdgeResizeCursor);
+        resizeGrip.onStarted = [this] { if (onResizeStarted) onResizeStarted(); };
+        resizeGrip.onDragged = [this](juce::Point<int> delta) { if (onResizedByDrag) onResizedByDrag(delta); };
+        resizeGrip.onEnded = [this] { if (onResizeEnded) onResizeEnded(); };
+        addAndMakeVisible(resizeGrip);
         // Keep channel strips flush with the fitted panel width. Vertical
         // navigation remains available from the wheel without reserving a
         // permanent scrollbar gutter; horizontal scrolling appears only when
@@ -2159,9 +2721,22 @@ public:
     std::function<void(juce::Point<int>)> onDragged;
     std::function<void()> onDragEnded;
     bool isMinimized() const { return minimized; }
+    bool isMaximized() const { return maximized; }
+    void setMaximized(bool shouldMaximize)
+    {
+        maximized = shouldMaximize;
+        maximizeButton.setKind(PlaylistWindowIconButton::Kind::maximize);
+        maximizeButton.setTooltip(maximized ? "Restore mixer size" : "Maximize mixer");
+    }
     void setMasterSectionMode(bool enabled) { masterSectionMode = enabled; }
     bool isMasterSectionMode() const { return masterSectionMode; }
     int getVisibleTrackCount() const { return visibleTrackIndices.size(); }
+    int getPreferredWidth() const
+    {
+        constexpr int mixerStripStep = 132;
+        const auto columns = getVisibleTrackCount() + (masterSectionMode ? 1 : 0);
+        return juce::jmax(152, columns * mixerStripStep + 20);
+    }
     void setMinimized(bool shouldMinimize)
     {
         minimized = shouldMinimize;
@@ -2229,6 +2804,7 @@ public:
                 [this, i](int band) { return getTrackEqParameter ? getTrackEqParameter(i, band * 3 + 1) : 0.0f; },
                 [this, i](int band, float frequency, float gain)
                 {
+                if (setTrackEqEnabled) setTrackEqEnabled(i, true);
                     if (setTrackEqBand) setTrackEqBand(i, band, frequency, gain);
                 });
             strip->getEqParameter = [this, i](int parameter)
@@ -2308,6 +2884,7 @@ public:
             [this, count](int band) { return getTrackEqParameter ? getTrackEqParameter(count, band * 3 + 1) : 0.0f; },
             [this, count](int band, float frequency, float gain)
             {
+                if (setTrackEqEnabled) setTrackEqEnabled(count, true);
                 if (setTrackEqBand) setTrackEqBand(count, band, frequency, gain);
             });
         masterStrip.getEqParameter = [this, count](int parameter)
@@ -2352,10 +2929,13 @@ public:
     void resized() override
     {
         content.setBounds(getLocalBounds().reduced(1).withTrimmedTop(titleBarHeight - 1));
-        minimizeButton.setBounds(getWidth() - 56, 2, 24, titleBarHeight - 4);
+        minimizeButton.setBounds(getWidth() - 83, 2, 24, titleBarHeight - 4);
+        maximizeButton.setBounds(getWidth() - 56, 2, 24, titleBarHeight - 4);
         closeButton.setBounds(getWidth() - 29, 2, 24, titleBarHeight - 4);
         viewport.setBounds(content.getLocalBounds());
         viewport.setVisible(!minimized);
+        resizeGrip.setVisible(!minimized && !maximized);
+        resizeGrip.setBounds(getWidth() - 18, getHeight() - 18, 18, 18);
         layoutStrips();
     }
 
@@ -2367,7 +2947,7 @@ public:
         g.fillRect(0, 0, getWidth(), titleBarHeight);
         g.setColour(juce::Colour::fromRGB(222, 235, 242));
         g.setFont(juce::Font(13.0f, juce::Font::bold));
-        g.drawText(masterSectionMode ? "Master Section" : "Mixing Desk", 9, 0, juce::jmax(0, getWidth() - 70), titleBarHeight,
+        g.drawText(masterSectionMode ? "Master Section" : "Mixing Desk", 9, 0, juce::jmax(0, getWidth() - 98), titleBarHeight,
                    juce::Justification::centred);
         g.setColour(juce::Colour::fromRGB(151, 194, 216));
         g.drawRect(getLocalBounds().toFloat().reduced(0.5f), 1.0f);
@@ -2426,9 +3006,12 @@ private:
         }
     } focusListener;
     static constexpr int titleBarHeight = 26;
-    juce::TextButton minimizeButton, closeButton;
+    PlaylistWindowIconButton minimizeButton { PlaylistWindowIconButton::Kind::minimize },
+                            maximizeButton { PlaylistWindowIconButton::Kind::maximize },
+                            closeButton { PlaylistWindowIconButton::Kind::close };
+    ResizeGrip resizeGrip;
     juce::Point<int> dragOrigin;
-    bool minimized = false;
+    bool minimized = false, maximized = false;
     bool masterSectionMode = false;
     juce::Array<int> visibleTrackIndices;
 
@@ -2444,8 +3027,8 @@ private:
         // The viewport adds horizontal scrolling when the active bank grows.
         const int count = channelStrips.size();
         const int columns = count + (masterSectionMode ? 1 : 0);
-        constexpr int columnStep = 116;
-        constexpr int columnWidth = 110;
+        constexpr int columnStep = 132;
+        constexpr int columnWidth = 126;
         // Keep each strip inside the visible mixer viewport. A taller fixed
         // minimum pushed the output-routing buttons below the window edge.
         const int stripHeight = juce::jmax(1, viewport.getHeight());
@@ -2510,23 +3093,28 @@ private:
     protected:
         void paintButton(juce::Graphics& g, bool highlighted, bool down) override
         {
-            juce::TextButton::paintButton(g, highlighted, down);
-            const auto bounds = getLocalBounds().toFloat().reduced(1.0f);
-            const auto centreY = bounds.getCentreY();
-            const auto radius = juce::jmin(3.5f, bounds.getHeight() * 0.18f);
-            g.setColour(isEnabled ? juce::Colour::fromRGB(72, 207, 229)
-                                  : juce::Colour::fromRGB(34, 47, 56));
-            g.fillEllipse(bounds.getX() + 7.0f, centreY - radius, radius * 2.0f, radius * 2.0f);
-            if (isEnabled)
+            auto bounds = getLocalBounds().toFloat().reduced(1.0f);
+            const auto switchWidth = juce::jmin(20.0f, bounds.getWidth());
+            const auto switchHeight = juce::jmin(11.0f, bounds.getHeight());
+            const auto pill = juce::Rectangle<float>(bounds.getRight() - switchWidth,
+                bounds.getCentreY() - switchHeight * 0.5f, switchWidth, switchHeight);
+            const auto active = isEnabled ? juce::Colour::fromRGB(48, 157, 183)
+                                          : juce::Colour::fromRGB(37, 55, 65);
+            g.setColour(down ? active.brighter(0.12f) : active);
+            g.fillRoundedRectangle(pill, switchHeight * 0.5f);
+            g.setColour(juce::Colour::fromRGB(146, 185, 200));
+            g.drawRoundedRectangle(pill, switchHeight * 0.5f, 0.8f);
+            const auto knobDiameter = switchHeight - 3.0f;
+            const auto knobX = isEnabled ? pill.getRight() - knobDiameter - 1.5f : pill.getX() + 1.5f;
+            g.setColour(isEnabled ? juce::Colour::fromRGB(225, 250, 255)
+                                  : juce::Colour::fromRGB(157, 179, 188));
+            g.fillEllipse(knobX, pill.getCentreY() - knobDiameter * 0.5f,
+                          knobDiameter, knobDiameter);
+            if (highlighted)
             {
-                g.setColour(juce::Colour::fromRGB(183, 242, 250).withAlpha(0.72f));
-                g.drawEllipse(bounds.getX() + 7.0f, centreY - radius, radius * 2.0f, radius * 2.0f, 0.8f);
+                g.setColour(juce::Colours::white.withAlpha(0.14f));
+                g.drawRoundedRectangle(pill.expanded(1.0f), switchHeight * 0.5f, 0.8f);
             }
-            g.setColour(juce::Colour::fromRGB(225, 240, 248));
-            g.drawLine(bounds.getRight() - 11.0f, centreY - 2.0f,
-                       bounds.getRight() - 8.0f, centreY + 1.0f, 1.1f);
-            g.drawLine(bounds.getRight() - 8.0f, centreY + 1.0f,
-                       bounds.getRight() - 5.0f, centreY - 2.0f, 1.1f);
         }
 
     private:
@@ -2536,6 +3124,114 @@ private:
     class ChannelStrip final : public juce::Component, private juce::Timer
     {
     public:
+        class FaderSlider final : public juce::Slider
+        {
+        public:
+            void paint(juce::Graphics& g) override
+            {
+                const auto bounds = getLocalBounds().toFloat().reduced(2.0f, 2.0f);
+                if (bounds.isEmpty()) return;
+                const auto centreX = bounds.getCentreX();
+                const auto railWidth = juce::jmin(9.0f, juce::jmax(6.0f, bounds.getWidth() * 0.17f));
+                auto rail = juce::Rectangle<float>(centreX - railWidth * 0.5f, bounds.getY() + 7.0f,
+                                                    railWidth, juce::jmax(0.0f, bounds.getHeight() - 14.0f));
+                g.setColour(juce::Colour::fromRGB(23, 43, 55));
+                g.fillRoundedRectangle(rail, railWidth * 0.5f);
+                g.setColour(juce::Colour::fromRGB(103, 157, 177).withAlpha(0.7f));
+                g.drawRoundedRectangle(rail, railWidth * 0.5f, 0.8f);
+
+                for (const double db : { -60.0, -36.0, -24.0, -18.0, -12.0, -6.0, 0.0 })
+                {
+                    const auto p = static_cast<float>(valueToProportionOfLength(db));
+                    const auto y = rail.getBottom() - p * rail.getHeight();
+                    g.setColour(juce::Colour::fromRGB(167, 199, 211).withAlpha(0.65f));
+                    g.drawHorizontalLine(juce::roundToInt(y), centreX - 9.0f, centreX + 9.0f);
+                }
+
+                const auto p = static_cast<float>(valueToProportionOfLength(getValue()));
+                const auto thumbY = rail.getBottom() - p * rail.getHeight();
+                const auto thumbWidth = juce::jmin(38.0f, juce::jmax(0.0f, bounds.getWidth() - 6.0f));
+                const auto thumb = juce::Rectangle<float>(centreX - thumbWidth * 0.5f, thumbY - 7.0f,
+                                                          thumbWidth, 14.0f);
+                juce::ColourGradient face(juce::Colour::fromRGB(231, 245, 250), thumb.getX(), thumb.getY(),
+                                          juce::Colour::fromRGB(112, 163, 183), thumb.getRight(), thumb.getBottom(), false);
+                g.setGradientFill(face);
+                g.fillRoundedRectangle(thumb, 3.0f);
+                g.setColour(juce::Colour::fromRGB(23, 48, 61));
+                g.drawRoundedRectangle(thumb, 3.0f, 1.0f);
+                g.setColour(juce::Colour::fromRGB(248, 253, 255).withAlpha(0.85f));
+                g.drawHorizontalLine(juce::roundToInt(thumb.getCentreY()), thumb.getX() + 6.0f, thumb.getRight() - 6.0f);
+            }
+        };
+
+        class EqKnob final : public juce::Slider
+        {
+        public:
+            void paint(juce::Graphics& g) override
+            {
+                auto bounds = getLocalBounds().toFloat().reduced(2.0f);
+                const auto diameter = juce::jmin(bounds.getWidth(), bounds.getHeight());
+                bounds = bounds.withSizeKeepingCentre(diameter, diameter);
+                const auto centre = bounds.getCentre();
+                const auto radius = diameter * 0.5f;
+                constexpr float start = juce::MathConstants<float>::pi * 0.75f;
+                constexpr float sweep = juce::MathConstants<float>::pi * 1.5f;
+
+                g.setColour(juce::Colour::fromRGB(21, 39, 51).withAlpha(0.55f));
+                g.fillEllipse(bounds.translated(0.0f, 1.3f));
+                juce::ColourGradient bezel(juce::Colour::fromRGB(155, 190, 204),
+                                           centre.x, bounds.getY(),
+                                           juce::Colour::fromRGB(48, 76, 92),
+                                           centre.x, bounds.getBottom(), false);
+                g.setGradientFill(bezel);
+                g.fillEllipse(bounds);
+
+                const auto face = bounds.reduced(radius * 0.15f);
+                juce::ColourGradient faceGradient(juce::Colour::fromRGB(71, 119, 143),
+                                                  face.getX(), face.getY(),
+                                                  juce::Colour::fromRGB(29, 54, 69),
+                                                  face.getRight(), face.getBottom(), true);
+                g.setGradientFill(faceGradient);
+                g.fillEllipse(face);
+                g.setColour(juce::Colour::fromRGB(18, 38, 50).withAlpha(0.75f));
+                g.drawEllipse(face, 0.8f);
+
+                const auto arcRadius = radius * 0.77f;
+                juce::Path track;
+                track.addCentredArc(centre.x, centre.y, arcRadius, arcRadius, 0.0f,
+                                    start, start + sweep, true);
+                g.setColour(juce::Colour::fromRGB(23, 44, 57));
+                g.strokePath(track, juce::PathStrokeType(2.8f, juce::PathStrokeType::curved,
+                                                         juce::PathStrokeType::rounded));
+
+                const auto proportion = static_cast<float>(valueToProportionOfLength(getValue()));
+                if (proportion > 0.001f)
+                {
+                    juce::Path activeArc;
+                    activeArc.addCentredArc(centre.x, centre.y, arcRadius, arcRadius, 0.0f,
+                                            start, start + sweep * proportion, true);
+                    g.setColour(juce::Colour::fromRGB(78, 207, 235));
+                    g.strokePath(activeArc, juce::PathStrokeType(3.0f, juce::PathStrokeType::curved,
+                                                                  juce::PathStrokeType::rounded));
+                }
+
+                const auto angle = start + sweep * proportion;
+                const auto inner = juce::Point<float>(centre.x + std::cos(angle) * radius * 0.22f,
+                                                       centre.y + std::sin(angle) * radius * 0.22f);
+                const auto outer = juce::Point<float>(centre.x + std::cos(angle) * radius * 0.63f,
+                                                       centre.y + std::sin(angle) * radius * 0.63f);
+                g.setColour(juce::Colour::fromRGB(211, 243, 252));
+                g.drawLine(inner.x, inner.y, outer.x, outer.y, 2.0f);
+                g.fillEllipse(outer.x - 1.6f, outer.y - 1.6f, 3.2f, 3.2f);
+                g.setColour(juce::Colour::fromRGB(239, 250, 255).withAlpha(0.45f));
+                juce::Path highlight;
+                highlight.addCentredArc(centre.x, centre.y, radius - 1.0f, radius - 1.0f, 0.0f,
+                                        juce::MathConstants<float>::pi * 1.08f,
+                                        juce::MathConstants<float>::pi * 1.92f, true);
+                g.strokePath(highlight, juce::PathStrokeType(0.9f));
+            }
+        };
+
         class SendKnob final : public juce::Slider
         {
         public:
@@ -2615,21 +3311,19 @@ private:
             insertsTitle.setFont(juce::FontOptions(10.5f, juce::Font::bold));
             insertsTitle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
             insertsTitle.setBorderSize(juce::BorderSize<int>(0, 0, 0, 14));
-            addAndMakeVisible(sendsTitle);
-            sendsTitle.setText("SENDS", juce::dontSendNotification);
-            sendsTitle.setFont(juce::FontOptions(10.5f, juce::Font::bold));
-            sendsTitle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
-            sendsTitle.setBorderSize(juce::BorderSize<int>(0, 0, 0, 14));
-            eqButton.setButtonText("EQ");
+            eqButton.setButtonText({});
             eqButton.setTitle("Toggle equaliser");
             eqButton.setClickingTogglesState(true);
             eqButton.setTooltip("Enable or bypass the Tracktion equaliser. Click the graph to open its full controls.");
             eqButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(53, 103, 130));
             eqButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(43, 118, 145));
             eqButton.onClick = [this] { if (onToggleEq) onToggleEq(eqButton.getToggleState()); };
-            static const std::array<const char*, 4> bandNames { "Hi Shelf", "High Mid", "Low Mid", "Low Shelf" };
+            // Compact power switch is placed beside the HI band title, so EQ
+            // can be bypassed without restoring a separate control row.
+            eqButton.setVisible(false);
+            static const std::array<const char*, 4> bandNames { "HI", "HM", "LMid", "Low" };
             static const std::array<const char*, 3> parameterNames { "Gain", "Frequency", "Q" };
-            static const std::array<const char*, 3> compactParameterNames { "Gain", "Freq", "Q" };
+            static const std::array<const char*, 3> compactParameterNames { "dB", "Freq", "Q" };
             for (int band = 0; band < 4; ++band)
             {
                 auto& bandTitle = eqBandTitles[static_cast<size_t>(band)];
@@ -2637,6 +3331,7 @@ private:
                 bandTitle.setFont(juce::FontOptions(9.0f, juce::Font::bold));
                 bandTitle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
                 bandTitle.setJustificationType(juce::Justification::centredLeft);
+                bandTitle.setTooltip(band == 0 ? "High shelf" : band == 1 ? "High mid" : band == 2 ? "Low mid" : "Low shelf");
                 addAndMakeVisible(bandTitle);
                 for (int parameter = 0; parameter < 3; ++parameter)
                 {
@@ -2670,6 +3365,11 @@ private:
                     control.setVisible(parameterUsed);
                     control.onValueChange = [this, band, parameter]
                     {
+                        if (!eqEnabled && onToggleEq)
+                        {
+                            eqEnabled = true;
+                            onToggleEq(true);
+                        }
                         if (onEqParameter)
                         {
                             // The compact strip shows Gain, Frequency, Q while
@@ -2813,7 +3513,7 @@ private:
             gain.setTextValueSuffix(" dB");
             gain.setPopupDisplayEnabled(true, true, this);
             gain.onValueChange = [this] { if (onGain) onGain(gain.getValue()); };
-            for (auto* slider : { &gain, &pan })
+            for (auto* slider : std::array<juce::Slider*, 2> { &gain, &pan })
             {
                 slider->setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(186, 225, 242));
                 slider->setColour(juce::Slider::trackColourId, juce::Colour::fromRGB(44, 78, 100));
@@ -2840,12 +3540,12 @@ private:
         std::function<void(int)> onEditInsert;
         std::function<void(int)> onToggleInsert, onRemoveInsert;
         std::function<void()> onAddInsert;
-        juce::Slider gain;
+        FaderSlider gain;
         juce::Label footer;
         juce::Label insertsTitle;
-        juce::Label sendsTitle;
         std::array<juce::Label, 4> eqBandTitles;
-        std::array<std::array<juce::Slider, 3>, 4> eqControls;
+        std::array<std::array<EqKnob, 3>, 4> eqControls;
+        std::array<juce::Rectangle<int>, 4> eqBandBounds;
         std::array<juce::Label, 8> sendNames;
         std::array<SendKnob, 8> sends;
         std::array<juce::TextButton, 8> outputBusButtons;
@@ -2877,6 +3577,7 @@ private:
         void setSoloState(bool value) { solo.setToggleState(value, juce::dontSendNotification); }
         void setEqEnabled(bool value)
         {
+            eqEnabled = value;
             eqButton.setToggleState(value, juce::dontSendNotification);
             eqButton.setEnabledIndicator(value);
             eqButton.setTooltip(value
@@ -2888,7 +3589,6 @@ private:
         {
             mute.setVisible(shouldShow);
             solo.setVisible(shouldShow);
-            sendsTitle.setVisible(shouldShow);
             for (int bus = 0; bus < 8; ++bus)
             {
                 sendNames[static_cast<size_t>(bus)].setVisible(shouldShow && bus < 4);
@@ -2896,7 +3596,7 @@ private:
             }
             outputMasterButton.setVisible(shouldShow && !masterEqView);
             for (auto& route : outputBusButtons) route.setVisible(shouldShow && !masterEqView);
-            eqButton.setVisible(shouldShow);
+            eqButton.setVisible(false);
             eqGraph.setVisible(shouldShow);
             for (int band = 0; band < 4; ++band)
             {
@@ -2922,7 +3622,6 @@ private:
         void setMasterControlsVisible(bool shouldShow)
         {
             masterEqView = shouldShow;
-            sendsTitle.setVisible(false);
             for (int bus = 0; bus < 8; ++bus)
             {
                 sendNames[static_cast<size_t>(bus)].setVisible(false);
@@ -2935,7 +3634,7 @@ private:
             solo.setVisible(shouldShow);
             solo.setEnabled(false);
             solo.setTooltip("The master output cannot be soloed");
-            eqButton.setVisible(shouldShow);
+            eqButton.setVisible(false);
             eqGraph.setVisible(shouldShow);
             for (int band = 0; band < 4; ++band)
             {
@@ -2952,7 +3651,6 @@ private:
         }
         void setSendsVisible(bool shouldShow)
         {
-            sendsTitle.setVisible(shouldShow);
             for (int bus = 0; bus < 8; ++bus)
             {
                 sendNames[static_cast<size_t>(bus)].setVisible(shouldShow && bus < 4);
@@ -3067,13 +3765,22 @@ private:
             g.fillRoundedRectangle(box, 5.0f);
             g.setColour(juce::Colour::fromRGB(161, 197, 216));
             g.drawRoundedRectangle(box, 5.0f, 1.0f);
-            if (sendsTitle.isVisible())
+            if (!masterEqView)
             {
-                const auto centreY = sendsTitle.getBounds().toFloat().getCentreY();
-                g.setColour(juce::Colour::fromRGB(72, 211, 235));
-                g.fillEllipse(static_cast<float>(sendsTitle.getX() - 12), centreY - 3.0f, 6.0f, 6.0f);
-                g.setColour(juce::Colour::fromRGB(190, 245, 252).withAlpha(0.75f));
-                g.drawEllipse(static_cast<float>(sendsTitle.getX() - 12), centreY - 3.0f, 6.0f, 6.0f, 0.8f);
+                for (size_t band = 0; band < eqBandBounds.size(); ++band)
+                {
+                    const auto panel = eqBandBounds[band].toFloat().reduced(1.0f, 0.5f);
+                    if (panel.isEmpty()) continue;
+                    const auto panelBase = band % 2 == 0 ? juce::Colour::fromRGB(58, 102, 126)
+                                                        : juce::Colour::fromRGB(53, 96, 120);
+                    g.setColour(panelBase.withAlpha(0.42f));
+                    g.fillRoundedRectangle(panel, 3.0f);
+                    g.setColour(juce::Colour::fromRGB(168, 207, 222).withAlpha(0.28f));
+                    g.drawRoundedRectangle(panel, 3.0f, 0.7f);
+                    g.setColour(juce::Colour::fromRGB(92, 210, 233).withAlpha(0.78f));
+                    g.fillRoundedRectangle(panel.getX() + 2.0f, panel.getY() + 2.0f, 2.0f,
+                                           juce::jmax(2.0f, panel.getHeight() - 4.0f), 1.0f);
+                }
             }
             if (insertsTitle.isVisible())
             {
@@ -3094,7 +3801,6 @@ private:
             if (sends[0].isVisible())
             {
                 // Four auxiliary send knobs arranged like the Orion reference.
-                sendsTitle.setBounds(area.removeFromTop(11).withTrimmedLeft(16));
                 auto sendArea = area.removeFromTop(64);
                 for (int bus = 0; bus < 4; ++bus)
                 {
@@ -3103,14 +3809,15 @@ private:
                     const auto cellX = area.getX() + column * (area.getWidth() / 2);
                     auto cell = juce::Rectangle<int>(cellX, sendArea.getY() + row * 32,
                                                      area.getWidth() / 2, 32).reduced(1, 0);
-                    auto sendNameArea = cell.removeFromTop(8).removeFromRight(18);
+                    const auto knobCell = cell;
+                    auto sendNameArea = cell.removeFromTop(9).removeFromRight(18);
                     sendNames[static_cast<size_t>(bus)].setBounds(sendNameArea);
-                    const auto knobSize = juce::jmin(29, cell.getWidth() - 2, cell.getHeight() - 1);
-                    sends[static_cast<size_t>(bus)].setBounds(cell.withSizeKeepingCentre(knobSize, knobSize));
+                    const auto knobSize = juce::jmin(31, knobCell.getWidth() - 2, knobCell.getHeight() - 1);
+                    sends[static_cast<size_t>(bus)].setBounds(knobCell.withSizeKeepingCentre(knobSize, knobSize));
                 }
                 area.removeFromTop(2);
             }
-            if (eqButton.isVisible())
+            if (eqGraph.isVisible())
             {
                 insertsTitle.setBounds(area.removeFromTop(16).withTrimmedLeft(16));
                 for (int slot = 0; slot < 4; ++slot)
@@ -3143,78 +3850,91 @@ private:
                 }
                 addInsertButton.setBounds({});
                 area.removeFromTop(2);
-                eqButton.setBounds(area.removeFromTop(22));
-                area.removeFromTop(2);
                 if (masterEqView)
                 {
                     // The reference Master strip gives its EQ response graph
                     // a dedicated display area instead of repeating the four
                     // compact channel EQ control rows.
-                    const auto graphHeight = juce::jmin(210, juce::jmax(110, area.getHeight() / 3));
+                    const auto graphHeight = juce::jmin(230, juce::jmax(130, area.getHeight() / 3));
+                    for (auto& bandBounds : eqBandBounds) bandBounds = {};
                     eqGraph.setBounds(area.removeFromTop(graphHeight));
                     area.removeFromTop(3);
                 }
                 else
                 {
-                    eqGraph.setBounds(area.removeFromTop(32));
-                    area.removeFromTop(3);
+                    const int eqGraphHeight = 64;
+                    const int eqTitleHeight = 17;
+                    const int eqLabelHeight = 11;
+                    const int fixedEqHeight = eqGraphHeight + 2 + 2
+                        + 4 * (eqTitleHeight + 10 + eqLabelHeight);
+                    // Keep the fader and meter compact so the four EQ bands
+                    // have room for controls that can be adjusted precisely.
+                    const int compactVolumeHeight = 80;
+                    const int lowerControlsHeight = 38 + 3 + 52 + compactVolumeHeight;
+                    const int controlsHeight = juce::jlimit(28, 56,
+                        (area.getHeight() - fixedEqHeight - lowerControlsHeight) / 4);
+                    eqGraph.setBounds(area.removeFromTop(eqGraphHeight));
+                    area.removeFromTop(2);
                     for (int band = 0; band < 4; ++band)
                     {
-                        eqBandTitles[static_cast<size_t>(band)].setBounds(area.removeFromTop(10));
-                        // Keep channel EQ controls compact enough that the
-                        // output routing bank remains visible in the mixer.
-                        auto controls = area.removeFromTop(22);
+                        auto bandArea = area.removeFromTop(eqTitleHeight + controlsHeight + eqLabelHeight).reduced(1, 0);
+                        eqBandBounds[static_cast<size_t>(band)] = bandArea;
+                        auto titleRow = bandArea.removeFromTop(eqTitleHeight).reduced(3, 0);
+                        if (band == 0)
+                        {
+                            eqButton.setBounds(titleRow.removeFromRight(22));
+                            titleRow.removeFromRight(3);
+                        }
+                        eqBandTitles[static_cast<size_t>(band)].setBounds(titleRow);
+                        auto controls = bandArea.removeFromTop(controlsHeight);
                         const int parameterCount = band == 1 ? 3 : 2;
-                        const std::array<float, 3> twoKnobPositions { 0.30f, 0.70f, 0.0f };
-                        const std::array<float, 3> threeKnobPositions { 0.18f, 0.50f, 0.82f };
+                        const std::array<float, 3> twoKnobPositions { 0.28f, 0.72f, 0.0f };
+                        const std::array<float, 3> threeKnobPositions { 0.16f, 0.50f, 0.84f };
                         for (int parameter = 0; parameter < parameterCount; ++parameter)
                         {
                             const auto xPosition = parameterCount == 3
                                 ? threeKnobPositions[static_cast<size_t>(parameter)]
                                 : twoKnobPositions[static_cast<size_t>(parameter)];
-                            const int knobSize = juce::jmin(22, controls.getHeight());
-                            const int diagonalOffset = parameterCount == 3
-                                ? (parameter == 1 ? 0 : 7)
-                                : (parameter == 0 ? 7 : 0);
+                            const int knobSize = juce::jmin(parameterCount == 3 ? 31 : 35,
+                                                            controls.getHeight() - 2);
                             const int x = controls.getX() + juce::roundToInt(
                                 xPosition * static_cast<float>(controls.getWidth())) - knobSize / 2;
                             eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setBounds(
-                                juce::Rectangle<int>(x, controls.getY() + diagonalOffset, knobSize, knobSize)
+                                juce::Rectangle<int>(x, controls.getCentreY() - knobSize / 2, knobSize, knobSize)
                                     .constrainedWithin(controls));
                         }
-                        auto labels = area.removeFromTop(8);
+                        auto labels = bandArea.removeFromTop(eqLabelHeight);
                         for (int parameter = 0; parameter < parameterCount; ++parameter)
                         {
                             const auto xPosition = parameterCount == 3
                                 ? threeKnobPositions[static_cast<size_t>(parameter)]
                                 : twoKnobPositions[static_cast<size_t>(parameter)];
-                            const int labelWidth = parameterCount == 3 ? 34 : 48;
+                            const int labelWidth = parameterCount == 3 ? 36 : 44;
                             const int x = controls.getX() + juce::roundToInt(
                                 xPosition * static_cast<float>(controls.getWidth())) - labelWidth / 2;
                             eqControlLabels[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setBounds(
                                 juce::Rectangle<int>(x, labels.getY(), labelWidth, labels.getHeight())
                                     .constrainedWithin(labels));
                         }
-                        area.removeFromTop(0);
                     }
                 }
                 area.removeFromTop(2);
             }
             if (mute.isVisible())
             {
-                auto modeButtons = area.removeFromTop(22);
-                mute.setBounds(modeButtons.removeFromLeft((modeButtons.getWidth() - 4) / 2));
-                modeButtons.removeFromLeft(4);
-                solo.setBounds(modeButtons);
-                area.removeFromTop(2);
-                auto panArea = area.removeFromTop(50);
+                auto modePanRow = area.removeFromTop(38);
+                auto modeButtons = modePanRow.removeFromLeft(48);
+                mute.setBounds(modeButtons.removeFromTop(18).reduced(1, 0));
+                solo.setBounds(modeButtons.removeFromTop(18).reduced(1, 0));
+                modePanRow.removeFromLeft(2);
+                auto panArea = modePanRow;
                 auto panLabelRow = panArea.removeFromTop(10);
-                panLeft.setBounds(panLabelRow.removeFromLeft(18));
-                panRight.setBounds(panLabelRow.removeFromRight(18));
+                panLeft.setBounds(panLabelRow.removeFromLeft(14));
+                panRight.setBounds(panLabelRow.removeFromRight(14));
                 panTitle.setBounds(panLabelRow);
-                const int panWidth = juce::jmin(46, panArea.getWidth());
+                const int panWidth = juce::jmin(38, panArea.getWidth());
                 pan.setBounds(panArea.withSizeKeepingCentre(panWidth, panArea.getHeight()));
-                area.removeFromTop(4);
+                area.removeFromTop(3);
             }
             if (!masterEqView)
             {
@@ -3234,8 +3954,8 @@ private:
                     }
                 }
             }
-            auto meterArea = area.removeFromRight(34);
-            area.removeFromRight(3);
+            auto meterArea = area.removeFromRight(38);
+            area.removeFromRight(1);
             gain.setBounds(area);
             meterBounds = meterArea.reduced(2, 0);
         }
@@ -3386,7 +4106,7 @@ private:
         int leftPeakHoldTicks = 0, rightPeakHoldTicks = 0;
         bool clipHeld = false;
         bool meterVisible = false, isMasterMeter = false;
-        bool masterEqView = false;
+        bool masterEqView = false, eqEnabled = false;
         bool isSelected = false;
     };
 
@@ -3422,6 +4142,26 @@ public:
     std::function<void(int, bool)> keyboardNoteChanged;
     std::function<float(int)> getAutomationValue;
     std::function<void(int, float)> setAutomationValue;
+    std::function<void(int)> removeAutomationValue;
+    std::function<void(int, int, float)> moveAutomationValue;
+    std::function<void()> automationGestureStarted, automationGestureEnded;
+    std::function<int(int)> getVelocityAtStep;
+    std::function<void(int, int)> setVelocityAtStep;
+    std::function<void()> velocityGestureStarted, velocityGestureEnded;
+    std::function<int()> getMaximumLaneHeight;
+    std::function<void()> laneHeightChanged;
+    std::function<void()> pasteNotes;
+
+    bool keyPressed(const juce::KeyPress& key) override
+    {
+        const auto character = juce::CharacterFunctions::toLowerCase(key.getTextCharacter());
+        if (character == 'v' && (key.getModifiers().isCommandDown() || key.getModifiers().isCtrlDown()))
+        {
+            if (pasteNotes) pasteNotes();
+            return true;
+        }
+        return false;
+    }
 
     void setPlayheadStep(double step, bool active)
     {
@@ -3434,11 +4174,35 @@ public:
     int visibleSteps() const { return juce::jmax(baseVisibleStepCount, activeSteps()); }
     int labelWidth() const { return 58; }
     int headerHeight() const { return 30; }
-    int rowHeight() const { return juce::jmax(22, (getHeight() - headerHeight() - 8 - (velocityLaneVisible ? 116 : 0)) / 37); }
-    int stepWidth() const { return juce::jmax(22, (getWidth() - labelWidth()) / visibleSteps()); }
+    static constexpr int defaultAutomationLaneHeight() { return 88; }
+    int velocityLaneHeight() const { return laneHeightPx; }
+    int rowHeight() const { return juce::jmax(6, juce::roundToInt(baseRowHeight * verticalZoom)); }
+    int stepWidth() const { return juce::jmax(14, juce::roundToInt(baseStepWidth * horizontalZoom)); }
+    void setViewMetrics(int width, int height)
+    {
+        baseStepWidth = juce::jmax(22.0f, static_cast<float>(width - labelWidth()) / visibleSteps());
+        const auto laneHeight = (velocityLaneVisible || automationLaneVisible) ? laneHeightPx : 0;
+        baseRowHeight = juce::jmax(8.0f, static_cast<float>(height - headerHeight() - 8 - laneHeight) / 37.0f);
+    }
+    void setZoom(float horizontal, float vertical)
+    {
+        horizontalZoom = juce::jlimit(0.5f, 3.0f, horizontal);
+        verticalZoom = juce::jlimit(0.6f, 2.2f, vertical);
+        repaint();
+    }
+    float getHorizontalZoom() const { return horizontalZoom; }
+    float getVerticalZoom() const { return verticalZoom; }
     void setVelocityLaneVisible(bool visible) { velocityLaneVisible = visible; repaint(); }
     void setAutomationLaneVisible(bool visible) { automationLaneVisible = visible; repaint(); }
+    void setAutomationLaneHeight(int height) { laneHeightPx = juce::jlimit(64, 260, height); repaint(); }
+    int getAutomationLaneHeight() const { return laneHeightPx; }
+    void setAutomationTool(int tool) { automationTool = juce::jlimit(0, 3, tool); }
+    int getAutomationTool() const { return automationTool; }
+    void setAutomationBars(bool enabled) { automationBars = enabled; repaint(); }
+    bool isAutomationBars() const { return automationBars; }
+    void setVelocityEditEnabled(bool enabled) { velocityEditEnabled = enabled; }
     bool isVelocityLaneVisible() const { return velocityLaneVisible; }
+    bool isAutomationLaneVisible() const { return automationLaneVisible; }
     void setKeyboardOptions(bool coloured, bool labels)
     {
         colouredKeys = coloured;
@@ -3458,7 +4222,7 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        constexpr int velocityHeight = 116;
+        const auto velocityHeight = laneHeightPx;
         const auto labelWidthPx = labelWidth();
         const auto headerHeightPx = headerHeight();
         const auto rowHeightPx = rowHeight();
@@ -3534,6 +4298,12 @@ public:
         {
             g.setColour(juce::Colour::fromRGB(29, 43, 55));
             g.fillRect(0, velocityTop, getWidth(), velocityHeight);
+            g.setColour(juce::Colour::fromRGB(103, 139, 157));
+            g.drawHorizontalLine(velocityTop, 0.0f, static_cast<float>(getWidth()));
+            g.setColour(resizingLane ? juce::Colour::fromRGB(183, 232, 246)
+                                     : juce::Colour::fromRGB(112, 179, 201));
+            g.fillRoundedRectangle(getWidth() * 0.5f - 24.0f,
+                                   static_cast<float>(velocityTop - 3), 48.0f, 6.0f, 3.0f);
             g.setColour(juce::Colour::fromRGB(178, 198, 211));
             g.setFont(11.0f);
             g.drawText(automationLaneVisible ? "Automation" : "Velocity", 4, velocityTop,
@@ -3549,11 +4319,35 @@ public:
                     const auto y = static_cast<float>(velocityTop + 26 + (1.0f - value) * (velocityHeight - 38));
                     if (!started) { curve.startNewSubPath(x, y); started = true; }
                     else curve.lineTo(x, y);
-                    g.setColour(juce::Colour::fromRGB(48, 158, 199));
-                    g.fillEllipse(x - 4.0f, y - 4.0f, 8.0f, 8.0f);
+                    const auto colour = automationColour(value);
+                    if (automationBars)
+                    {
+                        const auto barWidth = juce::jmax(5.0f, static_cast<float>(stepWidthPx) * 0.52f);
+                        g.setColour(colour);
+                        g.fillRoundedRectangle(x - barWidth * 0.5f,
+                            static_cast<float>(velocityTop + velocityHeight - 8) - value * (velocityHeight - 38),
+                            barWidth, value * (velocityHeight - 38), 2.0f);
+                    }
+                    else
+                    {
+                        g.setColour(colour);
+                        g.fillEllipse(x - 4.0f, y - 4.0f, 8.0f, 8.0f);
+                    }
                 }
-                g.setColour(juce::Colour::fromRGB(73, 207, 237));
-                g.strokePath(curve, juce::PathStrokeType(2.0f));
+                if (!automationBars)
+                {
+                    for (int step = 1; step < activeStepCount; ++step)
+                    {
+                        const auto a = juce::jlimit(0.0f, 1.0f, getAutomationValue ? getAutomationValue(step - 1) : 0.5f);
+                        const auto b = juce::jlimit(0.0f, 1.0f, getAutomationValue ? getAutomationValue(step) : 0.5f);
+                        const auto x1 = static_cast<float>(labelWidthPx + (step - 1) * stepWidthPx + stepWidthPx / 2);
+                        const auto x2 = static_cast<float>(labelWidthPx + step * stepWidthPx + stepWidthPx / 2);
+                        const auto y1 = static_cast<float>(velocityTop + 26 + (1.0f - a) * (velocityHeight - 38));
+                        const auto y2 = static_cast<float>(velocityTop + 26 + (1.0f - b) * (velocityHeight - 38));
+                        g.setColour(automationColour((a + b) * 0.5f));
+                        g.drawLine(x1, y1, x2, y2, 2.5f);
+                    }
+                }
                 for (int step = 0; step < visibleStepCount; ++step)
                     g.setColour(step < activeStepCount ? juce::Colour::fromRGB(53, 75, 90)
                                                        : juce::Colour::fromRGB(38, 52, 62)),
@@ -3568,13 +4362,21 @@ public:
                 const bool inPattern = step < activeStepCount;
                 g.setColour(inPattern ? juce::Colour::fromRGB(53, 75, 90) : juce::Colour::fromRGB(38, 52, 62));
                 g.drawVerticalLine(x, static_cast<float>(velocityTop + 22), static_cast<float>(velocityTop + velocityHeight));
-                bool active = false;
-                for (int pitch = 48; pitch <= 84 && inPattern && !active; ++pitch)
-                    active = noteIsOn && noteIsOn(pitch, step);
-                if (active)
+                const auto velocity = inPattern && getVelocityAtStep ? getVelocityAtStep(step) : 0;
+                if (velocity > 0)
                 {
                     g.setColour(juce::Colour::fromRGB(48, 158, 199));
-                    g.fillRect(x + stepWidthPx / 2 - 5, velocityTop + 30, 10, velocityHeight - 38);
+                    const auto barHeight = juce::jmax(2, juce::roundToInt((velocity / 127.0f) * (velocityHeight - 38)));
+                    const auto barX = x + stepWidthPx / 2 - juce::jmin(5, stepWidthPx / 3);
+                    g.fillRoundedRectangle(static_cast<float>(barX),
+                        static_cast<float>(velocityTop + velocityHeight - 8 - barHeight),
+                        static_cast<float>(juce::jmin(10, stepWidthPx - 2)), static_cast<float>(barHeight), 2.0f);
+                    if (velocityEditEnabled && !automationLaneVisible)
+                    {
+                        g.setColour(juce::Colour::fromRGB(176, 235, 250));
+                        g.fillEllipse(static_cast<float>(x + stepWidthPx / 2 - 3),
+                            static_cast<float>(velocityTop + velocityHeight - 8 - barHeight - 3), 6.0f, 6.0f);
+                    }
                 }
             }
         }
@@ -3591,12 +4393,40 @@ public:
 
     void mouseDown(const juce::MouseEvent& event) override
     {
+        grabKeyboardFocus();
         const auto velocityTop = headerHeight() + 37 * rowHeight() + 8;
+        if ((velocityLaneVisible || automationLaneVisible)
+            && std::abs(event.y - velocityTop) <= 8)
+        {
+            resizingLane = true;
+            resizeLaneStartY = event.y;
+            resizeLaneStartHeight = laneHeightPx;
+            return;
+        }
         if (automationLaneVisible && event.y >= velocityTop && event.x >= labelWidth()
-            && setAutomationValue)
+            && (setAutomationValue || removeAutomationValue))
         {
             automationDragActive = true;
-            setAutomationPointFromMouse(event);
+            if (automationGestureStarted) automationGestureStarted();
+            lastAutomationStep = juce::jlimit(0, activeSteps() - 1, (event.x - labelWidth()) / stepWidth());
+            lastAutomationValue = automationValueFromMouse(event);
+            if (automationTool == 2)
+            {
+                if (removeAutomationValue) removeAutomationValue(lastAutomationStep);
+            }
+            else
+            {
+                setAutomationPointFromMouse(event);
+            }
+            repaint();
+            return;
+        }
+        if (velocityLaneVisible && !automationLaneVisible && velocityEditEnabled
+            && event.y >= velocityTop && event.x >= labelWidth() && setVelocityAtStep)
+        {
+            velocityGestureActive = true;
+            if (velocityGestureStarted) velocityGestureStarted();
+            setVelocityPointFromMouse(event);
             return;
         }
         const auto pitch = 84 - (event.y - headerHeight()) / rowHeight();
@@ -3627,6 +4457,12 @@ public:
         dragPressStep = step;
         dragInitialLength = dragWasExisting && getNoteLength
             ? juce::jlimit(1, activeSteps() - dragStartStep, getNoteLength(pitch, dragStartStep)) : 1;
+        dragResizingFromEdge = false;
+        if (dragWasExisting)
+        {
+            const auto noteEndX = labelWidth() + (dragStartStep + dragInitialLength) * stepWidth() - 3;
+            dragResizingFromEdge = noteEndX - event.x <= juce::jmax(7, stepWidth() / 4);
+        }
         dragChanged = false;
         noteGestureActive = true;
         if (noteGestureStarted) noteGestureStarted();
@@ -3641,9 +4477,53 @@ public:
 
     void mouseDrag(const juce::MouseEvent& event) override
     {
+        if (resizingLane)
+        {
+            const auto maxHeight = getMaximumLaneHeight ? getMaximumLaneHeight() : 260;
+            const auto nextHeight = juce::jlimit(64, juce::jmax(64, maxHeight),
+                resizeLaneStartHeight + resizeLaneStartY - event.getPosition().y);
+            if (nextHeight != laneHeightPx)
+            {
+                laneHeightPx = nextHeight;
+                if (laneHeightChanged) laneHeightChanged();
+                repaint();
+            }
+            return;
+        }
         if (automationDragActive)
         {
-            setAutomationPointFromMouse(event);
+            const auto step = juce::jlimit(0, activeSteps() - 1, (event.x - labelWidth()) / stepWidth());
+            const auto value = automationValueFromMouse(event);
+            if (automationTool == 2)
+            {
+                if (removeAutomationValue) removeAutomationValue(step);
+            }
+            else if (automationTool == 3 && moveAutomationValue)
+            {
+                moveAutomationValue(lastAutomationStep, step, value);
+                lastAutomationStep = step;
+            }
+            else if (automationTool == 1 && setAutomationValue)
+            {
+                const auto start = lastAutomationStep;
+                const auto end = step;
+                const auto distance = juce::jmax(1, std::abs(end - start));
+                for (int index = 0; index <= distance; ++index)
+                {
+                    const auto fraction = static_cast<float>(index) / static_cast<float>(distance);
+                    const auto pointStep = start <= end ? start + index : start - index;
+                    setAutomationValue(pointStep, juce::jmap(fraction, lastAutomationValue, value));
+                }
+                lastAutomationStep = step;
+                lastAutomationValue = value;
+            }
+            else setAutomationPointFromMouse(event);
+            repaint();
+            return;
+        }
+        if (velocityGestureActive)
+        {
+            setVelocityPointFromMouse(event);
             return;
         }
         if (dragPitch < 0 || !noteLengthChanged) return;
@@ -3651,14 +4531,19 @@ public:
         const auto pointerStep = juce::jlimit(0, activeSteps() - 1,
             (event.x - labelWidth()) / stepWidth());
         const auto length = dragWasExisting
-            ? juce::jlimit(1, activeSteps() - dragStartStep,
-                           dragInitialLength + pointerStep - dragPressStep)
+            ? (dragResizingFromEdge
+                ? juce::jlimit(1, activeSteps() - dragStartStep, pointerStep - dragStartStep + 1)
+                : juce::jlimit(1, activeSteps() - dragStartStep,
+                               dragInitialLength + pointerStep - dragPressStep))
             : juce::jlimit(1, activeSteps() - dragStartStep, pointerStep - dragStartStep + 1);
         if (dragWasExisting || length > 1)
         {
             noteLengthChanged(dragPitch, dragStartStep, length);
-            paintLength = length;
-            if (paintLengthUpdated) paintLengthUpdated(paintLength);
+            if (!dragWasExisting)
+            {
+                paintLength = length;
+                if (paintLengthUpdated) paintLengthUpdated(paintLength);
+            }
             dragChanged = true;
             repaint();
         }
@@ -3669,7 +4554,11 @@ public:
 
     void mouseUp(const juce::MouseEvent&) override
     {
+        resizingLane = false;
+        if (automationDragActive && automationGestureEnded) automationGestureEnded();
         automationDragActive = false;
+        if (velocityGestureActive && velocityGestureEnded) velocityGestureEnded();
+        velocityGestureActive = false;
         if (keyboardPitch >= 0 && keyboardNoteChanged)
             keyboardNoteChanged(keyboardPitch, false);
         keyboardPitch = -1;
@@ -3678,7 +4567,38 @@ public:
         dragPitch = -1;
         dragStartStep = -1;
         dragWasExisting = false;
+        dragResizingFromEdge = false;
         dragChanged = false;
+    }
+
+    void mouseMove(const juce::MouseEvent& event) override
+    {
+        const auto velocityTop = headerHeight() + 37 * rowHeight() + 8;
+        if ((velocityLaneVisible || automationLaneVisible)
+            && std::abs(event.y - velocityTop) <= 8)
+        {
+            setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
+            return;
+        }
+        const auto pitch = 84 - (event.y - headerHeight()) / rowHeight();
+        const auto step = (event.x - labelWidth()) / stepWidth();
+        if (event.x >= labelWidth() && event.y >= headerHeight()
+            && pitch >= 48 && pitch <= 84 && juce::isPositiveAndBelow(step, activeSteps()))
+        {
+            const auto start = findNoteStart(pitch, step);
+            if (start >= 0)
+            {
+                const auto length = juce::jlimit(1, activeSteps() - start,
+                    getNoteLength ? getNoteLength(pitch, start) : 1);
+                const auto noteEndX = labelWidth() + (start + length) * stepWidth() - 3;
+                if (noteEndX - event.x <= juce::jmax(7, stepWidth() / 4))
+                {
+                    setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
+                    return;
+                }
+            }
+        }
+        setMouseCursor(juce::MouseCursor::NormalCursor);
     }
 
 private:
@@ -3686,10 +4606,37 @@ private:
     {
         if (!setAutomationValue) return;
         const auto step = juce::jlimit(0, activeSteps() - 1, (event.x - labelWidth()) / stepWidth());
+        setAutomationValue(step, automationValueFromMouse(event));
+        repaint();
+    }
+
+    float automationValueFromMouse(const juce::MouseEvent& event) const
+    {
         const auto laneTop = headerHeight() + 37 * rowHeight() + 8;
-        const auto value = 1.0f - juce::jlimit(0.0f, 1.0f,
-            static_cast<float>(event.y - laneTop - 26) / static_cast<float>(juce::jmax(1, 116 - 38)));
-        setAutomationValue(step, value);
+        return 1.0f - juce::jlimit(0.0f, 1.0f,
+            static_cast<float>(event.y - laneTop - 26)
+                / static_cast<float>(juce::jmax(1, laneHeightPx - 38)));
+    }
+
+    static juce::Colour automationColour(float value)
+    {
+        const auto v = juce::jlimit(0.0f, 1.0f, value);
+        const auto low = juce::Colour::fromRGB(190, 62, 74);
+        const auto middle = juce::Colour::fromRGB(161, 91, 180);
+        const auto high = juce::Colour::fromRGB(57, 174, 218);
+        return v < 0.5f ? low.interpolatedWith(middle, v * 2.0f)
+                        : middle.interpolatedWith(high, (v - 0.5f) * 2.0f);
+    }
+
+    void setVelocityPointFromMouse(const juce::MouseEvent& event)
+    {
+        if (!setVelocityAtStep) return;
+        const auto step = juce::jlimit(0, activeSteps() - 1, (event.x - labelWidth()) / stepWidth());
+        const auto laneTop = headerHeight() + 37 * rowHeight() + 8;
+        const auto velocity = juce::jlimit(1, 127, juce::roundToInt((1.0f
+            - juce::jlimit(0.0f, 1.0f, static_cast<float>(event.y - laneTop - 22)
+                / static_cast<float>(juce::jmax(1, velocityLaneHeight() - 30)))) * 126.0f) + 1);
+        setVelocityAtStep(step, velocity);
         repaint();
     }
 
@@ -3712,6 +4659,7 @@ private:
     int dragInitialLength = 1;
     int keyboardPitch = -1;
     bool dragWasExisting = false;
+    bool dragResizingFromEdge = false;
     bool dragChanged = false;
     bool noteGestureActive = false;
     int paintLength = 1;
@@ -3719,9 +4667,20 @@ private:
     bool playheadVisible = false;
     int subdivisionsPerBar = 16;
     int highlightEveryN = 4;
-    bool velocityLaneVisible = true;
+    int laneHeightPx = defaultAutomationLaneHeight();
+    float baseStepWidth = 22.0f, baseRowHeight = 16.0f;
+    float horizontalZoom = 1.0f, verticalZoom = 1.0f;
+    int automationTool = 0;
+    int lastAutomationStep = -1;
+    float lastAutomationValue = 0.5f;
+    bool automationBars = false;
+    bool velocityLaneVisible = false;
     bool automationLaneVisible = false;
     bool automationDragActive = false;
+    bool resizingLane = false;
+    int resizeLaneStartY = 0, resizeLaneStartHeight = defaultAutomationLaneHeight();
+    bool velocityEditEnabled = false;
+    bool velocityGestureActive = false;
     bool colouredKeys = true;
     bool showNoteNames = true;
     static juce::String pitchLabel(int pitch)
@@ -3734,7 +4693,7 @@ private:
 class PianoRollIconButton final : public juce::Button
 {
 public:
-    enum class Icon { Velocity, Keyboard, NoteNames };
+    enum class Icon { Velocity, VelocityEdit, Keyboard, NoteNames, Line, Erase, Move, Bars, Settings };
     PianoRollIconButton(const juce::String& name, Icon iconToDraw)
         : juce::Button(name), icon(iconToDraw)
     {
@@ -3760,6 +4719,60 @@ public:
                 const auto height = 4.0f + static_cast<float>((i * 7) % 10);
                 g.fillRoundedRectangle(x, iconArea.getBottom() - height, 3.0f, height, 1.0f);
             }
+        }
+        else if (icon == Icon::VelocityEdit)
+        {
+            juce::Path pencil;
+            pencil.startNewSubPath(iconArea.getX() + 3.0f, iconArea.getBottom() - 3.0f);
+            pencil.lineTo(iconArea.getRight() - 3.0f, iconArea.getY() + 3.0f);
+            g.setColour(getToggleState() ? juce::Colour::fromRGB(188, 242, 255)
+                                         : juce::Colour::fromRGB(148, 182, 198));
+            g.strokePath(pencil, juce::PathStrokeType(2.4f, juce::PathStrokeType::curved,
+                                                      juce::PathStrokeType::rounded));
+            g.drawLine(iconArea.getX() + 2.0f, iconArea.getBottom() - 2.0f,
+                       iconArea.getX() + 6.0f, iconArea.getBottom() - 2.0f, 1.5f);
+        }
+        else if (icon == Icon::Line)
+        {
+            g.drawLine(iconArea.getX() + 2.0f, iconArea.getBottom() - 2.0f,
+                       iconArea.getRight() - 2.0f, iconArea.getY() + 2.0f, 2.0f);
+        }
+        else if (icon == Icon::Erase)
+        {
+            g.drawLine(iconArea.getX() + 2.0f, iconArea.getY() + 2.0f,
+                       iconArea.getRight() - 2.0f, iconArea.getBottom() - 2.0f, 2.0f);
+            g.drawLine(iconArea.getRight() - 2.0f, iconArea.getY() + 2.0f,
+                       iconArea.getX() + 2.0f, iconArea.getBottom() - 2.0f, 2.0f);
+        }
+        else if (icon == Icon::Move)
+        {
+            const auto cx = iconArea.getCentreX(), cy = iconArea.getCentreY();
+            g.drawLine(cx, iconArea.getY() + 1.0f, cx, iconArea.getBottom() - 1.0f, 1.5f);
+            g.drawLine(iconArea.getX() + 1.0f, cy, iconArea.getRight() - 1.0f, cy, 1.5f);
+            g.drawLine(cx - 2.5f, iconArea.getY() + 4.0f, cx, iconArea.getY() + 1.0f, 1.5f);
+            g.drawLine(cx + 2.5f, iconArea.getY() + 4.0f, cx, iconArea.getY() + 1.0f, 1.5f);
+        }
+        else if (icon == Icon::Bars)
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                const auto x = iconArea.getX() + 2.0f + i * (iconArea.getWidth() - 4.0f) / 3.0f;
+                const auto height = 4.0f + static_cast<float>((i * 7) % 10);
+                g.fillRoundedRectangle(x, iconArea.getBottom() - height, 3.0f, height, 1.0f);
+            }
+        }
+        else if (icon == Icon::Settings)
+        {
+            const auto centre = iconArea.getCentre();
+            for (int tooth = 0; tooth < 8; ++tooth)
+            {
+                const auto angle = juce::MathConstants<float>::twoPi * static_cast<float>(tooth) / 8.0f;
+                const auto inner = centre.translated(std::cos(angle) * 4.5f, std::sin(angle) * 4.5f);
+                const auto outer = centre.translated(std::cos(angle) * 7.0f, std::sin(angle) * 7.0f);
+                g.drawLine(inner.x, inner.y, outer.x, outer.y, 2.0f);
+            }
+            g.drawEllipse(centre.x - 5.0f, centre.y - 5.0f, 10.0f, 10.0f, 2.0f);
+            g.fillEllipse(centre.x - 1.8f, centre.y - 1.8f, 3.6f, 3.6f);
         }
         else if (icon == Icon::Keyboard)
         {
@@ -3812,30 +4825,67 @@ public:
         title.setInterceptsMouseClicks(true, false);
         title.addMouseListener(this, false);
         addAndMakeVisible(closeButton);
-        closeButton.setButtonText("×");
+        closeButton.setButtonText("X");
         closeButton.onClick = [this] { if (onClose) onClose(); else setVisible(false); };
-        addAndMakeVisible(lengthSelector);
-        for (int length = 1; length <= 64; ++length)
-            lengthSelector.addItem(juce::String(length) + (length == 1 ? " step" : " steps"), length);
-        lengthSelector.setSelectedId(1, juce::dontSendNotification);
-        lengthSelector.setTooltip("Default note length for new piano-roll notes");
-        lengthSelector.onChange = [this]
+        addAndMakeVisible(zoomOutButton);
+        zoomOutButton.setButtonText("−");
+        zoomOutButton.setTooltip("Zoom out vertically in the piano roll");
+        zoomOutButton.onClick = [this]
         {
-            if (grid != nullptr) grid->setPaintLength(lengthSelector.getSelectedId());
+            if (grid == nullptr) return;
+            grid->setZoom(grid->getHorizontalZoom(), grid->getVerticalZoom() - 0.15f);
+            resizeGridToViewport();
         };
-        addAndMakeVisible(laneModeSelector);
-        laneModeSelector.addItem("Velocity", 1);
-        laneModeSelector.addItem("Automation", 2);
-        laneModeSelector.setSelectedId(1, juce::dontSendNotification);
-        laneModeSelector.onChange = [this]
+        addAndMakeVisible(zoomInButton);
+        zoomInButton.setButtonText("+");
+        zoomInButton.setTooltip("Zoom in vertically in the piano roll");
+        zoomInButton.onClick = [this]
         {
-            const bool automation = laneModeSelector.getSelectedId() == 2;
-            if (grid != nullptr) grid->setAutomationLaneVisible(automation);
-            lengthSelector.setVisible(!automation);
+            if (grid == nullptr) return;
+            grid->setZoom(grid->getHorizontalZoom(), grid->getVerticalZoom() + 0.15f);
+            resizeGridToViewport();
+        };
+        addAndMakeVisible(horizontalZoomOutButton);
+        horizontalZoomOutButton.setButtonText("H−");
+        horizontalZoomOutButton.setTooltip("Zoom out horizontally in the piano roll");
+        horizontalZoomOutButton.onClick = [this]
+        {
+            if (grid != nullptr) { grid->setZoom(grid->getHorizontalZoom() - 0.15f, grid->getVerticalZoom()); resizeGridToViewport(); }
+        };
+        addAndMakeVisible(horizontalZoomInButton);
+        horizontalZoomInButton.setButtonText("H+");
+        horizontalZoomInButton.setTooltip("Zoom in horizontally in the piano roll");
+        horizontalZoomInButton.onClick = [this]
+        {
+            if (grid != nullptr) { grid->setZoom(grid->getHorizontalZoom() + 0.15f, grid->getVerticalZoom()); resizeGridToViewport(); }
+        };
+        addAndMakeVisible(automationToggleButton);
+        automationToggleButton.setClickingTogglesState(true);
+        automationToggleButton.setTooltip("Show or hide the Automation lane and its parameter controls");
+        automationToggleButton.onClick = [this]
+        {
+            const bool automation = automationToggleButton.getToggleState();
+            if (automation)
+            {
+                velocityButton.setToggleState(false, juce::dontSendNotification);
+                velocityEditButton.setToggleState(false, juce::dontSendNotification);
+                velocityEditButton.setVisible(false);
+                if (grid != nullptr)
+                {
+                    grid->setVelocityEditEnabled(false);
+                    grid->setVelocityLaneVisible(false);
+                }
+            }
             automationTargetSelector.setVisible(automation);
+            if (grid != nullptr)
+            {
+                grid->setAutomationLaneVisible(automation);
+                resized();
+                resizeGridToViewport(true);
+            }
         };
-        laneModeSelector.setTooltip("Choose the piano-roll lower lane");
         addAndMakeVisible(automationTargetSelector);
+        automationTargetSelector.setVisible(false);
         automationTargetSelector.setTooltip("Automated plugin parameter");
         automationTargetSelector.onChange = [this]
         {
@@ -3848,19 +4898,79 @@ public:
             if (grid != nullptr) grid->repaint();
         };
         addAndMakeVisible(settingsButton);
-        settingsButton.setButtonText("Set");
-        settingsButton.setTooltip("Piano roll options");
+        settingsButton.setTooltip("Piano roll settings");
+        settingsButton.setClickingTogglesState(false);
         settingsButton.onClick = [this] { showSettings(); };
+        for (auto* button : { &automationDrawButton, &automationLineButton, &automationEraseButton, &automationMoveButton })
+        {
+            addAndMakeVisible(*button);
+            button->setVisible(false);
+        }
+        automationDrawButton.setTooltip("Freehand automation drawing");
+        automationLineButton.setTooltip("Draw straight automation lines");
+        automationEraseButton.setTooltip("Delete automation points");
+        automationMoveButton.setTooltip("Move automation points");
+        for (int i = 0; i < 4; ++i)
+        {
+            auto* button = automationToolButton(i);
+            button->onClick = [this, i]
+            {
+                for (int other = 0; other < 4; ++other)
+                    automationToolButton(other)->setToggleState(other == i, juce::dontSendNotification);
+                if (grid != nullptr) grid->setAutomationTool(i);
+            };
+        }
+        automationDrawButton.setToggleState(true, juce::dontSendNotification);
+        addAndMakeVisible(automationBarsButton);
+        automationBarsButton.setVisible(false);
+        automationBarsButton.setTooltip("Show automation as stepped bars");
+        automationBarsButton.onClick = [this]
+        {
+            if (grid != nullptr) grid->setAutomationBars(automationBarsButton.getToggleState());
+        };
+        for (auto* button : { &laneSmallerButton, &laneLargerButton }) addAndMakeVisible(*button);
+        laneSmallerButton.setVisible(false);
+        laneLargerButton.setVisible(false);
+        laneSmallerButton.setButtonText("−");
+        laneLargerButton.setButtonText("+");
+        laneSmallerButton.setTooltip("Make the automation lane shorter");
+        laneLargerButton.setTooltip("Make the automation lane taller");
+        laneSmallerButton.onClick = [this]
+        {
+            if (grid != nullptr) { grid->setAutomationLaneHeight(grid->getAutomationLaneHeight() - 16); resizeGridToViewport(); }
+        };
+        laneLargerButton.onClick = [this]
+        {
+            if (grid != nullptr) { grid->setAutomationLaneHeight(grid->getAutomationLaneHeight() + 16); resizeGridToViewport(); }
+        };
         addAndMakeVisible(velocityButton);
         velocityButton.setTooltip("Show or hide the velocity lane");
-        velocityButton.setToggleState(true, juce::dontSendNotification);
+        velocityButton.setToggleState(false, juce::dontSendNotification);
         velocityButton.onClick = [this]
         {
             if (grid != nullptr)
             {
-                grid->setVelocityLaneVisible(velocityButton.getToggleState());
-                resizeGridToViewport();
+                const bool showVelocity = velocityButton.getToggleState();
+                if (showVelocity)
+                {
+                    automationToggleButton.setToggleState(false, juce::dontSendNotification);
+                    automationTargetSelector.setVisible(false);
+                    grid->setAutomationLaneVisible(false);
+                }
+                velocityEditButton.setToggleState(false, juce::dontSendNotification);
+                grid->setVelocityEditEnabled(false);
+                grid->setVelocityLaneVisible(showVelocity);
+                velocityEditButton.setVisible(showVelocity);
+                resized();
+                resizeGridToViewport(true);
             }
+        };
+        addAndMakeVisible(velocityEditButton);
+        velocityEditButton.setVisible(false);
+        velocityEditButton.setTooltip("Enable velocity editing in the lower lane; click or drag to set note velocity");
+        velocityEditButton.onClick = [this]
+        {
+            if (grid != nullptr) grid->setVelocityEditEnabled(velocityEditButton.getToggleState());
         };
         addAndMakeVisible(keyboardButton);
         keyboardButton.setTooltip("Colour the piano keyboard keys");
@@ -3877,6 +4987,7 @@ public:
             if (grid != nullptr) grid->setKeyboardOptions(grid->hasColouredKeys(), noteNamesButton.getToggleState());
         };
         grid = new PianoRollGrid();
+        grid->setWantsKeyboardFocus(true);
         grid->getActiveStepCount = std::move(activeStepCount);
         grid->noteIsOn = std::move(isNoteOn);
         grid->areAllNotesSelected = std::move(areAllNotesSelected);
@@ -3888,11 +4999,38 @@ public:
         grid->keyboardNoteChanged = std::move(onKeyboardNoteChanged);
         grid->getAutomationValue = [this](int step) { return automationValue ? automationValue(step) : 0.5f; };
         grid->setAutomationValue = [this](int step, float value) { if (automationPointChanged) automationPointChanged(step, value); };
-        grid->paintLengthUpdated = [this](int length)
+        grid->removeAutomationValue = [this](int step) { if (automationPointRemoved) automationPointRemoved(step); };
+        grid->moveAutomationValue = [this](int from, int to, float value)
         {
-            lengthSelector.setSelectedId(length, juce::dontSendNotification);
+            if (automationPointMoved) automationPointMoved(from, to, value);
         };
-        grid->setSize(58 + grid->visibleSteps() * 58, 30 + 37 * 22 + 8 + 116);
+        grid->automationGestureStarted = [this] { if (onAutomationGestureStarted) onAutomationGestureStarted(); };
+        grid->automationGestureEnded = [this] { if (onAutomationGestureEnded) onAutomationGestureEnded(); };
+        grid->getVelocityAtStep = [this](int step)
+        {
+            int total = 0, count = 0;
+            for (int pitch = 48; pitch <= 84; ++pitch)
+                if (grid->noteIsOn && grid->noteIsOn(pitch, step))
+                {
+                    total += getVelocityAtStep ? getVelocityAtStep(step, pitch) : 100;
+                    ++count;
+                }
+            return count > 0 ? total / count : 0;
+        };
+        grid->setVelocityAtStep = [this](int step, int velocity)
+        {
+            if (setVelocityAtStep) setVelocityAtStep(step, velocity);
+        };
+        grid->velocityGestureStarted = [this] { if (onVelocityGestureStarted) onVelocityGestureStarted(); };
+        grid->velocityGestureEnded = [this] { if (onVelocityGestureEnded) onVelocityGestureEnded(); };
+        grid->getMaximumLaneHeight = [this]
+        {
+            constexpr int noteGridMinimumHeight = 30 + 37 * 8 + 8;
+            return juce::jmax(64, viewport.getHeight() - noteGridMinimumHeight);
+        };
+        grid->laneHeightChanged = [this] { resizeGridToViewport(); };
+        grid->setSize(58 + grid->visibleSteps() * 58,
+                      30 + 37 * 22 + 8 + grid->getAutomationLaneHeight());
         viewport.setViewedComponent(grid, true);
         addAndMakeVisible(viewport);
         resizeGrip.setMouseCursor(juce::MouseCursor::BottomRightCornerResizeCursor);
@@ -3933,8 +5071,24 @@ public:
         grid->repaint();
     }
 
+    void setPasteHandler(std::function<void()> handler)
+    {
+        if (grid != nullptr) grid->pasteNotes = std::move(handler);
+    }
+
+    void focusGrid()
+    {
+        if (grid != nullptr) grid->grabKeyboardFocus();
+    }
+
     std::function<float(int)> automationValue;
     std::function<void(int, float)> automationPointChanged;
+    std::function<void(int)> automationPointRemoved;
+    std::function<void(int, int, float)> automationPointMoved;
+    std::function<void()> onAutomationGestureStarted, onAutomationGestureEnded;
+    std::function<int(int, int)> getVelocityAtStep;
+    std::function<void(int, int)> setVelocityAtStep;
+    std::function<void()> onVelocityGestureStarted, onVelocityGestureEnded;
     std::function<void(const juce::String&)> onAutomationTargetChanged;
     void setAutomationTargets(const juce::StringArray& labels, const juce::StringArray& ids, int selectedId = 1)
     {
@@ -3961,13 +5115,56 @@ public:
         auto gripBounds = area.removeFromBottom(18).removeFromRight(18);
         resizeGrip.setBounds(gripBounds);
         auto footer = area.removeFromBottom(27);
+        // Keep time zoom controls with the other lower-right tools. The
+        // previous lower-left placement separated them from the lane tools.
+        horizontalZoomOutButton.setBounds(footer.removeFromRight(32).reduced(1));
+        horizontalZoomInButton.setBounds(footer.removeFromRight(32).reduced(1));
+        footer.removeFromRight(2);
+        keyboardButton.setBounds({});
+        noteNamesButton.setBounds({});
+        keyboardButton.setVisible(false);
+        noteNamesButton.setVisible(false);
         settingsButton.setBounds(footer.removeFromRight(28).reduced(1));
-        noteNamesButton.setBounds(footer.removeFromRight(28).reduced(1));
-        keyboardButton.setBounds(footer.removeFromRight(28).reduced(1));
+        automationToggleButton.setBounds(footer.removeFromRight(86).reduced(1));
         velocityButton.setBounds(footer.removeFromRight(28).reduced(1));
-        automationTargetSelector.setBounds(footer.removeFromRight(250).reduced(2, 2));
-        laneModeSelector.setBounds(footer.removeFromRight(116).reduced(2, 2));
-        lengthSelector.setBounds(footer.removeFromRight(104).reduced(2, 2));
+        if (automationToggleButton.getToggleState())
+        {
+            velocityEditButton.setBounds({});
+            automationTargetSelector.setBounds(footer.removeFromRight(230).reduced(2, 2));
+            automationDrawButton.setBounds(footer.removeFromRight(26).reduced(1));
+            automationLineButton.setBounds(footer.removeFromRight(26).reduced(1));
+            automationEraseButton.setBounds(footer.removeFromRight(26).reduced(1));
+            automationMoveButton.setBounds(footer.removeFromRight(26).reduced(1));
+            automationBarsButton.setBounds(footer.removeFromRight(26).reduced(1));
+            laneLargerButton.setBounds(footer.removeFromRight(24).reduced(1));
+            laneSmallerButton.setBounds(footer.removeFromRight(24).reduced(1));
+            for (auto* button : std::array<juce::Component*, 7> { &automationDrawButton, &automationLineButton,
+                    &automationEraseButton, &automationMoveButton, &automationBarsButton, &laneSmallerButton,
+                    &laneLargerButton })
+                button->setVisible(true);
+        }
+        else
+        {
+            for (auto* button : std::array<juce::Component*, 7> { &automationDrawButton, &automationLineButton,
+                    &automationEraseButton, &automationMoveButton, &automationBarsButton, &laneSmallerButton,
+                    &laneLargerButton })
+            {
+                button->setBounds({});
+                button->setVisible(false);
+            }
+            automationTargetSelector.setBounds({});
+            if (velocityEditButton.isVisible())
+                velocityEditButton.setBounds(footer.removeFromRight(28).reduced(1));
+            else
+                velocityEditButton.setBounds({});
+        }
+        // Pitch-range zoom lives on a slim rail beside the piano roll, like
+        // Orion's right-edge controls, rather than in the title bar.
+        auto sideRail = area.removeFromRight(28);
+        const auto sideX = sideRail.getX() + 1;
+        const auto sideBottom = sideRail.getBottom();
+        zoomOutButton.setBounds(sideX, juce::jmax(sideRail.getY(), sideBottom - 50), 25, 23);
+        zoomInButton.setBounds(sideX, juce::jmax(sideRail.getY(), sideBottom - 26), 25, 23);
         viewport.setBounds(area);
         resizeGridToViewport();
     }
@@ -4060,33 +5257,54 @@ private:
         });
     }
 
-    void resizeGridToViewport()
+    void resizeGridToViewport(bool resetVerticalScroll = false)
     {
         if (grid == nullptr) return;
         constexpr int labelWidth = 58;
         constexpr int headerHeight = 30;
-        const int velocityArea = 8 + (grid->isVelocityLaneVisible() ? 116 : 0);
         const auto columns = grid->visibleSteps();
-        const auto stepWidth = juce::jmax(22, (viewport.getWidth() - labelWidth) / columns);
-        const auto rowHeight = juce::jmax(22, (viewport.getHeight() - headerHeight - velocityArea) / 37);
-        grid->setSize(labelWidth + columns * stepWidth,
-                      headerHeight + 37 * rowHeight + velocityArea);
+        grid->setViewMetrics(viewport.getWidth(), viewport.getHeight());
+        const auto contentHeight = headerHeight + 37 * grid->rowHeight() + 8
+            + ((grid->isVelocityLaneVisible() || grid->isAutomationLaneVisible()) ? grid->getAutomationLaneHeight() : 0);
+        grid->setSize(labelWidth + columns * grid->stepWidth(), juce::jmax(viewport.getHeight(), contentHeight));
+        if (resetVerticalScroll)
+            viewport.setViewPosition(viewport.getViewPositionX(), 0);
     }
 
     PianoRollGrid* grid = nullptr;
     juce::Viewport viewport;
     juce::Label title;
-    juce::TextButton closeButton, settingsButton;
+    juce::TextButton closeButton;
+    PianoRollIconButton settingsButton { "Piano roll settings", PianoRollIconButton::Icon::Settings };
+    juce::TextButton zoomOutButton, zoomInButton, horizontalZoomOutButton, horizontalZoomInButton;
     ResizeGrip resizeGrip;
     PianoRollIconButton velocityButton { "Velocity lane", PianoRollIconButton::Icon::Velocity };
+    PianoRollIconButton velocityEditButton { "Edit note velocities", PianoRollIconButton::Icon::VelocityEdit };
+    PianoRollIconButton automationDrawButton { "Freehand automation", PianoRollIconButton::Icon::VelocityEdit };
+    PianoRollIconButton automationLineButton { "Line automation", PianoRollIconButton::Icon::Line };
+    PianoRollIconButton automationEraseButton { "Erase automation", PianoRollIconButton::Icon::Erase };
+    PianoRollIconButton automationMoveButton { "Move automation", PianoRollIconButton::Icon::Move };
+    PianoRollIconButton automationBarsButton { "Automation bars", PianoRollIconButton::Icon::Bars };
+    juce::TextButton laneSmallerButton, laneLargerButton;
     PianoRollIconButton keyboardButton { "Colour keyboard", PianoRollIconButton::Icon::Keyboard };
     PianoRollIconButton noteNamesButton { "Note names", PianoRollIconButton::Icon::NoteNames };
-    juce::ComboBox lengthSelector;
-    juce::ComboBox laneModeSelector, automationTargetSelector;
+    juce::ComboBox automationTargetSelector;
+    juce::TextButton automationToggleButton { "Automation" };
     juce::StringArray automationTargetIds;
     juce::Rectangle<int> dragStartBounds, resizeStartBounds;
     juce::Point<int> dragStartPoint, resizeStartPoint;
     bool dragging = false, resizing = false;
+
+    PianoRollIconButton* automationToolButton(int index)
+    {
+        switch (index)
+        {
+            case 1: return &automationLineButton;
+            case 2: return &automationEraseButton;
+            case 3: return &automationMoveButton;
+            default: return &automationDrawButton;
+        }
+    }
 };
 
 // A dedicated drag source makes the generator move gesture independent from
@@ -4354,6 +5572,164 @@ private:
     std::unique_ptr<te::Plugin::EditorComponent> editor;
 };
 
+// A small, native sampler front-end for Orbit's first drum-rack iteration.
+// Each pad maps to one MIDI note; its 16-step row edits the normal pattern
+// data, so rack hits use the same playback, playlist, and save path as notes.
+class DrumRackWindow final : public juce::DocumentWindow
+{
+public:
+    DrumRackWindow(std::function<void(int)> loadSample,
+                   std::function<void(int)> padSelected,
+                   std::function<void(int, int, bool)> setStep)
+        : DocumentWindow("Drum Rack", juce::Colour::fromRGB(25, 37, 46), closeButton),
+          loadSampleCallback(std::move(loadSample)), padSelectedCallback(std::move(padSelected)),
+          setStepCallback(std::move(setStep))
+    {
+        setUsingNativeTitleBar(true);
+        content.setLoadSampleHandler([this] { if (loadSampleCallback) loadSampleCallback(selectedPad); });
+        content.setPadSelectedHandler([this](int pad)
+        {
+            selectedPad = pad;
+            refreshPadSelection();
+            if (padSelectedCallback) padSelectedCallback(pad);
+        });
+        content.setStepHandler([this](int pad, int step, bool enabled)
+        {
+            if (setStepCallback) setStepCallback(pad, step, enabled);
+        });
+        setContentOwned(&content, false);
+        setResizable(true, true);
+        setResizeLimits(540, 440, 1100, 850);
+        centreWithSize(760, 570);
+        setVisible(true);
+        toFront(false);
+    }
+
+    void closeButtonPressed() override { setVisible(false); }
+
+    void setPadSampleName(int pad, const juce::String& name) { content.setPadSampleName(pad, name); }
+    void setSteps(int pad, const std::array<bool, 16>& steps) { content.setSteps(pad, steps); }
+    int getSelectedPad() const { return selectedPad; }
+
+private:
+    class Content final : public juce::Component
+    {
+    public:
+        Content()
+        {
+            setOpaque(true);
+            title.setText("DRUM RACK  ·  16 PADS", juce::dontSendNotification);
+            title.setFont(juce::FontOptions(16.0f, juce::Font::bold));
+            title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(221, 236, 244));
+            addAndMakeVisible(title);
+            configureButton(loadButton, "Load Sample…");
+            addAndMakeVisible(loadButton);
+            for (int pad = 0; pad < 16; ++pad)
+            {
+                auto button = std::make_unique<juce::TextButton>();
+                configureButton(*button, "PAD " + juce::String(pad + 1));
+                button->setClickingTogglesState(true);
+                button->setRadioGroupId(0x4f52);
+                button->setToggleState(pad == selectedPad, juce::dontSendNotification);
+                button->onClick = [this, pad] { selectedPad = pad; if (padSelected) padSelected(pad); repaint(); };
+                addAndMakeVisible(*button);
+                pads.push_back(std::move(button));
+                for (int step = 0; step < 16; ++step)
+                {
+                    auto stepButton = std::make_unique<juce::TextButton>();
+                    configureButton(*stepButton, {});
+                    stepButton->setClickingTogglesState(true);
+                    stepButton->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(43, 150, 190));
+                    stepButton->onClick = [this, pad, step, raw = stepButton.get()]
+                    { if (stepChanged) stepChanged(pad, step, raw->getToggleState()); };
+                    addAndMakeVisible(*stepButton);
+                    stepButtons.push_back(std::move(stepButton));
+                }
+            }
+            loadButton.onClick = [this] { if (loadSample) loadSample(); };
+        }
+
+        void setLoadSampleHandler(std::function<void()> fn) { loadSample = std::move(fn); }
+        void setPadSelectedHandler(std::function<void(int)> fn) { padSelected = std::move(fn); }
+        void setStepHandler(std::function<void(int, int, bool)> fn) { stepChanged = std::move(fn); }
+        void setSteps(int pad, const std::array<bool, 16>& values)
+        {
+            if (!juce::isPositiveAndBelow(pad, 16)) return;
+            for (int i = 0; i < 16; ++i)
+                stepButtons[static_cast<size_t>(pad * 16 + i)]->setToggleState(values[static_cast<size_t>(i)], juce::dontSendNotification);
+        }
+        void setPadSampleName(int pad, const juce::String& name)
+        {
+            if (!juce::isPositiveAndBelow(pad, static_cast<int>(pads.size()))) return;
+            pads[static_cast<size_t>(pad)]->setButtonText("PAD " + juce::String(pad + 1) + "\n" + name);
+        }
+
+        void paint(juce::Graphics& g) override
+        {
+            g.fillAll(juce::Colour::fromRGB(34, 49, 60));
+            g.setColour(juce::Colour::fromRGB(68, 101, 118));
+            g.drawRoundedRectangle(getLocalBounds().toFloat().reduced(8.0f), 8.0f, 1.0f);
+            g.setColour(juce::Colour::fromRGB(180, 205, 218));
+            g.setFont(juce::FontOptions(12.0f, juce::Font::bold));
+            g.drawText("PAD / SAMPLE", padHeaderBounds, juce::Justification::centredLeft);
+            for (int step = 0; step < 16; ++step)
+                g.drawText(juce::String(step + 1), stepHeaderBounds.withX(stepHeaderBounds.getX() + step * stepCellWidth)
+                               .withWidth(stepCellWidth), juce::Justification::centred);
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds().reduced(18);
+            auto header = area.removeFromTop(38);
+            title.setBounds(header.removeFromLeft(330));
+            loadButton.setBounds(header.removeFromRight(150).reduced(0, 3));
+            area.removeFromTop(6);
+            const int padWidth = juce::jmin(190, area.getWidth() / 4);
+            auto stepHeader = area.removeFromTop(22);
+            padHeaderBounds = stepHeader.removeFromLeft(padWidth);
+            stepHeaderBounds = stepHeader;
+            stepCellWidth = stepHeaderBounds.getWidth() / 16;
+            const int rowHeight = area.getHeight() / 16;
+            for (int i = 0; i < 16; ++i)
+            {
+                const int y = area.getY() + i * rowHeight;
+                pads[static_cast<size_t>(i)]->setBounds(area.getX(), y + 1, padWidth - 5, rowHeight - 2);
+                for (int step = 0; step < 16; ++step)
+                {
+                    auto* button = stepButtons[static_cast<size_t>(i * 16 + step)].get();
+                    button->setBounds(area.getX() + padWidth + step * stepCellWidth + 1, y + 2,
+                                      stepCellWidth - 2, rowHeight - 4);
+                }
+            }
+        }
+
+        int selectedPad = 0;
+    private:
+        void configureButton(juce::TextButton& button, const juce::String& text)
+        {
+            button.setButtonText(text);
+            button.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(43, 62, 74));
+            button.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(39, 129, 164));
+            button.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(216, 231, 238));
+            button.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+        }
+        juce::Label title;
+        juce::TextButton loadButton;
+        std::vector<std::unique_ptr<juce::TextButton>> pads, stepButtons;
+        std::function<void()> loadSample;
+        std::function<void(int)> padSelected;
+        std::function<void(int, int, bool)> stepChanged;
+        juce::Rectangle<int> padHeaderBounds, stepHeaderBounds;
+        int stepCellWidth = 1;
+    } content;
+
+    void refreshPadSelection() { content.repaint(); }
+    std::function<void(int)> loadSampleCallback;
+    std::function<void(int)> padSelectedCallback;
+    std::function<void(int, int, bool)> setStepCallback;
+    int selectedPad = 0;
+};
+
 class OrbitUIBehaviour final : public te::UIBehaviour
 {
 public:
@@ -4372,6 +5748,10 @@ public:
     void mouseDown(const juce::MouseEvent&) override { bringGeneratorToFront(); }
     ProjectView() : engine("Orbit", std::make_unique<OrbitUIBehaviour>(), nullptr)
     {
+        // Moving the overlapping playlist, generator, and piano roll panels
+        // exposes this component repeatedly. Paint it as an opaque backing so
+        // old child pixels cannot remain as scrambled strips during a drag.
+        setOpaque(true);
         juce::PropertiesFile::Options settingsOptions;
         settingsOptions.applicationName = "Orbit";
         settingsOptions.filenameSuffix = "settings";
@@ -4491,13 +5871,33 @@ public:
         patternLengthDisplay.setBorderSize({1, 4, 1, 4});
         addAndMakeVisible(patternPresetSelector);
         addAndMakeVisible(patternLengthDisplay);
-        configureButton(patternLengthDownButton, "−", [this] { adjustPatternLength(-1); });
+        configureButton(patternLengthDownButton, "-", [this] { adjustPatternLength(-1); });
         patternLengthDownButton.setTooltip("Shorten this pattern by one step.");
         addAndMakeVisible(patternLengthDownButton);
         configureButton(patternLengthUpButton, "+", [this] { adjustPatternLength(1); });
         patternLengthUpButton.setTooltip("Extend this pattern by one step.");
         addAndMakeVisible(patternLengthUpButton);
         addAndMakeVisible(outputMeter);
+        masterVolumeKnob.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        masterVolumeKnob.setRange(-60.0, 6.0, 0.1);
+        masterVolumeKnob.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+        masterVolumeKnob.setPopupDisplayEnabled(true, true, this);
+        masterVolumeKnob.setTextValueSuffix(" dB");
+        masterVolumeKnob.setTooltip("Master output volume.");
+        masterVolumeKnob.onValueChange = [this] { setMasterGainDb(masterVolumeKnob.getValue()); };
+        addAndMakeVisible(masterVolumeKnob);
+        barReadoutLabel.setText("001", juce::dontSendNotification);
+        barReadoutLabel.setJustificationType(juce::Justification::centred);
+        barReadoutLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(203, 221, 229));
+        barReadoutLabel.setColour(juce::Label::backgroundColourId, juce::Colour::fromRGB(25, 36, 43));
+        barReadoutLabel.setColour(juce::Label::outlineColourId, juce::Colour::fromRGB(91, 122, 136));
+        barReadoutLabel.setBorderSize({1, 4, 1, 4});
+        barReadoutLabel.setTooltip("Current song position in bars.");
+        barLabel.setText("BAR", juce::dontSendNotification);
+        barLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(176, 193, 203));
+        barLabel.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+        addAndMakeVisible(barLabel);
+        addAndMakeVisible(barReadoutLabel);
         configureButton(loopButton, "LOOP", [this] { setLoopEnabled(loopButton.getToggleState()); });
         loopButton.setClickingTogglesState(true);
         loopButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
@@ -4506,9 +5906,9 @@ public:
         metronomeButton.setClickingTogglesState(true);
         metronomeButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
         metronomeButton.setTooltip("Toggle Tracktion Engine's click track.");
-        loopStartSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+        loopStartSlider.setSliderStyle(juce::Slider::IncDecButtons);
         loopStartSlider.setRange(1, PlaylistGrid::barCount, 1);
-        loopStartSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 38, 22);
+        loopStartSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 42, 22);
         loopStartSlider.setValue(1, juce::dontSendNotification);
         loopStartSlider.setTooltip("Loop start bar.");
         loopStartLabel.setText("START", juce::dontSendNotification);
@@ -4521,9 +5921,9 @@ public:
             addAndMakeVisible(*label);
         }
         loopStartSlider.onValueChange = [this] { updateLoopRange(); };
-        loopLengthSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+        loopLengthSlider.setSliderStyle(juce::Slider::IncDecButtons);
         loopLengthSlider.setRange(1, PlaylistGrid::barCount, 1);
-        loopLengthSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 32, 22);
+        loopLengthSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 38, 22);
         loopLengthSlider.setValue(4, juce::dontSendNotification);
         loopLengthSlider.setTooltip("Loop length in bars.");
         loopLengthSlider.onValueChange = [this] { updateLoopRange(); };
@@ -4540,8 +5940,8 @@ public:
         tempoLabel.setText("BPM", juce::dontSendNotification);
         tempoLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 207, 221));
         addAndMakeVisible(tempoLabel);
-        tempoSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-        tempoSlider.setRange(20.0, 300.0, 0.1);
+        tempoSlider.setSliderStyle(juce::Slider::IncDecButtons);
+        tempoSlider.setRange(20.0, 300.0, 1.0);
         tempoSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 54, 24);
         tempoSlider.setValue(120.0, juce::dontSendNotification);
         tempoSlider.onValueChange = [this]
@@ -4604,12 +6004,8 @@ public:
         addAndMakeVisible(generatorResizeHandle);
         generatorResizeHandle.addMouseListener(this, true);
 
-        generatorCollapseButton.setButtonText("−");
+        generatorCollapseButton.setKind(PlaylistWindowIconButton::Kind::minimize);
         generatorCollapseButton.setTooltip("Collapse the generator to its pattern controls");
-        generatorCollapseButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(36, 53, 64));
-        generatorCollapseButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(46, 112, 139));
-        generatorCollapseButton.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(206, 226, 236));
-        generatorCollapseButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
         generatorCollapseButton.onClick = [this] { toggleGeneratorCollapsed(); };
         addAndMakeVisible(generatorCollapseButton);
         generatorCollapseButton.setVisible(false);
@@ -4690,9 +6086,49 @@ public:
                 movePlaylistClip(row, sourceBar, destinationRow, destinationBar);
             },
             [this](int row, int bar, juce::Component* target) { showPlaylistPatternMenu(row, bar, target); },
+            [this](int row)
+            {
+                if (!juce::isPositiveAndBelow(row, project.getTrackCount())) return;
+                trackSelector.setSelectedId(row + 1, juce::sendNotificationSync);
+                if (trackSelector.getSelectedId() == row + 1)
+                    selectInstrumentTrack();
+                bringGeneratorToFront();
+            },
             [this](int row, int bar) { deletePlaylistClip(row, bar); },
             [this](int row, int bar, int direction) { scrollPlaylistPattern(row, bar, direction); });
+        playlistWindow->setAudioClipHandlers(
+            [this](int row)
+            {
+                return juce::isPositiveAndBelow(row, project.getTrackCount())
+                    && project.getTrackKind(row) == ProjectDocument::TrackKind::audio;
+            },
+            [this](int row, int bar)
+            {
+                int startBar = -1;
+                findAudioClipAtBar(row, bar, &startBar, nullptr);
+                return startBar;
+            },
+            [this](int row, int bar)
+            {
+                int lengthBars = 1;
+                findAudioClipAtBar(row, bar, nullptr, &lengthBars);
+                return lengthBars;
+            },
+            [this](int row, int bar, juce::Component* target)
+            {
+                showPlaylistAudioContextMenu(row, bar, target);
+            });
         playlistWindow->setTrackColourProvider([this](int row) { return project.getTrackColour(row); });
+        if (auto* settings = applicationProperties.getUserSettings())
+            playlistWindow->setLightTheme(settings->getBoolValue("playlistLightTheme", false));
+        playlistWindow->setThemeChangedHandler([this](bool enabled)
+        {
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("playlistLightTheme", enabled);
+                applicationProperties.saveIfNeeded();
+            }
+        });
         playlistWindow->setLoopRangeFromRuler([this](int startBar, int lengthBars)
         {
             loopStartSlider.setValue(startBar, juce::dontSendNotification);
@@ -4732,7 +6168,34 @@ public:
                 ? "Playlist automation mode: draw the selected plugin parameter across song time."
                 : "Playlist pattern drawing mode restored.", juce::dontSendNotification);
         });
+        playlistWindow->onDragged = [this](juce::Point<int> position) { movePlaylistPanel(position); };
+        playlistWindow->onResizedByDrag = [this](juce::Rectangle<int> bounds) { resizePlaylistPanel(bounds); };
+        playlistWindow->onMinimizeChanged = [this](bool minimized)
+        {
+            if (!playlistBoundsInitialised || playlistWindow == nullptr) return;
+            if (minimized)
+            {
+                playlistRestoreBounds = playlistPanelBounds;
+                playlistPanelBounds.setHeight(28);
+            }
+            else if (!playlistRestoreBounds.isEmpty())
+                playlistPanelBounds = playlistRestoreBounds;
+            resized();
+        };
+        playlistWindow->onMaximizeToggled = [this] { togglePlaylistMaximized(); };
+        playlistWindow->onClose = [this]
+        {
+            if (playlistWindow != nullptr) playlistWindow->setVisible(false);
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("playlistWindowOpen", false);
+                settings->saveIfNeeded();
+            }
+        };
         addAndMakeVisible(*playlistWindow);
+        // The Playlist remains available from the toolbar without obscuring
+        // the blank workspace when Orbit first opens.
+        playlistWindow->setVisible(false);
         auditionKeyboard.setTitle("Play the selected instrument directly. Click or drag across keys to audition notes.");
         auditionKeyboard.onNote = [this](int pitch, bool isDown) { auditionSelectedInstrument(pitch, isDown); };
         addAndMakeVisible(auditionKeyboard);
@@ -4781,6 +6244,7 @@ public:
                     instrumentTrack->turnOffGuideNotes(te::MidiChannel(auditionChannel));
                 }
             });
+        pianoRollWindow->setPasteHandler([this] { pastePatternNotes(); });
         pianoRollWindow->automationValue = [this](int step)
         {
             const auto trackId = selectedProjectTrackId();
@@ -4799,8 +6263,53 @@ public:
             project.setPatternAutomationPoint(selectedProjectTrackId(), selectedPatternIndex(),
                 automationPluginName, automationParameterId, automationParameterName, step, value);
             isDirty = true;
+        };
+        pianoRollWindow->automationPointRemoved = [this](int step)
+        {
+            if (automationPluginName.isEmpty() || automationParameterId.isEmpty()) return;
+            project.removePatternAutomationPoint(selectedProjectTrackId(), selectedPatternIndex(),
+                                                  automationPluginName, automationParameterId, step);
+            isDirty = true;
+        };
+        pianoRollWindow->automationPointMoved = [this](int from, int to, float value)
+        {
+            if (automationPluginName.isEmpty() || automationParameterId.isEmpty()) return;
+            if (from != to)
+                project.removePatternAutomationPoint(selectedProjectTrackId(), selectedPatternIndex(),
+                                                      automationPluginName, automationParameterId, from);
+            project.setPatternAutomationPoint(selectedProjectTrackId(), selectedPatternIndex(),
+                automationPluginName, automationParameterId, automationParameterName, to, value);
+            isDirty = true;
+        };
+        pianoRollWindow->onAutomationGestureStarted = [this] { rememberUndo("Edit pattern automation"); };
+        pianoRollWindow->onAutomationGestureEnded = [this]
+        {
             updateEngineAutomation();
-            status.setText("Pattern automation point updated. Save to keep the change.", juce::dontSendNotification);
+            status.setText("Pattern automation updated. Save to keep the change.", juce::dontSendNotification);
+        };
+        pianoRollWindow->getVelocityAtStep = [this](int step, int pitch)
+        {
+            return project.getPatternNoteVelocity(selectedProjectTrackId(), selectedPatternIndex(), pitch, step);
+        };
+        pianoRollWindow->setVelocityAtStep = [this](int step, int velocity)
+        {
+            const auto trackId = selectedProjectTrackId();
+            const auto patternIndex = selectedPatternIndex();
+            bool changed = false;
+            for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
+                if (project.getPatternNote(trackId, patternIndex, pitch, step))
+                {
+                    project.setPatternNoteVelocity(trackId, patternIndex, pitch, step, velocity);
+                    changed = true;
+                }
+            isDirty = isDirty || changed;
+        };
+        pianoRollWindow->onVelocityGestureStarted = [this] { rememberUndo("Edit note velocities"); };
+        pianoRollWindow->onVelocityGestureEnded = [this]
+        {
+            rebuildPatternClip();
+            if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
+            status.setText("Note velocities updated. Save to keep the change.", juce::dontSendNotification);
         };
         pianoRollWindow->onAutomationTargetChanged = [this](const juce::String& target)
         {
@@ -4812,46 +6321,29 @@ public:
         };
         refreshPianoRollAutomationTargets();
         pianoRollWindow->onClose = [this] { closePianoRollView(); };
-        pianoRollWindow->onManipulationStarted = [this](juce::Point<int> pointer, bool resizing)
-        {
-            if (!pianoRollMaximized || pianoRollWindow == nullptr) return;
-            const auto workspace = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(48).reduced(14, 10);
-            const auto panel = pianoRollRestoreBounds.isEmpty() ? generatorPanelBounds : pianoRollRestoreBounds;
-            generatorPanelBounds = panel;
-            pianoRollMaximized = false;
-            const auto width = juce::jmin(900, workspace.getWidth());
-            const auto height = juce::jmin(500, workspace.getHeight());
-            int x = panel.getX() + 12;
-            int y = panel.getY() + 78;
-            if (resizing)
-            {
-                // Keep the resize corner under the pointer when a maximized
-                // roll is restored, so the same gesture continues resizing.
-                x = pointer.x - width;
-                y = pointer.y - height;
-            }
-            else
-            {
-                // Preserve the pointer's horizontal position across the
-                // maximized-to-floating size change, like a normal window.
-                const auto sourceWidth = juce::jmax(1, pianoRollWindow->getWidth());
-                const auto offsetX = juce::jlimit(20, juce::jmax(20, width - 36),
-                    juce::roundToInt(static_cast<double>(pointer.x - pianoRollWindow->getX())
-                                     * width / sourceWidth));
-                x = pointer.x - offsetX;
-                y = pointer.y - 14;
-            }
-            pianoRollBounds = { x, y, width, height };
-            pianoRollBounds.setPosition(
-                juce::jlimit(workspace.getX(), juce::jmax(workspace.getX(), workspace.getRight() - width), pianoRollBounds.getX()),
-                juce::jlimit(workspace.getY(), juce::jmax(workspace.getY(), workspace.getBottom() - height), pianoRollBounds.getY()));
-            pianoRollButton.setButtonText("INSTRUMENT");
-            resized();
-        };
+        // A maximized piano roll is still the editor embedded in its
+        // generator panel. Starting a resize or drag must not detach it.
+        pianoRollWindow->onManipulationStarted = [](juce::Point<int>, bool) {};
         pianoRollWindow->onBoundsChanged = [this](juce::Rectangle<int> bounds)
         {
+            if (pianoRollMaximized && pianoRollWindow != nullptr)
+            {
+                auto panelBounds = juce::Rectangle<int>(bounds.getX() - 12, bounds.getY() - 86,
+                                                         bounds.getWidth() + 32, bounds.getHeight() + 106);
+                const auto workspace = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(50).reduced(14, 10);
+                const auto width = juce::jlimit(juce::jmin(492, workspace.getWidth()), workspace.getWidth(), panelBounds.getWidth());
+                const auto height = juce::jlimit(juce::jmin(366, workspace.getHeight()), workspace.getHeight(), panelBounds.getHeight());
+                panelBounds.setSize(width, height);
+                panelBounds.setPosition(
+                    juce::jlimit(workspace.getX(), juce::jmax(workspace.getX(), workspace.getRight() - width), panelBounds.getX()),
+                    juce::jlimit(workspace.getY(), juce::jmax(workspace.getY(), workspace.getBottom() - height), panelBounds.getY()));
+                generatorPanelBounds = panelBounds;
+                pianoRollBounds = bounds;
+                resized();
+                repaint();
+                return;
+            }
             pianoRollBounds = bounds;
-            pianoRollMaximized = false;
         };
         pianoRollWindow->addMouseListener(this, true);
         addAndMakeVisible(*pianoRollWindow);
@@ -4873,10 +6365,7 @@ public:
         mixerWindow->onDragged = [this](juce::Point<int> position)
         {
             if (!mixerBoundsInitialised || mixerWindow == nullptr) return;
-            const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-            mixerPanelBounds.setPosition(
-                juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - mixerPanelBounds.getWidth()), position.x),
-                juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - mixerPanelBounds.getHeight()), position.y));
+            mixerPanelBounds.setPosition(constrainMixerPosition(position));
             mixerWindow->setBounds(mixerPanelBounds);
             draggingMixer = true;
             layoutMixerHandles();
@@ -4886,15 +6375,46 @@ public:
         {
             if (mixerWindow == nullptr) return;
             const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-            if (minimized) mixerPanelBounds.setHeight(26);
-            else mixerPanelBounds.setHeight(area.getHeight());
+            if (minimized)
+            {
+                mixerRestoreBounds = mixerPanelBounds;
+                mixerPanelBounds.setHeight(26);
+            }
+            else if (!mixerRestoreBounds.isEmpty()) mixerPanelBounds = mixerRestoreBounds;
+            else mixerPanelBounds.setHeight(juce::jmin(650, area.getHeight()));
             mixerWindow->setBounds(mixerPanelBounds);
             layoutMixerHandles();
             saveMixerPanelBounds();
         };
+        mixerWindow->onMaximizeToggled = [this] { toggleMixerMaximized(); };
+        mixerWindow->onResizeStarted = [this]
+        {
+            resizingMixer = true;
+            mixerMaximized = false;
+            if (mixerWindow != nullptr) mixerWindow->setMaximized(false);
+            mixerResizeStartBounds = mixerPanelBounds;
+        };
+        mixerWindow->onResizedByDrag = [this](juce::Point<int> delta)
+        {
+            if (!resizingMixer || mixerWindow == nullptr) return;
+            const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
+            mixerPanelBounds = mixerResizeStartBounds;
+            mixerPanelBounds.setSize(
+                juce::jlimit(juce::jmin(152, area.getWidth()), area.getWidth(), mixerWindow->getPreferredWidth()),
+                juce::jlimit(juce::jmin(300, area.getHeight()), area.getHeight(), mixerResizeStartBounds.getHeight() + delta.y));
+            mixerPanelBounds.setX(constrainMixerPosition(mixerResizeStartBounds.getPosition()).x);
+            mixerPanelBounds.setY(juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - 26), mixerPanelBounds.getY()));
+            mixerWindow->setBounds(mixerPanelBounds);
+        };
+        mixerWindow->onResizeEnded = [this] { endMixerResize(); };
         mixerWindow->onClose = [this]
         {
             if (mixerWindow != nullptr) mixerWindow->setVisible(false);
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("mixerWindowOpen", false);
+                settings->saveIfNeeded();
+            }
             layoutMixerHandles();
             repaint();
         };
@@ -5091,7 +6611,7 @@ public:
         meterStatus.setColour(juce::Label::textColourId, juce::Colour::fromRGB(170, 204, 222));
         addAndMakeVisible(meterStatus);
 
-        buildLabel.setText("Build 100  -  v0.3.79", juce::dontSendNotification);
+        buildLabel.setText("Build 131  -  v0.3.110", juce::dontSendNotification);
         buildLabel.setJustificationType(juce::Justification::centredRight);
         buildLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(154, 181, 196));
         addAndMakeVisible(buildLabel);
@@ -5104,8 +6624,19 @@ public:
         for (auto* component : hiddenComponents)
             component->setVisible(false);
         createProject();
+        // A newly opened DAW starts as a clean, untitled workspace. The empty
+        // starter edit is not a user change and must not block File > Open.
+        isDirty = false;
         updateAudioStatus();
         auto* settings = applicationProperties.getUserSettings();
+        if (settings != nullptr)
+        {
+            // Window visibility is a session choice, not part of the startup
+            // document. Always launch on the uncluttered workspace.
+            settings->setValue("playlistWindowOpen", false);
+            settings->setValue("mixerWindowOpen", false);
+            settings->saveIfNeeded();
+        }
         startTimerHz(juce::jlimit(2, 60, settings != nullptr ? settings->getIntValue("updateRateHz", 30) : 30));
         lastAutoSaveMs = juce::Time::getMillisecondCounter();
         if (settings != nullptr && settings->getBoolValue("scanVst3AtStartup", false))
@@ -5136,6 +6667,11 @@ public:
             auto& transport = edit->getTransport();
             const bool playing = transport.isPlaying();
             const auto seconds = transport.getPosition().inSeconds();
+            const auto signature = project.getInitialTimeSignature();
+            const auto secondsPerBar = (60.0 / juce::jmax(20.0, project.getInitialTempoBpm()))
+                * signature.numerator * (4.0 / juce::jmax(1, signature.denominator));
+            const auto currentBar = juce::jmax(1, static_cast<int>(std::floor(juce::jmax(0.0, seconds) / secondsPerBar)) + 1);
+            barReadoutLabel.setText(juce::String(currentBar).paddedLeft('0', 3), juce::dontSendNotification);
             if (playing && playbackMode == PlaybackMode::song)
                 rememberSongPatternsAt(seconds);
             const auto bpm = project.getInitialTempoBpm();
@@ -5170,27 +6706,29 @@ public:
         g.fillAll(juce::Colour::fromRGB(72, 96, 108));
         if (!generatorPanelBounds.isEmpty())
         {
-            g.setColour(juce::Colour::fromRGB(65, 87, 98));
-            g.fillRoundedRectangle(generatorPanelBounds.toFloat(), 8.0f);
-            g.setColour(juce::Colour::fromRGB(106, 137, 151));
-            g.drawRoundedRectangle(generatorPanelBounds.toFloat(), 8.0f, 1.0f);
-            auto titleBar = generatorPanelBounds.withHeight(22).toFloat();
-            g.setColour(juce::Colour::fromRGB(45, 65, 77));
-            g.fillRoundedRectangle(titleBar, 7.0f);
-            g.fillRect(titleBar.withY(titleBar.getBottom() - 7.0f));
-            g.setColour(juce::Colour::fromRGB(80, 111, 127));
-            g.drawHorizontalLine(generatorPanelBounds.getY() + 21,
-                                 static_cast<float>(generatorPanelBounds.getX() + 1),
-                                 static_cast<float>(generatorPanelBounds.getRight() - 1));
-            g.setColour(juce::Colour::fromRGB(157, 193, 208));
-            for (int row = 0; row < 3; ++row)
-                for (int column = 0; column < 2; ++column)
-                    g.fillEllipse(static_cast<float>(generatorPanelBounds.getX() + 9 + column * 5),
-                                  static_cast<float>(generatorPanelBounds.getY() + 6 + row * 5), 2.0f, 2.0f);
+            const bool showingExpandedRoll = pianoRollMaximized && pianoRollWindow != nullptr && pianoRollWindow->isVisible();
+            g.setColour(showingExpandedRoll ? juce::Colour::fromRGB(22, 32, 42)
+                                             : juce::Colour::fromRGB(45, 65, 77));
+            g.fillRect(generatorPanelBounds);
+            g.setColour(showingExpandedRoll ? juce::Colour::fromRGB(103, 139, 157)
+                                             : juce::Colour::fromRGB(106, 137, 151));
+            g.drawRect(generatorPanelBounds, 1.0f);
+            if (!showingExpandedRoll)
+            {
+                auto titleBar = generatorPanelBounds.withHeight(22).toFloat();
+                g.setColour(juce::Colour::fromRGB(45, 65, 77));
+                g.fillRoundedRectangle(titleBar, 7.0f);
+                g.fillRect(titleBar.withY(titleBar.getBottom() - 7.0f));
+                g.setColour(juce::Colour::fromRGB(157, 193, 208));
+                for (int row = 0; row < 3; ++row)
+                    for (int column = 0; column < 2; ++column)
+                        g.fillEllipse(static_cast<float>(generatorPanelBounds.getX() + 9 + column * 5),
+                                      static_cast<float>(generatorPanelBounds.getY() + 6 + row * 5), 2.0f, 2.0f);
+            }
         }
         if (!generatorInstrumentBounds.isEmpty() && (pianoRollWindow == nullptr || !pianoRollWindow->isVisible()))
         {
-            g.setColour(juce::Colour::fromRGB(39, 57, 68));
+            g.setColour(juce::Colour::fromRGB(45, 65, 77));
             g.fillRoundedRectangle(generatorInstrumentBounds.toFloat(), 5.0f);
             g.setColour(juce::Colour::fromRGB(96, 129, 145));
             g.drawRoundedRectangle(generatorInstrumentBounds.toFloat(), 5.0f, 1.0f);
@@ -5332,9 +6870,10 @@ public:
         auto transportRow = getLocalBounds().withTrimmedTop(28).removeFromTop(54).reduced(8, 3);
         auto meterBounds = transportRow.removeFromRight(154).reduced(0, 7);
         outputMeter.setBounds(meterBounds);
+        transportRow.removeFromRight(5);
         const auto controlY = transportRow.getY() + 15;
         tempoLabel.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(24));
-        tempoSlider.setBounds(transportRow.removeFromLeft(104).withY(controlY).withHeight(24));
+        tempoSlider.setBounds(transportRow.removeFromLeft(72).withY(controlY).withHeight(24));
         transportRow.removeFromLeft(7);
         auto modeBounds = transportRow.removeFromLeft(58).withY(controlY - 1).withHeight(32);
         patternModeButton.setBounds(modeBounds.removeFromTop(15));
@@ -5347,11 +6886,15 @@ public:
         nextButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(3);
         recordButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(9);
         loopButton.setBounds(transportRow.removeFromLeft(52).withY(controlY).withHeight(26)); transportRow.removeFromLeft(5);
-        auto startBounds = transportRow.removeFromLeft(96);
+        auto barBounds = transportRow.removeFromLeft(58);
+        barLabel.setBounds(barBounds.withY(transportRow.getY()).withHeight(12));
+        barReadoutLabel.setBounds(barBounds.withY(controlY).withHeight(24));
+        transportRow.removeFromLeft(5);
+        auto startBounds = transportRow.removeFromLeft(82);
         loopStartLabel.setBounds(startBounds.withY(transportRow.getY()).withHeight(12));
         loopStartSlider.setBounds(startBounds.withY(controlY).withHeight(24));
         transportRow.removeFromLeft(5);
-        auto lengthBounds = transportRow.removeFromLeft(92);
+        auto lengthBounds = transportRow.removeFromLeft(82);
         loopLengthLabel.setBounds(lengthBounds.withY(transportRow.getY()).withHeight(12));
         loopLengthSlider.setBounds(lengthBounds.withY(controlY).withHeight(24));
         transportRow.removeFromLeft(7);
@@ -5360,10 +6903,30 @@ public:
         playlistButton.setBounds(transportRow.removeFromLeft(88).withY(controlY).withHeight(30)); transportRow.removeFromLeft(4);
         mixerButton.setBounds(transportRow.removeFromLeft(82).withY(controlY).withHeight(30)); transportRow.removeFromLeft(4);
         masterButton.setBounds(transportRow.removeFromLeft(88).withY(controlY).withHeight(30));
+        transportRow.removeFromLeft(4);
+        masterVolumeKnob.setBounds(transportRow.removeFromLeft(50)
+            .withY(transportRow.getY() + 2).withHeight(42));
 
         auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
         if (playlistWindow != nullptr)
-            playlistWindow->setBounds(area);
+        {
+            if (!playlistBoundsInitialised)
+            {
+                playlistPanelBounds = area.withHeight(juce::jmin(700, area.getHeight()));
+                playlistBoundsInitialised = true;
+            }
+            if (playlistWindow->isMaximized()) playlistPanelBounds = area;
+            const auto minWidth = juce::jmin(440, area.getWidth());
+            const auto minHeight = juce::jmin(250, area.getHeight());
+            const auto panelHeight = playlistWindow->isMinimized() ? 28
+                : juce::jlimit(minHeight, area.getHeight(), playlistPanelBounds.getHeight());
+            playlistPanelBounds.setSize(juce::jlimit(minWidth, area.getWidth(), playlistPanelBounds.getWidth()), panelHeight);
+            playlistPanelBounds.setX(juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - playlistPanelBounds.getWidth()),
+                                                  playlistPanelBounds.getX()));
+            playlistPanelBounds.setY(juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - 28),
+                                                  playlistPanelBounds.getY()));
+            playlistWindow->setBounds(playlistPanelBounds);
+        }
         generatorDockViewport.setBounds(10, juce::jmax(82, getHeight() - 49), juce::jmax(0, getWidth() - 20), 25);
         const int dockButtonWidth = 150;
         generatorDockStrip.setSize(static_cast<int>(generatorDockButtons.size()) * dockButtonWidth, 25);
@@ -5373,13 +6936,12 @@ public:
         {
             const auto minWidth = juce::jmin(220, area.getWidth());
             const auto minHeight = juce::jmin(420, area.getHeight());
-            const auto panelHeight = mixerWindow->isMinimized() ? 26
-                : juce::jlimit(minHeight, area.getHeight(), mixerPanelBounds.getHeight());
+            const auto panelHeight = mixerWindow->isMinimized() ? 26 : mixerWindow->isMaximized()
+                ? area.getHeight() : juce::jlimit(minHeight, area.getHeight(), mixerPanelBounds.getHeight());
             mixerPanelBounds.setSize(juce::jlimit(minWidth, area.getWidth(), mixerPanelBounds.getWidth()), panelHeight);
-            mixerPanelBounds.setX(juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - mixerPanelBounds.getWidth()),
-                                               mixerPanelBounds.getX()));
-            mixerPanelBounds.setY(juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - mixerPanelBounds.getHeight()),
-                                               mixerPanelBounds.getY()));
+            if (mixerWindow->isMaximized() && !mixerWindow->isMinimized())
+                mixerPanelBounds.setPosition(area.getPosition());
+            else mixerPanelBounds.setPosition(constrainMixerPosition(mixerPanelBounds.getPosition()));
             mixerWindow->setBounds(mixerPanelBounds);
             layoutMixerHandles();
         }
@@ -5400,23 +6962,30 @@ public:
             auto panel = generatorPanelBounds;
             auto generatorHeader = panel.removeFromTop(22);
             generatorCollapseButton.setBounds(generatorHeader.removeFromRight(24).reduced(1));
-            trackSelector.setBounds(generatorHeader.removeFromRight(190).reduced(4, 0));
+            trackSelector.setBounds({});
             generatorDragHandle.setBounds(generatorHeader);
-            trackSelector.setVisible(instrumentTrack != nullptr);
+            trackSelector.setVisible(false);
             patternTitle.setBounds(0, 0, 0, 0);
             auto patternControls = panel.removeFromTop(56).reduced(8, 0);
-            generatorMuteButton.setBounds(patternControls.removeFromLeft(27).withY(patternControls.getY() + 2).withHeight(22));
+            constexpr int bankButtonWidth = 23;
+            constexpr int bankButtonPitch = 25;
+            constexpr int bankButtonHeight = 18;
+            constexpr int bankRowGap = 4;
+            const auto bankGroupHeight = bankButtonHeight * 2 + bankRowGap;
+            const auto bankTop = patternControls.getY() + (patternControls.getHeight() - bankGroupHeight) / 2;
+            generatorMuteButton.setBounds(patternControls.removeFromLeft(24).withY(bankTop + 11).withHeight(18));
             patternControls.removeFromLeft(3);
-            generatorSoloButton.setBounds(patternControls.removeFromLeft(27).withY(patternControls.getY() + 2).withHeight(22));
-            patternControls.removeFromLeft(6);
+            generatorSoloButton.setBounds(patternControls.removeFromLeft(24).withY(bankTop + 11).withHeight(18));
+            patternControls.removeFromLeft(5);
             const auto bankX = patternControls.getX();
             for (int i = 0; i < 8; ++i)
             {
-                const auto x = bankX + i * 34;
-                patternBankButtons[static_cast<size_t>(i)]->setBounds(x, patternControls.getY(), 31, 23);
-                patternSlotButtons[static_cast<size_t>(i)]->setBounds(x, patternControls.getY() + 26, 31, 23);
+                const auto x = bankX + i * bankButtonPitch;
+                patternBankButtons[static_cast<size_t>(i)]->setBounds(x, bankTop, bankButtonWidth, bankButtonHeight);
+                patternSlotButtons[static_cast<size_t>(i)]->setBounds(x, bankTop + bankButtonHeight + bankRowGap,
+                                                                       bankButtonWidth, bankButtonHeight);
             }
-            patternControls.removeFromLeft(8 * 34 + 8);
+            patternControls.removeFromLeft(8 * bankButtonPitch + 6);
             const auto controlY = patternControls.getY() + 13;
             pianoRollButton.setBounds(patternControls.removeFromLeft(136).withHeight(27).withY(controlY));
             patternControls.removeFromLeft(4);
@@ -5504,7 +7073,10 @@ public:
         }
         status.setBounds(10, getHeight() - 21, juce::jmax(0, getWidth() - 205), 18);
         buildLabel.setBounds(getWidth() - 180, getHeight() - 22, 170, 18);
-        if (generatorDockViewport.isVisible()) generatorDockViewport.toFront(false);
+        if (playlistWindow != nullptr && playlistWindow->isVisible() && !playlistWindow->isMinimized())
+            playlistWindow->toFront(false);
+        else if (generatorDockViewport.isVisible())
+            generatorDockViewport.toFront(false);
     }
 
 private:
@@ -5605,7 +7177,7 @@ private:
             // Keep the Insert hierarchy close to Orion: built-in instruments
             // live under Synths, while third-party instruments have their own
             // separate VST Instruments section.
-            menu.addItem(420, "Drum Rack (not available yet)", false);
+            menu.addItem(420, "Drum Rack", hasProject);
             menu.addItem(421, "Piano (not available yet)", false);
             menu.addItem(422, "Pro-9 (not available yet)", false);
             menu.addItem(423, "Sampler (not available yet)", false);
@@ -5653,7 +7225,8 @@ private:
             menu.addSubMenu("FX Holder", fxHolder);
             menu.addSeparator();
             juce::PopupMenu audioTrack;
-            audioTrack.addItem(406, "Audio Track (not available yet)", false);
+            audioTrack.addItem(406, "Add Audio Track", hasProject);
+            audioTrack.addItem(430, "Import Audio File...", hasProject);
             menu.addSubMenu("Audio Track", audioTrack);
             menu.addItem(407, "MIDI Out (not available yet)", false);
         }
@@ -5692,6 +7265,8 @@ private:
             menu.addItem(609, "Compact Mixer", mixerWindow != nullptr);
             menu.addItem(610, "Expand Mixer", mixerWindow != nullptr);
             menu.addItem(611, "Minimize Mixer", mixerWindow != nullptr && mixerWindow->isVisible());
+            menu.addItem(613, "Drum Rack", instrumentTrack != nullptr
+                         && findSamplerPlugin(selectedProjectTrackId()) != nullptr);
             menu.addSeparator();
             menu.addItem(605, "Hide All Child Windows");
             menu.addItem(606, "Minimize All Windows to Pattern Controls");
@@ -5777,6 +7352,9 @@ private:
                 }
                 break;
             case 401: insertBuiltInInstrument(); break;
+            case 420: addDrumRackTrack(); break;
+            case 406: addAudioTrack(); break;
+            case 430: importAudioFile(); break;
             case 404: showVst3InstrumentBrowser(); break;
             case 405: addPattern(); break;
             case 408:
@@ -5789,6 +7367,10 @@ private:
             case 602: showMixer(); break;
             case 603: showMixer(true); break;
             case 604: showPianoRoll(); break;
+            case 613:
+                if (instrumentTrack != nullptr)
+                    openDrumRackWindow(selectedProjectTrackId());
+                break;
             case 605:
                 if (playlistWindow != nullptr) playlistWindow->setVisible(false);
                 if (mixerWindow != nullptr) mixerWindow->setVisible(false);
@@ -6083,6 +7665,7 @@ private:
         updateActiveInstrumentEditor();
         refreshTrackSelector();
         readPatternSteps();
+        refreshPianoRollAutomationTargets();
         refreshMixerControls();
         isDirty = true;
         if (pianoRollWindow != nullptr) pianoRollWindow->refresh("A1");
@@ -6818,7 +8401,7 @@ private:
     {
         const auto length = selectedPatternLength();
         patternLengthDisplay.setText(juce::String(length).paddedLeft('0', 3), juce::dontSendNotification);
-        patternLengthDisplay.setTooltip("Pattern length: " + juce::String(length) + " steps. Use + and − to adjust.");
+        patternLengthDisplay.setTooltip("Pattern length: " + juce::String(length) + " steps. Use + and - to adjust.");
     }
 
     void adjustPatternLength(int delta)
@@ -6847,11 +8430,13 @@ private:
         {
             generatorCollapsed = false;
             if (!expandedGeneratorBounds.isEmpty()) generatorPanelBounds = expandedGeneratorBounds;
-            generatorCollapseButton.setButtonText("−");
+            generatorCollapseButton.setKind(PlaylistWindowIconButton::Kind::minimize);
             generatorCollapseButton.setTooltip("Minimize this generator");
             pianoRollWasVisibleWhenCollapsed = false;
         }
+        const auto previousPanelBounds = generatorPanelBounds;
         allGeneratorsMinimized = false;
+        refreshPianoRollAutomationTargets();
         pianoRollWindow->refresh(getSelectedPatternTitle());
         pianoRollRestoreBounds = generatorPanelBounds;
         pianoRollMaximized = true;
@@ -6859,14 +8444,22 @@ private:
         pianoRollButton.setButtonText("INSTRUMENT");
         pianoRollButton.setTooltip("Return to the VST or built-in instrument");
         pianoRollWindow->setVisible(true);
+        pianoRollWindow->focusGrid();
         if (activeInstrumentEditor != nullptr) activeInstrumentEditor->setVisible(false);
         resized();
         bringGeneratorToFront();
+        // The maximized roll expands the generator panel beyond the embedded
+        // plugin editor. Invalidate both extents so the newly exposed strip is
+        // repainted with the same panel background instead of showing stale
+        // pixels from the previous editor bounds.
+        repaint(previousPanelBounds.getUnion(generatorPanelBounds));
+        if (pianoRollWindow != nullptr) pianoRollWindow->repaint();
         status.setText("Piano Roll expanded across the generator workspace.", juce::dontSendNotification);
     }
 
     void closePianoRollView()
     {
+        const auto previousPanelBounds = generatorPanelBounds;
         if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
         if (pianoRollMaximized && !pianoRollRestoreBounds.isEmpty())
             generatorPanelBounds = pianoRollRestoreBounds;
@@ -6875,8 +8468,14 @@ private:
         pianoRollButton.setTooltip("Open the selected pattern in the piano roll");
         resized();
         if (activeInstrumentEditor != nullptr && instrumentTrack != nullptr && !generatorCollapsed)
+        {
             activeInstrumentEditor->setVisible(true);
+            activeInstrumentEditor->repaint();
+        }
         bringGeneratorToFront();
+        // Clearing the roll's former maximized area is necessary to prevent
+        // its background from lingering beside a narrower instrument GUI.
+        repaint(previousPanelBounds.getUnion(generatorPanelBounds));
     }
 
     void toggleGeneratorCollapsed()
@@ -6889,6 +8488,8 @@ private:
             pianoRollWasVisibleWhenCollapsed = false;
             generatorCollapsed = true;
             allGeneratorsMinimized = true;
+            generatorCollapseButton.setKind(PlaylistWindowIconButton::Kind::restore);
+            generatorCollapseButton.setTooltip("Restore generator");
             if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
         }
         else
@@ -6896,7 +8497,7 @@ private:
             generatorCollapsed = false;
             allGeneratorsMinimized = false;
             if (!expandedGeneratorBounds.isEmpty()) generatorPanelBounds = expandedGeneratorBounds;
-            generatorCollapseButton.setButtonText("−");
+            generatorCollapseButton.setKind(PlaylistWindowIconButton::Kind::minimize);
             generatorCollapseButton.setTooltip("Minimize this generator");
         }
         resized();
@@ -7001,11 +8602,6 @@ private:
 
     void openProject()
     {
-        if (hasProject && isDirty)
-        {
-            showError("Unsaved changes", "Save the current project before opening another.");
-            return;
-        }
         auto startLocation = juce::File{};
         if (auto* settings = applicationProperties.getUserSettings())
         {
@@ -7022,41 +8618,62 @@ private:
             {
                 const auto file = chooser.getResult();
                 if (file == juce::File{}) return;
-                juce::String error;
-                auto loaded = ProjectDocument::loadFromFile(file, error);
-                if (!loaded)
+                if (hasProject && isDirty)
                 {
-                    showError("Could not open project", error);
+                    auto* dialog = new juce::AlertWindow("Open another project?",
+                        "Discard the unsaved changes and open the selected project?",
+                        juce::MessageBoxIconType::WarningIcon, this);
+                    dialog->addButton("Discard and Open", 1);
+                    dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+                    dialog->centreAroundComponent(this, 440, 160);
+                    dialog->enterModalState(true, juce::ModalCallbackFunction::create(
+                        [safeThis = juce::Component::SafePointer<ProjectView>(this), file](int result)
+                        {
+                            if (safeThis != nullptr && result == 1)
+                                safeThis->loadProjectFile(file);
+                        }), true);
                     return;
                 }
-                auto engineState = loaded->getTracktionEditState();
-                if (!engineState.isValid())
-                {
-                    showError("Older project format", "This project has no saved audio-engine state yet. Create a new project for the instrument workflow.");
-                    return;
-                }
-                auto restoredEdit = te::loadEditFromState(engine, engineState);
-                if (restoredEdit == nullptr)
-                {
-                    showError("Could not open audio session", "Tracktion Engine could not restore this project's audio state.");
-                    return;
-                }
-                resetPatternButtons();
-                edit = std::move(restoredEdit);
-                project = std::move(*loaded);
-                hasProject = true;
-                isDirty = false;
-                undoHistory.clear();
-                redoHistory.clear();
-                migratePlaylistState();
-                ensureExistingFxReturns();
-                findFirstInstrumentTrack();
-                updateActiveInstrumentEditor();
-                refreshTrackSelector();
-                readPatternSteps();
-                refreshMixerControls();
-                refreshProjectView("Opened project and restored its Tracktion session.");
+                loadProjectFile(file);
             });
+    }
+
+    void loadProjectFile(const juce::File& file)
+    {
+        juce::String error;
+        auto loaded = ProjectDocument::loadFromFile(file, error);
+        if (!loaded)
+        {
+            showError("Could not open project", error);
+            return;
+        }
+        auto engineState = loaded->getTracktionEditState();
+        if (!engineState.isValid())
+        {
+            showError("Older project format", "This project has no saved audio-engine state yet. Create a new project for the instrument workflow.");
+            return;
+        }
+        auto restoredEdit = te::loadEditFromState(engine, engineState);
+        if (restoredEdit == nullptr)
+        {
+            showError("Could not open audio session", "Tracktion Engine could not restore this project's audio state.");
+            return;
+        }
+        resetPatternButtons();
+        edit = std::move(restoredEdit);
+        project = std::move(*loaded);
+        hasProject = true;
+        isDirty = false;
+        undoHistory.clear();
+        redoHistory.clear();
+        migratePlaylistState();
+        ensureExistingFxReturns();
+        findFirstInstrumentTrack();
+        updateActiveInstrumentEditor();
+        refreshTrackSelector();
+        readPatternSteps();
+        refreshMixerControls();
+        refreshProjectView("Opened project and restored its Tracktion session.");
     }
 
     void saveProject()
@@ -7180,9 +8797,257 @@ private:
         instrumentTrack = track;
         refreshTrackSelector();
         readPatternSteps();
+        refreshPianoRollAutomationTargets();
         refreshMixerControls();
         isDirty = true;
         refreshProjectView("Added a Tracktion instrument track with the built-in 4OSC synth.");
+    }
+
+    void addAudioTrack()
+    {
+        createAudioTrack({});
+    }
+
+    void importAudioFile(int targetTrackIndex = -1, int targetBar = 0)
+    {
+        if (!hasProject || edit == nullptr) return;
+        if (!juce::isPositiveAndBelow(targetTrackIndex, project.getTrackCount())
+            && juce::isPositiveAndBelow(trackSelector.getSelectedId() - 1, project.getTrackCount())
+            && project.getTrackKind(trackSelector.getSelectedId() - 1) == ProjectDocument::TrackKind::audio)
+            targetTrackIndex = trackSelector.getSelectedId() - 1;
+        fileChooser = std::make_unique<juce::FileChooser>("Import audio file",
+            juce::File::getSpecialLocation(juce::File::userMusicDirectory),
+            "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg");
+        auto* chooser = fileChooser.get();
+        chooser->launchAsync(juce::FileBrowserComponent::openMode
+                             | juce::FileBrowserComponent::canSelectFiles,
+            [this, targetTrackIndex, targetBar](const juce::FileChooser& result)
+            {
+                const auto audioFile = result.getResult();
+                if (audioFile.existsAsFile()) createAudioTrack(audioFile, targetTrackIndex, targetBar);
+            });
+    }
+
+    void createAudioTrack(const juce::File& sourceFile, int targetTrackIndex = -1, int targetBar = 0)
+    {
+        if (!hasProject || edit == nullptr) return;
+        rememberUndo(sourceFile.existsAsFile() ? "Import Audio Track" : "Add Audio Track");
+
+        const bool useExistingTrack = sourceFile.existsAsFile()
+            && juce::isPositiveAndBelow(targetTrackIndex, project.getTrackCount())
+            && project.getTrackKind(targetTrackIndex) == ProjectDocument::TrackKind::audio;
+        const auto trackName = sourceFile.existsAsFile() && !useExistingTrack
+            ? sourceFile.getFileNameWithoutExtension()
+            : "Audio " + juce::String(project.getTrackCount() + 1);
+        const auto existingTracks = getGeneratorTracks();
+        const bool reusingInitialTrack = project.getTrackCount() == 0 && existingTracks.size() == 1;
+        te::AudioTrack* track = useExistingTrack && juce::isPositiveAndBelow(targetTrackIndex, existingTracks.size())
+            ? existingTracks.getUnchecked(targetTrackIndex)
+            : reusingInitialTrack ? existingTracks.getUnchecked(0) : nullptr;
+        if (track == nullptr)
+        {
+            auto insertedTrack = edit->insertNewAudioTrack(te::TrackInsertPoint::getEndOfTracks(*edit), nullptr);
+            track = insertedTrack.get();
+        }
+        if (track == nullptr)
+        {
+            showError("Could not add Audio Track", "Tracktion Engine could not create an audio track.");
+            return;
+        }
+
+        if (!useExistingTrack)
+        {
+            track->setName(trackName);
+            project.addTrack(ProjectDocument::TrackKind::audio, trackName);
+            targetTrackIndex = project.getTrackCount() - 1;
+        }
+        if (sourceFile.existsAsFile())
+        {
+            te::AudioFile audioFile(edit->engine, sourceFile);
+            if (!audioFile.isValid() || audioFile.getLength() <= 0.0)
+            {
+                if (!useExistingTrack)
+                {
+                    project.removeTrack(project.getTrackCount() - 1);
+                    if (!reusingInitialTrack) edit->deleteTrack(track);
+                }
+                showError("Could not import audio", "Orbit could not read the selected audio file.");
+                return;
+            }
+
+            const auto secondsPerBar = 60.0 / juce::jmax(20.0, project.getInitialTempoBpm()) * 4.0;
+            const auto clipStart = juce::jmax(0, targetBar) * secondsPerBar;
+            const auto clipEnd = clipStart + audioFile.getLength();
+            auto clip = track->insertWaveClip(sourceFile.getFileNameWithoutExtension(), sourceFile,
+                { { tracktion::TimePosition::fromSeconds(clipStart), tracktion::TimePosition::fromSeconds(clipEnd) }, {} }, false);
+            if (clip == nullptr)
+            {
+                if (!useExistingTrack)
+                {
+                    project.removeTrack(project.getTrackCount() - 1);
+                    if (!reusingInitialTrack) edit->deleteTrack(track);
+                }
+                showError("Could not import audio", "Tracktion Engine could not create a clip from the selected file.");
+                return;
+            }
+            const auto tracksAfterImport = getGeneratorTracks();
+            if (juce::isPositiveAndBelow(targetTrackIndex, tracksAfterImport.size()))
+            {
+                auto* destinationTrack = tracksAfterImport.getUnchecked(targetTrackIndex);
+                for (int i = destinationTrack->getNumTrackItems(); --i >= 0;)
+                    if (auto* previous = dynamic_cast<te::WaveAudioClip*>(destinationTrack->getTrackItem(i));
+                        previous != nullptr && previous != clip.get())
+                    {
+                        const auto range = previous->getEditTimeRange();
+                        if (range.getStart().inSeconds() < clipEnd && range.getEnd().inSeconds() > clipStart)
+                            previous->removeFromParent();
+                    }
+            }
+        }
+
+        edit->restartPlayback();
+        instrumentTrack = track;
+        if (useExistingTrack)
+            status.setText("Imported audio at Playlist bar " + juce::String(targetBar + 1) + ". Drag the clip to move it on the grid.",
+                           juce::dontSendNotification);
+        patternClip = nullptr;
+        refreshTrackSelector();
+        refreshMixerControls();
+        isDirty = true;
+        if (playlistWindow != nullptr) playlistWindow->refresh();
+        refreshProjectView(sourceFile.existsAsFile()
+            ? "Imported audio onto " + trackName + ". Save to keep the change."
+            : "Added an empty audio track. Use Insert > Audio Track > Import Audio File to add a clip.");
+    }
+
+    te::SamplerPlugin* findSamplerPlugin(const juce::String& trackId) const
+    {
+        const auto tracks = getGeneratorTracks();
+        for (int index = 0; index < tracks.size() && index < project.getTrackCount(); ++index)
+        {
+            if (project.getTrackId(index) != trackId) continue;
+            for (auto* plugin : tracks.getUnchecked(index)->pluginList)
+                if (auto* sampler = dynamic_cast<te::SamplerPlugin*>(plugin)) return sampler;
+        }
+        return nullptr;
+    }
+
+    void addDrumRackTrack()
+    {
+        if (!hasProject || edit == nullptr) return;
+        rememberUndo("Insert Drum Rack");
+        const auto trackName = "Drum Rack " + juce::String(project.getTrackCount() + 1);
+        const auto existingTracks = getGeneratorTracks();
+        te::AudioTrack* track = existingTracks.size() == 1 && project.getTrackCount() == 0
+                                    ? existingTracks.getUnchecked(0) : nullptr;
+        if (track == nullptr)
+        {
+            auto insertedTrack = edit->insertNewAudioTrack(te::TrackInsertPoint::getEndOfTracks(*edit), nullptr);
+            track = insertedTrack.get();
+        }
+        if (track == nullptr)
+        {
+            showError("Could not add Drum Rack", "Tracktion Engine could not create an instrument track.");
+            return;
+        }
+
+        auto sampler = edit->getPluginCache().createNewPlugin(te::SamplerPlugin::xmlTypeName, {});
+        if (sampler == nullptr)
+        {
+            showError("Could not add Drum Rack", "Tracktion Engine could not create its built-in sampler.");
+            return;
+        }
+        track->setName(trackName);
+        track->pluginList.insertPlugin(*sampler, 0, nullptr);
+        project.addInstrumentTrack();
+        project.setTrackName(project.getTrackCount() - 1, trackName);
+        edit->restartPlayback();
+        instrumentTrack = track;
+        patternClip = nullptr;
+        refreshTrackSelector();
+        readPatternSteps();
+        refreshMixerControls();
+        isDirty = true;
+        openDrumRackWindow(project.getTrackId(project.getTrackCount() - 1));
+        refreshProjectView("Added a sampler-backed Drum Rack. Load samples into pads, then program its steps.");
+    }
+
+    void openDrumRackWindow(const juce::String& trackId)
+    {
+        drumRackTrackId = trackId;
+        drumRackWindow = std::make_unique<DrumRackWindow>(
+            [this, trackId](int pad)
+            {
+                const auto note = 48 + pad;
+                fileChooser = std::make_unique<juce::FileChooser>("Load a drum sample", juce::File{},
+                                                                  "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg");
+                fileChooser->launchAsync(juce::FileBrowserComponent::openMode
+                                             | juce::FileBrowserComponent::canSelectFiles,
+                    [this, trackId, pad, note](const juce::FileChooser& chooser)
+                    {
+                        const auto file = chooser.getResult();
+                        if (!file.existsAsFile()) return;
+                        auto* sampler = findSamplerPlugin(trackId);
+                        if (sampler == nullptr) return;
+                        for (int index = sampler->getNumSounds(); --index >= 0;)
+                            if (sampler->getKeyNote(index) == note) sampler->removeSound(index);
+                        const auto error = sampler->addSound(file.getFullPathName(), file.getFileNameWithoutExtension(),
+                                                             0.0, 0.0, 0.0f);
+                        if (error.isNotEmpty())
+                        {
+                            showError("Could not load sample", error);
+                            return;
+                        }
+                        const int soundIndex = sampler->getNumSounds() - 1;
+                        sampler->setSoundParams(soundIndex, note, note, note);
+                        drumRackWindow->setPadSampleName(pad, file.getFileNameWithoutExtension());
+                        isDirty = true;
+                        status.setText("Loaded " + file.getFileName() + " into Drum Rack pad "
+                                           + juce::String(pad + 1) + ". Save to keep the change.",
+                                       juce::dontSendNotification);
+                    });
+            },
+            [this, trackId](int pad)
+            {
+                drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, selectedPatternIndex(), pad));
+            },
+            [this, trackId](int pad, int step, bool enabled)
+            {
+                const int slot = selectedPatternIndex();
+                if (!project.isPatternCreated(trackId, slot))
+                {
+                    project.setPatternCreated(trackId, slot, true);
+                    project.setPatternLengthSteps(trackId, slot, 16);
+                }
+                const int pitch = 48 + pad;
+                project.setPatternNote(trackId, slot, pitch, step, enabled);
+                if (enabled)
+                {
+                    project.setPatternNoteVelocity(trackId, slot, pitch, step, 100);
+                    project.setPatternNoteLength(trackId, slot, pitch, step, 1);
+                }
+                drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, slot, pad));
+                rebuildPatternClip();
+                isDirty = true;
+                status.setText("Drum Rack pattern edited. Save to keep the change.", juce::dontSendNotification);
+            });
+
+        const auto* sampler = findSamplerPlugin(trackId);
+        if (sampler != nullptr)
+            for (int pad = 0; pad < 16; ++pad)
+                for (int sound = 0; sound < sampler->getNumSounds(); ++sound)
+                    if (sampler->getKeyNote(sound) == 48 + pad)
+                        drumRackWindow->setPadSampleName(pad, sampler->getSoundName(sound));
+        for (int pad = 0; pad < 16; ++pad)
+            drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, selectedPatternIndex(), pad));
+    }
+
+    std::array<bool, 16> getDrumRackSteps(const juce::String& trackId, int slot, int pad) const
+    {
+        std::array<bool, 16> steps{};
+        for (int step = 0; step < 16; ++step)
+            steps[static_cast<size_t>(step)] = project.getPatternNote(trackId, slot, 48 + pad, step);
+        return steps;
     }
 
     void addPattern()
@@ -7233,12 +9098,15 @@ private:
     void refreshEnginePlaylist()
     {
         if (edit == nullptr) return;
+        playlistPreviewCache.clear();
         patternClip = nullptr;
         const auto engineTracks = getGeneratorTracks();
         const auto secondsPerStep = 15.0 / juce::jmax(20.0, project.getInitialTempoBpm());
         const auto secondsPerBar = secondsPerStep * 16.0;
         for (int trackIndex = 0; trackIndex < engineTracks.size() && trackIndex < project.getTrackCount(); ++trackIndex)
         {
+            if (project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio)
+                continue;
             auto* track = engineTracks.getUnchecked(trackIndex);
             const auto trackId = project.getTrackId(trackIndex);
             std::vector<te::MidiClip*> oldClips;
@@ -7310,6 +9178,59 @@ private:
         if (playlistWindow != nullptr) playlistWindow->refresh();
     }
 
+    void refreshEnginePlaylistClip(int trackIndex, int bar)
+    {
+        if (edit == nullptr || auditionPatternPlayback)
+        {
+            if (edit != nullptr) refreshEnginePlaylist();
+            return;
+        }
+        const auto tracks = getGeneratorTracks();
+        if (!juce::isPositiveAndBelow(trackIndex, tracks.size())
+            || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
+            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return;
+
+        auto* track = tracks.getUnchecked(trackIndex);
+        const auto trackId = project.getTrackId(trackIndex);
+        const auto secondsPerStep = 15.0 / juce::jmax(20.0, project.getInitialTempoBpm());
+        const auto secondsPerBar = secondsPerStep * 16.0;
+        const auto targetStart = static_cast<double>(bar) * secondsPerBar;
+        std::vector<te::MidiClip*> oldClips;
+        for (int item = 0; item < track->getNumTrackItems(); ++item)
+            if (auto* clip = dynamic_cast<te::MidiClip*>(track->getTrackItem(item)); clip != nullptr
+                && std::abs(clip->getEditTimeRange().getStart().inSeconds() - targetStart) < 0.001)
+                oldClips.push_back(clip);
+
+        for (auto* clip : oldClips)
+        {
+            if (clip == patternClip) patternClip = nullptr;
+            track->deleteRegionOfClip(clip, clip->getEditTimeRange(), nullptr);
+        }
+
+        const auto patternId = project.getPlaylistPatternId(trackId, bar);
+        const auto patternIndex = project.getPatternIndexForId(trackId, patternId);
+        if (patternIndex < 0 || !project.isPatternCreated(trackId, patternIndex)) return;
+
+        const auto patternLength = project.getPatternLengthSteps(trackId, patternIndex);
+        const auto clipSeconds = juce::jmax(secondsPerBar, patternLength * secondsPerStep);
+        auto inserted = track->insertMIDIClip(project.getPatternName(trackId, patternIndex),
+            { tracktion::TimePosition::fromSeconds(targetStart),
+              tracktion::TimePosition::fromSeconds(targetStart + clipSeconds) }, nullptr);
+        auto* clip = inserted.get();
+        if (clip == nullptr) return;
+        clip->setLoopRangeBeats({ tracktion::BeatPosition::fromBeats(0.0),
+                                  tracktion::BeatPosition::fromBeats(patternLength * 0.25) });
+        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
+            for (int step = 0; step < patternLength; ++step)
+                if (project.getPatternNote(trackId, patternIndex, pitch, step))
+                    clip->getSequence().addNote(pitch, tracktion::BeatPosition::fromBeats(step * 0.25),
+                        tracktion::BeatDuration::fromBeats(
+                            project.getPatternNoteLength(trackId, patternIndex, pitch, step) * 0.25),
+                        project.getPatternNoteVelocity(trackId, patternIndex, pitch, step), 0, nullptr);
+        if (track == instrumentTrack && patternIndex == selectedPatternIndex())
+            patternClip = clip;
+    }
+
     static float evaluateAutomationLane(const ProjectDocument::AutomationLane& lane, int position)
     {
         if (lane.points.isEmpty()) return 0.5f;
@@ -7340,7 +9261,9 @@ private:
                 for (auto* parameter : plugin->getAutomatableParameters())
                 {
                     if (parameter == nullptr) continue;
-                    const auto parameterName = parameter->getParameterName();
+                    auto parameterName = parameter->getParameterName();
+                    if (parameterName.equalsIgnoreCase("Filter Freq"))
+                        parameterName = "Filter Cutoff";
                     labels.add(plugin->getName() + " / " + parameterName);
                     ids.add(plugin->getName() + "\n" + parameter->paramID + "\n" + parameterName);
                 }
@@ -7403,15 +9326,84 @@ private:
     void showPlaylist()
     {
         if (playlistWindow == nullptr) return;
+        if (!playlistBoundsInitialised) initialisePlaylistPanelBounds();
+        if (playlistWindow->isMinimized()) playlistWindow->setMinimized(false);
         playlistWindow->refresh();
         playlistWindow->setVisible(true);
+        if (auto* settings = applicationProperties.getUserSettings())
+        {
+            settings->setValue("playlistWindowOpen", true);
+            settings->saveIfNeeded();
+        }
+        // Keep generator pattern controls behind the Playlist while it is open.
+        playlistWindow->toFront(false);
+    }
+
+    void initialisePlaylistPanelBounds()
+    {
+        if (playlistBoundsInitialised) return;
+        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
+        playlistPanelBounds = area.withHeight(juce::jmin(700, area.getHeight()));
+        playlistBoundsInitialised = true;
+        resized();
+    }
+
+    void movePlaylistPanel(juce::Point<int> position)
+    {
+        if (playlistWindow == nullptr || playlistWindow->isMaximized() || playlistWindow->isMinimized()) return;
+        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
+        playlistPanelBounds.setPosition(
+            juce::jlimit(48 - playlistPanelBounds.getWidth(), getWidth() - 48, position.x),
+            juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - 28), position.y));
+        playlistWindow->setBounds(playlistPanelBounds);
+    }
+
+    void resizePlaylistPanel(juce::Rectangle<int> bounds)
+    {
+        if (playlistWindow == nullptr || playlistWindow->isMaximized() || playlistWindow->isMinimized()) return;
+        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
+        bounds.setSize(juce::jlimit(juce::jmin(440, area.getWidth()), area.getWidth(), bounds.getWidth()),
+                       juce::jlimit(juce::jmin(250, area.getHeight()), area.getHeight(), bounds.getHeight()));
+        bounds.setPosition(juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - bounds.getWidth()), bounds.getX()),
+                           juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - 28), bounds.getY()));
+        playlistPanelBounds = bounds;
+        playlistWindow->setBounds(playlistPanelBounds);
+    }
+
+    void togglePlaylistMaximized()
+    {
+        if (playlistWindow == nullptr) return;
+        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
+        if (!playlistWindow->isMaximized())
+        {
+            if (!playlistWindow->isMinimized()) playlistRestoreBounds = playlistPanelBounds;
+            playlistWindow->setMinimized(false);
+            playlistWindow->setMaximized(true);
+            playlistPanelBounds = area;
+        }
+        else
+        {
+            playlistWindow->setMaximized(false);
+            playlistPanelBounds = playlistRestoreBounds.isEmpty() ? area : playlistRestoreBounds;
+        }
+        playlistWindow->setBounds(playlistPanelBounds);
         playlistWindow->toFront(false);
     }
 
     void togglePlaylistView()
     {
         if (playlistWindow == nullptr) return;
-        if (playlistWindow->isVisible()) playlistWindow->setVisible(false);
+        if (playlistWindow->isVisible() && playlistWindow->isMinimized())
+            playlistWindow->setMinimized(false);
+        else if (playlistWindow->isVisible())
+        {
+            playlistWindow->setVisible(false);
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("playlistWindowOpen", false);
+                settings->saveIfNeeded();
+            }
+        }
         else showPlaylist();
     }
 
@@ -7453,14 +9445,26 @@ private:
         const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
         mixerWindow->refresh(tracks.indexOf(instrumentTrack));
         initialiseMixerPanelBounds();
+        if (mixerWindow->isMinimized() && !mixerRestoreBounds.isEmpty())
+            mixerPanelBounds = mixerRestoreBounds;
         mixerWindow->setMinimized(false);
         const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
         const auto stripCount = mixerWindow->getVisibleTrackCount();
-        const auto contentWidth = (stripCount + 1) * 116 + 2;
-        const auto width = juce::jlimit(juce::jmin(220, area.getWidth()), area.getWidth(), contentWidth);
-        mixerPanelBounds.setSize(width, area.getHeight());
-        mixerPanelBounds.setPosition(juce::jmax(area.getX(), area.getRight() - width), area.getY());
+        // The master strip is shown in its own view, so the instrument mixer
+        // must size to exactly the strips currently visible.
+        const auto contentWidth = stripCount * 132 + 20;
+        const auto width = juce::jlimit(juce::jmin(152, area.getWidth()), area.getWidth(), contentWidth);
+        mixerPanelBounds.setWidth(width);
+        mixerPanelBounds.setHeight(mixerMaximized ? area.getHeight()
+            : juce::jlimit(juce::jmin(420, area.getHeight()), area.getHeight(), mixerPanelBounds.getHeight()));
+        mixerPanelBounds.setPosition(constrainMixerPosition(mixerPanelBounds.getPosition()));
+        mixerWindow->setMaximized(mixerMaximized);
         mixerWindow->setVisible(true);
+        if (auto* settings = applicationProperties.getUserSettings())
+        {
+            settings->setValue("mixerWindowOpen", true);
+            settings->saveIfNeeded();
+        }
         resized();
         // resized() raises the generator-tab dock so it remains available
         // above the workspace. Re-raise the focused mixer afterward so the
@@ -7469,16 +9473,28 @@ private:
         if (focusMaster) mixerWindow->focusMaster();
     }
 
+    void fitMixerWidthToStrips()
+    {
+        if (mixerWindow == nullptr || mixerWindow->isMaximized() || mixerWindow->isMinimized()) return;
+        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
+        const auto width = juce::jlimit(juce::jmin(152, area.getWidth()), area.getWidth(),
+                                        mixerWindow->getPreferredWidth());
+        mixerPanelBounds = mixerWindow->getBounds();
+        mixerPanelBounds.setWidth(width);
+        mixerPanelBounds.setX(constrainMixerPosition(mixerPanelBounds.getPosition()).x);
+        mixerWindow->setBounds(mixerPanelBounds);
+    }
+
     void initialiseMixerPanelBounds()
     {
         if (mixerBoundsInitialised || mixerWindow == nullptr) return;
         const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
         const auto stripCount = mixerWindow->getTrackCount ? mixerWindow->getTrackCount() : 0;
-        const auto stripContentWidth = (stripCount + 1) * 116;
-        const auto defaultWidth = juce::jlimit(juce::jmin(300, area.getWidth()), area.getWidth(),
-                                               juce::jmax(360, stripContentWidth + 38));
+        const auto stripContentWidth = stripCount * 132;
+        const auto defaultWidth = juce::jlimit(juce::jmin(152, area.getWidth()), area.getWidth(),
+                                               juce::jmax(152, stripContentWidth + 20));
         mixerPanelBounds = { juce::jmax(area.getX(), area.getRight() - defaultWidth), area.getY(),
-                             defaultWidth, area.getHeight() };
+                             defaultWidth, juce::jmin(650, area.getHeight()) };
 
         if (auto* settings = applicationProperties.getUserSettings();
             settings != nullptr && settings->getBoolValue("mixerPanelBoundsSet", false))
@@ -7486,8 +9502,11 @@ private:
             mixerPanelBounds.setPosition(settings->getIntValue("mixerPanelX", area.getX()),
                                          settings->getIntValue("mixerPanelY", area.getY()));
             mixerPanelBounds.setSize(settings->getIntValue("mixerPanelWidth", defaultWidth),
-                                     settings->getIntValue("mixerPanelHeight", area.getHeight()));
+                                     settings->getIntValue("mixerPanelHeight", juce::jmin(650, area.getHeight())));
+            if (mixerPanelBounds.getHeight() >= area.getHeight())
+                mixerPanelBounds.setHeight(juce::jmin(650, area.getHeight()));
         }
+        mixerPanelBounds.setPosition(constrainMixerPosition(mixerPanelBounds.getPosition()));
         mixerBoundsInitialised = true;
         resized();
     }
@@ -7503,14 +9522,20 @@ private:
     void moveMixerPanel(juce::Point<int> point)
     {
         if (!draggingMixer || mixerWindow == nullptr) return;
-        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        mixerPanelBounds.setPosition(
-            juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - mixerPanelBounds.getWidth()),
-                         point.x - mixerDragOffset.x),
-            juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - mixerPanelBounds.getHeight()),
-                         point.y - mixerDragOffset.y));
+        mixerPanelBounds.setPosition(constrainMixerPosition(point - mixerDragOffset));
         mixerWindow->setBounds(mixerPanelBounds);
         layoutMixerHandles();
+    }
+
+    juce::Point<int> constrainMixerPosition(juce::Point<int> position) const
+    {
+        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
+        // Let the mixer slide past either side of the workspace while keeping
+        // a 48 px strip available to grab and bring it back.
+        const auto minX = 48 - mixerPanelBounds.getWidth();
+        const auto maxX = juce::jmax(minX, getWidth() - 48);
+        return { juce::jlimit(minX, maxX, position.x),
+                 juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - 28), position.y) };
     }
 
     void resizeMixerPanel(juce::Point<int> point)
@@ -7519,8 +9544,9 @@ private:
         const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
         const auto delta = point - mixerResizeStart;
         mixerPanelBounds.setSize(
-            juce::jlimit(juce::jmin(300, area.getWidth()), area.getWidth(), mixerResizeStartBounds.getWidth() + delta.x),
+            juce::jlimit(juce::jmin(152, area.getWidth()), area.getWidth(), mixerWindow->getPreferredWidth()),
             juce::jlimit(juce::jmin(420, area.getHeight()), area.getHeight(), mixerResizeStartBounds.getHeight() + delta.y));
+        mixerPanelBounds.setX(constrainMixerPosition(mixerResizeStartBounds.getPosition()).x);
         mixerWindow->setBounds(mixerPanelBounds);
         layoutMixerHandles();
     }
@@ -7563,6 +9589,11 @@ private:
                 return;
             }
             mixerWindow->setVisible(false);
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("mixerWindowOpen", false);
+                settings->saveIfNeeded();
+            }
             layoutMixerHandles();
             repaint();
             return;
@@ -7575,12 +9606,22 @@ private:
         if (mixerWindow == nullptr) return;
         const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
         initialiseMixerPanelBounds();
-        const auto stripCount = mixerWindow->getTrackCount ? mixerWindow->getTrackCount() : 0;
-        const auto width = juce::jlimit(juce::jmin(220, area.getWidth()), area.getWidth(),
-                                        (stripCount + 1) * 116 + 2);
-        const auto height = expanded ? area.getHeight() : juce::jmin(area.getHeight(), 520);
-        mixerPanelBounds = { juce::jmax(area.getX(), area.getRight() - width),
-                             expanded ? area.getY() : area.getBottom() - height, width, height };
+        const auto width = juce::jlimit(juce::jmin(152, area.getWidth()), area.getWidth(),
+                                        mixerWindow->getVisibleTrackCount() * 132 + 20);
+        if (expanded)
+        {
+            if (!mixerMaximized) mixerRestoreBounds = mixerPanelBounds;
+            mixerMaximized = true;
+            mixerPanelBounds = area;
+        }
+        else
+        {
+            mixerMaximized = false;
+            const auto height = juce::jmin(area.getHeight(), 520);
+            mixerPanelBounds = { juce::jmax(area.getX(), area.getRight() - width), area.getBottom() - height, width, height };
+            mixerRestoreBounds = mixerPanelBounds;
+        }
+        mixerWindow->setMaximized(mixerMaximized);
         mixerWindow->setMinimized(false);
         mixerWindow->setVisible(true);
         mixerWindow->setBounds(mixerPanelBounds);
@@ -7589,8 +9630,31 @@ private:
         mixerMoveHandle.toFront(false);
         mixerResizeHandle.toFront(false);
         saveMixerPanelBounds();
-        status.setText(expanded ? "Mixer expanded inside Orbit." : "Mixer restored to compact view.",
+        status.setText(expanded ? "Mixer maximized inside Orbit." : "Mixer restored to compact view.",
                        juce::dontSendNotification);
+    }
+
+    void toggleMixerMaximized()
+    {
+        if (mixerWindow == nullptr) return;
+        const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
+        if (!mixerWindow->isMaximized())
+        {
+            if (!mixerWindow->isMinimized()) mixerRestoreBounds = mixerPanelBounds;
+            mixerWindow->setMinimized(false);
+            mixerMaximized = true;
+            mixerWindow->setMaximized(true);
+            mixerPanelBounds = area;
+        }
+        else
+        {
+            mixerMaximized = false;
+            mixerWindow->setMaximized(false);
+            mixerPanelBounds = mixerRestoreBounds.isEmpty() ? mixerPanelBounds : mixerRestoreBounds;
+        }
+        mixerWindow->setBounds(mixerPanelBounds);
+        mixerWindow->toFront(false);
+        saveMixerPanelBounds();
     }
 
     juce::Array<te::AudioTrack*> getGeneratorTracks() const
@@ -7953,6 +10017,7 @@ private:
     {
         auto* eq = ensureTrackEqualiser(index);
         if (eq == nullptr || !juce::isPositiveAndBelow(parameter, 12)) return;
+        eq->setEnabled(true);
         const auto band = parameter / 3;
         const auto kind = parameter % 3;
         if (band == 0) { if (kind == 0) eq->setLowFreq(value); else if (kind == 1) eq->setLowGain(value); else eq->setLowQ(value); }
@@ -7972,6 +10037,7 @@ private:
     {
         auto* eq = ensureTrackEqualiser(index);
         if (eq == nullptr || !juce::isPositiveAndBelow(band, 4)) return;
+        eq->setEnabled(true);
         const auto safeFrequency = juce::jlimit(20.0f, 20000.0f, frequency);
         const auto safeGain = juce::jlimit(-20.0f, 20.0f, gain);
         if (band == 0) { eq->setLowFreq(safeFrequency); eq->setLowGain(safeGain); }
@@ -8008,7 +10074,9 @@ private:
                 && dynamic_cast<te::EqualiserPlugin*>(plugin) == nullptr
                 && dynamic_cast<te::SamplerPlugin*>(plugin) == nullptr
                 && dynamic_cast<te::AuxReturnPlugin*>(plugin) == nullptr
-                && dynamic_cast<te::AuxSendPlugin*>(plugin) == nullptr)
+                && dynamic_cast<te::AuxSendPlugin*>(plugin) == nullptr
+                && (dynamic_cast<te::ExternalPlugin*>(plugin) == nullptr
+                    || !dynamic_cast<te::ExternalPlugin*>(plugin)->isSynth()))
                 result.add(plugin);
         return result;
     }
@@ -8266,8 +10334,45 @@ private:
         selectInstrumentTrack();
     }
 
+    te::WaveAudioClip* findAudioClipAtBar(int trackIndex, int bar, int* startBarOut, int* lengthBarsOut) const
+    {
+        if (startBarOut != nullptr) *startBarOut = -1;
+        if (lengthBarsOut != nullptr) *lengthBarsOut = 1;
+        if (edit == nullptr || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
+            || project.getTrackKind(trackIndex) != ProjectDocument::TrackKind::audio
+            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return nullptr;
+        const auto tracks = getGeneratorTracks();
+        if (!juce::isPositiveAndBelow(trackIndex, tracks.size())) return nullptr;
+        const auto secondsPerBar = 60.0 / juce::jmax(20.0, project.getInitialTempoBpm()) * 4.0;
+        const auto barStart = bar * secondsPerBar;
+        const auto barEnd = barStart + secondsPerBar;
+        auto* track = tracks.getUnchecked(trackIndex);
+        for (int item = 0; item < track->getNumTrackItems(); ++item)
+            if (auto* clip = dynamic_cast<te::WaveAudioClip*>(track->getTrackItem(item)))
+            {
+                const auto range = clip->getEditTimeRange();
+                const auto clipStart = range.getStart().inSeconds();
+                const auto clipEnd = range.getEnd().inSeconds();
+                if (clipStart < barEnd && clipEnd > barStart)
+                {
+                    if (startBarOut != nullptr)
+                        *startBarOut = juce::jmax(0, static_cast<int>(std::floor(clipStart / secondsPerBar + 1.0e-6)));
+                    if (lengthBarsOut != nullptr)
+                        *lengthBarsOut = juce::jmax(1, static_cast<int>(std::ceil((clipEnd - clipStart) / secondsPerBar - 1.0e-6)));
+                    return clip;
+                }
+            }
+        return nullptr;
+    }
+
     juce::String getPlaylistClipLabel(int trackIndex, int bar) const
     {
+        if (!juce::isPositiveAndBelow(trackIndex, project.getTrackCount())) return {};
+        if (project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio && edit != nullptr)
+        {
+            if (auto* clip = findAudioClipAtBar(trackIndex, bar, nullptr, nullptr)) return clip->getName();
+            return {};
+        }
         const auto trackId = project.getTrackId(trackIndex);
         const auto patternId = project.getPlaylistPatternId(trackId, bar);
         const auto patternIndex = project.getPatternIndexForId(trackId, patternId);
@@ -8276,17 +10381,21 @@ private:
 
     std::vector<juce::Point<int>> getPlaylistPreviewNotes(int trackIndex, int bar) const
     {
-        std::vector<juce::Point<int>> notes;
         if (!juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
-            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return notes;
+            || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return {};
         const auto trackId = project.getTrackId(trackIndex);
         const auto patternIndex = project.getPatternIndexForId(trackId, project.getPlaylistPatternId(trackId, bar));
-        if (patternIndex < 0) return notes;
+        if (patternIndex < 0) return {};
+        const auto cacheKey = trackId + ":" + juce::String(patternIndex);
+        if (const auto found = playlistPreviewCache.find(cacheKey); found != playlistPreviewCache.end())
+            return found->second;
+        std::vector<juce::Point<int>> notes;
         const auto length = project.getPatternLengthSteps(trackId, patternIndex);
         for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
             for (int step = 0; step < length; ++step)
                 if (project.getPatternNote(trackId, patternIndex, pitch, step))
                     notes.emplace_back(step * 64 / juce::jmax(1, length), pitch - minimumPitch);
+        playlistPreviewCache.emplace(cacheKey, notes);
         return notes;
     }
 
@@ -8321,6 +10430,11 @@ private:
     {
         if (!hasProject || edit == nullptr || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
             || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return;
+        if (project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio)
+        {
+            importAudioFile(trackIndex, bar);
+            return;
+        }
         const auto trackId = project.getTrackId(trackIndex);
         // Use the current A1-H8 slot as the drawing tool on the clicked lane;
         // each destination generator retains its own note data for that slot.
@@ -8339,9 +10453,10 @@ private:
         if (createdPattern)
             project.setPatternCreated(trackId, patternIndex, true);
         project.setPlaylistClip(trackId, patternId, bar, 1, true);
-        rebuildPatternClip();
+        refreshEnginePlaylistClip(trackIndex, bar);
         isDirty = true;
         if (createdPattern) readPatternSteps();
+        if (playlistWindow != nullptr) playlistWindow->repaintGrid();
         status.setText("Drew " + project.getPatternName(trackId, patternIndex)
             + " in Playlist bar " + juce::String(bar + 1) + ".", juce::dontSendNotification);
     }
@@ -8350,6 +10465,11 @@ private:
     {
         if (!hasProject || edit == nullptr || trackIndex < 0 || trackIndex >= project.getTrackCount()) return;
         if (!juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return;
+        if (project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio)
+        {
+            importAudioFile(trackIndex, bar);
+            return;
+        }
         const auto trackId = project.getTrackId(trackIndex);
         const auto current = project.getPlaylistPatternId(trackId, bar);
         if (current.isNotEmpty())
@@ -8379,9 +10499,9 @@ private:
         if (patternId.isEmpty()) return;
         rememberUndo("Delete Playlist clip");
         project.setPlaylistClip(trackId, {}, bar, 1, false);
-        refreshEnginePlaylist();
+        refreshEnginePlaylistClip(trackIndex, bar);
         isDirty = true;
-        if (playlistWindow != nullptr) playlistWindow->refresh();
+        if (playlistWindow != nullptr) playlistWindow->repaintGrid();
         status.setText("Deleted the Playlist clip at bar " + juce::String(bar + 1) + ". Save to keep the change.",
                        juce::dontSendNotification);
     }
@@ -8402,9 +10522,9 @@ private:
         trackSelector.setSelectedId(trackIndex + 1, juce::sendNotificationSync);
         selectPatternBank(patternIndex / ProjectDocument::patternsPerBank);
         selectPatternSlot(patternIndex % ProjectDocument::patternsPerBank);
-        rebuildPatternClip();
+        refreshEnginePlaylistClip(trackIndex, bar);
         isDirty = true;
-        if (playlistWindow != nullptr) playlistWindow->refresh();
+        if (playlistWindow != nullptr) playlistWindow->repaintGrid();
         status.setText("Selected " + project.getPatternName(trackId, patternIndex)
                            + " for Playlist bar " + juce::String(bar + 1) + ".", juce::dontSendNotification);
     }
@@ -8455,9 +10575,129 @@ private:
         setPlaylistPattern(trackIndex, bar, available[static_cast<size_t>(position)]);
     }
 
+    void showPlaylistAudioContextMenu(int trackIndex, int bar, juce::Component* target)
+    {
+        if (!hasProject || edit == nullptr || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
+            || project.getTrackKind(trackIndex) != ProjectDocument::TrackKind::audio) return;
+        int clipStartBar = -1;
+        int clipLengthBars = 1;
+        auto* clip = bar >= 0 ? findAudioClipAtBar(trackIndex, bar, &clipStartBar, &clipLengthBars) : nullptr;
+        const auto trackId = project.getTrackId(trackIndex);
+        juce::PopupMenu menu;
+        menu.addItem(9201, clip != nullptr ? "Replace / Import Audio File…" : "Open / Import Audio File…");
+        if (clip != nullptr)
+        {
+            menu.addItem(9202, "Rename Audio Clip…");
+            menu.addItem(9203, "Delete Audio Clip");
+        }
+        menu.addSeparator();
+        menu.addItem(9204, "Rename Audio Track…");
+        menu.addItem(9205, "Delete Audio Track…");
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(target != nullptr ? target : playlistWindow.get()),
+            [this, trackId, clipStartBar, bar](int result)
+            {
+                auto findTrackIndex = [this, trackId]
+                {
+                    for (int i = 0; i < project.getTrackCount(); ++i)
+                        if (project.getTrackId(i) == trackId) return i;
+                    return -1;
+                };
+                const auto row = findTrackIndex();
+                if (!juce::isPositiveAndBelow(row, project.getTrackCount())) return;
+                auto findClip = [this, row, clipStartBar, bar]() -> te::WaveAudioClip*
+                {
+                    const auto targetBar = clipStartBar >= 0 ? clipStartBar : bar;
+                    return targetBar >= 0 ? findAudioClipAtBar(row, targetBar, nullptr, nullptr) : nullptr;
+                };
+                if (result == 9201)
+                {
+                    const auto importBar = clipStartBar >= 0 ? clipStartBar : juce::jmax(0, bar);
+                    importAudioFile(row, importBar);
+                    return;
+                }
+                if (result == 9202)
+                {
+                    auto* audioClip = findClip();
+                    if (audioClip == nullptr) return;
+                    juce::AlertWindow dialog("Rename Audio Clip", "Enter a new clip name.", juce::MessageBoxIconType::NoIcon);
+                    dialog.addTextEditor("name", audioClip->getName());
+                    dialog.addButton("Rename", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
+                    dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
+                    if (dialog.runModalLoop() != 1) return;
+                    const auto name = dialog.getTextEditorContents("name").trim();
+                    if (name.isEmpty()) return;
+                    rememberUndo("Rename audio clip");
+                    audioClip->setName(name);
+                    isDirty = true;
+                    if (playlistWindow != nullptr) playlistWindow->refresh();
+                    status.setText("Renamed audio clip. Save to keep the change.", juce::dontSendNotification);
+                    return;
+                }
+                if (result == 9203)
+                {
+                    auto* audioClip = findClip();
+                    if (audioClip == nullptr) return;
+                    rememberUndo("Delete audio clip");
+                    audioClip->removeFromParent();
+                    edit->restartPlayback();
+                    isDirty = true;
+                    if (playlistWindow != nullptr) playlistWindow->refresh();
+                    status.setText("Deleted audio clip. Save to keep the change.", juce::dontSendNotification);
+                    return;
+                }
+                if (result == 9204)
+                {
+                    juce::AlertWindow dialog("Rename Audio Track", "Enter a new track name.", juce::MessageBoxIconType::NoIcon);
+                    dialog.addTextEditor("name", project.getTrackName(row));
+                    dialog.addButton("Rename", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
+                    dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
+                    if (dialog.runModalLoop() != 1) return;
+                    const auto name = dialog.getTextEditorContents("name").trim();
+                    if (name.isEmpty()) return;
+                    rememberUndo("Rename audio track");
+                    project.setTrackName(row, name);
+                    const auto tracks = getGeneratorTracks();
+                    if (juce::isPositiveAndBelow(row, tracks.size())) tracks.getUnchecked(row)->setName(name);
+                    isDirty = true;
+                    refreshTrackSelector();
+                    if (playlistWindow != nullptr) playlistWindow->refresh();
+                    status.setText("Renamed audio track. Save to keep the change.", juce::dontSendNotification);
+                    return;
+                }
+                if (result == 9205)
+                {
+                    const auto name = project.getTrackName(row);
+                    juce::AlertWindow dialog("Delete Audio Track", "Delete " + name + " and all of its audio clips?",
+                                             juce::MessageBoxIconType::NoIcon);
+                    dialog.addButton("Delete", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
+                    dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
+                    if (dialog.runModalLoop() != 1) return;
+                    const auto tracks = getGeneratorTracks();
+                    if (!juce::isPositiveAndBelow(row, tracks.size())) return;
+                    rememberUndo("Delete audio track");
+                    auto* removedTrack = tracks.getUnchecked(row);
+                    if (instrumentTrack == removedTrack) instrumentTrack = nullptr;
+                    edit->deleteTrack(removedTrack);
+                    project.removeTrack(row);
+                    findFirstInstrumentTrack();
+                    refreshTrackSelector();
+                    refreshMixerControls();
+                    refreshEnginePlaylist();
+                    updateActiveInstrumentEditor();
+                    isDirty = true;
+                    refreshProjectView("Deleted " + name + ". Save to keep the change.");
+                }
+            });
+    }
+
     void showPlaylistTrackContextMenu(int sourceIndex, juce::Component* target)
     {
         if (!hasProject || !juce::isPositiveAndBelow(sourceIndex, project.getTrackCount())) return;
+        if (project.getTrackKind(sourceIndex) == ProjectDocument::TrackKind::audio)
+        {
+            showPlaylistAudioContextMenu(sourceIndex, -1, target);
+            return;
+        }
         const auto sourceTrackId = project.getTrackId(sourceIndex);
         juce::PopupMenu menu, cloneMenu, colourMenu;
         std::vector<juce::String> destinations;
@@ -8639,6 +10879,58 @@ private:
             || (sourceBar == destinationBar && trackIndex == destinationTrackIndex))
             return;
 
+        if (project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio)
+        {
+            if (project.getTrackKind(destinationTrackIndex) != ProjectDocument::TrackKind::audio)
+            {
+                status.setText("Audio clips can only be moved to another audio track.", juce::dontSendNotification);
+                return;
+            }
+            int clipStartBar = -1;
+            int clipLengthBars = 1;
+            auto* clip = findAudioClipAtBar(trackIndex, sourceBar, &clipStartBar, &clipLengthBars);
+            const auto tracks = getGeneratorTracks();
+            if (clip == nullptr || !juce::isPositiveAndBelow(trackIndex, tracks.size())
+                || !juce::isPositiveAndBelow(destinationTrackIndex, tracks.size())) return;
+            const int newStartBar = destinationBar - (sourceBar - clipStartBar);
+            if (newStartBar < 0 || newStartBar + clipLengthBars > PlaylistGrid::barCount)
+            {
+                status.setText("Move canceled. The audio clip would extend outside the Playlist grid.", juce::dontSendNotification);
+                return;
+            }
+            auto* destinationTrack = tracks.getUnchecked(destinationTrackIndex);
+            if (destinationTrackIndex != trackIndex)
+            {
+                const auto secondsPerBar = 60.0 / juce::jmax(20.0, project.getInitialTempoBpm()) * 4.0;
+                const auto start = newStartBar * secondsPerBar;
+                const auto end = start + clip->getEditTimeRange().getLength().inSeconds();
+                for (int i = 0; i < destinationTrack->getNumTrackItems(); ++i)
+                    if (auto* other = dynamic_cast<te::WaveAudioClip*>(destinationTrack->getTrackItem(i));
+                        other != nullptr)
+                    {
+                        const auto range = other->getEditTimeRange();
+                        if (range.getStart().inSeconds() < end && range.getEnd().inSeconds() > start)
+                        {
+                            status.setText("Move canceled. The destination audio lane already has a clip there.",
+                                           juce::dontSendNotification);
+                            return;
+                        }
+                    }
+            }
+            rememberUndo("Move audio clip");
+            if (destinationTrackIndex != trackIndex && !clip->moveTo(*destinationTrack))
+            {
+                status.setText("Move canceled. Tracktion Engine could not move the audio clip.", juce::dontSendNotification);
+                return;
+            }
+            const auto secondsPerBar = 60.0 / juce::jmax(20.0, project.getInitialTempoBpm()) * 4.0;
+            clip->setStart(tracktion::TimePosition::fromSeconds(newStartBar * secondsPerBar), true, true);
+            edit->restartPlayback();
+            isDirty = true;
+            refreshProjectView("Moved audio clip to Playlist bar " + juce::String(newStartBar + 1) + ".");
+            return;
+        }
+
         const auto trackId = project.getTrackId(trackIndex);
         const auto patternId = project.getPlaylistPatternId(trackId, sourceBar);
         if (patternId.isEmpty()) return;
@@ -8701,7 +10993,8 @@ private:
         }
         project.setPlaylistClip(trackId, {}, sourceBar, 1, false);
         project.setPlaylistClip(destinationTrackId, destinationPatternId, destinationBar, 1, true);
-        rebuildPatternClip();
+        refreshEnginePlaylistClip(trackIndex, sourceBar);
+        refreshEnginePlaylistClip(destinationTrackIndex, destinationBar);
         isDirty = true;
         const auto destinationPattern = project.getPatternIndexForId(destinationTrackId, destinationPatternId);
         const juce::String name = destinationPattern >= 0 ? project.getPatternName(destinationTrackId, destinationPattern) : juce::String("pattern");
@@ -8777,7 +11070,6 @@ private:
             if (project.getTrackSelectedPatternIndex(trackId) != patternIndex)
             {
                 project.setTrackSelectedPatternIndex(trackId, patternIndex);
-                isDirty = true;
             }
             if (trackIndex == activeGeneratorIndex)
             {
@@ -8842,8 +11134,12 @@ private:
                 for (int bar = 0; bar < PlaylistGrid::barCount; ++bar)
                     hasPlaylistContent |= project.getPlaylistPatternId(project.getTrackId(trackIndex), bar).isNotEmpty();
             if (!hasPlaylistContent)
+                for (auto* track : getGeneratorTracks())
+                    for (int item = 0; item < track->getNumTrackItems() && !hasPlaylistContent; ++item)
+                        hasPlaylistContent = dynamic_cast<te::WaveAudioClip*>(track->getTrackItem(item)) != nullptr;
+            if (!hasPlaylistContent)
             {
-                status.setText("Song mode: place one or more pattern clips in the Playlist before playback.",
+                status.setText("Song mode: place pattern clips or import audio into the Playlist before playback.",
                                juce::dontSendNotification);
                 return;
             }
@@ -9128,9 +11424,11 @@ private:
         if (project.getTrackSelectedPatternIndex(trackId) != patternIndex)
         {
             project.setTrackSelectedPatternIndex(trackId, patternIndex);
-            isDirty = true;
         }
         readPatternSteps();
+        if (drumRackWindow != nullptr && drumRackTrackId == trackId)
+            for (int pad = 0; pad < 16; ++pad)
+                drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, patternIndex, pad));
         if (auditionPatternPlayback && edit->getTransport().isPlaying())
             refreshEnginePlaylist();
         status.setText(hasPattern ? "Selected pattern. Click Playlist to place it, or edit its notes in Piano Roll."
@@ -9239,7 +11537,7 @@ private:
         const auto selected = tracks.indexOf(instrumentTrack);
         trackSelector.setSelectedId(selected >= 0 ? selected + 1 : 0, juce::dontSendNotification);
         trackSelector.setEnabled(!tracks.isEmpty());
-        trackSelector.setVisible(!tracks.isEmpty());
+        trackSelector.setVisible(false);
         for (auto& button : patternBankButtons) button->setEnabled(instrumentTrack != nullptr);
         for (auto& button : patternSlotButtons) button->setEnabled(instrumentTrack != nullptr);
         refreshingTrackSelector = false;
@@ -9325,7 +11623,6 @@ private:
                 if (project.getTrackSelectedPatternIndex(previousTrackId) != selectedPatternIndex())
                 {
                     project.setTrackSelectedPatternIndex(previousTrackId, selectedPatternIndex());
-                    isDirty = true;
                 }
             }
         }
@@ -9343,7 +11640,7 @@ private:
         {
             generatorCollapsed = false;
             if (!expandedGeneratorBounds.isEmpty()) generatorPanelBounds = expandedGeneratorBounds;
-            generatorCollapseButton.setButtonText("−");
+            generatorCollapseButton.setKind(PlaylistWindowIconButton::Kind::minimize);
         }
         if (generatorPanelBounds.isEmpty())
             generatorPanelBounds = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(50).reduced(14, 10)
@@ -9358,7 +11655,7 @@ private:
         updateActiveInstrumentEditor();
         readPatternSteps();
         refreshPianoRollAutomationTargets();
-        trackSelector.setVisible(true);
+        trackSelector.setVisible(false);
         refreshMixerControls();
         if (playlistWindow != nullptr) playlistWindow->refresh();
         updateGeneratorDockSelection();
@@ -9443,6 +11740,7 @@ private:
         playlistButton.setEnabled(ready);
         mixerButton.setEnabled(ready);
         masterButton.setEnabled(ready);
+        masterVolumeKnob.setEnabled(ready);
         tempoLabel.setEnabled(ready);
         tempoSlider.setEnabled(ready);
         stopButton.setEnabled(ready);
@@ -9453,6 +11751,7 @@ private:
         if (ready)
         {
             tempoSlider.setValue(project.getInitialTempoBpm(), juce::dontSendNotification);
+            masterVolumeKnob.setValue(getMasterGainDb(), juce::dontSendNotification);
             loopStartSlider.setValue(project.getLoopStartBar(), juce::dontSendNotification);
             loopLengthSlider.setValue(project.getLoopLengthBars(), juce::dontSendNotification);
             loopButton.setToggleState(project.isLoopEnabled(), juce::dontSendNotification);
@@ -9465,6 +11764,8 @@ private:
             {
                 const auto tracks = getGeneratorTracks();
                 mixerWindow->refresh(tracks.indexOf(instrumentTrack));
+                if (mixerWindow->isVisible() && !mixerWindow->isMaximized() && !mixerWindow->isMinimized())
+                    fitMixerWidthToStrips();
             }
         }
         playButton.setEnabled(ready && instrumentTrack != nullptr);
@@ -9504,6 +11805,7 @@ private:
     te::LevelMeterPlugin* trackMeter = nullptr;
     te::LevelMeasurer::Client trackMeterClient;
     ProjectDocument project;
+    mutable std::map<juce::String, std::vector<juce::Point<int>>> playlistPreviewCache;
     bool hasProject = false;
     bool isDirty = false;
     bool pianoRollGestureActive = false;
@@ -9540,15 +11842,16 @@ private:
     juce::Slider levelSlider, panSlider;
     juce::Slider tempoSlider;
     juce::Slider loopStartSlider, loopLengthSlider;
+    juce::Slider masterVolumeKnob;
     OrbitAuditionKeyboard auditionKeyboard;
     juce::Label title, status, projectDetails, musicalDetails, audioDetails, patternTitle,
                 arrangementTitle, mixerTitle, levelLabel, panLabel, meterStatus, buildLabel, tempoLabel,
-                loopStartLabel, loopLengthLabel, timeSignatureLabel;
+                loopStartLabel, loopLengthLabel, timeSignatureLabel, barLabel, barReadoutLabel;
     GeneratorDragLabel generatorDragHandle;
     GeneratorResizeHandle generatorResizeHandle;
     MixerMoveHandle mixerMoveHandle;
     GeneratorResizeHandle mixerResizeHandle { "Resize mixer" };
-    juce::TextButton generatorCollapseButton;
+    PlaylistWindowIconButton generatorCollapseButton { PlaylistWindowIconButton::Kind::minimize };
     juce::Viewport generatorDockViewport;
     juce::Component generatorDockStrip;
     std::vector<std::unique_ptr<juce::TextButton>> generatorDockButtons;
@@ -9572,15 +11875,19 @@ private:
     std::unique_ptr<PlaylistWindow> playlistWindow;
     std::unique_ptr<MixerWindow> mixerWindow;
     std::unique_ptr<PianoRollWindow> pianoRollWindow;
+    std::unique_ptr<DrumRackWindow> drumRackWindow;
+    juce::String drumRackTrackId;
     std::unique_ptr<te::Plugin::EditorComponent> activeInstrumentEditor;
     std::unique_ptr<EqualiserWindow> equaliserWindow;
     juce::Rectangle<int> generatorPanelBounds, generatorInstrumentBounds, generatorResizeStart;
     juce::Rectangle<int> pianoRollBounds;
     juce::Point<int> generatorDragOffset, generatorDragStart, generatorDragStartPosition;
-    juce::Rectangle<int> mixerPanelBounds, mixerResizeStartBounds;
+    juce::Rectangle<int> playlistPanelBounds, playlistRestoreBounds, playlistResizeStartBounds;
+    juce::Rectangle<int> mixerPanelBounds, mixerRestoreBounds, mixerResizeStartBounds;
     juce::Point<int> mixerDragOffset, mixerResizeStart;
     bool draggingGenerator = false, resizingGenerator = false, playlistPaintGestureActive = false;
-    bool mixerBoundsInitialised = false, draggingMixer = false, resizingMixer = false;
+    bool playlistBoundsInitialised = false, mixerBoundsInitialised = false;
+    bool mixerMaximized = false, draggingMixer = false, resizingMixer = false;
     bool showHints = true;
 };
 
@@ -9605,7 +11912,7 @@ class OrbitApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override { return "Orbit"; }
-    const juce::String getApplicationVersion() override { return "0.3.79"; }
+    const juce::String getApplicationVersion() override { return "0.3.110"; }
     void initialise(const juce::String&) override
     {
         installOrbitCrashReportHandler();
