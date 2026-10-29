@@ -1,0 +1,384 @@
+diff --git a/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.cpp b/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.cpp
+index fd8ca6f..be6c91d 100644
+--- a/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.cpp
++++ b/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.cpp
+@@ -27,23 +27,37 @@ public:
+                  const juce::AudioBuffer<float>& data,
+                  int lengthInSamples,
+                  float gainDb,
++                 float trackLevelDb,
+                  float pan,
+-                 bool openEnded_)
++                 float velocitySensitivity,
++                 float velocityTune,
++                 float velocityOffset,
++                 float releaseMs,
++                 bool openEnded_,
++                 bool looping_)
+        : note (midiNote),
+          offset (-sampleDelayFromBufferStart),
++         sampleStartOffset (juce::roundToInt ((1.0f - velocity) * juce::jlimit (0.0f, 1.0f, velocityOffset)
++                                              * juce::jmax (0, lengthInSamples - 1))),
++         noteOnSampleOffset (sampleDelayFromBufferStart),
+          audioData (data),
+-         openEnded (openEnded_)
++         openEnded (openEnded_),
++         looping (looping_),
++         loopLengthSamples (lengthInSamples)
+     {
+         resampler[0].reset();
+         resampler[1].reset();
+ 
+-        const float volumeSliderPos = decibelsToVolumeFaderPosition (gainDb - (20.0f * (1.0f - velocity)));
++        const float velocityGain = 20.0f * juce::jlimit (0.0f, 2.0f, velocitySensitivity) * (1.0f - velocity);
++        const float volumeSliderPos = decibelsToVolumeFaderPosition (gainDb + trackLevelDb - velocityGain);
+         getGainsFromVolumeFaderPositionAndPan (volumeSliderPos, pan, getDefaultPanLaw(), gains[0], gains[1]);
+ 
+-        const double hz = juce::MidiMessage::getMidiNoteInHertz (midiNote);
++        const double hz = juce::MidiMessage::getMidiNoteInHertz (midiNote + velocityTune * velocity);
+         playbackRatio = hz / juce::MidiMessage::getMidiNoteInHertz (keyNote);
+         playbackRatio *= file.getSampleRate() / sampleRate;
+-        samplesLeftToPlay = playbackRatio > 0 ? (1 + (int) (lengthInSamples / playbackRatio)) : 0;
++        samplesLeftToPlay = looping ? 0x3fffffff
++                                    : (playbackRatio > 0 ? (1 + (int) ((lengthInSamples - sampleStartOffset) / playbackRatio)) : 0);
++        releaseSamples = juce::jmax (1, juce::roundToInt (sampleRate * juce::jlimit (0.0f, 3000.0f, releaseMs) / 1000.0f));
+     }
+ 
+     void addNextBlock (juce::AudioBuffer<float>& outBuffer, int startSamp, int numSamples)
+@@ -58,25 +72,54 @@ public:
+             offset += num;
+         }
+ 
++        if (offset >= 0 && ! hasStartedRendering)
++            offset += sampleStartOffset;
++
+         auto numSamps = std::min (numSamples, samplesLeftToPlay);
+ 
+         if (numSamps > 0)
+         {
+-            int numUsed = 0;
++            if (looping)
++            {
++                auto remaining = numSamps;
++                auto destination = startSamp;
++                while (remaining > 0)
++                {
++                    if (offset >= loopLengthSamples)
++                    {
++                        offset = 0;
++                        resampler[0].reset();
++                        resampler[1].reset();
++                    }
+ 
+-            for (int i = std::min (2, outBuffer.getNumChannels()); --i >= 0;)
++                    const auto sourceRemaining = loopLengthSamples - offset;
++                    const auto safeOutput = juce::jmax (1, juce::roundToInt ((sourceRemaining + 16.0) / playbackRatio));
++                    const auto chunk = juce::jmin (remaining, safeOutput);
++                    int numUsed = 0;
++                    for (int i = std::min (2, outBuffer.getNumChannels()); --i >= 0;)
++                        numUsed = resampler[i].processAdding (playbackRatio,
++                            audioData.getReadPointer (std::min (i, audioData.getNumChannels() - 1), offset),
++                            outBuffer.getWritePointer (i, destination), chunk, gains[i]);
++
++                    if (numUsed <= 0) break;
++                    offset += numUsed;
++                    destination += chunk;
++                    remaining -= chunk;
++                    samplesLeftToPlay -= chunk;
++                }
++                numSamps -= remaining;
++            }
++            else
+             {
+-                numUsed = resampler[i]
+-                            .processAdding (playbackRatio,
+-                                            audioData.getReadPointer (std::min (i, audioData.getNumChannels() - 1), offset),
+-                                            outBuffer.getWritePointer (i, startSamp),
+-                                            numSamps,
+-                                            gains[i]);
++                int numUsed = 0;
++                for (int i = std::min (2, outBuffer.getNumChannels()); --i >= 0;)
++                    numUsed = resampler[i].processAdding (playbackRatio,
++                        audioData.getReadPointer (std::min (i, audioData.getNumChannels() - 1), offset),
++                        outBuffer.getWritePointer (i, startSamp), numSamps, gains[i]);
++                offset += numUsed;
++                samplesLeftToPlay -= numSamps;
+             }
+ 
+-            offset += numUsed;
+-            samplesLeftToPlay -= numSamps;
+-
+             jassert (offset <= audioData.getNumSamples());
+         }
+ 
+@@ -86,15 +129,8 @@ public:
+             numSamps = numSamples - numSamps;
+             float endFade;
+ 
+-            if (numSamps > 100)
+-            {
+-                endFade = 0.0f;
+-                numSamps = 100;
+-            }
+-            else
+-            {
+-                endFade = std::max (0.0f, startFade - numSamps * 0.01f);
+-            }
++            numSamps = juce::jmin (numSamps, releaseSamples);
++            endFade = std::max (0.0f, startFade - static_cast<float> (numSamps) / releaseSamples);
+ 
+             const int numSampsNeeded = 2 + juce::roundToInt ((numSamps + 2) * playbackRatio);
+             AudioScratchBuffer scratch (audioData.getNumChannels(), numSampsNeeded + 8);
+@@ -128,17 +164,24 @@ public:
+             if (startFade <= 0.0f)
+                 isFinished = true;
+         }
++
++        hasStartedRendering = true;
+     }
+ 
+     juce::LagrangeInterpolator resampler[2];
+     int note;
+     int offset, samplesLeftToPlay = 0;
++    int sampleStartOffset = 0;
++    int noteOnSampleOffset = 0;
+     float gains[2];
+     double playbackRatio = 1.0;
+     const juce::AudioBuffer<float>& audioData;
+     float lastVals[4] = { 0, 0, 0, 0 };
+     float startFade = 1.0f;
+     bool openEnded, isFinished = false;
++    bool looping = false;
++    bool hasStartedRendering = false;
++    int loopLengthSamples = 0, releaseSamples = 1;
+ 
+ private:
+     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SampledNote)
+@@ -187,6 +230,14 @@ void SamplerPlugin::handleAsyncUpdate()
+             s->maxNote      = juce::jlimit (0, 127, static_cast<int> (v[IDs::maxNote]));
+             s->pan          = juce::jlimit (-1.0f, 1.0f, static_cast<float> (v[IDs::pan]));
+             s->openEnded    = v[IDs::openEnded];
++            s->looping      = static_cast<bool> (v.getProperty (juce::Identifier ("orbitLooping"), false));
++            s->velocitySensitivity = juce::jlimit (0.0f, 2.0f, static_cast<float> (v.getProperty (juce::Identifier ("orbitVelocitySensitivity"), 1.0f)));
++            s->velocityTune = juce::jlimit (-24.0f, 24.0f, static_cast<float> (v.getProperty (juce::Identifier ("orbitVelocityTune"), 0.0f)));
++            s->velocityOffset = juce::jlimit (0.0f, 1.0f, static_cast<float> (v.getProperty (juce::Identifier ("orbitVelocityOffset"), 0.0f)));
++            s->releaseMs = juce::jlimit (0.0f, 3000.0f, static_cast<float> (v.getProperty (juce::Identifier ("orbitReleaseMs"), 10.0f)));
++            s->cutoffHz = juce::jlimit (20.0f, 20000.0f, static_cast<float> (v.getProperty (juce::Identifier ("orbitCutoffHz"), 20000.0f)));
++            s->trackLevelDb = juce::jlimit (-48.0f, 24.0f, static_cast<float> (v.getProperty (juce::Identifier ("orbitTrackLevelDb"), 0.0f)));
++            s->applyCutoffToAudioData();
+ 
+             newSounds.add (s);
+         }
+@@ -198,7 +249,8 @@ void SamplerPlugin::handleAsyncUpdate()
+         {
+             if (s->source == newSound->source
+                 && s->startTime == newSound->startTime
+-                && s->length == newSound->length)
++                && s->length == newSound->length
++                && s->cutoffHz == newSound->cutoffHz)
+             {
+                 newSound->audioFile = s->audioFile;
+                 newSound->fileStartSample = s->fileStartSample;
+@@ -252,6 +304,7 @@ void SamplerPlugin::playNotes (const juce::BigInteger& keysDown)
+                 {
+                     if (ss->minNote <= note
+                          && ss->maxNote >= note
++                         && ss->fileLengthSamples > 0
+                          && ss->audioData.getNumSamples() > 0
+                          && (! ss->audioFile.isNull())
+                          && playingNotes.size() < maximumSimultaneousNotes)
+@@ -265,8 +318,14 @@ void SamplerPlugin::playNotes (const juce::BigInteger& keysDown)
+                                                            ss->audioData,
+                                                            ss->fileLengthSamples,
+                                                            ss->gainDb,
++                                                           ss->trackLevelDb,
+                                                            ss->pan,
+-                                                           ss->openEnded));
++                                                           ss->velocitySensitivity,
++                                                           ss->velocityTune,
++                                                           ss->velocityOffset,
++                                                           ss->releaseMs,
++                                                           ss->openEnded,
++                                                           ss->looping));
+                     }
+                 }
+             }
+@@ -314,7 +373,8 @@ void SamplerPlugin::applyToBuffer (const PluginRenderContext& fc)
+                         {
+                             playingNote->samplesLeftToPlay = std::min (playingNote->samplesLeftToPlay,
+                                                                        std::max (minimumSamplesToPlayWhenStopping,
+-                                                                                 noteTimeSample));
++                                                                           noteTimeSample - (playingNote->hasStartedRendering ? 0
++                                                                                                                              : playingNote->noteOnSampleOffset)));
+                             highlightedNotes.clearBit (note);
+                         }
+                     }
+@@ -323,6 +383,7 @@ void SamplerPlugin::applyToBuffer (const PluginRenderContext& fc)
+                     {
+                         if (ss->minNote <= note
+                             && ss->maxNote >= note
++                            && ss->fileLengthSamples > 0
+                             && ss->audioData.getNumSamples() > 0
+                             && playingNotes.size() < maximumSimultaneousNotes)
+                         {
+@@ -337,8 +398,14 @@ void SamplerPlugin::applyToBuffer (const PluginRenderContext& fc)
+                                                                ss->audioData,
+                                                                ss->fileLengthSamples,
+                                                                ss->gainDb,
++                                                               ss->trackLevelDb,
+                                                                ss->pan,
+-                                                               ss->openEnded));
++                                                               ss->velocitySensitivity,
++                                                               ss->velocityTune,
++                                                               ss->velocityOffset,
++                                                               ss->releaseMs,
++                                                               ss->openEnded,
++                                                               ss->looping));
+                         }
+                     }
+                 }
+@@ -353,7 +420,8 @@ void SamplerPlugin::applyToBuffer (const PluginRenderContext& fc)
+                         {
+                             playingNote->samplesLeftToPlay = std::min (playingNote->samplesLeftToPlay,
+                                                                        std::max (minimumSamplesToPlayWhenStopping,
+-                                                                                 noteTimeSample));
++                                                                           noteTimeSample - (playingNote->hasStartedRendering ? 0
++                                                                                                                              : playingNote->noteOnSampleOffset)));
+ 
+                             highlightedNotes.clearBit (note);
+                         }
+@@ -444,8 +512,15 @@ int SamplerPlugin::getMinKey (int index) const              { return getSound (i
+ int SamplerPlugin::getMaxKey (int index) const              { return getSound (index)[IDs::maxNote]; }
+ float SamplerPlugin::getSoundGainDb (int index) const       { return getSound (index)[IDs::gainDb]; }
+ float SamplerPlugin::getSoundPan (int index) const          { return getSound (index)[IDs::pan]; }
++float SamplerPlugin::getSoundCutoffHz (int index) const      { return getSound (index).getProperty (juce::Identifier ("orbitCutoffHz"), 20000.0f); }
++float SamplerPlugin::getSoundTrackLevelDb (int index) const  { return getSound (index).getProperty (juce::Identifier ("orbitTrackLevelDb"), 0.0f); }
+ double SamplerPlugin::getSoundStartTime (int index) const   { return getSound (index)[IDs::startTime]; }
+ bool SamplerPlugin::isSoundOpenEnded (int index) const      { return getSound (index)[IDs::openEnded]; }
++bool SamplerPlugin::isSoundLooping (int index) const        { return getSound (index).getProperty (juce::Identifier ("orbitLooping"), false); }
++float SamplerPlugin::getSoundVelocitySensitivity (int index) const { return getSound (index).getProperty (juce::Identifier ("orbitVelocitySensitivity"), 1.0f); }
++float SamplerPlugin::getSoundVelocityTune (int index) const { return getSound (index).getProperty (juce::Identifier ("orbitVelocityTune"), 0.0f); }
++float SamplerPlugin::getSoundVelocityOffset (int index) const { return getSound (index).getProperty (juce::Identifier ("orbitVelocityOffset"), 0.0f); }
++float SamplerPlugin::getSoundReleaseMs (int index) const { return getSound (index).getProperty (juce::Identifier ("orbitReleaseMs"), 10.0f); }
+ 
+ double SamplerPlugin::getSoundLength (int index) const
+ {
+@@ -513,6 +588,16 @@ void SamplerPlugin::setSoundGains (int index, float gainDb, float pan)
+     v.setProperty (IDs::pan,    juce::jlimit (-1.0f,  1.0f,  pan), um);
+ }
+ 
++void SamplerPlugin::setSoundCutoffHz (int index, float cutoffHz)
++{
++    getSound (index).setProperty (juce::Identifier ("orbitCutoffHz"), juce::jlimit (20.0f, 20000.0f, cutoffHz), getUndoManager());
++}
++
++void SamplerPlugin::setSoundTrackLevelDb (int index, float levelDb)
++{
++    getSound (index).setProperty (juce::Identifier ("orbitTrackLevelDb"), juce::jlimit (-48.0f, 24.0f, levelDb), getUndoManager());
++}
++
+ void SamplerPlugin::setSoundExcerpt (int index, double start, double length)
+ {
+     auto um = getUndoManager();
+@@ -530,6 +615,25 @@ void SamplerPlugin::setSoundOpenEnded (int index, bool b)
+     v.setProperty (IDs::openEnded, b, um);
+ }
+ 
++void SamplerPlugin::setSoundLooping (int index, bool b)
++{
++    getSound (index).setProperty (juce::Identifier ("orbitLooping"), b, getUndoManager());
++}
++
++void SamplerPlugin::setSoundVelocityParams (int index, float sensitivity, float tuneSemitones, float startOffset)
++{
++    auto sound = getSound (index);
++    auto undo = getUndoManager();
++    sound.setProperty (juce::Identifier ("orbitVelocitySensitivity"), juce::jlimit (0.0f, 2.0f, sensitivity), undo);
++    sound.setProperty (juce::Identifier ("orbitVelocityTune"), juce::jlimit (-24.0f, 24.0f, tuneSemitones), undo);
++    sound.setProperty (juce::Identifier ("orbitVelocityOffset"), juce::jlimit (0.0f, 1.0f, startOffset), undo);
++}
++
++void SamplerPlugin::setSoundReleaseMs (int index, float releaseMs)
++{
++    getSound (index).setProperty (juce::Identifier ("orbitReleaseMs"), juce::jlimit (0.0f, 3000.0f, releaseMs), getUndoManager());
++}
++
+ void SamplerPlugin::setSoundMedia (int index, const juce::String& source)
+ {
+     auto v = getSound (index);
+@@ -708,6 +812,24 @@ void SamplerPlugin::SamplerSound::refreshFile()
+ {
+     audioFile = AudioFile (owner.edit.engine);
+     setExcerpt (startTime, length);
++    applyCutoffToAudioData();
++}
++
++void SamplerPlugin::SamplerSound::applyCutoffToAudioData()
++{
++    const auto safeCutoff = juce::jlimit (20.0f, 20000.0f, cutoffHz);
++    if (! audioFile.isValid() || audioData.getNumSamples() <= 0
++        || safeCutoff >= static_cast<float> (audioFile.getSampleRate() * 0.49))
++        return;
++
++    const auto coefficients = juce::IIRCoefficients::makeLowPass (audioFile.getSampleRate(), safeCutoff);
++    for (int channel = audioData.getNumChannels(); --channel >= 0;)
++    {
++        juce::SingleThreadedIIRFilter filter;
++        filter.setCoefficients (coefficients);
++        filter.reset();
++        filter.processSamples (audioData.getWritePointer (channel), fileLengthSamples);
++    }
+ }
+ 
+ }} // namespace tracktion { inline namespace engine
+diff --git a/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.h b/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.h
+index d283880..8c37a4a 100644
+--- a/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.h
++++ b/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.h
+@@ -29,7 +29,14 @@ public:
+     int getMaxKey (int index) const;
+     float getSoundGainDb (int index) const;
+     float getSoundPan (int index) const;
++    float getSoundCutoffHz (int index) const;
++    float getSoundTrackLevelDb (int index) const;
+     bool isSoundOpenEnded (int index) const;
++    bool isSoundLooping (int index) const;
++    float getSoundVelocitySensitivity (int index) const;
++    float getSoundVelocityTune (int index) const;
++    float getSoundVelocityOffset (int index) const;
++    float getSoundReleaseMs (int index) const;
+     double getSoundStartTime (int index) const;
+     double getSoundLength (int index) const;
+     void setSoundExcerpt (int index, double start, double length);
+@@ -40,7 +47,12 @@ public:
+     void removeSound (int index);
+     void setSoundParams (int index, int keyNote, int minNote, int maxNote);
+     void setSoundGains (int index, float gainDb, float pan);
++    void setSoundCutoffHz (int index, float cutoffHz);
++    void setSoundTrackLevelDb (int index, float levelDb);
+     void setSoundOpenEnded (int index, bool isOpenEnded);
++    void setSoundLooping (int index, bool isLooping);
++    void setSoundVelocityParams (int index, float sensitivity, float tuneSemitones, float startOffset);
++    void setSoundReleaseMs (int index, float releaseMs);
+     void setSoundMedia (int index, const juce::String& sourcePathOrProjectID);
+ 
+     void playNotes (const juce::BigInteger& keysDown);
+@@ -81,6 +93,7 @@ public:
+ 
+         void setExcerpt (double startTime, double length);
+         void refreshFile();
++        void applyCutoffToAudioData();
+ 
+         SamplerPlugin& owner;
+         juce::String source;
+@@ -88,7 +101,10 @@ public:
+         int keyNote = -1, minNote = 0, maxNote = 0;
+         int fileStartSample = 0, fileLengthSamples = 0;
+         bool openEnded = false;
++    bool looping = false;
+         float gainDb = 0, pan = 0;
++    float velocitySensitivity = 1.0f, velocityTune = 0, velocityOffset = 0, releaseMs = 10.0f;
++    float cutoffHz = 20000.0f, trackLevelDb = 0.0f;
+         double startTime = 0, length = 0;
+         AudioFile audioFile;
+         juce::AudioBuffer<float> audioData { 2, 64 };

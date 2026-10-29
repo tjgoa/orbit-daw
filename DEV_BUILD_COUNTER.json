@@ -1,9 +1,9 @@
 {
-  "product_checkpoint_build": 131,
-  "product_checkpoint_version": "0.3.110",
-  "successful_dev_iterations": 181,
-  "last_successful_build_utc": "2026-10-27T10:13:06+00:00",
+  "product_checkpoint_build": 235,
+  "product_checkpoint_version": "0.3.214",
+  "successful_dev_iterations": 270,
+  "last_successful_build_utc": "2026-10-29T05:30:51+00:00",
   "artifact_path": "Builds/Current/Orbit.app",
   "bundle_identifier": "com.touchtheuniverse.orbit",
-  "last_reserved_product_build": 131
+  "last_reserved_product_build": 236
 }

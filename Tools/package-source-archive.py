@@ -28,9 +28,12 @@ def eligible_files() -> list[pathlib.Path]:
         "BUILD_HISTORY.md",
         "ORBIT_DAW_FOUNDATION_PLAN_001.md",
         "ORION_LEARN_TODO.md",
+        "ORION_MANUAL_AUDIT.md",
         "ORION_NATIVE_EFFECTS_COMPATIBILITY.md",
         "ORION_VISUAL_TARGETS.md",
+        "DRUM_RACK_SCOPE.md",
         "DEV_BUILD_COUNTER.json",
+        "DISTRIBUTION.md",
     ):
         path = ROOT / name
         if path.is_file():
@@ -39,8 +42,21 @@ def eligible_files() -> list[pathlib.Path]:
         for path in (ROOT / folder).rglob("*"):
             if not path.is_file() or path.name == "__pycache__":
                 continue
-            if path.suffix in {".cpp", ".h", ".hpp", ".mm", ".m", ".py", ".sh", ".md", ".json"}:
+            if path.suffix in {".cpp", ".h", ".hpp", ".mm", ".m", ".py", ".sh", ".md", ".json", ".patch"}:
                 files.add(path)
+    for path in (ROOT / ".github" / "workflows").glob("*.yml"):
+        if path.is_file():
+            files.add(path)
+    # Orbit's sampler-backed Drum Rack extends two files in the pinned
+    # Tracktion Engine submodule. Include only this small project patch overlay;
+    # never duplicate the unchanged JUCE/Tracktion dependency tree in archives.
+    for relative in (
+        "Dependencies/tracktion_engine/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.h",
+        "Dependencies/tracktion_engine/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.cpp",
+    ):
+        path = ROOT / relative
+        if path.is_file():
+            files.add(path)
     return sorted(files, key=lambda p: p.relative_to(ROOT).as_posix().lower())
 
 
@@ -89,8 +105,8 @@ def main() -> None:
         summary = (
             f"# Orbit {label} source checkpoint\n\n"
             f"Complete Orbit-owned source/configuration checkpoint for product Build {build}, version {version}. "
-            "This archive contains no compiled app, executable, build output, cache, or vendored JUCE/Tracktion dependency source.\n\n"
-            "The project uses CMake with JUCE and Tracktion Engine as pinned external dependencies; see DEPENDENCIES.md and README.md.\n"
+            "This archive contains no compiled app, executable, build output, or cache. It includes only Orbit's two patched Tracktion sampler files; all unchanged JUCE/Tracktion dependency source remains external.\n\n"
+            "The project uses CMake with JUCE and Tracktion Engine as pinned external dependencies; apply the included sampler overlay to the pinned Tracktion revision. See DEPENDENCIES.md and README.md.\n"
         )
         baseline = f"Complete source checkpoint. Product Build {build}, version {version}. Created {datetime.now(timezone.utc).isoformat(timespec='seconds')}."
     else:

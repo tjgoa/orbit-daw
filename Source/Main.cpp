@@ -5,6 +5,9 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 #if JUCE_MAC || JUCE_LINUX
 #include <csignal>
@@ -14,6 +17,17 @@
 #endif
 
 #include "Project/ProjectDocument.h"
+#include "Editing/PatternTools.h"
+#include "Editing/EditToolPanel.h"
+#include "Options/OptionsPanel.h"
+#include "Options/Appearance.h"
+#include "Options/MidiInbox.h"
+#include "Options/VirtualKeyboard.h"
+#include "Generator/GeneratorMidiPlugin.h"
+#include "Generator/ArpeggiatorPanel.h"
+#include "Recording/MidiTake.h"
+#include "Import/OrionSfsImportDialog.h"
+#include "Import/ProjectImportSessionAdapter.h"
 
 namespace te = tracktion::engine;
 
@@ -104,16 +118,122 @@ void installOrbitCrashReportHandler() {}
 void setCurrentVst3ScanTarget(const juce::String&) {}
 #endif
 
+class MergeTracksDialog final : public juce::Component, private juce::ListBoxModel
+{
+public:
+    using MergeCallback = std::function<void(const std::vector<int>&, bool)>;
+
+    MergeTracksDialog(juce::StringArray trackNames, MergeCallback callback)
+        : names(std::move(trackNames)), selected(static_cast<size_t>(names.size()), true), onMerge(std::move(callback))
+    {
+        addAndMakeVisible(list);
+        list.setRowHeight(28);
+        addAndMakeVisible(selectAllButton);
+        addAndMakeVisible(selectNoneButton);
+        addAndMakeVisible(removeUnusedFxButton);
+        addAndMakeVisible(cancelButton);
+        addAndMakeVisible(mergeButton);
+        selectAllButton.onClick = [this] { std::fill(selected.begin(), selected.end(), true); list.repaint(); };
+        selectNoneButton.onClick = [this] { std::fill(selected.begin(), selected.end(), false); list.repaint(); };
+        cancelButton.onClick = [this] { closeDialog(0); };
+        mergeButton.onClick = [this]
+        {
+            std::vector<int> chosen;
+            for (size_t i = 0; i < selected.size(); ++i)
+                if (selected[i]) chosen.push_back(static_cast<int>(i));
+            if (chosen.empty())
+            {
+                juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                    "Nothing selected", "Select at least one project track to merge.");
+                return;
+            }
+            if (onMerge) onMerge(chosen, removeUnusedFxButton.getToggleState());
+            closeDialog(1);
+        };
+        removeUnusedFxButton.setToggleState(true, juce::dontSendNotification);
+        setSize(540, 430);
+        list.updateContent();
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(orbit::options::colour(27, 39, 49));
+        g.setColour(orbit::options::colour(218, 231, 238));
+        g.setFont(juce::Font(15.0f, juce::Font::bold));
+        g.drawText("Choose tracks to add to the open project", 18, 12, getWidth() - 36, 24,
+                   juce::Justification::centredLeft);
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced(16);
+        area.removeFromTop(34);
+        list.setBounds(area.removeFromTop(area.getHeight() - 98));
+        auto row = area.removeFromTop(28);
+        selectAllButton.setBounds(row.removeFromLeft(98));
+        row.removeFromLeft(8);
+        selectNoneButton.setBounds(row.removeFromLeft(108));
+        row.removeFromLeft(18);
+        removeUnusedFxButton.setBounds(row);
+        area.removeFromTop(8);
+        row = area.removeFromTop(34);
+        mergeButton.setBounds(row.removeFromRight(110));
+        row.removeFromRight(8);
+        cancelButton.setBounds(row.removeFromRight(90));
+    }
+
+private:
+    int getNumRows() override { return names.size(); }
+
+    void paintListBoxItem(int rowNumber, juce::Graphics& g, int width, int height, bool rowIsSelected) override
+    {
+        if (!juce::isPositiveAndBelow(rowNumber, names.size())) return;
+        g.fillAll(rowIsSelected ? orbit::options::colour(48, 73, 88) : orbit::options::colour(34, 49, 61));
+        const auto box = juce::Rectangle<int>(12, (height - 16) / 2, 16, 16);
+        g.setColour(orbit::options::colour(129, 165, 181));
+        g.drawRoundedRectangle(box.toFloat(), 2.0f, 1.0f);
+        if (selected[static_cast<size_t>(rowNumber)])
+        {
+            g.setColour(orbit::options::colour(67, 173, 207));
+            g.fillRoundedRectangle(box.toFloat().reduced(3.0f), 2.0f);
+        }
+        g.setColour(orbit::options::colour(221, 233, 239));
+        g.setFont(14.0f);
+        g.drawText(names[rowNumber], 40, 0, width - 50, height, juce::Justification::centredLeft);
+    }
+
+    void listBoxItemClicked(int row, const juce::MouseEvent&) override
+    {
+        if (!juce::isPositiveAndBelow(row, static_cast<int>(selected.size()))) return;
+        selected[static_cast<size_t>(row)] = !selected[static_cast<size_t>(row)];
+        list.repaintRow(row);
+    }
+
+    void closeDialog(int result)
+    {
+        if (auto* dialog = findParentComponentOfClass<juce::DialogWindow>())
+            dialog->exitModalState(result);
+    }
+
+    juce::StringArray names;
+    std::vector<bool> selected;
+    MergeCallback onMerge;
+    juce::ListBox list { "Tracks", this };
+    juce::TextButton selectAllButton { "Select All" }, selectNoneButton { "Select None" },
+                     cancelButton { "Cancel" }, mergeButton { "Merge" };
+    juce::ToggleButton removeUnusedFxButton { "Remove unused FX sends" };
+};
+
 class ToolbarButton final : public juce::TextButton
 {
 public:
-    enum class Symbol { none, play, stop, rewind, previous, next, record, playlist, mixer, master, settings, save, open };
+    enum class Symbol { none, play, stop, rewind, previous, next, record, playlist, mixer, master, settings, dropdown, save, open };
 
     explicit ToolbarButton(Symbol buttonSymbol = Symbol::none) : symbol(buttonSymbol)
     {
-        setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(24, 31, 37));
-        setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(37, 112, 143));
-        setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(222, 232, 237));
+        setColour(juce::TextButton::buttonColourId, orbit::options::colour(24, 31, 37));
+        setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(37, 112, 143));
+        setColour(juce::TextButton::textColourOffId, orbit::options::colour(222, 232, 237));
         setColour(juce::TextButton::textColourOnId, juce::Colours::white);
     }
 
@@ -129,18 +249,18 @@ public:
         if (!isEnabled()) fill = fill.withAlpha(0.55f);
         g.setColour(fill);
         g.fillRoundedRectangle(bounds, 4.0f);
-        g.setColour(juce::Colour::fromRGB(92, 122, 137));
+        g.setColour(orbit::options::colour(92, 122, 137));
         g.drawRoundedRectangle(bounds, 4.0f, 1.0f);
 
-        const auto iconColour = isEnabled() ? juce::Colour::fromRGB(185, 224, 238)
-                                            : juce::Colour::fromRGB(125, 145, 153);
+        const auto iconColour = isEnabled() ? orbit::options::colour(185, 224, 238)
+                                            : orbit::options::colour(125, 145, 153);
         const bool hasIcon = symbol != Symbol::none;
         const float iconSize = hasIcon ? (showText ? 14.0f : juce::jmin(18.0f, static_cast<float>(getHeight()) * 0.62f)) : 0.0f;
         const float iconX = !hasIcon ? bounds.getX() + 5.0f
                           : showText ? bounds.getX() + 7.0f
                                      : bounds.getCentreX() - iconSize * 0.5f;
         const float iconY = bounds.getCentreY() - iconSize * 0.5f;
-        g.setColour(symbol == Symbol::record ? juce::Colour::fromRGB(225, 74, 67) : iconColour);
+        g.setColour(symbol == Symbol::record ? orbit::options::colour(225, 74, 67) : iconColour);
         const auto triangle = [this, &g, iconX, iconY, iconSize](bool pointsRight, bool doubleArrow)
         {
             juce::Path path;
@@ -211,6 +331,15 @@ public:
                                            2.2f, h, 0.7f);
                 }
                 break;
+            case Symbol::dropdown:
+            {
+                juce::Path arrow;
+                arrow.addTriangle(iconX + 1.0f, iconY + iconSize * 0.3f,
+                                  iconX + iconSize - 1.0f, iconY + iconSize * 0.3f,
+                                  iconX + iconSize * 0.5f, iconY + iconSize * 0.75f);
+                g.fillPath(arrow);
+                break;
+            }
             case Symbol::settings:
                 g.drawEllipse(iconX + 3.5f, iconY + 3.5f, iconSize - 7.0f, iconSize - 7.0f, 2.0f);
                 g.fillEllipse(iconX + iconSize * 0.42f, iconY + iconSize * 0.42f, iconSize * 0.16f, iconSize * 0.16f);
@@ -258,9 +387,9 @@ class ModeSelectorButton final : public juce::TextButton
 public:
     ModeSelectorButton()
     {
-        setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(24, 31, 37));
-        setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(37, 112, 143));
-        setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(170, 190, 199));
+        setColour(juce::TextButton::buttonColourId, orbit::options::colour(24, 31, 37));
+        setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(37, 112, 143));
+        setColour(juce::TextButton::textColourOffId, orbit::options::colour(170, 190, 199));
         setColour(juce::TextButton::textColourOnId, juce::Colours::white);
     }
 
@@ -273,7 +402,7 @@ public:
         else if (highlighted) fill = fill.brighter(0.07f);
         g.setColour(fill);
         g.fillRoundedRectangle(bounds, 2.0f);
-        g.setColour(juce::Colour::fromRGB(92, 122, 137));
+        g.setColour(orbit::options::colour(92, 122, 137));
         g.drawRoundedRectangle(bounds, 2.0f, 0.8f);
         g.setColour(findColour(getToggleState() ? juce::TextButton::textColourOnId
                                                 : juce::TextButton::textColourOffId));
@@ -292,15 +421,15 @@ public:
         juce::TextButton::paintButton(g, highlighted, down);
         const auto x = 7.0f;
         const auto y = static_cast<float>(getHeight()) * 0.5f - 7.0f;
-        const auto white = isEnabled() ? juce::Colour::fromRGB(190, 224, 238)
-                                       : juce::Colour::fromRGB(125, 145, 153);
+        const auto white = isEnabled() ? orbit::options::colour(190, 224, 238)
+                                       : orbit::options::colour(125, 145, 153);
         g.setColour(white);
         g.fillRoundedRectangle(x, y, 20.0f, 14.0f, 1.5f);
-        g.setColour(juce::Colour::fromRGB(74, 109, 125));
+        g.setColour(orbit::options::colour(74, 109, 125));
         g.drawRoundedRectangle(x, y, 20.0f, 14.0f, 1.5f, 1.0f);
         for (int key = 1; key < 7; ++key)
             g.drawVerticalLine(static_cast<int>(x + static_cast<float>(key) * 20.0f / 7.0f), y + 7.0f, y + 13.0f);
-        g.setColour(juce::Colour::fromRGB(24, 39, 49));
+        g.setColour(orbit::options::colour(24, 39, 49));
         for (const auto key : { 1, 2, 4, 5, 6 })
         {
             const auto keyX = x + static_cast<float>(key) * 20.0f / 7.0f - 1.2f;
@@ -315,11 +444,11 @@ public:
     void paint(juce::Graphics& g) override
     {
         auto area = getLocalBounds().toFloat();
-        g.setColour(juce::Colour::fromRGB(18, 25, 30));
+        g.setColour(orbit::options::colour(18, 25, 30));
         g.fillRoundedRectangle(area, 4.0f);
-        g.setColour(juce::Colour::fromRGB(81, 112, 126));
+        g.setColour(orbit::options::colour(81, 112, 126));
         g.drawRoundedRectangle(area, 4.0f, 1.0f);
-        g.setColour(juce::Colour::fromRGB(177, 200, 210));
+        g.setColour(orbit::options::colour(177, 200, 210));
         g.setFont(juce::FontOptions(9.0f, juce::Font::bold));
         g.drawText("OUT", getLocalBounds().removeFromLeft(27), juce::Justification::centred);
         auto meters = getLocalBounds().withTrimmedLeft(28).reduced(2, 5);
@@ -328,7 +457,7 @@ public:
         for (int channel = 0; channel < 2; ++channel)
         {
             auto x = meters.getX() + channel * (channelWidth + gap);
-            g.setColour(juce::Colour::fromRGB(8, 15, 19));
+            g.setColour(orbit::options::colour(8, 15, 19));
             g.fillRoundedRectangle(static_cast<float>(x), static_cast<float>(meters.getY()),
                                    static_cast<float>(channelWidth), static_cast<float>(meters.getHeight()), 1.5f);
             constexpr int segments = 14;
@@ -337,9 +466,9 @@ public:
             for (int segment = 0; segment < segments; ++segment)
             {
                 const auto y = meters.getBottom() - segmentHeight - segment * (segmentHeight + segmentGap);
-                const auto colour = segment >= 12 ? juce::Colour::fromRGB(184, 76, 62)
-                                  : segment >= 10 ? juce::Colour::fromRGB(203, 164, 66)
-                                                  : juce::Colour::fromRGB(48, 139, 158);
+                const auto colour = segment >= 12 ? orbit::options::colour(184, 76, 62)
+                                  : segment >= 10 ? orbit::options::colour(203, 164, 66)
+                                                  : orbit::options::colour(48, 139, 158);
                 g.setColour(colour.withAlpha(0.48f));
                 g.fillRoundedRectangle(static_cast<float>(x + 2), static_cast<float>(y),
                                        static_cast<float>(channelWidth - 4), static_cast<float>(segmentHeight), 0.8f);
@@ -351,13 +480,13 @@ public:
 class AudioSettingsWindow final : public juce::DocumentWindow
 {
 public:
-    explicit AudioSettingsWindow(juce::AudioDeviceManager& manager)
-        : DocumentWindow("Orbit Audio & MIDI Settings", juce::Colour::fromRGB(20, 29, 38), juce::DocumentWindow::closeButton)
+    explicit AudioSettingsWindow(juce::AudioDeviceManager& manager, const juce::String& title = "Audio Device Settings", bool inputs = false)
+        : DocumentWindow(title, orbit::options::colour(20, 29, 38), juce::DocumentWindow::closeButton)
     {
         setUsingNativeTitleBar(true);
-        setContentOwned(new juce::AudioDeviceSelectorComponent(manager, 0, 0, 1, 2, true, true, true, true), true);
+        setContentOwned(new juce::AudioDeviceSelectorComponent(manager, 0, 256, 1, 256, false, false, true, false), true);
         setResizable(true, true);
-        centreWithSize(520, 460);
+        centreWithSize(620, inputs ? 540 : 500);
     }
 
     void closeButtonPressed() override { setVisible(false); }
@@ -379,7 +508,7 @@ public:
                           ? "Standard VST3 locations are included automatically. Add extra folders below."
                           : "Folders Orbit searches",
                       juce::dontSendNotification);
-        title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(208, 224, 233));
+        title.setColour(juce::Label::textColourId, orbit::options::colour(208, 224, 233));
         addAndMakeVisible(title);
         folderList.setModel(this);
         folderList.setRowHeight(30);
@@ -438,10 +567,10 @@ private:
     void paintListBoxItem(int row, juce::Graphics& g, int width, int height, bool selected) override
     {
         if (!juce::isPositiveAndBelow(row, paths.size())) return;
-        g.fillAll(selected ? juce::Colour::fromRGB(54, 109, 137)
-                           : (row % 2 == 0 ? juce::Colour::fromRGB(31, 45, 55)
-                                           : juce::Colour::fromRGB(37, 52, 62)));
-        g.setColour(juce::Colour::fromRGB(220, 231, 237));
+        g.fillAll(selected ? orbit::options::colour(54, 109, 137)
+                           : (row % 2 == 0 ? orbit::options::colour(31, 45, 55)
+                                           : orbit::options::colour(37, 52, 62)));
+        g.setColour(orbit::options::colour(220, 231, 237));
         g.setFont(13.0f);
         g.drawText(paths[row], 10, 0, width - 20, height, juce::Justification::centredLeft, true);
     }
@@ -498,7 +627,7 @@ public:
                       bool showVstStartupOption = false,
                       bool scanVst3AtStartupInitially = false,
                       std::function<void(bool)> saveVstStartupOption = {})
-        : DocumentWindow(windowTitle, juce::Colour::fromRGB(20, 29, 38), juce::DocumentWindow::closeButton)
+        : DocumentWindow(windowTitle, orbit::options::colour(20, 29, 38), juce::DocumentWindow::closeButton)
     {
         setUsingNativeTitleBar(true);
         setContentOwned(new SearchPathEditor(std::move(paths), std::move(onSave), [this] { setVisible(false); },
@@ -520,13 +649,13 @@ public:
                           std::function<juce::StringArray()> getSearchPaths,
                           std::function<void()> openPathSettings,
                           std::function<void(const juce::PluginDescription&)> onInsert)
-        : DocumentWindow("Insert VST3 Instrument", juce::Colour::fromRGB(20, 29, 38),
+        : DocumentWindow("Insert VST3 Instrument", orbit::options::colour(20, 29, 38),
                          juce::DocumentWindow::closeButton),
           pluginFormats(formats), pluginList(knownPlugins), readPaths(std::move(getSearchPaths)),
           showPathSettings(std::move(openPathSettings)), insertPlugin(std::move(onInsert))
     {
         setUsingNativeTitleBar(true);
-        list.setColour(juce::ListBox::backgroundColourId, juce::Colour::fromRGB(25, 38, 48));
+        list.setColour(juce::ListBox::backgroundColourId, orbit::options::colour(25, 38, 48));
         list.setModel(this);
         list.setRowHeight(34);
         list.setMultipleSelectionEnabled(false);
@@ -562,12 +691,12 @@ private:
     void paintListBoxItem(int row, juce::Graphics& g, int width, int height, bool selected) override
     {
         if (!juce::isPositiveAndBelow(row, instruments.size())) return;
-        g.fillAll(selected ? juce::Colour::fromRGB(38, 111, 143) : juce::Colour::fromRGB(25, 38, 48));
+        g.fillAll(selected ? orbit::options::colour(38, 111, 143) : orbit::options::colour(25, 38, 48));
         const auto& description = instruments.getReference(row);
-        g.setColour(juce::Colour::fromRGB(229, 237, 241));
+        g.setColour(orbit::options::colour(229, 237, 241));
         g.setFont(14.0f);
         g.drawText(description.name, 10, 2, width - 20, height / 2, juce::Justification::centredLeft);
-        g.setColour(juce::Colour::fromRGB(151, 178, 190));
+        g.setColour(orbit::options::colour(151, 178, 190));
         g.setFont(11.0f);
         g.drawText(description.manufacturerName + "  ·  VST3", 10, height / 2, width - 20,
                    height / 2 - 2, juce::Justification::centredLeft);
@@ -762,12 +891,20 @@ private:
     bool hasStartedScan = false;
 };
 
-class PlaylistGrid final : public juce::Component
+struct PlaylistPreviewNote
+{
+    double start = 0.0; // Position within the normalized pattern cycle (0..1).
+    int pitch = 0;   // Semitone offset from MIDI 48; previews expand for outlying notes.
+    double length = 0.0; // Length within the normalized pattern cycle (0..1).
+};
+
+class PlaylistGrid final : public juce::Component, private juce::ChangeListener
 {
 public:
     static constexpr int barCount = 512;
     PlaylistGrid()
     {
+        audioFormats.registerBasicFormats();
         zoomOut.setButtonText("H-");
         zoomOut.setTooltip("Zoom out in the Playlist.");
         zoomOut.onClick = [this] { setHorizontalZoom(horizontalZoom - 0.1f); };
@@ -787,7 +924,7 @@ public:
         pencilTool.setButtonText("Draw");
         pencilTool.setTooltip("Draw tool: click or drag to place the selected pattern, replacing a clip when needed.");
         pencilTool.setClickingTogglesState(false);
-        pencilTool.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
+        pencilTool.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(36, 132, 174));
         addAndMakeVisible(pencilTool);
         selectTool.setButtonText("Move");
         selectTool.setTooltip("Selection tool: drag clips to move them.");
@@ -804,7 +941,45 @@ public:
 
     // Leave enough room for readable generator names and M/S/R controls before
     // the first Playlist bar begins.
-    int labelWidth() const { return 250; }
+    int labelWidth() const { return trackHeaderWidth; }
+    void setTrackHeaderWidth(int width)
+    {
+        trackHeaderWidth = juce::jlimit(160, 480, width);
+        refreshLayout();
+    }
+    std::function<void(int)> onTrackHeaderWidthChanged;
+    std::function<void(int, int)> trackReordered;
+    void setPatternResizePreview(int track, int startBar, int lengthBars)
+    {
+        resizePreviewTrack = track;
+        resizePreviewStartBar = startBar;
+        resizePreviewLengthBars = lengthBars;
+        repaint();
+    }
+    void clearPatternResizePreview()
+    {
+        resizePreviewTrack = resizePreviewStartBar = -1;
+        resizePreviewLengthBars = 0;
+        repaint();
+    }
+    void setPatternRangePaintPreview(int track, int firstBar, int lastBar)
+    {
+        paintPreviewTrack = track;
+        paintPreviewStartBar = juce::jmin(firstBar, lastBar);
+        paintPreviewEndBar = juce::jmax(firstBar, lastBar);
+        repaint();
+    }
+    void clearPatternRangePaintPreview()
+    {
+        paintPreviewTrack = paintPreviewStartBar = paintPreviewEndBar = -1;
+        repaint();
+    }
+    int displayedPatternClipLength(int track, int startBar) const
+    {
+        if (track == resizePreviewTrack && startBar == resizePreviewStartBar && resizePreviewLengthBars > 0)
+            return resizePreviewLengthBars;
+        return patternClipLengthBars ? juce::jmax(1, patternClipLengthBars(track, startBar)) : 1;
+    }
     int headerHeight() const { return 34; }
     int rowHeight() const { return juce::roundToInt(46.0f * verticalZoom); }
     int barWidth() const { return juce::jmax(4, juce::roundToInt(92.0f * horizontalZoom)); }
@@ -833,7 +1008,7 @@ public:
 
     void setHorizontalZoom(float nextZoom)
     {
-        horizontalZoom = juce::jlimit(0.035f, 1.55f, nextZoom);
+        horizontalZoom = juce::jlimit(0.035f, 4.0f, nextZoom);
         refreshLayout();
     }
 
@@ -841,7 +1016,7 @@ public:
 
     void setVerticalZoom(float nextZoom)
     {
-        verticalZoom = juce::jlimit(0.65f, 1.5f, nextZoom);
+        verticalZoom = juce::jlimit(0.65f, 3.0f, nextZoom);
         refreshLayout();
     }
 
@@ -873,8 +1048,16 @@ public:
         lightTheme = enabled;
         repaint();
     }
+    void setShowPatternGrid(bool enabled)
+    {
+        if (showPatternGrid == enabled) return;
+        showPatternGrid = enabled;
+        repaint();
+    }
+    bool isShowPatternGridEnabled() const { return showPatternGrid; }
     std::function<void(bool)> onAutomationModeChanged;
     std::function<void(bool)> onThemeChanged;
+    std::function<void(bool)> onPatternGridChanged;
 
     std::function<void(bool)> onToolChanged;
     std::function<void()> onPaintFinished;
@@ -890,9 +1073,12 @@ public:
     std::function<int()> trackCount;
     std::function<juce::String(int)> trackName;
     std::function<juce::String(int, int)> clipName;
-    std::function<std::vector<juce::Point<int>>(int, int)> clipNotes;
+    std::function<std::vector<PlaylistPreviewNote>(int, int)> clipNotes;
+    std::function<int(int, int)> patternClipStartBar, patternClipLengthBars, patternStepCount;
+    std::function<void(int, int, int)> resizePatternClip;
     std::function<void(int, int)> cellClicked;
     std::function<void(int, int)> cellPainted;
+    std::function<void(int, int, int)> paintPatternRange;
     std::function<void(int, int, int, int)> clipDragged;
     std::function<void(int, int, juce::Component*)> showPatternMenu;
     std::function<void(int)> openGeneratorForTrack;
@@ -902,15 +1088,30 @@ public:
     std::function<bool(int)> isAudioTrack;
     std::function<int(int, int)> audioClipStartBar;
     std::function<int(int, int)> audioClipLengthBars;
+    std::function<juce::File(int, int)> audioClipSourceFile;
+    std::function<bool(int, int)> audioClipIsReversed;
     std::function<void(int, int, juce::Component*)> audioContextMenu;
     std::function<juce::Colour(int)> getTrackColour;
+    std::function<bool(int)> getTrackGradientHighlight;
+    std::function<bool(int)> getTrackGridNotes;
     std::function<float(int, int)> getSongAutomationValue;
     std::function<void(int, int, float)> setSongAutomationPoint;
 
 private:
     float horizontalZoom = 1.0f;
     float verticalZoom = 1.0f;
+    int trackHeaderWidth = 250;
+    int resizePreviewTrack = -1, resizePreviewStartBar = -1, resizePreviewLengthBars = 0;
+    int paintPreviewTrack = -1, paintPreviewStartBar = -1, paintPreviewEndBar = -1;
+    bool resizingTrackHeader = false;
+    int resizeHeaderStartX = 0, resizeHeaderStartWidth = 250;
+    int dragSourceTrackRow = -1;
+    bool draggingTrackRow = false;
+    juce::AudioFormatManager audioFormats;
+    juce::AudioThumbnailCache audioThumbnailCache { 32 };
+    std::map<juce::String, std::unique_ptr<juce::AudioThumbnail>> audioThumbnails;
     juce::TextButton zoomOut, zoomIn, verticalZoomOut, verticalZoomIn, pencilTool, selectTool;
+    void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
     void resized() override
     {
         const auto h = headerHeight();
@@ -940,7 +1141,14 @@ public:
         std::function<void(int, int, juce::Component*)> onAudioMenu;
         std::function<bool()> pencilMode;
         std::function<void(int, int)> paintCell;
+        std::function<void(int, int, int)> paintRange;
+        std::function<void(int, int, int)> previewPaintRange;
+        std::function<void()> clearPaintRangePreview;
         std::function<void()> paintFinished;
+        std::function<int(int, int)> getPatternClipStartBar, getPatternClipLengthBars, getPatternStepCount;
+        std::function<void(int, int, int)> resizePatternClip;
+        std::function<void(int, int, int)> previewPatternClipResize;
+        std::function<void()> clearPatternClipResizePreview;
         std::function<bool()> sourceHasClip;
         std::function<bool()> automationMode;
         std::function<float(int, int)> getAutomationValue;
@@ -988,6 +1196,8 @@ public:
             barWidthForDrag = scaledBarWidth;
             rowHeightForDrag = scaledRowHeight;
             dragGesture = false;
+            rangePaintGesture = false;
+            paintRangeStartBar = bar;
             onActivate = [activateCallback = std::move(activate), track, bar]
             {
                 if (activateCallback) activateCallback(track, bar);
@@ -1007,10 +1217,20 @@ public:
             setButtonText(currentClip.isNotEmpty() ? currentClip : barLabel);
             setTitle(trackLabel + ", " + barLabel);
             setDescription(currentClip.isNotEmpty()
-                ? "Contains pattern " + currentClip + ". Drag it to move the clip."
+                ? "Contains pattern " + currentClip + ". Drag to move it; drag its right edge to resize it."
                 : "Empty playlist cell. Activate to place the selected pattern here.");
             setTooltip(trackLabel + ", " + barLabel + (currentClip.isNotEmpty()
-                ? " — " + currentClip : " — empty; activate to place the selected pattern"));
+                ? " — " + currentClip + "; drag the right edge to resize"
+                : " — empty; activate to place the selected pattern"));
+        }
+
+        void paintButton(juce::Graphics& g, bool highlighted, bool down) override
+        {
+            // Audio lanes are rendered as one continuous waveform by the grid.
+            // These per-bar hit targets should stay visually inert so their
+            // hover/focus states cannot draw seams across the clip.
+            if (audioTrack) return;
+            juce::TextButton::paintButton(g, highlighted, down);
         }
 
         void mouseDown(const juce::MouseEvent& event) override
@@ -1037,6 +1257,24 @@ public:
                 lastErasedBar = barIndex;
                 return;
             }
+            if (!audioTrack && sourceHasClip && sourceHasClip() && getPatternClipStartBar
+                && getPatternClipLengthBars && resizePatternClip)
+            {
+                const auto start = getPatternClipStartBar(trackIndex, barIndex);
+                const auto length = getPatternClipLengthBars(trackIndex, barIndex);
+                if (start >= 0 && length > 0 && start + length == barIndex + 1
+                    && event.getPosition().x >= getWidth() - resizeHitWidth())
+                {
+                    resizeGesture = true;
+                    resizeStartX = event.getPosition().x;
+                    resizeInitialLength = length;
+                    resizeClipStartBar = start;
+                    resizeFinalLength = length;
+                    if (previewPatternClipResize)
+                        previewPatternClipResize(trackIndex, resizeClipStartBar, resizeFinalLength);
+                    return;
+                }
+            }
             dragGesture = false;
             dragSourceHasClip = sourceHasClip && sourceHasClip();
             juce::TextButton::mouseDown(event);
@@ -1044,6 +1282,19 @@ public:
 
         void mouseDrag(const juce::MouseEvent& event) override
         {
+            if (resizeGesture)
+            {
+                const auto deltaBars = juce::roundToInt(static_cast<float>(event.x - resizeStartX)
+                    / static_cast<float>(juce::jmax(1, barWidthForDrag)));
+                const auto minimumLength = getPatternStepCount
+                    ? juce::jmax(1, (getPatternStepCount(trackIndex, resizeClipStartBar) + 15) / 16) : 1;
+                resizeFinalLength = juce::jlimit(minimumLength,
+                    juce::jmax(minimumLength, PlaylistGrid::barCount - resizeClipStartBar),
+                    resizeInitialLength + deltaBars);
+                if (previewPatternClipResize)
+                    previewPatternClipResize(trackIndex, resizeClipStartBar, resizeFinalLength);
+                return;
+            }
             if (automationGesture)
             {
                 writeAutomationPoint(event);
@@ -1071,18 +1322,24 @@ public:
             }
             if (event.getDistanceFromDragStart() >= 8)
             {
-                if (pencilMode && pencilMode())
+                if (audioTrack && dragSourceHasClip)
                 {
                     dragGesture = true;
-                    if (paintCell) paintCell(trackIndex, barIndex);
+                }
+                else if (pencilMode && pencilMode())
+                {
+                    dragGesture = true;
+                    rangePaintGesture = true;
+                    paintRangeStartBar = barIndex;
                     const auto pointInGrid = event.getEventRelativeTo(getParentComponent()).position;
                     const auto* grid = dynamic_cast<const PlaylistGrid*>(getParentComponent());
                     const int destinationTrack = grid != nullptr
                         ? static_cast<int>((pointInGrid.y - grid->headerHeight()) / rowHeightForDrag) : -1;
                     const int destinationBar = grid != nullptr
                         ? static_cast<int>((pointInGrid.x - grid->labelWidth()) / barWidthForDrag) : -1;
-                    if (destinationTrack >= 0 && destinationBar >= 0 && paintCell)
-                        paintCell(destinationTrack, destinationBar);
+                    if (destinationTrack >= 0 && destinationBar >= 0 && previewPaintRange)
+                        previewPaintRange(destinationTrack, paintRangeStartBar, destinationBar);
+                    return;
                 }
                 else if (dragSourceHasClip) dragGesture = true;
             }
@@ -1091,6 +1348,14 @@ public:
 
         void mouseUp(const juce::MouseEvent& event) override
         {
+            if (resizeGesture)
+            {
+                resizeGesture = false;
+                if (clearPatternClipResizePreview) clearPatternClipResizePreview();
+                if (resizeFinalLength != resizeInitialLength && resizePatternClip)
+                    resizePatternClip(trackIndex, resizeClipStartBar, resizeFinalLength);
+                return;
+            }
             if (automationGesture)
             {
                 automationGesture = false;
@@ -1110,7 +1375,21 @@ public:
                 ? static_cast<int>((pointInGrid.y - grid->headerHeight()) / rowHeightForDrag) : -1;
             const int destinationBar = grid != nullptr
                 ? static_cast<int>((pointInGrid.x - grid->labelWidth()) / barWidthForDrag) : -1;
-            const bool shouldMove = dragGesture && dragSourceHasClip && !(pencilMode && pencilMode())
+            if (rangePaintGesture)
+            {
+                rangePaintGesture = false;
+                if (clearPaintRangePreview) clearPaintRangePreview();
+                // Release the TextButton's pressed state while dragGesture is
+                // still true, so its click callback cannot place a second clip.
+                juce::TextButton::mouseUp(event);
+                if (destinationTrack >= 0 && destinationBar >= 0 && paintRange)
+                    paintRange(destinationTrack, paintRangeStartBar, destinationBar);
+                if (paintFinished) paintFinished();
+                dragGesture = false;
+                return;
+            }
+            const bool shouldMove = dragGesture && dragSourceHasClip
+                && (audioTrack || !(pencilMode && pencilMode()))
                 && destinationTrack >= 0 && destinationBar >= 0;
             juce::TextButton::mouseUp(event);
             if (shouldMove && onDragToCell)
@@ -1140,7 +1419,29 @@ public:
                 juce::TextButton::mouseWheelMove(event, wheel);
         }
 
+        void mouseMove(const juce::MouseEvent& event) override
+        {
+            if (!audioTrack && sourceHasClip && sourceHasClip() && getPatternClipStartBar
+                && getPatternClipLengthBars)
+            {
+                const auto start = getPatternClipStartBar(trackIndex, barIndex);
+                const auto length = getPatternClipLengthBars(trackIndex, barIndex);
+                if (start >= 0 && length > 0 && start + length == barIndex + 1
+                    && event.getPosition().x >= getWidth() - resizeHitWidth())
+                {
+                    setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
+                    return;
+                }
+            }
+            setMouseCursor(juce::MouseCursor::NormalCursor);
+        }
+
     private:
+        int resizeHitWidth() const
+        {
+            return juce::jmin(getWidth(), juce::jmax(14, juce::jmin(30, getWidth() / 3)));
+        }
+
         void writeAutomationPoint(const juce::MouseEvent& event)
         {
             if (!setAutomationValue) return;
@@ -1162,6 +1463,10 @@ public:
         int barIndex = -1;
         int trackIndex = -1;
         bool dragGesture = false;
+        bool rangePaintGesture = false;
+        int paintRangeStartBar = -1;
+        bool resizeGesture = false;
+        int resizeStartX = 0, resizeInitialLength = 1, resizeFinalLength = 1, resizeClipStartBar = -1;
         bool automationGesture = false;
         bool dragSourceHasClip = false;
         bool rightClickHandled = false;
@@ -1179,19 +1484,23 @@ public:
             for (auto* button : { &mute, &solo, &record })
             {
                 button->setClickingTogglesState(true);
-                button->setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 51, 62));
-                button->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(164, 72, 66));
-                button->setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(197, 214, 224));
+                button->setColour(juce::TextButton::buttonColourId, orbit::options::colour(35, 51, 62));
+                button->setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(164, 72, 66));
+                button->setColour(juce::TextButton::textColourOffId, orbit::options::colour(197, 214, 224));
                 button->setColour(juce::TextButton::textColourOnId, juce::Colours::white);
                 addAndMakeVisible(*button);
             }
         }
         void resized() override
         {
-            auto area = getLocalBounds().reduced(1, 9);
-            mute.setBounds(area.removeFromLeft(25)); area.removeFromLeft(2);
-            solo.setBounds(area.removeFromLeft(25)); area.removeFromLeft(2);
-            record.setBounds(area.removeFromLeft(25));
+            constexpr int buttonHeight = 28;
+            auto x = 1;
+            const auto y = (getHeight() - buttonHeight) / 2;
+            for (auto* button : { &mute, &solo, &record })
+            {
+                button->setBounds(x, y, 25, buttonHeight);
+                x += 27;
+            }
         }
     };
 
@@ -1201,22 +1510,22 @@ public:
         const auto headerHeightPx = headerHeight();
         const auto rowHeightPx = rowHeight();
         const auto barWidthPx = barWidth();
-        g.fillAll(lightTheme ? juce::Colour::fromRGB(177, 187, 202)
-                             : juce::Colour::fromRGB(20, 29, 38));
-        g.setColour(lightTheme ? juce::Colour::fromRGB(42, 53, 63)
-                               : juce::Colour::fromRGB(29, 43, 55));
+        g.fillAll(lightTheme ? orbit::options::colour(177, 187, 202)
+                             : orbit::options::colour(20, 29, 38));
+        g.setColour(lightTheme ? orbit::options::colour(42, 53, 63)
+                               : orbit::options::colour(29, 43, 55));
         g.fillRect(0, 0, getWidth(), headerHeightPx);
         if (loopRangeEnabled)
         {
             const auto rangeX = labelWidthPx + (loopStartBar - 1) * barWidthPx;
             const auto rangeWidth = loopLengthBars * barWidthPx;
-            g.setColour(juce::Colour::fromRGB(54, 151, 190).withAlpha(0.22f));
+            g.setColour(orbit::options::colour(54, 151, 190).withAlpha(0.22f));
             g.fillRect(rangeX, 0, rangeWidth, headerHeightPx);
-            g.setColour(juce::Colour::fromRGB(80, 184, 220));
+            g.setColour(orbit::options::colour(80, 184, 220));
             g.drawRect(rangeX, 1, rangeWidth, headerHeightPx - 2, 2);
         }
-        g.setColour(lightTheme ? juce::Colour::fromRGB(220, 229, 236)
-                               : juce::Colour::fromRGB(178, 198, 211));
+        g.setColour(lightTheme ? orbit::options::colour(220, 229, 236)
+                               : orbit::options::colour(178, 198, 211));
         g.setFont(14.0f);
         g.drawText("GENERATOR", 8, 0, labelWidthPx - 112, headerHeightPx, juce::Justification::centredLeft);
         // Keep a number on every visible bar. The ruler's stronger guide is
@@ -1232,8 +1541,8 @@ public:
             if (bar % rulerLabelInterval == 0)
             {
                 const bool majorBar = highlightEveryBars > 1 && bar % highlightEveryBars == 0;
-                g.setColour(majorBar ? juce::Colour::fromRGB(239, 246, 250)
-                                     : juce::Colour::fromRGB(196, 215, 226));
+                g.setColour(majorBar ? orbit::options::colour(239, 246, 250)
+                                     : orbit::options::colour(196, 215, 226));
                 const auto label = juce::String(bar + 1);
                 g.setFont(barWidthPx < 18 ? 8.0f : majorBar ? 11.0f : 10.0f);
                 g.drawText(label, labelWidthPx + bar * barWidthPx, 0, barWidthPx, headerHeightPx,
@@ -1253,12 +1562,12 @@ public:
             const auto y = headerHeightPx + row * rowHeightPx;
             const auto trackTint = getTrackColour ? getTrackColour(row) : juce::Colour{};
             const auto rowBase = lightTheme
-                ? (row % 2 == 0 ? juce::Colour::fromRGB(169, 181, 196) : juce::Colour::fromRGB(183, 193, 207))
-                : (row % 2 == 0 ? juce::Colour::fromRGB(25, 38, 49) : juce::Colour::fromRGB(22, 33, 43));
+                ? (row % 2 == 0 ? orbit::options::colour(169, 181, 196) : orbit::options::colour(183, 193, 207))
+                : (row % 2 == 0 ? orbit::options::colour(25, 38, 49) : orbit::options::colour(22, 33, 43));
             g.setColour(trackTint.isTransparent() ? rowBase : rowBase.overlaidWith(trackTint.withAlpha(0.25f)));
             g.fillRect(0, y, getWidth(), rowHeightPx);
-            g.setColour(lightTheme ? juce::Colour::fromRGB(45, 57, 69)
-                                   : juce::Colour::fromRGB(178, 198, 211));
+            g.setColour(lightTheme ? orbit::options::colour(45, 57, 69)
+                                   : orbit::options::colour(178, 198, 211));
             g.drawFittedText(juce::String(row + 1) + "   " + (trackName ? trackName(row) : juce::String{}),
                              8, y, labelWidthPx - 108, rowHeightPx,
                              juce::Justification::centredLeft, 1, 0.72f);
@@ -1266,60 +1575,131 @@ public:
             {
                 const auto x = labelWidthPx + bar * barWidthPx;
                 const bool majorBar = highlightEveryBars > 1 && bar % highlightEveryBars == 0;
-                g.setColour(majorBar
-                    ? (lightTheme ? juce::Colour::fromRGB(247, 249, 251) : juce::Colour::fromRGB(111, 151, 169))
-                    : (lightTheme ? juce::Colour::fromRGB(125, 139, 155) : juce::Colour::fromRGB(68, 88, 101)));
-                g.drawRect(x, y, barWidthPx, rowHeightPx, 1);
                 const auto label = clipName ? clipName(row, bar) : juce::String{};
                 const bool audioRow = isAudioTrack && isAudioTrack(row);
-                const int audioStart = audioRow && audioClipStartBar ? audioClipStartBar(row, bar) : bar;
+                g.setColour(majorBar
+                    ? (lightTheme ? orbit::options::colour(247, 249, 251) : orbit::options::colour(111, 151, 169))
+                    : (lightTheme ? orbit::options::colour(125, 139, 155) : orbit::options::colour(68, 88, 101)));
+                // Skip cell borders beneath audio clips. Empty audio cells
+                // retain the Playlist grid, while clip bodies stay seamless.
+                if (!audioRow || label.isEmpty())
+                    g.drawRect(x, y, barWidthPx, rowHeightPx, 1);
+                const bool showGridNotesForRow = showPatternGrid || (getTrackGridNotes && getTrackGridNotes(row));
                 if (label.isNotEmpty() && !audioRow)
                 {
-                    const int clipBars = audioRow && audioClipLengthBars
-                        ? juce::jmax(1, audioClipLengthBars(row, bar)) : 1;
-                    const int clipX = labelWidthPx + audioStart * barWidthPx;
+                    const int clipStart = patternClipStartBar ? patternClipStartBar(row, bar) : bar;
+                    const int clipBars = displayedPatternClipLength(row, clipStart);
+                    const bool clipStartsHere = clipStart == bar;
+                    const bool clipContinuesFromLeft = bar == firstVisibleBar && clipStart >= 0 && clipStart < bar;
+                    if (!clipStartsHere && !clipContinuesFromLeft) continue;
+                    const int clipX = labelWidthPx + clipStart * barWidthPx;
                     const int clipWidth = juce::jmin(contentWidth() - clipX, clipBars * barWidthPx);
                     const auto clipFill = trackTint.isTransparent()
-                        ? juce::Colour::fromRGB(39, 125, 165)
-                        : trackTint.interpolatedWith(juce::Colour::fromRGB(39, 125, 165), 0.35f);
-                    g.setColour(clipFill.withAlpha(0.72f));
+                        ? orbit::options::colour(39, 125, 165)
+                        : trackTint.interpolatedWith(orbit::options::colour(39, 125, 165), 0.35f);
+                    if (getTrackGradientHighlight && getTrackGradientHighlight(row))
+                    {
+                        juce::ColourGradient gradient(clipFill.brighter(0.32f),
+                            static_cast<float>(clipX), static_cast<float>(y),
+                            clipFill.darker(0.45f),
+                            static_cast<float>(clipX + clipWidth), static_cast<float>(y + rowHeightPx), false);
+                        g.setGradientFill(gradient);
+                    }
+                    else
+                    {
+                        g.setColour(clipFill);
+                    }
                     g.fillRoundedRectangle(static_cast<float>(clipX + 3), static_cast<float>(y + 4),
                                            static_cast<float>(juce::jmax(1, clipWidth - 6)), static_cast<float>(rowHeightPx - 8), 5.0f);
-                    if (audioRow)
+                    if (clipWidth >= 12 && clipX + clipWidth < contentWidth())
                     {
-                        const auto midY = y + rowHeightPx / 2;
-                        g.setColour(juce::Colour::fromRGB(178, 229, 244).withAlpha(0.85f));
-                        juce::Path waveform;
-                        waveform.startNewSubPath(static_cast<float>(clipX + 8), static_cast<float>(midY));
-                        const int samples = juce::jlimit(8, 80, clipWidth / 4);
-                        for (int sample = 1; sample <= samples; ++sample)
-                        {
-                            const auto px = clipX + 8 + sample * juce::jmax(1, clipWidth - 16) / samples;
-                            const auto phase = static_cast<float>(sample * 2.41 + row * 3.17);
-                            const auto envelope = 0.22f + 0.78f * std::sin(juce::MathConstants<float>::pi
-                                * static_cast<float>(sample) / static_cast<float>(samples));
-                            const auto amplitude = envelope * (0.18f + 0.32f * std::abs(std::sin(phase)));
-                            waveform.lineTo(static_cast<float>(px), static_cast<float>(midY)
-                                + static_cast<float>(rowHeightPx) * amplitude * std::sin(phase * 2.7f));
-                        }
-                        g.strokePath(waveform, juce::PathStrokeType(1.2f));
+                        const auto gripX = clipX + clipWidth - 5;
+                        const auto gripY = y + juce::jmax(7, rowHeightPx / 2 - 6);
+                        g.setColour(juce::Colours::white.withAlpha(0.82f));
+                        g.drawVerticalLine(gripX, static_cast<float>(gripY),
+                                           static_cast<float>(gripY + 12));
+                        g.drawVerticalLine(gripX - 3, static_cast<float>(gripY),
+                                           static_cast<float>(gripY + 12));
                     }
                     // Draw the MIDI preview after the translucent clip body so
                     // note marks remain visible, like Orion's Playlist blocks.
-                    if (!audioRow && showPatternNotes && clipNotes)
+                    const auto stepCount = patternStepCount
+                        ? juce::jmax(1, patternStepCount(row, clipStart)) : 16;
+                    const auto clipArea = juce::Rectangle<float>(static_cast<float>(clipX + 4),
+                        static_cast<float>(y + 5), static_cast<float>(juce::jmax(1, clipBars * barWidthPx - 8)),
+                        static_cast<float>(juce::jmax(1, rowHeightPx - 10)));
+                    const auto patternBars = juce::jmax(1, (stepCount + 15) / 16);
+                    const auto cycleWidth = clipArea.getWidth() * static_cast<float>(patternBars)
+                        / static_cast<float>(clipBars);
+                    const auto cycleCount = (clipBars + patternBars - 1) / patternBars;
+                    if (showGridNotesForRow)
                     {
-                        const auto notes = clipNotes(row, bar);
-                        const auto noteWidth = juce::jmax(2.0f, static_cast<float>(barWidthPx) / 64.0f * 2.4f);
-                        g.setColour(juce::Colour::fromRGB(15, 30, 40).withAlpha(0.88f));
-                        for (const auto note : notes)
+                        constexpr int pitchRows = 12;
+                        g.saveState();
+                        g.reduceClipRegion(clipArea.toNearestInt());
+                        g.setColour(trackTint.isTransparent()
+                            ? orbit::options::colour(21, 65, 84).withAlpha(0.44f)
+                            : trackTint.darker(0.7f).withAlpha(0.55f));
+                        g.fillRect(clipArea);
+                        for (int cycle = 0; cycle < cycleCount; ++cycle)
                         {
-                            const auto noteX = x + 5 + note.x * (barWidthPx - 12) / 64;
-                            const auto noteY = y + 7 + (36 - note.y) * (rowHeightPx - 17) / 36;
-                            g.fillRect(static_cast<float>(noteX), static_cast<float>(noteY), noteWidth,
-                                       juce::jmax(1.5f, static_cast<float>(rowHeightPx) / 18.0f));
+                            const auto lineBudget = juce::jlimit(1, 4096,
+                                juce::roundToInt(juce::jmax(1.0f, cycleWidth)));
+                            const auto lineStride = juce::jmax(1, juce::roundToInt(
+                                std::ceil(static_cast<double>(stepCount) / lineBudget)));
+                            for (int column = 0; column <= stepCount; column += lineStride)
+                            {
+                                const auto lineX = clipArea.getX() + cycle * cycleWidth + cycleWidth
+                                    * static_cast<float>(column) / static_cast<float>(stepCount);
+                                const auto majorStep = stepCount >= 16 ? column % juce::jmax(1, stepCount / 4) == 0
+                                                                       : column % 4 == 0;
+                                g.setColour(majorStep ? orbit::options::colour(161, 206, 221).withAlpha(0.70f)
+                                                      : orbit::options::colour(112, 163, 180).withAlpha(0.42f));
+                                g.drawVerticalLine(juce::roundToInt(lineX), clipArea.getY(), clipArea.getBottom());
+                            }
                         }
+                        for (int pitchRow = 0; pitchRow <= pitchRows; ++pitchRow)
+                        {
+                            const auto lineY = clipArea.getY() + clipArea.getHeight()
+                                * static_cast<float>(pitchRow) / static_cast<float>(pitchRows);
+                            g.setColour(pitchRow % 3 == 0 ? orbit::options::colour(161, 206, 221).withAlpha(0.52f)
+                                                        : orbit::options::colour(112, 163, 180).withAlpha(0.28f));
+                            g.drawHorizontalLine(juce::roundToInt(lineY), clipArea.getX(), clipArea.getRight());
+                        }
+                        g.restoreState();
                     }
-                    if (showPatternLabels || audioRow)
+                    if ((showPatternNotes || showGridNotesForRow) && clipNotes)
+                    {
+                        const auto notes = clipNotes(row, clipStart);
+                        int lowPitch=0,highPitch=36;
+                        for(const auto& note:notes){lowPitch=juce::jmin(lowPitch,note.pitch);highPitch=juce::jmax(highPitch,note.pitch);}
+                        const auto pitchSpan=juce::jmax(1,highPitch-lowPitch);
+                        g.saveState();
+                        g.reduceClipRegion(clipArea.toNearestInt());
+                        g.setColour(orbit::options::colour(220, 244, 250).withAlpha(0.95f));
+                        for (int cycle = 0; cycle < cycleCount; ++cycle)
+                            for (const auto note : notes)
+                        {
+                            const auto noteX = clipArea.getX() + cycle * cycleWidth + cycleWidth
+                                * static_cast<float>(note.start);
+                            const auto noteWidth = juce::jmax(2.0f, cycleWidth
+                                * static_cast<float>(juce::jmax(0.0, note.length)) - 1.0f);
+                            const auto noteHeight = showGridNotesForRow
+                                ? juce::jmax(2.0f, clipArea.getHeight() / 12.0f - 1.0f)
+                                : juce::jmax(1.5f, static_cast<float>(rowHeightPx) / 18.0f);
+                            const auto displayPitchRow = juce::jlimit(0, 11, (note.pitch-lowPitch)*11/pitchSpan);
+                            const auto noteY = showGridNotesForRow
+                                ? clipArea.getY() + (11 - displayPitchRow) * clipArea.getHeight() / 12.0f
+                                    + 0.5f
+                                : static_cast<float>(y + 7 + (highPitch - note.pitch) * (rowHeightPx - 17) / pitchSpan);
+                            if (showGridNotesForRow)
+                                g.fillRoundedRectangle(noteX + 0.7f, noteY + 0.7f, noteWidth, noteHeight, 1.0f);
+                            else
+                                g.fillRect(noteX, noteY, noteWidth, noteHeight);
+                        }
+                        g.restoreState();
+                    }
+                    if (showPatternLabels)
                     {
                         g.setColour(juce::Colours::white);
                         g.drawText(label, clipX + 5, y + rowHeightPx - 15, juce::jmax(8, clipWidth - 10), 11,
@@ -1341,27 +1721,77 @@ public:
                     const auto clipX = juce::jmax(labelWidthPx + firstVisibleBar * barWidthPx, clipOriginX);
                     const auto clipWidth = clipEndX - clipX;
                     const auto clipFill = trackTint.isTransparent()
-                        ? juce::Colour::fromRGB(39, 125, 165)
-                        : trackTint.interpolatedWith(juce::Colour::fromRGB(39, 125, 165), 0.35f);
-                    g.setColour(clipFill.withAlpha(0.82f));
-                    g.fillRoundedRectangle(static_cast<float>(clipX + 3), static_cast<float>(y + 4),
-                        static_cast<float>(juce::jmax(1, clipWidth - 6)), static_cast<float>(rowHeightPx - 8), 5.0f);
-                    const auto midY = y + rowHeightPx / 2;
-                    g.setColour(juce::Colour::fromRGB(178, 229, 244).withAlpha(0.85f));
-                    juce::Path waveform;
-                    waveform.startNewSubPath(static_cast<float>(clipX + 8), static_cast<float>(midY));
-                    const int samples = juce::jlimit(8, 80, clipWidth / 4);
-                    for (int sample = 1; sample <= samples; ++sample)
+                        ? orbit::options::colour(39, 125, 165)
+                        : trackTint.interpolatedWith(orbit::options::colour(39, 125, 165), 0.35f);
+                    // Audio clips are opaque so the Playlist grid does not
+                    // show through the waveform region.
+                    if (getTrackGradientHighlight && getTrackGradientHighlight(row))
                     {
-                        const auto px = clipX + 8 + sample * juce::jmax(1, clipWidth - 16) / samples;
-                        const auto phase = static_cast<float>(sample * 2.41 + row * 3.17);
-                        const auto envelope = 0.22f + 0.78f * std::sin(juce::MathConstants<float>::pi
-                            * static_cast<float>(sample) / static_cast<float>(samples));
-                        const auto amplitude = envelope * (0.18f + 0.32f * std::abs(std::sin(phase)));
-                        waveform.lineTo(static_cast<float>(px), static_cast<float>(midY)
-                            + static_cast<float>(rowHeightPx) * amplitude * std::sin(phase * 2.7f));
+                        juce::ColourGradient gradient(clipFill.brighter(0.26f),
+                            static_cast<float>(clipX), static_cast<float>(y),
+                            clipFill.darker(0.42f), static_cast<float>(clipX + clipWidth),
+                            static_cast<float>(y + rowHeightPx), false);
+                        g.setGradientFill(gradient);
                     }
-                    g.strokePath(waveform, juce::PathStrokeType(1.2f));
+                    else
+                    {
+                        g.setColour(clipFill);
+                    }
+                    g.fillRect(clipX, y, clipWidth, rowHeightPx);
+                    if (audioClipSourceFile)
+                    {
+                        const auto source = audioClipSourceFile(row, bar);
+                        if (source.existsAsFile())
+                        {
+                            const auto key = source.getFullPathName();
+                            auto found = audioThumbnails.find(key);
+                            if (found == audioThumbnails.end())
+                            {
+                                auto thumbnail = std::make_unique<juce::AudioThumbnail>(512, audioFormats, audioThumbnailCache);
+                                thumbnail->addChangeListener(this);
+                                thumbnail->setSource(new juce::FileInputSource(source));
+                                found = audioThumbnails.emplace(key, std::move(thumbnail)).first;
+                            }
+                            auto* thumbnail = found->second.get();
+                            if (thumbnail != nullptr && thumbnail->getTotalLength() > 0.0)
+                            {
+                                g.setColour(orbit::options::colour(194, 235, 248).withAlpha(0.95f));
+                                const auto waveformBounds = juce::Rectangle<int>(clipX + 7, y + 5,
+                                    juce::jmax(1, clipWidth - 14), juce::jmax(1, rowHeightPx - 10));
+                                const bool reversed = audioClipIsReversed && audioClipIsReversed(row, bar);
+                                if (reversed)
+                                {
+                                    g.saveState();
+                                    g.addTransform(juce::AffineTransform(-1.0f, 0.0f,
+                                        static_cast<float>(waveformBounds.getX() * 2 + waveformBounds.getWidth()),
+                                        0.0f, 1.0f, 0.0f));
+                                    thumbnail->drawChannels(g, waveformBounds, 0.0,
+                                        thumbnail->getTotalLength(), 0.95f);
+                                    g.restoreState();
+                                }
+                                else
+                                {
+                                    thumbnail->drawChannels(g, waveformBounds, 0.0,
+                                        thumbnail->getTotalLength(), 0.95f);
+                                }
+                            }
+                        }
+                    }
+                    g.setColour(orbit::options::colour(156, 232, 250));
+                    const auto clipStartBar = startBar;
+                    const auto clipEndBar = startBar + clipBars;
+                    const bool joinsPrevious = clipStartBar > 0 && audioClipStartBar
+                        && audioClipStartBar(row, clipStartBar - 1) == clipStartBar - 1
+                        && audioClipLengthBars && clipStartBar - 1
+                            + audioClipLengthBars(row, clipStartBar - 1) == clipStartBar;
+                    const bool joinsNext = clipEndBar < barCount && audioClipStartBar
+                        && audioClipStartBar(row, clipEndBar) == clipEndBar;
+                    g.drawHorizontalLine(y, static_cast<float>(clipX), static_cast<float>(clipX + clipWidth));
+                    g.drawHorizontalLine(y + rowHeightPx - 1, static_cast<float>(clipX),
+                                         static_cast<float>(clipX + clipWidth));
+                    // The opaque waveform body is the clip boundary. Avoid
+                    // repeating a bar outline over a continuous audio region.
+                    juce::ignoreUnused(joinsPrevious, joinsNext);
                     g.setColour(juce::Colours::white);
                     if (!clippedAtLeftEdge)
                         g.drawText(label, clipX + 5, y + rowHeightPx - 15, juce::jmax(8, clipWidth - 10), 11,
@@ -1374,8 +1804,8 @@ public:
         {
             const auto y = headerHeightPx + row * rowHeightPx;
             const auto rowBase = lightTheme
-                ? (row % 2 == 0 ? juce::Colour::fromRGB(169, 181, 196) : juce::Colour::fromRGB(183, 193, 207))
-                : (row % 2 == 0 ? juce::Colour::fromRGB(25, 38, 49) : juce::Colour::fromRGB(22, 33, 43));
+                ? (row % 2 == 0 ? orbit::options::colour(169, 181, 196) : orbit::options::colour(183, 193, 207))
+                : (row % 2 == 0 ? orbit::options::colour(25, 38, 49) : orbit::options::colour(22, 33, 43));
             g.setColour(rowBase);
             g.fillRect(0, y, getWidth(), rowHeightPx);
             for (int bar = firstVisibleBar; bar < lastVisibleBar; ++bar)
@@ -1383,8 +1813,8 @@ public:
                 const auto x = labelWidthPx + bar * barWidthPx;
                 const bool majorBar = highlightEveryBars > 1 && bar % highlightEveryBars == 0;
                 g.setColour(majorBar
-                    ? (lightTheme ? juce::Colour::fromRGB(247, 249, 251) : juce::Colour::fromRGB(111, 151, 169))
-                    : (lightTheme ? juce::Colour::fromRGB(125, 139, 155) : juce::Colour::fromRGB(68, 88, 101)));
+                    ? (lightTheme ? orbit::options::colour(247, 249, 251) : orbit::options::colour(111, 151, 169))
+                    : (lightTheme ? orbit::options::colour(125, 139, 155) : orbit::options::colour(68, 88, 101)));
                 g.drawRect(x, y, barWidthPx, rowHeightPx, 1);
             }
         }
@@ -1397,16 +1827,40 @@ public:
             for (int bar = firstGuide; bar < lastVisibleBar; bar += highlightEveryBars)
             {
                 const auto x = labelWidthPx + bar * barWidthPx;
-            g.setColour(juce::Colour::fromRGB(177, 207, 222).withAlpha(0.62f));
-                g.drawVerticalLine(x, headerHeightPx, headerHeightPx + displayedRowCount * rowHeightPx);
-                g.setColour(lightTheme ? juce::Colour::fromRGB(255, 255, 255)
-                                       : juce::Colour::fromRGB(205, 225, 236));
+                g.setColour(orbit::options::colour(177, 207, 222).withAlpha(0.62f));
+                for (int row = firstVisibleRow; row < lastVisibleRow; ++row)
+                {
+                    if (isAudioTrack && isAudioTrack(row)) continue;
+                    if (clipName && clipName(row, bar).isNotEmpty()) continue;
+                    const auto y = headerHeightPx + row * rowHeightPx;
+                    g.drawVerticalLine(x, static_cast<float>(y), static_cast<float>(y + rowHeightPx));
+                }
+                g.setColour(lightTheme ? orbit::options::colour(255, 255, 255)
+                                       : orbit::options::colour(205, 225, 236));
                 g.drawVerticalLine(x, 0.0f, static_cast<float>(headerHeightPx));
             }
         }
+        if (juce::isPositiveAndBelow(paintPreviewTrack, count)
+            && juce::isPositiveAndBelow(paintPreviewStartBar, barCount)
+            && juce::isPositiveAndBelow(paintPreviewEndBar, barCount))
+        {
+            const auto previewStart = juce::jmin(paintPreviewStartBar, paintPreviewEndBar);
+            const auto previewEnd = juce::jmax(paintPreviewStartBar, paintPreviewEndBar);
+            const auto x = labelWidthPx + previewStart * barWidthPx;
+            const auto y = headerHeightPx + paintPreviewTrack * rowHeightPx;
+            const auto width = (previewEnd - previewStart + 1) * barWidthPx;
+            g.setColour(orbit::options::colour(71, 177, 218).withAlpha(0.20f));
+            g.fillRoundedRectangle(static_cast<float>(x + 3), static_cast<float>(y + 4),
+                                   static_cast<float>(juce::jmax(1, width - 6)),
+                                   static_cast<float>(juce::jmax(1, rowHeightPx - 8)), 5.0f);
+            g.setColour(orbit::options::colour(141, 218, 244).withAlpha(0.95f));
+            g.drawRoundedRectangle(static_cast<float>(x + 3), static_cast<float>(y + 4),
+                                   static_cast<float>(juce::jmax(1, width - 6)),
+                                   static_cast<float>(juce::jmax(1, rowHeightPx - 8)), 5.0f, 1.5f);
+        }
         if (playheadVisible)
         {
-            g.setColour(juce::Colour::fromRGB(232, 72, 68));
+            g.setColour(orbit::options::colour(232, 72, 68));
             g.fillRect(juce::roundToInt(playheadX) - 1, headerHeightPx, 2,
                        juce::jmax(0, displayedRowCount * rowHeightPx));
         }
@@ -1431,16 +1885,30 @@ public:
                         - value * juce::jmax(1, rowHeightPx - 16));
                     if (step == firstStep) curve.startNewSubPath(x, pointY); else curve.lineTo(x, pointY);
                 }
-                g.setColour(juce::Colour::fromRGB(73, 207, 237).withAlpha(0.85f));
+                g.setColour(orbit::options::colour(73, 207, 237).withAlpha(0.85f));
                 g.strokePath(curve, juce::PathStrokeType(2.0f));
             }
         }
-        g.setColour(juce::Colour::fromRGB(65, 94, 112));
+        g.setColour(orbit::options::colour(65, 94, 112));
+        g.drawVerticalLine(labelWidth() - 1, 0.0f, static_cast<float>(getHeight()));
+        g.setColour(orbit::options::colour(93, 173, 199).withAlpha(0.8f));
+        const auto gripY = headerHeightPx / 2.0f;
+        for (int offset = -5; offset <= 5; offset += 5)
+            g.drawLine(static_cast<float>(labelWidth() - 5), gripY + offset,
+                       static_cast<float>(labelWidth() - 1), gripY + offset, 1.0f);
         g.drawRect(getLocalBounds(), 1);
     }
 
     void mouseDown(const juce::MouseEvent& event) override
     {
+        if (event.mods.isLeftButtonDown() && event.y >= headerHeight()
+            && event.x >= labelWidth() - 9 && event.x < labelWidth())
+        {
+            resizingTrackHeader = true;
+            resizeHeaderStartX = event.x;
+            resizeHeaderStartWidth = labelWidth();
+            return;
+        }
         if (event.mods.isLeftButtonDown() && event.y < headerHeight() && event.x >= labelWidth())
         {
             loopDragAnchorBar = barAtX(event.x);
@@ -1457,6 +1925,25 @@ public:
             if (trackContextMenu) trackContextMenu(row, this);
             return;
         }
+        if (event.mods.isLeftButtonDown() && event.x < labelWidth() && event.y >= headerHeight()
+            && juce::isPositiveAndBelow(row, trackCount ? trackCount() : 0))
+        {
+            dragSourceTrackRow = row;
+            draggingTrackRow = false;
+            return;
+        }
+        // Audio clips are drawn as continuous waveforms across multiple bars.
+        // Route their context click through the grid itself so each underlying
+        // bar does not act like a separate hover/click target.
+        if ((event.mods.isPopupMenu() || event.mods.isRightButtonDown())
+            && event.x >= labelWidth() && event.y >= headerHeight()
+            && trackCount && juce::isPositiveAndBelow(row, trackCount())
+            && juce::isPositiveAndBelow(bar, barCount)
+            && isAudioTrack && isAudioTrack(row))
+        {
+            if (audioContextMenu) audioContextMenu(row, bar, this);
+            return;
+        }
         if (event.x < labelWidth() || event.y < headerHeight() || !trackCount
             || !juce::isPositiveAndBelow(row, trackCount()) || !juce::isPositiveAndBelow(bar, barCount))
             return;
@@ -1467,11 +1954,41 @@ public:
 
     void mouseDrag(const juce::MouseEvent& event) override
     {
+        if (resizingTrackHeader)
+        {
+            setTrackHeaderWidth(resizeHeaderStartWidth + event.x - resizeHeaderStartX);
+            return;
+        }
+        if (dragSourceTrackRow >= 0)
+        {
+            if (event.getDistanceFromDragStart() >= 8) draggingTrackRow = true;
+            if (draggingTrackRow) repaint();
+            return;
+        }
         updateLoopFromRuler(event.x);
     }
 
     void mouseUp(const juce::MouseEvent& event) override
     {
+        if (resizingTrackHeader)
+        {
+            resizingTrackHeader = false;
+            if (onTrackHeaderWidthChanged) onTrackHeaderWidthChanged(labelWidth());
+            return;
+        }
+        if (dragSourceTrackRow >= 0)
+        {
+            const auto source = dragSourceTrackRow;
+            const auto destination = (event.y - headerHeight()) / rowHeight();
+            const bool shouldReorder = draggingTrackRow
+                && juce::isPositiveAndBelow(destination, trackCount ? trackCount() : 0)
+                && destination != source;
+            dragSourceTrackRow = -1;
+            draggingTrackRow = false;
+            repaint();
+            if (shouldReorder && trackReordered) trackReordered(source, destination);
+            return;
+        }
         if (draggingLoopRange)
         {
             updateLoopFromRuler(event.x);
@@ -1496,6 +2013,22 @@ public:
         dragSourceRow = dragSourceBar = -1;
         dragSourceHasClip = false;
         repaint();
+    }
+
+    void mouseMove(const juce::MouseEvent& event) override
+    {
+        if (event.y >= headerHeight() && event.x >= labelWidth() - 9 && event.x < labelWidth())
+        {
+            setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
+            return;
+        }
+        if (event.x < labelWidth() && event.y >= headerHeight())
+        {
+            setMouseCursor(draggingTrackRow ? juce::MouseCursor::DraggingHandCursor
+                                            : juce::MouseCursor::NormalCursor);
+            return;
+        }
+        setMouseCursor(juce::MouseCursor::NormalCursor);
     }
 
     void refreshCellButtons()
@@ -1528,7 +2061,14 @@ public:
         for (int row = 0; row < rows; ++row)
         {
             auto& controls = *trackControls[static_cast<size_t>(row)];
-            controls.setBounds(labelWidth() - 100, headerHeight() + row * rowHeight(), 78, rowHeight());
+            // Keep M/S/R controls at a fixed size while the Playlist rows are
+            // vertically zoomed. The controls stay centered in each row and
+            // do not inherit the track-height zoom as their own dimensions.
+            constexpr int trackControlsHeight = 30;
+            const auto rowY = headerHeight() + row * rowHeight();
+            controls.setBounds(labelWidth() - 100,
+                               rowY + (rowHeight() - trackControlsHeight) / 2,
+                               80, trackControlsHeight);
             controls.mute.setToggleState(getTrackMute && getTrackMute(row), juce::dontSendNotification);
             controls.solo.setToggleState(getTrackSolo && getTrackSolo(row), juce::dontSendNotification);
             controls.record.setToggleState(getTrackRecordArm && getTrackRecordArm(row), juce::dontSendNotification);
@@ -1558,6 +2098,21 @@ public:
                                  currentClip, cellClicked, cellPainted, onPaintFinished, isPencilToolActive,
                                  clipDragged, barWidth(), rowHeight(),
                                  [this] { return automationMode; }, getSongAutomationValue, setSongAutomationPoint);
+                button.getPatternClipStartBar = patternClipStartBar;
+                button.getPatternClipLengthBars = patternClipLengthBars;
+                button.getPatternStepCount = patternStepCount;
+                button.paintRange = paintPatternRange;
+                button.previewPaintRange = [this](int track, int start, int end)
+                {
+                    setPatternRangePaintPreview(track, start, end);
+                };
+                button.clearPaintRangePreview = [this] { clearPatternRangePaintPreview(); };
+                button.resizePatternClip = resizePatternClip;
+                button.previewPatternClipResize = [this](int track, int start, int length)
+                {
+                    setPatternResizePreview(track, start, length);
+                };
+                button.clearPatternClipResizePreview = [this] { clearPatternResizePreview(); };
                 button.onPatternMenu = showPatternMenu;
                 button.onOpenGenerator = openGeneratorForTrack;
                 button.onDeleteClip = cellDeleted;
@@ -1565,6 +2120,10 @@ public:
                 button.audioTrack = isAudioTrack && isAudioTrack(row);
                 button.onAudioMenu = audioContextMenu;
                 button.setBounds(labelWidth() + bar * barWidth(), headerHeight() + row * rowHeight(), barWidth(), rowHeight());
+                // A waveform spans many bars. Hiding its bar-sized TextButtons
+                // lets the grid receive one uninterrupted mouse gesture and
+                // prevents hover repaint seams from appearing over the audio.
+                button.setVisible(!button.audioTrack);
             }
     }
 
@@ -1576,15 +2135,16 @@ public:
         juce::ToggleButton followToggle("Follow play cursor");
         juce::ToggleButton notesToggle("Show notes in patterns");
         juce::ToggleButton velocitiesToggle("Show note velocities");
+        juce::ToggleButton gridPreviewToggle("Show grid notes on all tracks");
         juce::ToggleButton navigationToggle("Show navigation bar");
         juce::ToggleButton automationToggle("Song automation mode");
         juce::ToggleButton lightThemeToggle("Light Playlist grid");
-        std::array<juce::ToggleButton*, 7> toggles {
-            &snapToggle, &followToggle, &notesToggle, &velocitiesToggle, &navigationToggle,
+        std::array<juce::ToggleButton*, 8> toggles {
+            &snapToggle, &followToggle, &notesToggle, &gridPreviewToggle, &velocitiesToggle, &navigationToggle,
             &automationToggle, &lightThemeToggle
         };
-        const std::array<bool, 7> toggleValues {
-            snapToGrid, followPlayCursor, showPatternNotes, showPatternVelocities, showNavigationBar,
+        const std::array<bool, 8> toggleValues {
+            snapToGrid, followPlayCursor, showPatternNotes, showPatternGrid, showPatternVelocities, showNavigationBar,
             automationMode, lightTheme
         };
         for (size_t i = 0; i < toggles.size(); ++i)
@@ -1632,6 +2192,8 @@ public:
         snapToGrid = snapToggle.getToggleState();
         followPlayCursor = followToggle.getToggleState();
         showPatternNotes = notesToggle.getToggleState();
+        showPatternGrid = gridPreviewToggle.getToggleState();
+        if (onPatternGridChanged) onPatternGridChanged(showPatternGrid);
         showPatternVelocities = velocitiesToggle.getToggleState();
         showNavigationBar = navigationToggle.getToggleState();
         automationMode = automationToggle.getToggleState();
@@ -1642,6 +2204,7 @@ public:
         highlightEveryBars = selectedHighlight;
         snapDivision = selectedSnap;
         repaint();
+        refreshCellButtons();
     }
 
 private:
@@ -1669,6 +2232,7 @@ private:
     bool snapToGrid = true;
     bool followPlayCursor = false;
     bool showPatternNotes = true;
+    bool showPatternGrid = false;
     bool showPatternVelocities = false;
     bool showNavigationBar = true;
     int snapDivision = 5;
@@ -1697,12 +2261,12 @@ public:
     {
         auto bounds = getLocalBounds().toFloat().reduced(1.5f);
         const auto active = getToggleState();
-        g.setColour(active ? juce::Colour::fromRGB(36, 132, 174)
-                           : juce::Colour::fromRGB(35, 51, 62));
+        g.setColour(active ? orbit::options::colour(36, 132, 174)
+                           : orbit::options::colour(35, 51, 62));
         g.fillRoundedRectangle(bounds, 4.0f);
-        g.setColour(juce::Colour::fromRGB(112, 151, 170));
+        g.setColour(orbit::options::colour(112, 151, 170));
         g.drawRoundedRectangle(bounds, 4.0f, 1.0f);
-        g.setColour(juce::Colour::fromRGB(220, 237, 245).withAlpha(down ? 0.65f : highlighted ? 1.0f : 0.9f));
+        g.setColour(orbit::options::colour(220, 237, 245).withAlpha(down ? 0.65f : highlighted ? 1.0f : 0.9f));
         const auto cx = bounds.getCentreX(), cy = bounds.getCentreY();
         const auto stroke = juce::PathStrokeType(1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
         juce::Path icon;
@@ -1750,13 +2314,13 @@ public:
     void paintButton(juce::Graphics& g, bool highlighted, bool down) override
     {
         auto bounds = getLocalBounds().toFloat().reduced(2.0f);
-        g.setColour((down ? juce::Colour::fromRGB(48, 113, 143)
-                          : highlighted ? juce::Colour::fromRGB(48, 78, 95)
-                                        : juce::Colour::fromRGB(35, 51, 62)));
+        g.setColour((down ? orbit::options::colour(48, 113, 143)
+                          : highlighted ? orbit::options::colour(48, 78, 95)
+                                        : orbit::options::colour(35, 51, 62)));
         g.fillRoundedRectangle(bounds, 3.0f);
-        g.setColour(juce::Colour::fromRGB(112, 151, 170));
+        g.setColour(orbit::options::colour(112, 151, 170));
         g.drawRoundedRectangle(bounds, 3.0f, 0.8f);
-        g.setColour(juce::Colour::fromRGB(220, 237, 245));
+        g.setColour(orbit::options::colour(220, 237, 245));
         const auto cx = bounds.getCentreX(), cy = bounds.getCentreY();
         if (kind == Kind::minimize || kind == Kind::restore)
         {
@@ -1848,8 +2412,8 @@ public:
     {
         // The Playlist is a workspace view; do not let the floating generator
         // panel beneath it show through unused rows or the bottom toolbar.
-        g.fillAll(lightTheme ? juce::Colour::fromRGB(177, 187, 202)
-                             : juce::Colour::fromRGB(20, 29, 38));
+        g.fillAll(lightTheme ? orbit::options::colour(177, 187, 202)
+                             : orbit::options::colour(20, 29, 38));
     }
     void setAutomationMode(bool enabled)
     {
@@ -1880,8 +2444,8 @@ private:
     public:
         void paint(juce::Graphics& g) override
         {
-            g.fillAll(lightTheme ? juce::Colour::fromRGB(177, 187, 202)
-                                 : juce::Colour::fromRGB(20, 29, 38));
+            g.fillAll(lightTheme ? orbit::options::colour(177, 187, 202)
+                                 : orbit::options::colour(20, 29, 38));
         }
         void setLightTheme(bool enabled) { lightTheme = enabled; repaint(); }
         void setGrid(PlaylistGrid* playlistGrid) { grid = playlistGrid; }
@@ -1921,7 +2485,7 @@ public:
         void mouseUp(const juce::MouseEvent&) override { if (onEnded) onEnded(); }
         void paint(juce::Graphics& g) override
         {
-            g.setColour(juce::Colour::fromRGB(112, 179, 201));
+            g.setColour(orbit::options::colour(112, 179, 201));
             const bool left = corner == Corner::topLeft || corner == Corner::bottomLeft;
             const bool top = corner == Corner::topLeft || corner == Corner::topRight;
             const float x0 = left ? 0.0f : static_cast<float>(getWidth());
@@ -1957,7 +2521,7 @@ public:
         setOpaque(true);
         title.setText("Playlist", juce::dontSendNotification);
         title.setFont(juce::FontOptions(13.0f, juce::Font::bold));
-        title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(222, 235, 242));
+        title.setColour(juce::Label::textColourId, orbit::options::colour(222, 235, 242));
         title.setJustificationType(juce::Justification::centred);
         title.setInterceptsMouseClicks(false, false);
         addAndMakeVisible(title);
@@ -2099,10 +2663,10 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        g.fillAll(juce::Colour::fromRGB(20, 29, 38));
-        g.setColour(juce::Colour::fromRGB(32, 42, 52));
+        g.fillAll(orbit::options::colour(20, 29, 38));
+        g.setColour(orbit::options::colour(32, 42, 52));
         g.fillRect(0, 0, getWidth(), titleBarHeight);
-        g.setColour(juce::Colour::fromRGB(151, 194, 216));
+        g.setColour(orbit::options::colour(151, 194, 216));
         g.drawRect(getLocalBounds().toFloat().reduced(0.5f), 1.0f);
     }
 
@@ -2131,9 +2695,60 @@ public:
         if (grid != nullptr) grid->setLoopRangeFromRuler = std::move(callback);
     }
     void showSettings() { if (grid != nullptr) grid->showSettings(); }
-    void setClipPreview(std::function<std::vector<juce::Point<int>>(int, int)> provider)
+    void setClipPreview(std::function<std::vector<PlaylistPreviewNote>(int, int)> provider)
     {
         if (grid != nullptr) grid->clipNotes = std::move(provider);
+    }
+    void setPatternClipHandlers(std::function<int(int, int)> getStart,
+                                std::function<int(int, int)> getLength,
+                                std::function<int(int, int)> getSteps,
+                                std::function<void(int, int, int)> resize)
+    {
+        if (grid == nullptr) return;
+        grid->patternClipStartBar = std::move(getStart);
+        grid->patternClipLengthBars = std::move(getLength);
+        grid->patternStepCount = std::move(getSteps);
+        grid->resizePatternClip = std::move(resize);
+        grid->refreshCellButtons();
+        grid->repaint();
+    }
+    void setPatternRangePaintHandler(std::function<void(int, int, int)> callback)
+    {
+        if (grid == nullptr) return;
+        grid->paintPatternRange = std::move(callback);
+        grid->refreshCellButtons();
+    }
+    void setTrackGridNotesProvider(std::function<bool(int)> provider)
+    {
+        if (grid != nullptr) grid->getTrackGridNotes = std::move(provider);
+    }
+    void setTrackGradientHighlightProvider(std::function<bool(int)> provider)
+    {
+        if (grid != nullptr) grid->getTrackGradientHighlight = std::move(provider);
+    }
+    void setTrackHeaderWidth(int width)
+    {
+        if (grid != nullptr) grid->setTrackHeaderWidth(width);
+    }
+    void setTrackHeaderWidthChangedHandler(std::function<void(int)> callback)
+    {
+        if (grid != nullptr) grid->onTrackHeaderWidthChanged = std::move(callback);
+    }
+    void setTrackReorderHandler(std::function<void(int, int)> callback)
+    {
+        if (grid != nullptr) grid->trackReordered = std::move(callback);
+    }
+    void setShowPatternGrid(bool enabled)
+    {
+        if (grid != nullptr) grid->setShowPatternGrid(enabled);
+    }
+    bool isShowPatternGridEnabled() const
+    {
+        return grid != nullptr && grid->isShowPatternGridEnabled();
+    }
+    void setPatternGridChangedHandler(std::function<void(bool)> callback)
+    {
+        if (grid != nullptr) grid->onPatternGridChanged = std::move(callback);
     }
     void setSongAutomationCallbacks(std::function<float(int, int)> getValue,
                                     std::function<void(int, int, float)> setPoint)
@@ -2151,6 +2766,8 @@ public:
     void setAudioClipHandlers(std::function<bool(int)> isAudio,
                               std::function<int(int, int)> clipStart,
                               std::function<int(int, int)> clipLength,
+                              std::function<juce::File(int, int)> clipSource,
+                              std::function<bool(int, int)> clipIsReversed,
                               std::function<void(int, int, juce::Component*)> contextMenu)
     {
         if (grid != nullptr)
@@ -2158,6 +2775,8 @@ public:
             grid->isAudioTrack = std::move(isAudio);
             grid->audioClipStartBar = std::move(clipStart);
             grid->audioClipLengthBars = std::move(clipLength);
+            grid->audioClipSourceFile = std::move(clipSource);
+            grid->audioClipIsReversed = std::move(clipIsReversed);
             grid->audioContextMenu = std::move(contextMenu);
         }
     }
@@ -2175,6 +2794,8 @@ public:
         if (grid != nullptr) grid->setLightTheme(enabled);
         if (surface != nullptr) surface->setLightTheme(enabled);
     }
+
+    bool isLightTheme() const { return grid != nullptr && grid->isLightTheme(); }
 
     void setThemeChangedHandler(std::function<void(bool)> callback)
     {
@@ -2256,7 +2877,7 @@ public:
     void paint(juce::Graphics& g) override
     {
         auto bounds = getLocalBounds().toFloat();
-        g.fillAll(juce::Colour::fromRGB(22, 39, 52));
+        g.fillAll(orbit::options::colour(22, 39, 52));
         if (bounds.getWidth() < 4.0f || bounds.getHeight() < 4.0f) return;
 
         constexpr float minDb = -18.0f;
@@ -2264,13 +2885,13 @@ public:
         for (int db = -18; db <= 18; db += 6)
         {
             const auto y = juce::jmap(static_cast<float>(db), minDb, maxDb, bounds.getBottom(), bounds.getY());
-            g.setColour(db == 0 ? juce::Colour::fromRGB(96, 132, 151) : juce::Colour::fromRGB(48, 72, 89));
+            g.setColour(db == 0 ? orbit::options::colour(96, 132, 151) : orbit::options::colour(48, 72, 89));
             g.drawHorizontalLine(juce::roundToInt(y), bounds.getX(), bounds.getRight());
         }
         for (float frequency : { 20.0f, 50.0f, 100.0f, 200.0f, 500.0f, 1000.0f, 2000.0f, 5000.0f, 10000.0f, 20000.0f })
         {
             const auto x = frequencyToX(frequency, bounds);
-            g.setColour(juce::Colour::fromRGB(40, 62, 77));
+            g.setColour(orbit::options::colour(40, 62, 77));
             g.drawVerticalLine(juce::roundToInt(x), bounds.getY(), bounds.getBottom());
         }
 
@@ -2285,7 +2906,7 @@ public:
             const auto y = juce::jmap(db, minDb, maxDb, bounds.getBottom(), bounds.getY());
             if (i == 0) curve.startNewSubPath(x, y); else curve.lineTo(x, y);
         }
-        g.setColour(juce::Colour::fromRGB(93, 211, 241));
+        g.setColour(orbit::options::colour(93, 211, 241));
         g.strokePath(curve, juce::PathStrokeType(getHeight() < 90 ? 1.5f : 2.5f));
         for (int band = 0; band < 4; ++band)
         {
@@ -2293,12 +2914,12 @@ public:
             if (frequency < 20.0f) continue;
             const auto gain = bandGain ? bandGain(band) : 0.0f;
             const auto point = juce::Point<float>(frequencyToX(frequency, bounds), gainToY(gain, bounds));
-            g.setColour(juce::Colour::fromRGB(18, 41, 53));
+            g.setColour(orbit::options::colour(18, 41, 53));
             g.fillEllipse(point.x - 5.0f, point.y - 5.0f, 10.0f, 10.0f);
-            g.setColour(juce::Colour::fromRGB(174, 239, 255));
+            g.setColour(orbit::options::colour(174, 239, 255));
             g.fillEllipse(point.x - 3.5f, point.y - 3.5f, 7.0f, 7.0f);
         }
-        g.setColour(juce::Colour::fromRGB(174, 207, 224));
+        g.setColour(orbit::options::colour(174, 207, 224));
         g.drawRect(getLocalBounds(), 1);
     }
 
@@ -2333,14 +2954,14 @@ public:
     std::function<juce::String(int)> getTrackName;
 
     EqualiserWindow()
-        : DocumentWindow("Orbit Equaliser", juce::Colour::fromRGB(23, 41, 54), juce::DocumentWindow::allButtons)
+        : DocumentWindow("Orbit Equaliser", orbit::options::colour(23, 41, 54), juce::DocumentWindow::allButtons)
     {
         setUsingNativeTitleBar(true);
         setContentNonOwned(&content, false);
         content.setOpaque(true);
         content.addAndMakeVisible(title);
         title.setFont(juce::FontOptions(18.0f, juce::Font::bold));
-        title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(238, 248, 252));
+        title.setColour(juce::Label::textColourId, orbit::options::colour(238, 248, 252));
         content.addAndMakeVisible(graph);
 
         static const std::array<const char*, 4> bandNames { "LOW SHELF", "LOW MID", "HIGH MID", "HIGH SHELF" };
@@ -2350,14 +2971,14 @@ public:
             bandTitles[static_cast<size_t>(band)].setText(bandNames[static_cast<size_t>(band)], juce::dontSendNotification);
             bandTitles[static_cast<size_t>(band)].setJustificationType(juce::Justification::centredLeft);
             bandTitles[static_cast<size_t>(band)].setFont(juce::FontOptions(12.0f, juce::Font::bold));
-            bandTitles[static_cast<size_t>(band)].setColour(juce::Label::textColourId, juce::Colour::fromRGB(187, 221, 237));
+            bandTitles[static_cast<size_t>(band)].setColour(juce::Label::textColourId, orbit::options::colour(187, 221, 237));
             content.addAndMakeVisible(bandTitles[static_cast<size_t>(band)]);
             for (int parameter = 0; parameter < 3; ++parameter)
             {
                 auto& label = parameterTitles[static_cast<size_t>(band)][static_cast<size_t>(parameter)];
                 label.setText(parameterNames[static_cast<size_t>(parameter)], juce::dontSendNotification);
                 label.setFont(juce::FontOptions(10.5f));
-                label.setColour(juce::Label::textColourId, juce::Colour::fromRGB(205, 223, 232));
+                label.setColour(juce::Label::textColourId, orbit::options::colour(205, 223, 232));
                 content.addAndMakeVisible(label);
 
                 auto& slider = controls[static_cast<size_t>(band)][static_cast<size_t>(parameter)];
@@ -2378,11 +2999,11 @@ public:
                 {
                     slider.setRange(0.1, 4.0, 0.01);
                 }
-                slider.setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(128, 222, 244));
-                slider.setColour(juce::Slider::trackColourId, juce::Colour::fromRGB(69, 124, 152));
+                slider.setColour(juce::Slider::thumbColourId, orbit::options::colour(128, 222, 244));
+                slider.setColour(juce::Slider::trackColourId, orbit::options::colour(69, 124, 152));
                 slider.setPopupDisplayEnabled(true, true, &content);
                 slider.setColour(juce::Slider::textBoxTextColourId, juce::Colours::white);
-                slider.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour::fromRGB(33, 57, 73));
+                slider.setColour(juce::Slider::textBoxBackgroundColourId, orbit::options::colour(33, 57, 73));
                 slider.onValueChange = [this, band, parameter]
                 {
                     if (trackIndex >= 0 && setParameter)
@@ -2480,7 +3101,7 @@ class PluginParameterWindow final : public juce::DocumentWindow
         {
             addAndMakeVisible(label);
             label.setText(parameterRef->getParameterName(), juce::dontSendNotification);
-            label.setColour(juce::Label::textColourId, juce::Colour::fromRGB(228, 241, 248));
+            label.setColour(juce::Label::textColourId, orbit::options::colour(228, 241, 248));
             label.setTooltip(parameterRef->getCurrentValueAsStringWithLabel());
             addAndMakeVisible(value);
             value.setSliderStyle(juce::Slider::LinearHorizontal);
@@ -2500,11 +3121,11 @@ class PluginParameterWindow final : public juce::DocumentWindow
                 label.setTooltip(parameterRef->getCurrentValueAsStringWithLabel());
                 if (changed) changed();
             };
-            value.setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(106, 210, 236));
-            value.setColour(juce::Slider::trackColourId, juce::Colour::fromRGB(44, 78, 100));
-            value.setColour(juce::Slider::textBoxTextColourId, juce::Colour::fromRGB(242, 249, 252));
-            value.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour::fromRGB(33, 56, 71));
-            value.setColour(juce::Slider::textBoxOutlineColourId, juce::Colour::fromRGB(97, 146, 170));
+            value.setColour(juce::Slider::thumbColourId, orbit::options::colour(106, 210, 236));
+            value.setColour(juce::Slider::trackColourId, orbit::options::colour(44, 78, 100));
+            value.setColour(juce::Slider::textBoxTextColourId, orbit::options::colour(242, 249, 252));
+            value.setColour(juce::Slider::textBoxBackgroundColourId, orbit::options::colour(33, 56, 71));
+            value.setColour(juce::Slider::textBoxOutlineColourId, orbit::options::colour(97, 146, 170));
         }
 
         void resized() override
@@ -2556,7 +3177,7 @@ class PluginParameterWindow final : public juce::DocumentWindow
             }
         }
 
-        void paint(juce::Graphics& g) override { g.fillAll(juce::Colour::fromRGB(27, 43, 55)); }
+        void paint(juce::Graphics& g) override { g.fillAll(orbit::options::colour(27, 43, 55)); }
 
     private:
         te::Plugin::Ptr pluginRef;
@@ -2565,7 +3186,7 @@ class PluginParameterWindow final : public juce::DocumentWindow
 
 public:
     PluginParameterWindow()
-        : DocumentWindow("Orbit Effect", juce::Colour::fromRGB(25, 44, 58), juce::DocumentWindow::allButtons)
+        : DocumentWindow("Orbit Effect", orbit::options::colour(25, 44, 58), juce::DocumentWindow::allButtons)
     {
         setUsingNativeTitleBar(true);
         setContentNonOwned(&viewport, false);
@@ -2618,7 +3239,7 @@ public:
         void mouseUp(const juce::MouseEvent&) override { if (onEnded) onEnded(); }
         void paint(juce::Graphics& g) override
         {
-            g.setColour(juce::Colour::fromRGB(112, 179, 201));
+            g.setColour(orbit::options::colour(112, 179, 201));
             const auto centreX = static_cast<float>(getWidth()) * 0.5f;
             const auto centreY = static_cast<float>(getHeight()) * 0.5f;
             for (int offset = -4; offset <= 4; offset += 4)
@@ -2670,9 +3291,16 @@ public:
     std::function<void(double)> setMasterPan;
     std::function<bool()> getMasterMuted;
     std::function<void(bool)> setMasterMuted;
+    std::function<void(bool, int)> onAppearanceChanged;
     MixerWindow()
     {
         content.setOpaque(true);
+        menuButton.setButtonText("▾");
+        menuButton.setTooltip("Mixer options and colors");
+        menuButton.setColour(juce::TextButton::buttonColourId, orbit::options::colour(35, 48, 58));
+        menuButton.setColour(juce::TextButton::textColourOffId, orbit::options::colour(220, 235, 243));
+        menuButton.onClick = [this] { showMixerMenu(); };
+        addAndMakeVisible(menuButton);
         minimizeButton.setKind(PlaylistWindowIconButton::Kind::minimize);
         maximizeButton.setKind(PlaylistWindowIconButton::Kind::maximize);
         closeButton.setKind(PlaylistWindowIconButton::Kind::close);
@@ -2681,8 +3309,8 @@ public:
         closeButton.setTooltip("Close mixer");
         for (auto* button : { &minimizeButton, &maximizeButton, &closeButton })
         {
-            button->setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 48, 58));
-            button->setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(220, 235, 243));
+            button->setColour(juce::TextButton::buttonColourId, orbit::options::colour(35, 48, 58));
+            button->setColour(juce::TextButton::textColourOffId, orbit::options::colour(220, 235, 243));
             addAndMakeVisible(button);
         }
         focusListener.onMouseDown = [this] { if (onFocus) onFocus(); };
@@ -2730,6 +3358,25 @@ public:
     }
     void setMasterSectionMode(bool enabled) { masterSectionMode = enabled; }
     bool isMasterSectionMode() const { return masterSectionMode; }
+    bool isEqSectionVisible() const { return eqSectionVisible; }
+    int getMixerSkin() const { return mixerSkin; }
+    void setEqSectionVisible(bool shouldShow)
+    {
+        if (eqSectionVisible == shouldShow) return;
+        eqSectionVisible = shouldShow;
+        for (auto* strip : channelStrips) strip->setEqSectionVisible(shouldShow);
+        masterStrip.setEqSectionVisible(shouldShow);
+        resized();
+        repaint();
+    }
+    void setMixerSkin(int skin)
+    {
+        mixerSkin = juce::jlimit(0, 2, skin);
+        content.setSkin(mixerSkin);
+        for (auto* strip : channelStrips) strip->setSkin(mixerSkin);
+        masterStrip.setSkin(mixerSkin);
+        repaint();
+    }
     int getVisibleTrackCount() const { return visibleTrackIndices.size(); }
     int getPreferredWidth() const
     {
@@ -2782,6 +3429,7 @@ public:
             const auto i = visibleTrackIndices.getUnchecked(stripIndex);
             auto* strip = channelStrips[stripIndex];
             if (strip->getParentComponent() != &strips) strips.addAndMakeVisible(strip);
+            strip->setSkin(mixerSkin);
             // The selected-track control and footer already identify a
             // channel. The mixer strip itself starts with the send section.
             strip->setFooterText(getTrackName ? getTrackName(i) : "Channel " + juce::String(i + 1));
@@ -2821,6 +3469,7 @@ public:
                 if (setTrackEqEnabled) setTrackEqEnabled(i, enabled);
             };
             strip->setMixControlsVisible(true);
+            strip->setEqSectionVisible(eqSectionVisible);
             // setMixControlsVisible enables the channel's send controls too.
             // Apply track-kind visibility after it so FX return strips do not
             // expose dead send knobs that only accept generator-track indices.
@@ -2873,6 +3522,8 @@ public:
         masterStrip.setMuteState(getMasterMuted && getMasterMuted());
         masterStrip.setMixControlsVisible(false);
         masterStrip.setMasterControlsVisible(true);
+        masterStrip.setSkin(mixerSkin);
+        masterStrip.setEqSectionVisible(eqSectionVisible);
         masterStrip.setSendsVisible(false);
         masterStrip.setEqResponse([this, count](float frequency)
         {
@@ -2929,6 +3580,7 @@ public:
     void resized() override
     {
         content.setBounds(getLocalBounds().reduced(1).withTrimmedTop(titleBarHeight - 1));
+        menuButton.setBounds(5, 2, 23, titleBarHeight - 4);
         minimizeButton.setBounds(getWidth() - 83, 2, 24, titleBarHeight - 4);
         maximizeButton.setBounds(getWidth() - 56, 2, 24, titleBarHeight - 4);
         closeButton.setBounds(getWidth() - 29, 2, 24, titleBarHeight - 4);
@@ -2941,28 +3593,87 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        g.setColour(juce::Colour::fromRGB(25, 46, 60));
+        const auto frame = mixerSkin == 1 ? orbit::options::colour(13, 24, 39)
+            : mixerSkin == 2 ? orbit::options::colour(31, 35, 43)
+            : orbit::options::colour(25, 46, 60);
+        const auto header = mixerSkin == 1 ? orbit::options::colour(20, 34, 53)
+            : mixerSkin == 2 ? orbit::options::colour(40, 45, 54)
+            : orbit::options::colour(32, 42, 52);
+        const auto edge = mixerSkin == 1 ? orbit::options::colour(74, 111, 145)
+            : mixerSkin == 2 ? orbit::options::colour(107, 122, 138)
+            : orbit::options::colour(151, 194, 216);
+        g.setColour(frame);
         g.fillRect(getLocalBounds());
-        g.setColour(juce::Colour::fromRGB(32, 42, 52));
+        g.setColour(header);
         g.fillRect(0, 0, getWidth(), titleBarHeight);
-        g.setColour(juce::Colour::fromRGB(222, 235, 242));
+        g.setColour(orbit::options::colour(222, 235, 242));
         g.setFont(juce::Font(13.0f, juce::Font::bold));
         g.drawText(masterSectionMode ? "Master Section" : "Mixing Desk", 9, 0, juce::jmax(0, getWidth() - 98), titleBarHeight,
                    juce::Justification::centred);
-        g.setColour(juce::Colour::fromRGB(151, 194, 216));
+        g.setColour(edge);
         g.drawRect(getLocalBounds().toFloat().reduced(0.5f), 1.0f);
     }
 
-    void focusMaster() { masterStrip.gain.grabKeyboardFocus(); }
-    void repaintEqGraphs()
+    void showMixerMenu()
     {
-        for (auto* strip : channelStrips) strip->repaintEqGraph();
-        masterStrip.repaintEqGraph();
+        juce::PopupMenu menu;
+        menu.addItem(1, eqSectionVisible ? "Hide EQ" : "Show EQ");
+        menu.addSeparator();
+        juce::PopupMenu skinMenu;
+        skinMenu.addItem(10, "Classic Blue", true, mixerSkin == 0);
+        skinMenu.addItem(11, "Midnight Navy", true, mixerSkin == 1);
+        skinMenu.addItem(12, "Graphite", true, mixerSkin == 2);
+        menu.addSubMenu("Mixer colors", skinMenu);
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&menuButton), [this](int result)
+        {
+            if (result == 1)
+                setEqSectionVisible(!eqSectionVisible);
+            else if (result >= 10 && result <= 12)
+                setMixerSkin(result - 10);
+            else
+                return;
+            if (onAppearanceChanged) onAppearanceChanged(eqSectionVisible, mixerSkin);
+        });
     }
-    void refreshEqControls()
+
+    void focusMaster() { masterStrip.gain.grabKeyboardFocus(); }
+    void repaintEqGraphs(int mixerTrackIndex = -1)
     {
-        for (auto* strip : channelStrips) strip->refreshEqParameterValues();
-        masterStrip.refreshEqParameterValues();
+        if (mixerTrackIndex < 0)
+        {
+            for (auto* strip : channelStrips) strip->repaintEqGraph();
+            masterStrip.repaintEqGraph();
+            return;
+        }
+
+        if (getTrackCount && mixerTrackIndex == getTrackCount())
+        {
+            masterStrip.repaintEqGraph();
+            return;
+        }
+
+        const auto stripIndex = visibleTrackIndices.indexOf(mixerTrackIndex);
+        if (juce::isPositiveAndBelow(stripIndex, channelStrips.size()))
+            channelStrips[stripIndex]->repaintEqGraph();
+    }
+    void refreshEqControls(int mixerTrackIndex = -1)
+    {
+        if (mixerTrackIndex < 0)
+        {
+            for (auto* strip : channelStrips) strip->refreshEqParameterValues();
+            masterStrip.refreshEqParameterValues();
+            return;
+        }
+
+        if (getTrackCount && mixerTrackIndex == getTrackCount())
+        {
+            masterStrip.refreshEqParameterValues();
+            return;
+        }
+
+        const auto stripIndex = visibleTrackIndices.indexOf(mixerTrackIndex);
+        if (juce::isPositiveAndBelow(stripIndex, channelStrips.size()))
+            channelStrips[stripIndex]->refreshEqParameterValues();
     }
     void showEffectEditor(te::Plugin::Ptr plugin, std::function<void()> onChanged)
     {
@@ -3006,6 +3717,7 @@ private:
         }
     } focusListener;
     static constexpr int titleBarHeight = 26;
+    juce::TextButton menuButton;
     PlaylistWindowIconButton minimizeButton { PlaylistWindowIconButton::Kind::minimize },
                             maximizeButton { PlaylistWindowIconButton::Kind::maximize },
                             closeButton { PlaylistWindowIconButton::Kind::close };
@@ -3013,6 +3725,8 @@ private:
     juce::Point<int> dragOrigin;
     bool minimized = false, maximized = false;
     bool masterSectionMode = false;
+    bool eqSectionVisible = true;
+    int mixerSkin = 0;
     juce::Array<int> visibleTrackIndices;
 
     void updateMinimizeButton()
@@ -3054,25 +3768,25 @@ private:
             if (down) background = background.darker(0.12f);
             g.setColour(background);
             g.fillRoundedRectangle(bounds, 3.0f);
-            g.setColour(juce::Colour::fromRGB(116, 157, 178));
+            g.setColour(orbit::options::colour(116, 157, 178));
             g.drawRoundedRectangle(bounds, 3.0f, 1.0f);
 
             const auto centre = bounds.getCentre();
             if (drawsBypass)
             {
                 const auto radius = juce::jmin(3.8f, bounds.getHeight() * 0.22f);
-                g.setColour(isActive ? juce::Colour::fromRGB(72, 207, 229)
-                                     : juce::Colour::fromRGB(34, 47, 56));
+                g.setColour(isActive ? orbit::options::colour(72, 207, 229)
+                                     : orbit::options::colour(34, 47, 56));
                 g.fillEllipse(centre.x - radius, centre.y - radius, radius * 2.0f, radius * 2.0f);
                 if (isActive)
                 {
-                    g.setColour(juce::Colour::fromRGB(183, 242, 250).withAlpha(0.72f));
+                    g.setColour(orbit::options::colour(183, 242, 250).withAlpha(0.72f));
                     g.drawEllipse(centre.x - radius, centre.y - radius, radius * 2.0f, radius * 2.0f, 0.8f);
                 }
             }
             else
             {
-                g.setColour(juce::Colour::fromRGB(232, 244, 249));
+                g.setColour(orbit::options::colour(232, 244, 249));
                 g.drawLine(centre.x - 3.0f, centre.y - 3.0f,
                            centre.x + 3.0f, centre.y + 3.0f, 1.2f);
                 g.drawLine(centre.x + 3.0f, centre.y - 3.0f,
@@ -3098,16 +3812,16 @@ private:
             const auto switchHeight = juce::jmin(11.0f, bounds.getHeight());
             const auto pill = juce::Rectangle<float>(bounds.getRight() - switchWidth,
                 bounds.getCentreY() - switchHeight * 0.5f, switchWidth, switchHeight);
-            const auto active = isEnabled ? juce::Colour::fromRGB(48, 157, 183)
-                                          : juce::Colour::fromRGB(37, 55, 65);
+            const auto active = isEnabled ? orbit::options::colour(48, 157, 183)
+                                          : orbit::options::colour(37, 55, 65);
             g.setColour(down ? active.brighter(0.12f) : active);
             g.fillRoundedRectangle(pill, switchHeight * 0.5f);
-            g.setColour(juce::Colour::fromRGB(146, 185, 200));
+            g.setColour(orbit::options::colour(146, 185, 200));
             g.drawRoundedRectangle(pill, switchHeight * 0.5f, 0.8f);
             const auto knobDiameter = switchHeight - 3.0f;
             const auto knobX = isEnabled ? pill.getRight() - knobDiameter - 1.5f : pill.getX() + 1.5f;
-            g.setColour(isEnabled ? juce::Colour::fromRGB(225, 250, 255)
-                                  : juce::Colour::fromRGB(157, 179, 188));
+            g.setColour(isEnabled ? orbit::options::colour(225, 250, 255)
+                                  : orbit::options::colour(157, 179, 188));
             g.fillEllipse(knobX, pill.getCentreY() - knobDiameter * 0.5f,
                           knobDiameter, knobDiameter);
             if (highlighted)
@@ -3135,16 +3849,16 @@ private:
                 const auto railWidth = juce::jmin(9.0f, juce::jmax(6.0f, bounds.getWidth() * 0.17f));
                 auto rail = juce::Rectangle<float>(centreX - railWidth * 0.5f, bounds.getY() + 7.0f,
                                                     railWidth, juce::jmax(0.0f, bounds.getHeight() - 14.0f));
-                g.setColour(juce::Colour::fromRGB(23, 43, 55));
+                g.setColour(orbit::options::colour(23, 43, 55));
                 g.fillRoundedRectangle(rail, railWidth * 0.5f);
-                g.setColour(juce::Colour::fromRGB(103, 157, 177).withAlpha(0.7f));
+                g.setColour(orbit::options::colour(103, 157, 177).withAlpha(0.7f));
                 g.drawRoundedRectangle(rail, railWidth * 0.5f, 0.8f);
 
                 for (const double db : { -60.0, -36.0, -24.0, -18.0, -12.0, -6.0, 0.0 })
                 {
                     const auto p = static_cast<float>(valueToProportionOfLength(db));
                     const auto y = rail.getBottom() - p * rail.getHeight();
-                    g.setColour(juce::Colour::fromRGB(167, 199, 211).withAlpha(0.65f));
+                    g.setColour(orbit::options::colour(167, 199, 211).withAlpha(0.65f));
                     g.drawHorizontalLine(juce::roundToInt(y), centreX - 9.0f, centreX + 9.0f);
                 }
 
@@ -3153,13 +3867,13 @@ private:
                 const auto thumbWidth = juce::jmin(38.0f, juce::jmax(0.0f, bounds.getWidth() - 6.0f));
                 const auto thumb = juce::Rectangle<float>(centreX - thumbWidth * 0.5f, thumbY - 7.0f,
                                                           thumbWidth, 14.0f);
-                juce::ColourGradient face(juce::Colour::fromRGB(231, 245, 250), thumb.getX(), thumb.getY(),
-                                          juce::Colour::fromRGB(112, 163, 183), thumb.getRight(), thumb.getBottom(), false);
+                juce::ColourGradient face(orbit::options::colour(231, 245, 250), thumb.getX(), thumb.getY(),
+                                          orbit::options::colour(112, 163, 183), thumb.getRight(), thumb.getBottom(), false);
                 g.setGradientFill(face);
                 g.fillRoundedRectangle(thumb, 3.0f);
-                g.setColour(juce::Colour::fromRGB(23, 48, 61));
+                g.setColour(orbit::options::colour(23, 48, 61));
                 g.drawRoundedRectangle(thumb, 3.0f, 1.0f);
-                g.setColour(juce::Colour::fromRGB(248, 253, 255).withAlpha(0.85f));
+                g.setColour(orbit::options::colour(248, 253, 255).withAlpha(0.85f));
                 g.drawHorizontalLine(juce::roundToInt(thumb.getCentreY()), thumb.getX() + 6.0f, thumb.getRight() - 6.0f);
             }
         };
@@ -3177,30 +3891,30 @@ private:
                 constexpr float start = juce::MathConstants<float>::pi * 0.75f;
                 constexpr float sweep = juce::MathConstants<float>::pi * 1.5f;
 
-                g.setColour(juce::Colour::fromRGB(21, 39, 51).withAlpha(0.55f));
+                g.setColour(orbit::options::colour(21, 39, 51).withAlpha(0.55f));
                 g.fillEllipse(bounds.translated(0.0f, 1.3f));
-                juce::ColourGradient bezel(juce::Colour::fromRGB(155, 190, 204),
+                juce::ColourGradient bezel(orbit::options::colour(155, 190, 204),
                                            centre.x, bounds.getY(),
-                                           juce::Colour::fromRGB(48, 76, 92),
+                                           orbit::options::colour(48, 76, 92),
                                            centre.x, bounds.getBottom(), false);
                 g.setGradientFill(bezel);
                 g.fillEllipse(bounds);
 
                 const auto face = bounds.reduced(radius * 0.15f);
-                juce::ColourGradient faceGradient(juce::Colour::fromRGB(71, 119, 143),
+                juce::ColourGradient faceGradient(orbit::options::colour(71, 119, 143),
                                                   face.getX(), face.getY(),
-                                                  juce::Colour::fromRGB(29, 54, 69),
+                                                  orbit::options::colour(29, 54, 69),
                                                   face.getRight(), face.getBottom(), true);
                 g.setGradientFill(faceGradient);
                 g.fillEllipse(face);
-                g.setColour(juce::Colour::fromRGB(18, 38, 50).withAlpha(0.75f));
+                g.setColour(orbit::options::colour(18, 38, 50).withAlpha(0.75f));
                 g.drawEllipse(face, 0.8f);
 
                 const auto arcRadius = radius * 0.77f;
                 juce::Path track;
                 track.addCentredArc(centre.x, centre.y, arcRadius, arcRadius, 0.0f,
                                     start, start + sweep, true);
-                g.setColour(juce::Colour::fromRGB(23, 44, 57));
+                g.setColour(orbit::options::colour(23, 44, 57));
                 g.strokePath(track, juce::PathStrokeType(2.8f, juce::PathStrokeType::curved,
                                                          juce::PathStrokeType::rounded));
 
@@ -3210,7 +3924,7 @@ private:
                     juce::Path activeArc;
                     activeArc.addCentredArc(centre.x, centre.y, arcRadius, arcRadius, 0.0f,
                                             start, start + sweep * proportion, true);
-                    g.setColour(juce::Colour::fromRGB(78, 207, 235));
+                    g.setColour(orbit::options::colour(78, 207, 235));
                     g.strokePath(activeArc, juce::PathStrokeType(3.0f, juce::PathStrokeType::curved,
                                                                   juce::PathStrokeType::rounded));
                 }
@@ -3220,10 +3934,10 @@ private:
                                                        centre.y + std::sin(angle) * radius * 0.22f);
                 const auto outer = juce::Point<float>(centre.x + std::cos(angle) * radius * 0.63f,
                                                        centre.y + std::sin(angle) * radius * 0.63f);
-                g.setColour(juce::Colour::fromRGB(211, 243, 252));
+                g.setColour(orbit::options::colour(211, 243, 252));
                 g.drawLine(inner.x, inner.y, outer.x, outer.y, 2.0f);
                 g.fillEllipse(outer.x - 1.6f, outer.y - 1.6f, 3.2f, 3.2f);
-                g.setColour(juce::Colour::fromRGB(239, 250, 255).withAlpha(0.45f));
+                g.setColour(orbit::options::colour(239, 250, 255).withAlpha(0.45f));
                 juce::Path highlight;
                 highlight.addCentredArc(centre.x, centre.y, radius - 1.0f, radius - 1.0f, 0.0f,
                                         juce::MathConstants<float>::pi * 1.08f,
@@ -3245,7 +3959,7 @@ private:
                 juce::Path arc;
                 arc.addCentredArc(centre.x, centre.y, radius, radius, 0.0f,
                                   startAngle, endAngle, true);
-                g.setColour(juce::Colour::fromRGB(29, 53, 67));
+                g.setColour(orbit::options::colour(29, 53, 67));
                 g.strokePath(arc, juce::PathStrokeType(4.0f, juce::PathStrokeType::curved,
                                                        juce::PathStrokeType::rounded));
 
@@ -3255,7 +3969,7 @@ private:
                     juce::Path activeArc;
                     activeArc.addCentredArc(centre.x, centre.y, radius, radius, 0.0f,
                                             startAngle, startAngle + (endAngle - startAngle) * proportion, true);
-                    g.setColour(juce::Colour::fromRGB(62, 184, 215));
+                    g.setColour(orbit::options::colour(62, 184, 215));
                     g.strokePath(activeArc, juce::PathStrokeType(4.0f, juce::PathStrokeType::curved,
                                                                   juce::PathStrokeType::rounded));
                 }
@@ -3263,10 +3977,10 @@ private:
                 const auto angle = startAngle + (endAngle - startAngle) * proportion;
                 const auto indicator = juce::Point<float>(centre.x + std::cos(angle) * radius,
                                                           centre.y + std::sin(angle) * radius);
-                g.setColour(juce::Colour::fromRGB(23, 42, 53));
+                g.setColour(orbit::options::colour(23, 42, 53));
                 g.fillEllipse(centre.x - radius * 0.64f, centre.y - radius * 0.64f,
                               radius * 1.28f, radius * 1.28f);
-                g.setColour(juce::Colour::fromRGB(196, 229, 241));
+                g.setColour(orbit::options::colour(196, 229, 241));
                 g.fillEllipse(indicator.x - 3.3f, indicator.y - 3.3f, 6.6f, 6.6f);
             }
         };
@@ -3280,12 +3994,12 @@ private:
             {
                 juce::TextButton::paintButton(g, highlighted, down);
                 const auto centreY = static_cast<float>(getHeight()) * 0.5f;
-                const auto colour = insertActive ? juce::Colour::fromRGB(68, 205, 227)
-                                                 : juce::Colour::fromRGB(23, 35, 43);
+                const auto colour = insertActive ? orbit::options::colour(68, 205, 227)
+                                                 : orbit::options::colour(23, 35, 43);
                 g.setColour(colour);
                 g.fillEllipse(5.0f, centreY - 3.3f, 6.6f, 6.6f);
-                g.setColour(insertActive ? juce::Colour::fromRGB(185, 243, 250).withAlpha(0.75f)
-                                         : juce::Colour::fromRGB(103, 131, 144));
+                g.setColour(insertActive ? orbit::options::colour(185, 243, 250).withAlpha(0.75f)
+                                         : orbit::options::colour(103, 131, 144));
                 g.drawEllipse(5.0f, centreY - 3.3f, 6.6f, 6.6f, 0.8f);
             }
         private:
@@ -3298,9 +4012,9 @@ private:
             addAndMakeVisible(footer);
             footer.setJustificationType(juce::Justification::centred);
             footer.setFont(juce::FontOptions(10.5f, juce::Font::bold));
-            footer.setColour(juce::Label::textColourId, juce::Colour::fromRGB(242, 249, 252));
-            footer.setColour(juce::Label::backgroundColourId, juce::Colour::fromRGB(29, 69, 94));
-            footer.setColour(juce::Label::outlineColourId, juce::Colour::fromRGB(106, 164, 193));
+            footer.setColour(juce::Label::textColourId, orbit::options::colour(242, 249, 252));
+            footer.setColour(juce::Label::backgroundColourId, orbit::options::colour(29, 69, 94));
+            footer.setColour(juce::Label::outlineColourId, orbit::options::colour(106, 164, 193));
             addAndMakeVisible(mute);
             addAndMakeVisible(solo);
             addAndMakeVisible(eqButton);
@@ -3309,14 +4023,14 @@ private:
             addAndMakeVisible(insertsTitle);
             insertsTitle.setText("INSERTS", juce::dontSendNotification);
             insertsTitle.setFont(juce::FontOptions(10.5f, juce::Font::bold));
-            insertsTitle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
+            insertsTitle.setColour(juce::Label::textColourId, orbit::options::colour(225, 240, 248));
             insertsTitle.setBorderSize(juce::BorderSize<int>(0, 0, 0, 14));
             eqButton.setButtonText({});
             eqButton.setTitle("Toggle equaliser");
             eqButton.setClickingTogglesState(true);
             eqButton.setTooltip("Enable or bypass the Tracktion equaliser. Click the graph to open its full controls.");
-            eqButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(53, 103, 130));
-            eqButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(43, 118, 145));
+            eqButton.setColour(juce::TextButton::buttonColourId, orbit::options::colour(53, 103, 130));
+            eqButton.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(43, 118, 145));
             eqButton.onClick = [this] { if (onToggleEq) onToggleEq(eqButton.getToggleState()); };
             // Compact power switch is placed beside the HI band title, so EQ
             // can be bypassed without restoring a separate control row.
@@ -3329,7 +4043,7 @@ private:
                 auto& bandTitle = eqBandTitles[static_cast<size_t>(band)];
                 bandTitle.setText(bandNames[static_cast<size_t>(band)], juce::dontSendNotification);
                 bandTitle.setFont(juce::FontOptions(9.0f, juce::Font::bold));
-                bandTitle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
+                bandTitle.setColour(juce::Label::textColourId, orbit::options::colour(225, 240, 248));
                 bandTitle.setJustificationType(juce::Justification::centredLeft);
                 bandTitle.setTooltip(band == 0 ? "High shelf" : band == 1 ? "High mid" : band == 2 ? "Low mid" : "Low shelf");
                 addAndMakeVisible(bandTitle);
@@ -3340,9 +4054,9 @@ private:
                     control.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
                     control.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
                     control.setPopupDisplayEnabled(true, true, this);
-                    control.setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(186, 225, 242));
-                    control.setColour(juce::Slider::rotarySliderFillColourId, juce::Colour::fromRGB(62, 169, 205));
-                    control.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour::fromRGB(34, 58, 74));
+                    control.setColour(juce::Slider::thumbColourId, orbit::options::colour(186, 225, 242));
+                    control.setColour(juce::Slider::rotarySliderFillColourId, orbit::options::colour(62, 169, 205));
+                    control.setColour(juce::Slider::rotarySliderOutlineColourId, orbit::options::colour(34, 58, 74));
                     if (parameter == 0)
                     {
                         control.setRange(-20.0, 20.0, 0.1);
@@ -3385,7 +4099,7 @@ private:
                     controlLabel.setText(compactParameterNames[static_cast<size_t>(parameter)], juce::dontSendNotification);
                     controlLabel.setFont(juce::FontOptions(8.5f));
                     controlLabel.setJustificationType(juce::Justification::centred);
-                    controlLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(205, 227, 237));
+                    controlLabel.setColour(juce::Label::textColourId, orbit::options::colour(205, 227, 237));
                     addAndMakeVisible(controlLabel);
                     controlLabel.setVisible(parameterUsed);
                 }
@@ -3402,11 +4116,11 @@ private:
                 addAndMakeVisible(remove);
                 bypass.setDrawsBypassIndicator(true);
                 insert.setClickingTogglesState(false);
-                insert.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(47, 91, 117));
+                insert.setColour(juce::TextButton::buttonColourId, orbit::options::colour(47, 91, 117));
                 remove.setButtonText("x");
                 remove.setTitle("Remove insert");
                 remove.setTooltip("Remove this effect insert");
-                remove.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(63, 86, 101));
+                remove.setColour(juce::TextButton::buttonColourId, orbit::options::colour(63, 86, 101));
                 insert.onClick = [this, slot]
                 {
                     if (insertSlotHasEffect[static_cast<size_t>(slot)])
@@ -3418,12 +4132,12 @@ private:
                 };
                 edit.setButtonText("E");
                 edit.setTooltip("Open effect controls");
-                edit.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(44, 80, 101));
+                edit.setColour(juce::TextButton::buttonColourId, orbit::options::colour(44, 80, 101));
                 edit.onClick = [this, slot] { if (onEditInsert) onEditInsert(slot); };
                 bypass.setButtonText("B");
                 bypass.setTitle("Bypass insert");
                 bypass.setTooltip("Bypass or enable this insert");
-                bypass.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(44, 80, 101));
+                bypass.setColour(juce::TextButton::buttonColourId, orbit::options::colour(44, 80, 101));
                 bypass.onClick = [this, slot] { if (onToggleInsert) onToggleInsert(slot); };
                 remove.onClick = [this, slot] { if (onRemoveInsert) onRemoveInsert(slot); };
                 insert.setVisible(false);
@@ -3433,14 +4147,14 @@ private:
             }
             addAndMakeVisible(addInsertButton);
             addInsertButton.setButtonText("+ Insert");
-            addInsertButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(44, 80, 101));
+            addInsertButton.setColour(juce::TextButton::buttonColourId, orbit::options::colour(44, 80, 101));
             addInsertButton.onClick = [this] { if (onAddInsert) onAddInsert(); };
             mute.setButtonText("M");
             solo.setButtonText("S");
             mute.setClickingTogglesState(true);
             solo.setClickingTogglesState(true);
-            mute.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(183, 87, 71));
-            solo.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(193, 153, 71));
+            mute.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(183, 87, 71));
+            solo.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(193, 153, 71));
             mute.onClick = [this] { if (onMute) onMute(mute.getToggleState()); };
             solo.onClick = [this] { if (onSolo) onSolo(solo.getToggleState()); };
             addAndMakeVisible(pan);
@@ -3448,7 +4162,7 @@ private:
             {
                 addAndMakeVisible(*label);
                 label->setFont(juce::FontOptions(9.0f, juce::Font::bold));
-                label->setColour(juce::Label::textColourId, juce::Colour::fromRGB(215, 234, 243));
+                label->setColour(juce::Label::textColourId, orbit::options::colour(215, 234, 243));
                 label->setJustificationType(juce::Justification::centred);
             }
             panLeft.setText("L", juce::dontSendNotification);
@@ -3468,7 +4182,7 @@ private:
                 label.setText(juce::String(bus + 1), juce::dontSendNotification);
                 label.setJustificationType(juce::Justification::centredRight);
                 label.setFont(juce::FontOptions(10.5f, juce::Font::bold));
-                label.setColour(juce::Label::textColourId, juce::Colour::fromRGB(225, 240, 248));
+                label.setColour(juce::Label::textColourId, orbit::options::colour(225, 240, 248));
                 addAndMakeVisible(send);
                 send.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
                 send.setRange(-60.0, 6.0, 0.1);
@@ -3478,12 +4192,12 @@ private:
                 send.setPopupDisplayEnabled(true, true, this);
                 send.setTooltip("FX " + juce::String(bus + 1) + " post-fader send level");
                 send.onValueChange = [this, bus] { if (onSend) onSend(bus, sends[static_cast<size_t>(bus)].getValue()); };
-                send.setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(186, 225, 242));
-                send.setColour(juce::Slider::rotarySliderFillColourId, juce::Colour::fromRGB(62, 169, 205));
-                send.setColour(juce::Slider::rotarySliderOutlineColourId, juce::Colour::fromRGB(34, 58, 74));
-                send.setColour(juce::Slider::textBoxTextColourId, juce::Colour::fromRGB(242, 249, 252));
-                send.setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour::fromRGB(43, 73, 94));
-                send.setColour(juce::Slider::textBoxOutlineColourId, juce::Colour::fromRGB(125, 169, 193));
+                send.setColour(juce::Slider::thumbColourId, orbit::options::colour(186, 225, 242));
+                send.setColour(juce::Slider::rotarySliderFillColourId, orbit::options::colour(62, 169, 205));
+                send.setColour(juce::Slider::rotarySliderOutlineColourId, orbit::options::colour(34, 58, 74));
+                send.setColour(juce::Slider::textBoxTextColourId, orbit::options::colour(242, 249, 252));
+                send.setColour(juce::Slider::textBoxBackgroundColourId, orbit::options::colour(43, 73, 94));
+                send.setColour(juce::Slider::textBoxOutlineColourId, orbit::options::colour(125, 169, 193));
             }
             for (int bus = 0; bus < 8; ++bus)
             {
@@ -3493,17 +4207,17 @@ private:
                 route.setClickingTogglesState(false);
                 route.setTooltip("Route this channel to Bus " + juce::String(bus + 1));
                 route.onClick = [this, bus] { if (onOutputBus) onOutputBus(bus); };
-                route.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 58, 72));
-                route.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-                route.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(208, 231, 243));
+                route.setColour(juce::TextButton::buttonColourId, orbit::options::colour(35, 58, 72));
+                route.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(36, 132, 174));
+                route.setColour(juce::TextButton::textColourOffId, orbit::options::colour(208, 231, 243));
                 route.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
             }
             addAndMakeVisible(outputMasterButton);
             outputMasterButton.setClickingTogglesState(false);
             outputMasterButton.setTooltip("Route this channel to the Master output");
-            outputMasterButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 58, 72));
-            outputMasterButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
-            outputMasterButton.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(208, 231, 243));
+            outputMasterButton.setColour(juce::TextButton::buttonColourId, orbit::options::colour(35, 58, 72));
+            outputMasterButton.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(36, 132, 174));
+            outputMasterButton.setColour(juce::TextButton::textColourOffId, orbit::options::colour(208, 231, 243));
             outputMasterButton.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
             outputMasterButton.onClick = [this] { if (onOutputBus) onOutputBus(-1); };
             addAndMakeVisible(gain);
@@ -3515,11 +4229,11 @@ private:
             gain.onValueChange = [this] { if (onGain) onGain(gain.getValue()); };
             for (auto* slider : std::array<juce::Slider*, 2> { &gain, &pan })
             {
-                slider->setColour(juce::Slider::thumbColourId, juce::Colour::fromRGB(186, 225, 242));
-                slider->setColour(juce::Slider::trackColourId, juce::Colour::fromRGB(44, 78, 100));
-                slider->setColour(juce::Slider::textBoxTextColourId, juce::Colour::fromRGB(242, 249, 252));
-                slider->setColour(juce::Slider::textBoxBackgroundColourId, juce::Colour::fromRGB(43, 73, 94));
-                slider->setColour(juce::Slider::textBoxOutlineColourId, juce::Colour::fromRGB(125, 169, 193));
+                slider->setColour(juce::Slider::thumbColourId, orbit::options::colour(186, 225, 242));
+                slider->setColour(juce::Slider::trackColourId, orbit::options::colour(44, 78, 100));
+                slider->setColour(juce::Slider::textBoxTextColourId, orbit::options::colour(242, 249, 252));
+                slider->setColour(juce::Slider::textBoxBackgroundColourId, orbit::options::colour(43, 73, 94));
+                slider->setColour(juce::Slider::textBoxOutlineColourId, orbit::options::colour(125, 169, 193));
             }
         }
 
@@ -3587,6 +4301,7 @@ private:
         void setPanVisible(bool shouldShow) { pan.setVisible(shouldShow); }
         void setMixControlsVisible(bool shouldShow)
         {
+            mixControlsShown = shouldShow;
             mute.setVisible(shouldShow);
             solo.setVisible(shouldShow);
             for (int bus = 0; bus < 8; ++bus)
@@ -3597,15 +4312,15 @@ private:
             outputMasterButton.setVisible(shouldShow && !masterEqView);
             for (auto& route : outputBusButtons) route.setVisible(shouldShow && !masterEqView);
             eqButton.setVisible(false);
-            eqGraph.setVisible(shouldShow);
+            eqGraph.setVisible(shouldShow && eqSectionVisible);
             for (int band = 0; band < 4; ++band)
             {
-                eqBandTitles[static_cast<size_t>(band)].setVisible(shouldShow);
+                eqBandTitles[static_cast<size_t>(band)].setVisible(shouldShow && eqSectionVisible);
                 for (int parameter = 0; parameter < 3; ++parameter)
                 {
                     const bool parameterUsed = parameter < 2 || band == 1;
-                    eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(shouldShow && parameterUsed);
-                    eqControlLabels[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(shouldShow && parameterUsed);
+                    eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(shouldShow && eqSectionVisible && parameterUsed);
+                    eqControlLabels[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(shouldShow && eqSectionVisible && parameterUsed);
                 }
             }
             insertsTitle.setVisible(shouldShow);
@@ -3635,7 +4350,7 @@ private:
             solo.setEnabled(false);
             solo.setTooltip("The master output cannot be soloed");
             eqButton.setVisible(false);
-            eqGraph.setVisible(shouldShow);
+            eqGraph.setVisible(shouldShow && eqSectionVisible);
             for (int band = 0; band < 4; ++band)
             {
                 eqBandTitles[static_cast<size_t>(band)].setVisible(false);
@@ -3648,6 +4363,30 @@ private:
             insertsTitle.setVisible(shouldShow);
             addInsertButton.setVisible(false);
             resized();
+        }
+        void setEqSectionVisible(bool shouldShow)
+        {
+            eqSectionVisible = shouldShow;
+            eqGraph.setVisible((mixControlsShown || masterEqView) && shouldShow);
+            for (int band = 0; band < 4; ++band)
+            {
+                eqBandTitles[static_cast<size_t>(band)].setVisible(mixControlsShown && shouldShow);
+                for (int parameter = 0; parameter < 3; ++parameter)
+                {
+                    const bool parameterUsed = parameter < 2 || band == 1;
+                    eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(
+                        mixControlsShown && shouldShow && parameterUsed);
+                    eqControlLabels[static_cast<size_t>(band)][static_cast<size_t>(parameter)].setVisible(
+                        mixControlsShown && shouldShow && parameterUsed);
+                }
+            }
+            resized();
+            repaint();
+        }
+        void setSkin(int skin)
+        {
+            mixerSkin = juce::jlimit(0, 2, skin);
+            repaint();
         }
         void setSendsVisible(bool shouldShow)
         {
@@ -3727,14 +4466,14 @@ private:
             insert.setButtonText(populated ? "    " + insertName : juce::String{});
             insert.setInsertActive(populated && enabled);
             insert.setColour(juce::TextButton::buttonColourId,
-                             !populated ? juce::Colour::fromRGB(48, 78, 95)
-                                : enabled ? juce::Colour::fromRGB(47, 91, 117) : juce::Colour::fromRGB(55, 69, 78));
+                             !populated ? orbit::options::colour(48, 78, 95)
+                                : enabled ? orbit::options::colour(47, 91, 117) : orbit::options::colour(55, 69, 78));
             insert.setTooltip(populated ? "Open " + insertName + " controls" : "Add an effect to this insert slot");
             bypass.setButtonText("");
             bypass.setTooltip(enabled ? "Bypass this effect" : "Enable this effect");
             bypass.setActive(enabled);
             bypass.setColour(juce::TextButton::buttonColourId,
-                             enabled ? juce::Colour::fromRGB(44, 80, 101) : juce::Colour::fromRGB(55, 69, 78));
+                             enabled ? orbit::options::colour(44, 80, 101) : orbit::options::colour(55, 69, 78));
         }
         void setSelected(bool selected) { isSelected = selected; repaint(); }
 
@@ -3759,11 +4498,15 @@ private:
         void paint(juce::Graphics& g) override
         {
             auto box = getLocalBounds().toFloat().reduced(1.0f);
-            const auto base = isSelected ? juce::Colour::fromRGB(91, 143, 171) : juce::Colour::fromRGB(71, 117, 146);
+            const auto base = mixerSkin == 1
+                ? (isSelected ? orbit::options::colour(45, 83, 113) : orbit::options::colour(25, 43, 63))
+                : mixerSkin == 2
+                    ? (isSelected ? orbit::options::colour(83, 98, 113) : orbit::options::colour(48, 57, 69))
+                    : (isSelected ? orbit::options::colour(91, 143, 171) : orbit::options::colour(71, 117, 146));
             g.setGradientFill(juce::ColourGradient(base.brighter(0.12f), 0.0f, 0.0f,
                                                    base.darker(0.16f), 0.0f, getHeight(), false));
             g.fillRoundedRectangle(box, 5.0f);
-            g.setColour(juce::Colour::fromRGB(161, 197, 216));
+            g.setColour(orbit::options::colour(161, 197, 216));
             g.drawRoundedRectangle(box, 5.0f, 1.0f);
             if (!masterEqView)
             {
@@ -3771,13 +4514,16 @@ private:
                 {
                     const auto panel = eqBandBounds[band].toFloat().reduced(1.0f, 0.5f);
                     if (panel.isEmpty()) continue;
-                    const auto panelBase = band % 2 == 0 ? juce::Colour::fromRGB(58, 102, 126)
-                                                        : juce::Colour::fromRGB(53, 96, 120);
+                    const auto panelBase = mixerSkin == 1
+                        ? (band % 2 == 0 ? orbit::options::colour(29, 51, 72) : orbit::options::colour(25, 45, 64))
+                        : mixerSkin == 2
+                            ? (band % 2 == 0 ? orbit::options::colour(43, 51, 62) : orbit::options::colour(38, 46, 56))
+                            : (band % 2 == 0 ? orbit::options::colour(58, 102, 126) : orbit::options::colour(53, 96, 120));
                     g.setColour(panelBase.withAlpha(0.42f));
                     g.fillRoundedRectangle(panel, 3.0f);
-                    g.setColour(juce::Colour::fromRGB(168, 207, 222).withAlpha(0.28f));
+                    g.setColour(orbit::options::colour(168, 207, 222).withAlpha(0.28f));
                     g.drawRoundedRectangle(panel, 3.0f, 0.7f);
-                    g.setColour(juce::Colour::fromRGB(92, 210, 233).withAlpha(0.78f));
+                    g.setColour(orbit::options::colour(92, 210, 233).withAlpha(0.78f));
                     g.fillRoundedRectangle(panel.getX() + 2.0f, panel.getY() + 2.0f, 2.0f,
                                            juce::jmax(2.0f, panel.getHeight() - 4.0f), 1.0f);
                 }
@@ -3785,9 +4531,9 @@ private:
             if (insertsTitle.isVisible())
             {
                 const auto centreY = insertsTitle.getBounds().toFloat().getCentreY();
-                g.setColour(juce::Colour::fromRGB(234, 62, 52));
+                g.setColour(orbit::options::colour(234, 62, 52));
                 g.fillEllipse(static_cast<float>(insertsTitle.getX() - 12), centreY - 3.0f, 6.0f, 6.0f);
-                g.setColour(juce::Colour::fromRGB(255, 183, 166).withAlpha(0.75f));
+                g.setColour(orbit::options::colour(255, 183, 166).withAlpha(0.75f));
                 g.drawEllipse(static_cast<float>(insertsTitle.getX() - 12), centreY - 3.0f, 6.0f, 6.0f, 0.8f);
             }
             paintMeter(g);
@@ -3817,7 +4563,7 @@ private:
                 }
                 area.removeFromTop(2);
             }
-            if (eqGraph.isVisible())
+            if (insertsTitle.isVisible())
             {
                 insertsTitle.setBounds(area.removeFromTop(16).withTrimmedLeft(16));
                 for (int slot = 0; slot < 4; ++slot)
@@ -3850,6 +4596,9 @@ private:
                 }
                 addInsertButton.setBounds({});
                 area.removeFromTop(2);
+            }
+            if (eqGraph.isVisible())
+            {
                 if (masterEqView)
                 {
                     // The reference Master strip gives its EQ response graph
@@ -4012,7 +4761,7 @@ private:
         void paintMeter(juce::Graphics& g)
         {
             if (!meterVisible || meterBounds.isEmpty()) return;
-            g.setColour(juce::Colour::fromRGB(19, 33, 43));
+            g.setColour(orbit::options::colour(19, 33, 43));
             g.fillRoundedRectangle(meterBounds.toFloat(), 2.0f);
             const int gap = 2;
             constexpr int scaleWidth = 12;
@@ -4025,11 +4774,11 @@ private:
             {
                 const auto level = static_cast<float>(db + 60) / 60.0f;
                 const auto y = meterTop + juce::roundToInt((1.0f - level) * static_cast<float>(meterHeight));
-                g.setColour(juce::Colour::fromRGB(194, 216, 225));
+                g.setColour(orbit::options::colour(194, 216, 225));
                 g.drawFittedText(db == 0 ? "0" : juce::String(db),
                                  meterBounds.getX(), y - 4, scaleWidth - 2, 9,
                                  juce::Justification::centredRight, 1);
-                g.setColour(juce::Colour::fromRGB(125, 158, 173));
+                g.setColour(orbit::options::colour(125, 158, 173));
                 g.drawHorizontalLine(y, static_cast<float>(meterBounds.getX() + scaleWidth - 2),
                                      static_cast<float>(meterBounds.getX() + scaleWidth + 2));
             }
@@ -4037,7 +4786,7 @@ private:
             {
                 const auto channel = juce::Rectangle<int>(x, meterBounds.getY() + 2,
                                                            channelWidth, meterBounds.getHeight() - 4);
-                g.setColour(juce::Colour::fromRGB(31, 49, 60));
+                g.setColour(orbit::options::colour(31, 49, 60));
                 g.fillRect(channel);
                 constexpr int segmentCount = 30; // 2 dB per LED over the -60 to 0 dB range
                 constexpr int segmentGap = 2;
@@ -4050,11 +4799,11 @@ private:
                     if (db < thresholdDb) continue;
 
                     if (thresholdDb > -6.0f)
-                        g.setColour(juce::Colour::fromRGB(227, 101, 81));
+                        g.setColour(orbit::options::colour(227, 101, 81));
                     else if (thresholdDb > -18.0f)
-                        g.setColour(juce::Colour::fromRGB(204, 231, 241));
+                        g.setColour(orbit::options::colour(204, 231, 241));
                     else
-                        g.setColour(juce::Colour::fromRGB(86, 203, 231));
+                        g.setColour(orbit::options::colour(86, 203, 231));
 
                     const int y = channel.getBottom() - (segment + 1) * (segmentHeight + segmentGap)
                         + segmentGap;
@@ -4066,7 +4815,7 @@ private:
                     const auto heldLevel = juce::jlimit(0.0f, 1.0f, (heldDb + 60.0f) / 60.0f);
                     const auto markerY = channel.getBottom()
                         - juce::roundToInt(heldLevel * static_cast<float>(channel.getHeight()));
-                    g.setColour(juce::Colour::fromRGB(232, 247, 252));
+                    g.setColour(orbit::options::colour(232, 247, 252));
                     g.fillRect(x, juce::jlimit(channel.getY(), channel.getBottom() - 2, markerY - 1),
                                channelWidth, 2);
                 }
@@ -4075,11 +4824,11 @@ private:
             drawChannel(meterBounds.getX() + scaleWidth + channelWidth + gap, rightPeakDb, rightPeakHoldDb);
             if (clipHeld)
             {
-                g.setColour(juce::Colour::fromRGB(235, 75, 61));
+                g.setColour(orbit::options::colour(235, 75, 61));
                 g.fillRect(meterBounds.getX() + scaleWidth, meterBounds.getY() + 2,
                            meterBounds.getWidth() - scaleWidth - 2, 3);
             }
-            g.setColour(juce::Colour::fromRGB(147, 185, 202));
+            g.setColour(orbit::options::colour(147, 185, 202));
             g.drawRoundedRectangle(meterBounds.toFloat(), 2.0f, 1.0f);
         }
 
@@ -4107,13 +4856,24 @@ private:
         bool clipHeld = false;
         bool meterVisible = false, isMasterMeter = false;
         bool masterEqView = false, eqEnabled = false;
+        bool mixControlsShown = false, eqSectionVisible = true;
         bool isSelected = false;
+        int mixerSkin = 0;
     };
 
     class MixerPanel final : public juce::Component
     {
     public:
-        void paint(juce::Graphics& g) override { g.fillAll(juce::Colour::fromRGB(68, 112, 139)); }
+        void setSkin(int value) { skin = juce::jlimit(0, 2, value); repaint(); }
+        void paint(juce::Graphics& g) override
+        {
+            const auto colour = skin == 1 ? orbit::options::colour(18, 30, 47)
+                : skin == 2 ? orbit::options::colour(42, 47, 56)
+                : orbit::options::colour(68, 112, 139);
+            g.fillAll(colour);
+        }
+    private:
+        int skin = 0;
     };
 
     MixerPanel content;
@@ -4130,12 +4890,44 @@ public:
     // Keep the maximized editor's time ruler broad like Orion's piano roll.
     // A pattern can still be shorter; the red boundary shows its current end.
     static constexpr int baseVisibleStepCount = 48;
+    static constexpr int minimumPitch = 0, maximumPitch = 127, pitchCount = 128;
+    std::function<void()> pitchViewportChanged;
+    int displayedLaneHeight() const
+    {
+        if(!velocityLaneVisible && !automationLaneVisible)return 0;
+        return juce::jmin(laneHeightPx,juce::jmax(1,getHeight()-headerHeight()-8-4*rowHeight()));
+    }
+    int noteAreaHeight() const {return juce::jmax(rowHeight(),getHeight()-headerHeight()-8-displayedLaneHeight());}
+    int laneTop() const {return headerHeight()+noteAreaHeight()+8;}
+    double visiblePitchRows() const {return noteAreaHeight()/double(rowHeight());}
+    double getPitchScrollPosition() const {return firstPitchRow;}
+    void setPitchScrollPosition(double row)
+    {
+        firstPitchRow=juce::jlimit(0.0,juce::jmax(0.0,pitchCount-visiblePitchRows()),row);
+        if(pitchViewportChanged)pitchViewportChanged();repaint();
+    }
+    int pitchAtY(int y) const {return maximumPitch-int(std::floor(firstPitchRow+(y-headerHeight())/double(rowHeight())));}
+    int yForPitch(int pitch) const {return headerHeight()+juce::roundToInt((maximumPitch-pitch-firstPitchRow)*rowHeight());}
+    void centrePitch(int pitch) {setPitchScrollPosition(maximumPitch-juce::jlimit(minimumPitch,maximumPitch,pitch)-(visiblePitchRows()-1)*0.5);}
+    void resized() override {setPitchScrollPosition(firstPitchRow);}
+    void mouseWheelMove(const juce::MouseEvent& event,const juce::MouseWheelDetails& wheel) override
+    {
+        if(!event.mods.isShiftDown() && std::abs(wheel.deltaY)>=std::abs(wheel.deltaX)
+            && event.y<headerHeight()+noteAreaHeight())
+        {
+            if(!noteGestureActive && !selectingNotes && keyboardPitch<0)setPitchScrollPosition(firstPitchRow-wheel.deltaY*8);
+            return;
+        }
+        juce::Component::mouseWheelMove(event,wheel);
+    }
     std::function<int()> getActiveStepCount;
     std::function<bool(int, int)> noteIsOn;
     std::function<bool()> areAllNotesSelected;
+    std::function<std::vector<ProjectDocument::PatternNote>()> getNotes;
     std::function<int(int, int)> getNoteLength;
     std::function<void(int, int, bool)> noteClicked;
     std::function<void(int, int, int)> noteLengthChanged;
+    std::function<bool(int, int, int, int)> noteMoved;
     std::function<void()> noteGestureStarted;
     std::function<void()> noteGestureEnded;
     std::function<void(int)> paintLengthUpdated;
@@ -4151,9 +4943,15 @@ public:
     std::function<int()> getMaximumLaneHeight;
     std::function<void()> laneHeightChanged;
     std::function<void()> pasteNotes;
+    std::function<bool(const juce::KeyPress&)> editShortcut;
+    std::function<bool(int,int)> noteIsSelected;
+    std::function<void(int,int,bool)> selectNote;
+    std::function<void(int,int,int,int,bool)> selectNoteRange;
+    std::function<void(int)> editCursorChanged;
 
     bool keyPressed(const juce::KeyPress& key) override
     {
+        if (editShortcut && editShortcut(key)) return true;
         const auto character = juce::CharacterFunctions::toLowerCase(key.getTextCharacter());
         if (character == 'v' && (key.getModifiers().isCommandDown() || key.getModifiers().isCtrlDown()))
         {
@@ -4170,19 +4968,22 @@ public:
         repaint();
     }
 
-    int activeSteps() const { return juce::jlimit(1, 64, getActiveStepCount ? getActiveStepCount() : 16); }
+    int activeSteps() const { return juce::jmax(1, getActiveStepCount ? getActiveStepCount() : 16); }
     int visibleSteps() const { return juce::jmax(baseVisibleStepCount, activeSteps()); }
-    int labelWidth() const { return 58; }
+    int labelWidth() const { return 64; }
     int headerHeight() const { return 30; }
     static constexpr int defaultAutomationLaneHeight() { return 88; }
     int velocityLaneHeight() const { return laneHeightPx; }
-    int rowHeight() const { return juce::jmax(6, juce::roundToInt(baseRowHeight * verticalZoom)); }
+    int rowHeight() const { return juce::jmax(8, juce::roundToInt(baseRowHeight * verticalZoom)); }
     int stepWidth() const { return juce::jmax(14, juce::roundToInt(baseStepWidth * horizontalZoom)); }
     void setViewMetrics(int width, int height)
     {
         baseStepWidth = juce::jmax(22.0f, static_cast<float>(width - labelWidth()) / visibleSteps());
-        const auto laneHeight = (velocityLaneVisible || automationLaneVisible) ? laneHeightPx : 0;
-        baseRowHeight = juce::jmax(8.0f, static_cast<float>(height - headerHeight() - 8 - laneHeight) / 37.0f);
+        // Size pitch rows from the full editor viewport. The velocity and
+        // automation lanes are independently resizable; changing their height
+        // must not squeeze the full MIDI range into the visible area.
+        const auto availableForRows = juce::jmax(0, height - headerHeight() - 8);
+        baseRowHeight = juce::jmax(8.0f, static_cast<float>(availableForRows) / 37.0f);
     }
     void setZoom(float horizontal, float vertical)
     {
@@ -4192,6 +4993,8 @@ public:
     }
     float getHorizontalZoom() const { return horizontalZoom; }
     float getVerticalZoom() const { return verticalZoom; }
+    void setLightTheme(bool enabled) { lightTheme = enabled; repaint(); }
+    bool isLightTheme() const { return lightTheme; }
     void setVelocityLaneVisible(bool visible) { velocityLaneVisible = visible; repaint(); }
     void setAutomationLaneVisible(bool visible) { automationLaneVisible = visible; repaint(); }
     void setAutomationLaneHeight(int height) { laneHeightPx = juce::jlimit(64, 260, height); repaint(); }
@@ -4200,7 +5003,11 @@ public:
     int getAutomationTool() const { return automationTool; }
     void setAutomationBars(bool enabled) { automationBars = enabled; repaint(); }
     bool isAutomationBars() const { return automationBars; }
+    void setAutomationFillEnabled(bool enabled) { automationFillEnabled = enabled; repaint(); }
+    bool isAutomationFillEnabled() const { return automationFillEnabled; }
     void setVelocityEditEnabled(bool enabled) { velocityEditEnabled = enabled; }
+    void setSnapToGrid(bool enabled) { snapToGrid = enabled; repaint(); }
+    bool isSnapToGrid() const { return snapToGrid; }
     bool isVelocityLaneVisible() const { return velocityLaneVisible; }
     bool isAutomationLaneVisible() const { return automationLaneVisible; }
     void setKeyboardOptions(bool coloured, bool labels)
@@ -4211,7 +5018,7 @@ public:
     }
     void setGridOptions(int stepsPerBar, int emphasis)
     {
-        subdivisionsPerBar = juce::jlimit(4, 64, stepsPerBar);
+        subdivisionsPerBar = juce::jlimit(4, 256, stepsPerBar);
         highlightEveryN = juce::jlimit(1, subdivisionsPerBar, emphasis);
         repaint();
     }
@@ -4222,89 +5029,172 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        const auto velocityHeight = laneHeightPx;
+        const auto velocityHeight = displayedLaneHeight();
         const auto labelWidthPx = labelWidth();
         const auto headerHeightPx = headerHeight();
         const auto rowHeightPx = rowHeight();
         const auto stepWidthPx = stepWidth();
-        g.fillAll(juce::Colour::fromRGB(20, 29, 38));
-        g.setColour(juce::Colour::fromRGB(29, 43, 55));
+        // Match the light piano-roll canvas to the Playlist's cool gray palette.
+        g.fillAll(lightTheme ? orbit::options::colour(177, 187, 202) : orbit::options::colour(20, 29, 38));
+        g.setColour(lightTheme ? orbit::options::colour(42, 53, 63) : orbit::options::colour(29, 43, 55));
         g.fillRect(0, 0, getWidth(), headerHeightPx);
         g.setFont(12.0f);
         const auto activeStepCount = activeSteps();
         const auto visibleStepCount = visibleSteps();
-        for (int step = 0; step < visibleStepCount; ++step)
+        const auto clipBounds = g.getClipBounds();
+        const auto firstVisibleStep = juce::jlimit(0, visibleStepCount - 1,
+            static_cast<int>(std::floor((clipBounds.getX() - labelWidthPx) / static_cast<double>(stepWidthPx))));
+        const auto lastVisibleStep = juce::jlimit(firstVisibleStep, visibleStepCount - 1,
+            static_cast<int>(std::ceil((clipBounds.getRight() - labelWidthPx) / static_cast<double>(stepWidthPx))));
+        const auto firstCurveStep = juce::jmax(0, firstVisibleStep - 1);
+        const auto lastActiveVisibleStep = juce::jmin(activeStepCount - 1, lastVisibleStep + 1);
+        const auto patternNotes = getNotes ? getNotes() : std::vector<ProjectDocument::PatternNote>{};
+        for (int step = firstVisibleStep; step <= lastVisibleStep; ++step)
         {
-            g.setColour(step < activeStepCount ? juce::Colour::fromRGB(178, 198, 211)
-                                                : juce::Colour::fromRGB(90, 111, 124));
+            g.setColour(lightTheme
+                ? (step < activeStepCount ? orbit::options::colour(220, 229, 236) : orbit::options::colour(151, 166, 178))
+                : (step < activeStepCount ? orbit::options::colour(178, 198, 211) : orbit::options::colour(90, 111, 124)));
             g.drawText(juce::String(step + 1), labelWidthPx + step * stepWidthPx, 0, stepWidthPx, headerHeightPx,
                        juce::Justification::centred);
         }
 
-        for (int pitch = 84; pitch >= 48; --pitch)
+        g.saveState();g.reduceClipRegion(0,headerHeightPx,getWidth(),noteAreaHeight());
+        for (int pitch = maximumPitch; pitch >= minimumPitch; --pitch)
         {
-            const auto row = 84 - pitch;
-            const auto y = headerHeightPx + row * rowHeightPx;
+            const auto y = yForPitch(pitch);
+            if(y+rowHeightPx<=headerHeightPx || y>=headerHeightPx+noteAreaHeight())continue;
             const bool blackKey = ((pitch % 12) == 1 || (pitch % 12) == 3 || (pitch % 12) == 6
                                    || (pitch % 12) == 8 || (pitch % 12) == 10);
-            const auto keyWidth = blackKey ? (labelWidthPx * 3) / 5 : labelWidthPx - 2;
-            g.setColour(colouredKeys
-                ? (blackKey ? juce::Colour::fromRGB(24, 34, 43) : juce::Colour::fromRGB(224, 232, 237))
-                : juce::Colour::fromRGB(196, 207, 215));
-            g.fillRect(0, y, keyWidth, rowHeightPx);
-            g.setColour(blackKey ? juce::Colour::fromRGB(13, 21, 28) : juce::Colour::fromRGB(106, 126, 139));
-            g.drawRect(0, y, keyWidth, rowHeightPx, 1);
-            g.setColour(blackKey ? juce::Colour::fromRGB(178, 198, 211) : juce::Colour::fromRGB(28, 43, 53));
-            if (showNoteNames)
-                g.drawText(pitchLabel(pitch), 4, y, labelWidthPx - 8, rowHeightPx, juce::Justification::centredRight);
+            // Draw a compact piano keyboard at the left edge: white keys span
+            // the strip while black keys sit over the left portion of their row.
+            // This makes the chromatic pattern immediately recognizable.
+            if (!blackKey)
+            {
+                g.setColour(lightTheme ? orbit::options::colour(232, 238, 244)
+                    : (colouredKeys ? orbit::options::colour(224, 232, 237) : orbit::options::colour(196, 207, 215)));
+                g.fillRect(0, y, labelWidthPx - 2, rowHeightPx);
+                g.setColour(orbit::options::colour(106, 126, 139));
+                g.drawRect(0, y, labelWidthPx - 2, rowHeightPx, 1);
+            }
+            else
+            {
+                const auto keyWidth = (labelWidthPx * 3) / 5;
+                const auto keyHeight = juce::jmax(4, rowHeightPx - 2);
+                g.setColour(lightTheme ? orbit::options::colour(36, 48, 58)
+                    : (colouredKeys ? orbit::options::colour(24, 34, 43) : orbit::options::colour(13, 21, 28)));
+                g.fillRoundedRectangle(0.0f, static_cast<float>(y), static_cast<float>(keyWidth),
+                                       static_cast<float>(keyHeight), 2.0f);
+                g.setColour(orbit::options::colour(13, 21, 28));
+                g.drawRoundedRectangle(0.0f, static_cast<float>(y), static_cast<float>(keyWidth),
+                                       static_cast<float>(keyHeight), 2.0f, 1.0f);
+                g.setColour(orbit::options::colour(67, 84, 96));
+                g.drawVerticalLine(keyWidth - 1, static_cast<float>(y + 2),
+                                   static_cast<float>(y + keyHeight - 2));
+            }
+            if (showNoteNames && pitch % 12 == 0)
+            {
+                g.setColour(orbit::options::colour(28, 43, 53));
+                g.setFont(juce::FontOptions(11.0f, juce::Font::bold));
+                g.drawText(pitchLabel(pitch), 4, y, labelWidthPx - 10, rowHeightPx,
+                           juce::Justification::centredRight);
+                g.setFont(12.0f);
+            }
 
-            for (int step = 0; step < visibleStepCount; ++step)
+            for (int step = firstVisibleStep; step <= lastVisibleStep; ++step)
             {
                 const auto x = labelWidthPx + step * stepWidthPx;
                 const bool inPattern = step < activeStepCount;
-                const bool active = inPattern && noteIsOn && noteIsOn(pitch, step);
-                g.setColour(inPattern
-                    ? (blackKey ? juce::Colour::fromRGB(24, 34, 43) : juce::Colour::fromRGB(32, 46, 58))
-                    : (blackKey ? juce::Colour::fromRGB(18, 27, 35) : juce::Colour::fromRGB(23, 34, 42)));
+                g.setColour(lightTheme
+                    ? (inPattern ? (blackKey ? orbit::options::colour(169, 181, 196) : orbit::options::colour(183, 193, 207))
+                                 : (blackKey ? orbit::options::colour(183, 193, 207) : orbit::options::colour(195, 203, 215)))
+                    : (inPattern
+                        ? (blackKey ? orbit::options::colour(24, 34, 43) : orbit::options::colour(32, 46, 58))
+                        : (blackKey ? orbit::options::colour(18, 27, 35) : orbit::options::colour(23, 34, 42))));
                 g.fillRect(x + 1, y + 1, stepWidthPx - 2, rowHeightPx - 2);
-                if (active)
+                g.setColour(lightTheme
+                    ? (!inPattern ? orbit::options::colour(203, 211, 220)
+                       : step % subdivisionsPerBar == 0 ? orbit::options::colour(125, 139, 155)
+                       : step % highlightEveryN == 0 ? orbit::options::colour(151, 165, 180)
+                                                      : orbit::options::colour(183, 193, 207))
+                    : (!inPattern ? orbit::options::colour(40, 55, 66)
+                       : step % subdivisionsPerBar == 0 ? orbit::options::colour(100, 137, 155)
+                       : step % highlightEveryN == 0 ? orbit::options::colour(82, 113, 130)
+                                                      : orbit::options::colour(53, 75, 90)));
+                g.drawRect(x, y, stepWidthPx, rowHeightPx, 1);
+            }
+
+            // Overlay the chosen subdivisions after the cell fills and before
+            // notes, so finer divisions remain visible without crossing notes.
+            const auto subdivisionTicks = juce::jmax(1, 1024 / subdivisionsPerBar);
+            const auto lastTick = static_cast<int64_t>(activeStepCount) * 64;
+            const auto firstTick = juce::jmax<int64_t>(0,
+                static_cast<int64_t>(std::floor((clipBounds.getX() - labelWidthPx)
+                    * 64.0 / stepWidthPx / subdivisionTicks)) * subdivisionTicks);
+            for (auto tick = firstTick; tick <= lastTick
+                && tick <= static_cast<int64_t>(std::ceil((clipBounds.getRight() - labelWidthPx)
+                    * 64.0 / stepWidthPx)) + subdivisionTicks; tick += subdivisionTicks)
+            {
+                const auto x = labelWidthPx + static_cast<float>(tick) * stepWidthPx / 64.0f;
+                const bool barLine = tick % 1024 == 0;
+                const bool emphasized = tick % (subdivisionTicks * highlightEveryN) == 0;
+                g.setColour(lightTheme
+                    ? (barLine ? orbit::options::colour(125, 139, 155).withAlpha(0.72f)
+                               : emphasized ? orbit::options::colour(151, 165, 180).withAlpha(0.48f)
+                                            : orbit::options::colour(125, 139, 155).withAlpha(0.28f))
+                    : (barLine ? orbit::options::colour(100, 137, 155).withAlpha(0.90f)
+                               : emphasized ? orbit::options::colour(82, 113, 130).withAlpha(0.68f)
+                                            : orbit::options::colour(53, 75, 90).withAlpha(0.48f)));
+                g.drawVerticalLine(juce::roundToInt(x), static_cast<float>(y), static_cast<float>(y + rowHeightPx));
+            }
+
+            if (getNotes)
+            {
+                for (const auto& note : patternNotes)
                 {
-                    const auto noteLength = juce::jlimit(1, activeStepCount - step,
-                        getNoteLength ? getNoteLength(pitch, step) : 1);
-                    const auto noteWidth = juce::jmax(4, noteLength * stepWidthPx - 5);
-                    g.setColour(juce::Colour::fromRGB(48, 158, 199));
-                    g.fillRoundedRectangle(static_cast<float>(x + 2), static_cast<float>(y + 3),
-                                           static_cast<float>(noteWidth), static_cast<float>(rowHeightPx - 6), 3.0f);
-                    g.setColour(juce::Colour::fromRGB(156, 232, 250));
-                    g.drawRoundedRectangle(static_cast<float>(x + 2), static_cast<float>(y + 3),
-                                           static_cast<float>(noteWidth), static_cast<float>(rowHeightPx - 6), 3.0f, 1.0f);
-                    if (areAllNotesSelected && areAllNotesSelected())
+                    if (note.pitch != pitch) continue;
+                    if (note.startTick + note.lengthTicks < firstVisibleStep * 64
+                        || note.startTick > (lastVisibleStep + 1) * 64) continue;
+                    const auto startStep = note.startTick / 64.0f;
+                    const auto lengthSteps = note.lengthTicks / 64.0f;
+                    const auto noteX = labelWidthPx + startStep * stepWidthPx;
+                    const auto noteWidth = juce::jmax(2.0f, lengthSteps * stepWidthPx - 4.0f);
+                    g.setColour(orbit::options::colour(48, 158, 199));
+                    g.fillRoundedRectangle(noteX + 2.0f, static_cast<float>(y + 3), noteWidth,
+                                           static_cast<float>(rowHeightPx - 6), 3.0f);
+                    g.setColour(orbit::options::colour(156, 232, 250));
+                    g.drawRoundedRectangle(noteX + 2.0f, static_cast<float>(y + 3), noteWidth,
+                                           static_cast<float>(rowHeightPx - 6), 3.0f, 1.0f);
+                    if (noteIsSelected ? noteIsSelected(note.pitch,note.startTick) : (areAllNotesSelected && areAllNotesSelected()))
                     {
-                        g.setColour(juce::Colour::fromRGB(255, 220, 125));
-                        g.drawRoundedRectangle(static_cast<float>(x + 1), static_cast<float>(y + 2),
-                                               static_cast<float>(noteWidth + 2), static_cast<float>(rowHeightPx - 4), 3.0f, 2.0f);
+                        g.setColour(orbit::options::colour(255, 220, 125));
+                        g.drawRoundedRectangle(noteX + 1.0f, static_cast<float>(y + 2), noteWidth + 2.0f,
+                                               static_cast<float>(rowHeightPx - 4), 3.0f, 2.0f);
                     }
                 }
-                g.setColour(!inPattern ? juce::Colour::fromRGB(40, 55, 66)
-                    : step % subdivisionsPerBar == 0 ? juce::Colour::fromRGB(100, 137, 155)
-                    : step % highlightEveryN == 0 ? juce::Colour::fromRGB(82, 113, 130)
-                                                   : juce::Colour::fromRGB(53, 75, 90));
-                g.drawRect(x, y, stepWidthPx, rowHeightPx, 1);
+            }
+
+            // C rows mark octave boundaries across the full piano roll grid.
+            if (pitch % 12 == 0)
+            {
+                g.setColour(lightTheme ? orbit::options::colour(125, 139, 155).withAlpha(0.38f)
+                                       : orbit::options::colour(152, 177, 190).withAlpha(0.52f));
+                g.fillRect(labelWidthPx, y, getWidth() - labelWidthPx, 1);
             }
         }
 
-        const auto velocityTop = headerHeightPx + 37 * rowHeightPx + 8;
+        g.restoreState();
+        const auto velocityTop = laneTop();
         if (velocityLaneVisible || automationLaneVisible)
         {
-            g.setColour(juce::Colour::fromRGB(29, 43, 55));
+            g.setColour(lightTheme ? orbit::options::colour(177, 187, 202) : orbit::options::colour(29, 43, 55));
             g.fillRect(0, velocityTop, getWidth(), velocityHeight);
-            g.setColour(juce::Colour::fromRGB(103, 139, 157));
+            g.setColour(orbit::options::colour(103, 139, 157));
             g.drawHorizontalLine(velocityTop, 0.0f, static_cast<float>(getWidth()));
-            g.setColour(resizingLane ? juce::Colour::fromRGB(183, 232, 246)
-                                     : juce::Colour::fromRGB(112, 179, 201));
+            g.setColour(resizingLane ? orbit::options::colour(183, 232, 246)
+                                     : orbit::options::colour(112, 179, 201));
             g.fillRoundedRectangle(getWidth() * 0.5f - 24.0f,
                                    static_cast<float>(velocityTop - 3), 48.0f, 6.0f, 3.0f);
-            g.setColour(juce::Colour::fromRGB(178, 198, 211));
+            g.setColour(orbit::options::colour(178, 198, 211));
             g.setFont(11.0f);
             g.drawText(automationLaneVisible ? "Automation" : "Velocity", 4, velocityTop,
                        labelWidthPx - 8, 20, juce::Justification::centredLeft);
@@ -4312,13 +5202,40 @@ public:
             {
                 juce::Path curve;
                 bool started = false;
-                for (int step = 0; step < activeStepCount; ++step)
+                for (int step = firstCurveStep; step <= lastActiveVisibleStep; ++step)
                 {
                     const auto value = juce::jlimit(0.0f, 1.0f, getAutomationValue ? getAutomationValue(step) : 0.5f);
                     const auto x = static_cast<float>(labelWidthPx + step * stepWidthPx + stepWidthPx / 2);
                     const auto y = static_cast<float>(velocityTop + 26 + (1.0f - value) * (velocityHeight - 38));
                     if (!started) { curve.startNewSubPath(x, y); started = true; }
                     else curve.lineTo(x, y);
+                }
+                if (automationFillEnabled && !automationBars && started)
+                {
+                    const auto firstX = static_cast<float>(labelWidthPx + stepWidthPx / 2);
+                    const auto lastX = static_cast<float>(labelWidthPx + (activeStepCount - 1) * stepWidthPx + stepWidthPx / 2);
+                    const auto baseline = static_cast<float>(velocityTop + velocityHeight - 8);
+                    auto filledCurve = curve;
+                    filledCurve.lineTo(lastX, baseline);
+                    filledCurve.lineTo(firstX, baseline);
+                    filledCurve.closeSubPath();
+                    g.saveState();
+                    g.reduceClipRegion(filledCurve);
+                    juce::ColourGradient gradient(automationColour(1.0f).withAlpha(0.48f), 0.0f,
+                                                  static_cast<float>(velocityTop + 24),
+                                                  automationColour(0.0f).withAlpha(0.48f), 0.0f,
+                                                  baseline, false);
+                    g.setGradientFill(gradient);
+                    g.fillRect(juce::Rectangle<float>(static_cast<float>(labelWidthPx),
+                        static_cast<float>(velocityTop + 22), static_cast<float>(getWidth() - labelWidthPx),
+                        static_cast<float>(velocityHeight - 30)));
+                    g.restoreState();
+                }
+                for (int step = firstVisibleStep; step <= juce::jmin(activeStepCount - 1, lastVisibleStep); ++step)
+                {
+                    const auto value = juce::jlimit(0.0f, 1.0f, getAutomationValue ? getAutomationValue(step) : 0.5f);
+                    const auto x = static_cast<float>(labelWidthPx + step * stepWidthPx + stepWidthPx / 2);
+                    const auto y = static_cast<float>(velocityTop + 26 + (1.0f - value) * (velocityHeight - 38));
                     const auto colour = automationColour(value);
                     if (automationBars)
                     {
@@ -4336,7 +5253,7 @@ public:
                 }
                 if (!automationBars)
                 {
-                    for (int step = 1; step < activeStepCount; ++step)
+                    for (int step = juce::jmax(1, firstCurveStep); step <= lastActiveVisibleStep; ++step)
                     {
                         const auto a = juce::jlimit(0.0f, 1.0f, getAutomationValue ? getAutomationValue(step - 1) : 0.5f);
                         const auto b = juce::jlimit(0.0f, 1.0f, getAutomationValue ? getAutomationValue(step) : 0.5f);
@@ -4348,24 +5265,24 @@ public:
                         g.drawLine(x1, y1, x2, y2, 2.5f);
                     }
                 }
-                for (int step = 0; step < visibleStepCount; ++step)
-                    g.setColour(step < activeStepCount ? juce::Colour::fromRGB(53, 75, 90)
-                                                       : juce::Colour::fromRGB(38, 52, 62)),
+                for (int step = firstVisibleStep; step <= lastVisibleStep; ++step)
+                    g.setColour(step < activeStepCount ? orbit::options::colour(53, 75, 90)
+                                                       : orbit::options::colour(38, 52, 62)),
                     g.drawVerticalLine(labelWidthPx + step * stepWidthPx,
                                        static_cast<float>(velocityTop + 22),
                                        static_cast<float>(velocityTop + velocityHeight));
             }
             else
-            for (int step = 0; step < visibleStepCount; ++step)
+            for (int step = firstVisibleStep; step <= lastVisibleStep; ++step)
             {
                 const auto x = labelWidthPx + step * stepWidthPx;
                 const bool inPattern = step < activeStepCount;
-                g.setColour(inPattern ? juce::Colour::fromRGB(53, 75, 90) : juce::Colour::fromRGB(38, 52, 62));
+                g.setColour(inPattern ? orbit::options::colour(53, 75, 90) : orbit::options::colour(38, 52, 62));
                 g.drawVerticalLine(x, static_cast<float>(velocityTop + 22), static_cast<float>(velocityTop + velocityHeight));
                 const auto velocity = inPattern && getVelocityAtStep ? getVelocityAtStep(step) : 0;
                 if (velocity > 0)
                 {
-                    g.setColour(juce::Colour::fromRGB(48, 158, 199));
+                    g.setColour(orbit::options::colour(48, 158, 199));
                     const auto barHeight = juce::jmax(2, juce::roundToInt((velocity / 127.0f) * (velocityHeight - 38)));
                     const auto barX = x + stepWidthPx / 2 - juce::jmin(5, stepWidthPx / 3);
                     g.fillRoundedRectangle(static_cast<float>(barX),
@@ -4373,7 +5290,7 @@ public:
                         static_cast<float>(juce::jmin(10, stepWidthPx - 2)), static_cast<float>(barHeight), 2.0f);
                     if (velocityEditEnabled && !automationLaneVisible)
                     {
-                        g.setColour(juce::Colour::fromRGB(176, 235, 250));
+                        g.setColour(orbit::options::colour(176, 235, 250));
                         g.fillEllipse(static_cast<float>(x + stepWidthPx / 2 - 3),
                             static_cast<float>(velocityTop + velocityHeight - 8 - barHeight - 3), 6.0f, 6.0f);
                     }
@@ -4381,7 +5298,7 @@ public:
             }
         }
         const auto boundaryX = labelWidthPx + activeStepCount * stepWidthPx;
-        g.setColour(juce::Colour::fromRGB(220, 73, 69));
+        g.setColour(orbit::options::colour(220, 73, 69));
         const auto gridBottom = (velocityLaneVisible || automationLaneVisible) ? velocityTop + velocityHeight : velocityTop;
         g.fillRect(boundaryX - 1, headerHeightPx, 2, gridBottom - headerHeightPx);
         if (playheadVisible)
@@ -4389,12 +5306,14 @@ public:
             const auto x = labelWidthPx + juce::roundToInt(playheadStep * stepWidthPx);
             g.fillRect(x - 1, headerHeightPx, 2, gridBottom - headerHeightPx);
         }
+        if(selectingNotes){g.setColour(orbit::options::colour(160,225,247).withAlpha(0.15f));g.fillRect(selectionRect);g.setColour(orbit::options::colour(160,225,247));g.drawRect(selectionRect);}
+
     }
 
     void mouseDown(const juce::MouseEvent& event) override
     {
         grabKeyboardFocus();
-        const auto velocityTop = headerHeight() + 37 * rowHeight() + 8;
+        const auto velocityTop = laneTop();
         if ((velocityLaneVisible || automationLaneVisible)
             && std::abs(event.y - velocityTop) <= 8)
         {
@@ -4429,9 +5348,9 @@ public:
             setVelocityPointFromMouse(event);
             return;
         }
-        const auto pitch = 84 - (event.y - headerHeight()) / rowHeight();
-        const auto step = (event.x - labelWidth()) / stepWidth();
-        if (event.y < headerHeight() || pitch < 48 || pitch > 84)
+        const auto pitch = pitchAtY(event.y);
+        const auto positionSteps = (event.x - labelWidth()) / static_cast<double>(stepWidth());
+        if (event.y < headerHeight() || event.y >= headerHeight()+noteAreaHeight() || pitch < minimumPitch || pitch > maximumPitch)
             return;
         // The piano keys are also a live audition keyboard. Keep the grid's
         // note-entry gesture separate so clicking a key never paints a note.
@@ -4444,39 +5363,67 @@ public:
             }
             return;
         }
-        if (!juce::isPositiveAndBelow(step, activeSteps())) return;
-        const auto noteStart = findNoteStart(pitch, step);
+        if (positionSteps < 0.0 || positionSteps >= activeSteps()) return;
+        const auto note = findNoteAt(pitch, positionSteps);
+        const auto noteStartTick = note.has_value() ? note->startTick : tickFromPosition(positionSteps);
+        if (editCursorChanged) editCursorChanged(noteStartTick);
+        if (event.mods.isShiftDown() || event.mods.isCommandDown() || event.mods.isCtrlDown())
+        {
+            if (note.has_value()) { if (selectNote) selectNote(pitch,note->startTick,true); }
+            else { selectingNotes=true;selectionStart=event.getPosition();selectionRect={};selectionAdditive=event.mods.isCommandDown() || event.mods.isCtrlDown(); }
+            repaint();return;
+        }
+        if (selectNote) selectNote(-1,0,false);
         if (event.mods.isRightButtonDown())
         {
-            if (noteStart >= 0 && noteClicked) noteClicked(pitch, noteStart, true);
+            if (note.has_value() && noteClicked) noteClicked(pitch, noteStartTick, true);
             return;
         }
         dragPitch = pitch;
-        dragStartStep = noteStart >= 0 ? noteStart : step;
-        dragWasExisting = noteStart >= 0;
-        dragPressStep = step;
-        dragInitialLength = dragWasExisting && getNoteLength
-            ? juce::jlimit(1, activeSteps() - dragStartStep, getNoteLength(pitch, dragStartStep)) : 1;
+        dragStartTick = note.has_value() ? note->startTick : noteStartTick;
+        dragOriginalStartTick = dragStartTick;
+        dragWasExisting = note.has_value();
+        dragPressTick = tickFromPosition(positionSteps);
+        dragInitialLengthTicks = dragWasExisting ? note->lengthTicks : 64;
         dragResizingFromEdge = false;
         if (dragWasExisting)
         {
-            const auto noteEndX = labelWidth() + (dragStartStep + dragInitialLength) * stepWidth() - 3;
-            dragResizingFromEdge = noteEndX - event.x <= juce::jmax(7, stepWidth() / 4);
+            const auto noteWidth = juce::jmax(2.0, dragInitialLengthTicks / 64.0 * stepWidth() - 4.0);
+            const auto noteEndX = labelWidth() + ((dragStartTick + dragInitialLengthTicks) / 64.0) * stepWidth() - 3;
+            const auto resizeHitWidth = juce::jmin(static_cast<int>(noteWidth / 3.0), juce::jmax(7, stepWidth() / 4));
+            dragResizingFromEdge = noteEndX - event.x <= juce::jmax(1, resizeHitWidth);
         }
         dragChanged = false;
         noteGestureActive = true;
         if (noteGestureStarted) noteGestureStarted();
         if (!dragWasExisting && noteClicked)
         {
-            noteClicked(pitch, step, false);
-            if (paintLength > 1 && noteLengthChanged)
-                noteLengthChanged(pitch, step, juce::jmin(paintLength, activeSteps() - step));
+            noteClicked(pitch, dragStartTick, false);
+            if (noteLengthChanged)
+            {
+                const auto maximumLengthTicks = juce::jmax(1, activeSteps() * 64 - dragStartTick);
+                const auto snapIntervalTicks = juce::jmax(1, 1024 / subdivisionsPerBar);
+                auto length = hasRememberedNoteLength ? rememberedNoteLengthTicks
+                    : (snapToGrid ? snapIntervalTicks : 64);
+                if (snapToGrid)
+                {
+                    const auto snappedLength = juce::jmax(snapIntervalTicks,
+                        juce::roundToInt(length / static_cast<double>(snapIntervalTicks)) * snapIntervalTicks);
+                    length = juce::jmin(maximumLengthTicks, snappedLength);
+                }
+                else
+                {
+                    length = juce::jlimit(1, maximumLengthTicks, length);
+                }
+                noteLengthChanged(pitch, dragStartTick, length);
+            }
             repaint();
         }
     }
 
     void mouseDrag(const juce::MouseEvent& event) override
     {
+        if(selectingNotes){selectionRect=juce::Rectangle<int>(selectionStart,event.getPosition());repaint();return;}
         if (resizingLane)
         {
             const auto maxHeight = getMaximumLaneHeight ? getMaximumLaneHeight() : 260;
@@ -4526,34 +5473,68 @@ public:
             setVelocityPointFromMouse(event);
             return;
         }
-        if (dragPitch < 0 || !noteLengthChanged) return;
+        if (dragPitch < 0 || (!noteLengthChanged && !noteMoved)) return;
         if (event.getDistanceFromDragStart() < 5) return;
-        const auto pointerStep = juce::jlimit(0, activeSteps() - 1,
-            (event.x - labelWidth()) / stepWidth());
-        const auto length = dragWasExisting
-            ? (dragResizingFromEdge
-                ? juce::jlimit(1, activeSteps() - dragStartStep, pointerStep - dragStartStep + 1)
-                : juce::jlimit(1, activeSteps() - dragStartStep,
-                               dragInitialLength + pointerStep - dragPressStep))
-            : juce::jlimit(1, activeSteps() - dragStartStep, pointerStep - dragStartStep + 1);
-        if (dragWasExisting || length > 1)
+        const auto pointerPosition = juce::jlimit(0.0, static_cast<double>(activeSteps()),
+            (event.x - labelWidth()) / static_cast<double>(stepWidth()));
+        const auto pointerTick = tickFromPosition(pointerPosition);
+        if (dragWasExisting && !dragResizingFromEdge)
         {
-            noteLengthChanged(dragPitch, dragStartStep, length);
-            if (!dragWasExisting)
+            const auto pointerPitch = juce::jlimit(minimumPitch, maximumPitch,
+                pitchAtY(event.y));
+            const auto grabOffsetTicks = dragPressTick - dragOriginalStartTick;
+            const auto maxStartTick = juce::jmax(0, activeSteps() * 64 - dragInitialLengthTicks);
+            const auto newStartTick = juce::jlimit(0, maxStartTick, snapTickToGrid(pointerTick - grabOffsetTicks));
+            if ((newStartTick != dragStartTick || pointerPitch != dragPitch) && noteMoved)
             {
-                paintLength = length;
-                if (paintLengthUpdated) paintLengthUpdated(paintLength);
+                if (noteMoved(dragPitch, dragStartTick, pointerPitch, newStartTick))
+                {
+                    dragPitch = pointerPitch;
+                    dragStartTick = newStartTick;
+                    dragChanged = true;
+                    repaint();
+                }
             }
+            return;
+        }
+
+        const auto maximumLengthTicks = activeSteps() * 64 - dragStartTick;
+        const auto snapIntervalTicks = juce::jmax(1, 1024 / subdivisionsPerBar);
+        const auto minimumLengthTicks = juce::jmin(snapToGrid ? snapIntervalTicks : 1, maximumLengthTicks);
+        auto length = juce::jlimit(minimumLengthTicks, maximumLengthTicks, pointerTick - dragStartTick);
+        if (snapToGrid)
+            length = juce::jlimit(minimumLengthTicks, maximumLengthTicks,
+                                  juce::roundToInt(length / static_cast<double>(snapIntervalTicks)) * snapIntervalTicks);
+        if ((dragWasExisting || length > 1) && noteLengthChanged)
+        {
+            noteLengthChanged(dragPitch, dragStartTick, length);
+            rememberedNoteLengthTicks = length;
+            hasRememberedNoteLength = true;
+            paintLength = juce::jmax(1, (length + 63) / 64);
+            if (paintLengthUpdated) paintLengthUpdated(paintLength);
             dragChanged = true;
             repaint();
         }
     }
 
-    void setPaintLength(int length) { paintLength = juce::jlimit(1, 64, length); }
+    void setPaintLength(int length)
+    {
+        paintLength = juce::jlimit(1, ProjectDocument::maximumPatternLengthSteps, length);
+        rememberedNoteLengthTicks = paintLength * 64;
+        hasRememberedNoteLength = true;
+    }
     int getPaintLength() const { return paintLength; }
 
-    void mouseUp(const juce::MouseEvent&) override
+    void mouseUp(const juce::MouseEvent& event) override
     {
+        if(selectingNotes)
+        {
+            const auto bounds=juce::Rectangle<int>(selectionStart,event.getPosition());
+            if(selectNoteRange)selectNoteRange(juce::jmax(0,int((bounds.getX()-labelWidth())*64.0/stepWidth())),
+                juce::jmax(1,int((bounds.getRight()-labelWidth())*64.0/stepWidth())),
+                juce::jlimit(minimumPitch,maximumPitch,pitchAtY(bounds.getBottom()-1)),juce::jlimit(minimumPitch,maximumPitch,pitchAtY(bounds.getY())),selectionAdditive);
+            selectingNotes=false;selectionRect={};repaint();return;
+        }
         resizingLane = false;
         if (automationDragActive && automationGestureEnded) automationGestureEnded();
         automationDragActive = false;
@@ -4565,7 +5546,7 @@ public:
         if (noteGestureActive && noteGestureEnded) noteGestureEnded();
         noteGestureActive = false;
         dragPitch = -1;
-        dragStartStep = -1;
+        dragStartTick = -1;
         dragWasExisting = false;
         dragResizingFromEdge = false;
         dragChanged = false;
@@ -4573,29 +5554,31 @@ public:
 
     void mouseMove(const juce::MouseEvent& event) override
     {
-        const auto velocityTop = headerHeight() + 37 * rowHeight() + 8;
+        const auto velocityTop = laneTop();
         if ((velocityLaneVisible || automationLaneVisible)
             && std::abs(event.y - velocityTop) <= 8)
         {
             setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
             return;
         }
-        const auto pitch = 84 - (event.y - headerHeight()) / rowHeight();
-        const auto step = (event.x - labelWidth()) / stepWidth();
+        const auto pitch = pitchAtY(event.y);
+        const auto positionSteps = (event.x - labelWidth()) / static_cast<double>(stepWidth());
         if (event.x >= labelWidth() && event.y >= headerHeight()
-            && pitch >= 48 && pitch <= 84 && juce::isPositiveAndBelow(step, activeSteps()))
+            && event.y<headerHeight()+noteAreaHeight() && pitch >= minimumPitch && pitch <= maximumPitch && positionSteps >= 0.0 && positionSteps < activeSteps())
         {
-            const auto start = findNoteStart(pitch, step);
-            if (start >= 0)
+            const auto note = findNoteAt(pitch, positionSteps);
+            if (note.has_value())
             {
-                const auto length = juce::jlimit(1, activeSteps() - start,
-                    getNoteLength ? getNoteLength(pitch, start) : 1);
-                const auto noteEndX = labelWidth() + (start + length) * stepWidth() - 3;
-                if (noteEndX - event.x <= juce::jmax(7, stepWidth() / 4))
+                const auto noteEndX = labelWidth() + ((note->startTick + note->lengthTicks) / 64.0) * stepWidth() - 3;
+                const auto noteWidth = juce::jmax(2.0, note->lengthTicks / 64.0 * stepWidth() - 4.0);
+                const auto resizeHitWidth = juce::jmin(static_cast<int>(noteWidth / 3.0), juce::jmax(7, stepWidth() / 4));
+                if (noteEndX - event.x <= juce::jmax(1, resizeHitWidth))
                 {
                     setMouseCursor(juce::MouseCursor::LeftRightResizeCursor);
                     return;
                 }
+                setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+                return;
             }
         }
         setMouseCursor(juce::MouseCursor::NormalCursor);
@@ -4612,18 +5595,18 @@ private:
 
     float automationValueFromMouse(const juce::MouseEvent& event) const
     {
-        const auto laneTop = headerHeight() + 37 * rowHeight() + 8;
+        const auto laneTop = this->laneTop();
         return 1.0f - juce::jlimit(0.0f, 1.0f,
             static_cast<float>(event.y - laneTop - 26)
-                / static_cast<float>(juce::jmax(1, laneHeightPx - 38)));
+                / static_cast<float>(juce::jmax(1, displayedLaneHeight() - 38)));
     }
 
     static juce::Colour automationColour(float value)
     {
         const auto v = juce::jlimit(0.0f, 1.0f, value);
-        const auto low = juce::Colour::fromRGB(190, 62, 74);
-        const auto middle = juce::Colour::fromRGB(161, 91, 180);
-        const auto high = juce::Colour::fromRGB(57, 174, 218);
+        const auto low = orbit::options::colour(190, 62, 74);
+        const auto middle = orbit::options::colour(161, 91, 180);
+        const auto high = orbit::options::colour(57, 174, 218);
         return v < 0.5f ? low.interpolatedWith(middle, v * 2.0f)
                         : middle.interpolatedWith(high, (v - 0.5f) * 2.0f);
     }
@@ -4632,48 +5615,73 @@ private:
     {
         if (!setVelocityAtStep) return;
         const auto step = juce::jlimit(0, activeSteps() - 1, (event.x - labelWidth()) / stepWidth());
-        const auto laneTop = headerHeight() + 37 * rowHeight() + 8;
+        const auto laneTop = this->laneTop();
         const auto velocity = juce::jlimit(1, 127, juce::roundToInt((1.0f
             - juce::jlimit(0.0f, 1.0f, static_cast<float>(event.y - laneTop - 22)
-                / static_cast<float>(juce::jmax(1, velocityLaneHeight() - 30)))) * 126.0f) + 1);
+                / static_cast<float>(juce::jmax(1, displayedLaneHeight() - 30)))) * 126.0f) + 1);
         setVelocityAtStep(step, velocity);
         repaint();
     }
 
-    int findNoteStart(int pitch, int step) const
+    int tickFromPosition(double positionSteps) const
     {
-        if (!noteIsOn) return -1;
-        for (int start = step; start >= 0; --start)
-        {
-            if (!noteIsOn(pitch, start)) continue;
-            const auto length = juce::jlimit(1, activeSteps() - start,
-                getNoteLength ? getNoteLength(pitch, start) : 1);
-            if (step < start + length) return start;
-        }
-        return -1;
+        const auto clamped = juce::jlimit(0.0, static_cast<double>(activeSteps()), positionSteps);
+        if (snapToGrid)
+            return snapTickToGrid(juce::roundToInt(clamped * 64.0));
+        return juce::jlimit(0, activeSteps() * 64, juce::roundToInt(clamped * 64.0));
     }
 
+    int snapTickToGrid(int tick) const
+    {
+        if (!snapToGrid) return juce::jlimit(0, activeSteps() * 64, tick);
+        const auto interval = juce::jmax(1, 1024 / subdivisionsPerBar);
+        return juce::jlimit(0, activeSteps() * 64, juce::roundToInt(tick / static_cast<double>(interval)) * interval);
+    }
+
+    std::optional<ProjectDocument::PatternNote> findNoteAt(int pitch, double positionSteps) const
+    {
+        if (!getNotes) return {};
+        const auto positionTick = positionSteps * 64.0;
+        for (const auto& note : getNotes())
+        {
+            if (note.pitch == pitch && positionTick >= note.startTick
+                && positionTick < note.startTick + note.lengthTicks)
+                return note;
+        }
+        return {};
+    }
+
+    double firstPitchRow = maximumPitch - 84.0;
+    bool selectingNotes=false,selectionAdditive=false;
+    juce::Point<int> selectionStart;
+    juce::Rectangle<int> selectionRect;
     int dragPitch = -1;
-    int dragStartStep = -1;
-    int dragPressStep = -1;
-    int dragInitialLength = 1;
+    int dragStartTick = -1;
+    int dragOriginalStartTick = -1;
+    int dragPressTick = -1;
+    int dragInitialLengthTicks = 64;
     int keyboardPitch = -1;
     bool dragWasExisting = false;
     bool dragResizingFromEdge = false;
     bool dragChanged = false;
     bool noteGestureActive = false;
+    bool snapToGrid = true;
     int paintLength = 1;
+    int rememberedNoteLengthTicks = 64;
+    bool hasRememberedNoteLength = false;
     double playheadStep = 0.0;
     bool playheadVisible = false;
     int subdivisionsPerBar = 16;
     int highlightEveryN = 4;
     int laneHeightPx = defaultAutomationLaneHeight();
     float baseStepWidth = 22.0f, baseRowHeight = 16.0f;
-    float horizontalZoom = 1.0f, verticalZoom = 1.0f;
+    // Start with slightly broader step cells, closer to Orion's default view.
+    float horizontalZoom = 1.12f, verticalZoom = 1.12f;
     int automationTool = 0;
     int lastAutomationStep = -1;
     float lastAutomationValue = 0.5f;
     bool automationBars = false;
+    bool automationFillEnabled = false;
     bool velocityLaneVisible = false;
     bool automationLaneVisible = false;
     bool automationDragActive = false;
@@ -4683,6 +5691,7 @@ private:
     bool velocityGestureActive = false;
     bool colouredKeys = true;
     bool showNoteNames = true;
+    bool lightTheme = false;
     static juce::String pitchLabel(int pitch)
     {
         static const char* names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
@@ -4703,12 +5712,12 @@ public:
     void paintButton(juce::Graphics& g, bool highlighted, bool down) override
     {
         auto bounds = getLocalBounds().toFloat().reduced(1.0f);
-        const auto background = getToggleState() ? juce::Colour::fromRGB(35, 130, 165)
-            : juce::Colour::fromRGB(30, 48, 61);
+        const auto background = getToggleState() ? orbit::options::colour(35, 130, 165)
+            : orbit::options::colour(30, 48, 61);
         g.setColour(down ? background.brighter(0.18f) : highlighted ? background.brighter(0.10f) : background);
         g.fillRoundedRectangle(bounds, 4.0f);
-        g.setColour(getToggleState() ? juce::Colour::fromRGB(188, 242, 255)
-                                     : juce::Colour::fromRGB(148, 182, 198));
+        g.setColour(getToggleState() ? orbit::options::colour(188, 242, 255)
+                                     : orbit::options::colour(148, 182, 198));
         g.drawRoundedRectangle(bounds, 4.0f, 1.0f);
         auto iconArea = bounds.reduced(5.0f, 4.0f);
         if (icon == Icon::Velocity)
@@ -4725,8 +5734,8 @@ public:
             juce::Path pencil;
             pencil.startNewSubPath(iconArea.getX() + 3.0f, iconArea.getBottom() - 3.0f);
             pencil.lineTo(iconArea.getRight() - 3.0f, iconArea.getY() + 3.0f);
-            g.setColour(getToggleState() ? juce::Colour::fromRGB(188, 242, 255)
-                                         : juce::Colour::fromRGB(148, 182, 198));
+            g.setColour(getToggleState() ? orbit::options::colour(188, 242, 255)
+                                         : orbit::options::colour(148, 182, 198));
             g.strokePath(pencil, juce::PathStrokeType(2.4f, juce::PathStrokeType::curved,
                                                       juce::PathStrokeType::rounded));
             g.drawLine(iconArea.getX() + 2.0f, iconArea.getBottom() - 2.0f,
@@ -4778,7 +5787,7 @@ public:
         {
             auto keys = iconArea.reduced(0.0f, 2.0f);
             g.fillRoundedRectangle(keys, 1.5f);
-            g.setColour(juce::Colour::fromRGB(33, 51, 64));
+            g.setColour(orbit::options::colour(33, 51, 64));
             for (int i = 1; i < 5; ++i)
                 g.drawVerticalLine(juce::roundToInt(keys.getX() + keys.getWidth() * i / 5.0f), keys.getY(), keys.getBottom());
             for (int i : { 1, 2, 4 })
@@ -4798,18 +5807,22 @@ private:
     Icon icon;
 };
 
-class PianoRollWindow final : public juce::Component
+class PianoRollWindow final : public juce::Component, private juce::ScrollBar::Listener
 {
 public:
     std::function<void()> onClose;
+    std::function<void(int, int)> onGridOptionsChanged;
+    std::function<void(bool)> onAutomationFillChanged;
     std::function<void(juce::Point<int>, bool)> onManipulationStarted;
     std::function<void(juce::Rectangle<int>)> onBoundsChanged;
     PianoRollWindow(std::function<int()> activeStepCount,
                     std::function<bool(int, int)> isNoteOn,
                     std::function<bool()> areAllNotesSelected,
                     std::function<int(int, int)> getNoteLength,
+                    std::function<std::vector<ProjectDocument::PatternNote>()> getNotes,
                     std::function<void(int, int, bool)> onNoteClicked,
                     std::function<void(int, int, int)> onNoteLengthChanged,
+                    std::function<bool(int, int, int, int)> onNoteMoved,
                     std::function<void()> onNoteGestureStarted,
                     std::function<void()> onNoteGestureEnded,
                     std::function<void(int, bool)> onKeyboardNoteChanged)
@@ -4818,7 +5831,7 @@ public:
         addAndMakeVisible(title);
         title.setText("PIANO ROLL", juce::dontSendNotification);
         title.setFont(juce::FontOptions(13.0f, juce::Font::bold));
-        title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(218, 237, 246));
+        title.setColour(juce::Label::textColourId, orbit::options::colour(218, 237, 246));
         // Let the editor receive title-bar pointer events directly. A label
         // that intercepts the gesture prevents the parent drag handlers from
         // seeing the same mouse-down/drag sequence consistently.
@@ -4889,9 +5902,26 @@ public:
         automationTargetSelector.setTooltip("Automated plugin parameter");
         automationTargetSelector.onChange = [this]
         {
-            if (onAutomationTargetChanged && automationTargetSelector.getSelectedId() > 0)
+            const auto selected = automationTargetSelector.getSelectedId();
+            if (selected >= 1 && selected <= 4)
             {
-                const auto index = automationTargetSelector.getSelectedId() - 1;
+                static const std::array<juce::String, 4> midiTargets {
+                    "Velocity", "Pitch", "Aftertouch", "Modulation Wheel"
+                };
+                if (selected == 1)
+                {
+                    automationToggleButton.setToggleState(false, juce::dontSendNotification);
+                    automationTargetSelector.setVisible(false);
+                    velocityButton.setToggleState(true, juce::dontSendNotification);
+                    if (velocityButton.onClick) velocityButton.onClick();
+                }
+                else if (onAutomationTargetChanged)
+                    onAutomationTargetChanged("MIDI\n" + midiTargets[static_cast<size_t>(selected - 1)]
+                                               + "\n" + midiTargets[static_cast<size_t>(selected - 1)]);
+            }
+            else if (onAutomationTargetChanged && selected > 4)
+            {
+                const auto index = selected - 5;
                 if (juce::isPositiveAndBelow(index, automationTargetIds.size()))
                     onAutomationTargetChanged(automationTargetIds[index]);
             }
@@ -4986,14 +6016,27 @@ public:
         {
             if (grid != nullptr) grid->setKeyboardOptions(grid->hasColouredKeys(), noteNamesButton.getToggleState());
         };
+        addAndMakeVisible(snapButton);
+        snapButton.setClickingTogglesState(true);
+        snapButton.setToggleState(true, juce::dontSendNotification);
+        snapButton.setButtonText("Snap On");
+        snapButton.setTooltip("Snap note positions and lengths to the piano-roll grid. Turn off for fine positioning.");
+        snapButton.onClick = [this]
+        {
+            const auto enabled = snapButton.getToggleState();
+            snapButton.setButtonText(enabled ? "Snap On" : "Snap Off");
+            if (grid != nullptr) grid->setSnapToGrid(enabled);
+        };
         grid = new PianoRollGrid();
         grid->setWantsKeyboardFocus(true);
         grid->getActiveStepCount = std::move(activeStepCount);
         grid->noteIsOn = std::move(isNoteOn);
         grid->areAllNotesSelected = std::move(areAllNotesSelected);
         grid->getNoteLength = std::move(getNoteLength);
+        grid->getNotes = std::move(getNotes);
         grid->noteClicked = std::move(onNoteClicked);
         grid->noteLengthChanged = std::move(onNoteLengthChanged);
+        grid->noteMoved = std::move(onNoteMoved);
         grid->noteGestureStarted = std::move(onNoteGestureStarted);
         grid->noteGestureEnded = std::move(onNoteGestureEnded);
         grid->keyboardNoteChanged = std::move(onKeyboardNoteChanged);
@@ -5009,7 +6052,7 @@ public:
         grid->getVelocityAtStep = [this](int step)
         {
             int total = 0, count = 0;
-            for (int pitch = 48; pitch <= 84; ++pitch)
+            for (int pitch = PianoRollGrid::minimumPitch; pitch <= PianoRollGrid::maximumPitch; ++pitch)
                 if (grid->noteIsOn && grid->noteIsOn(pitch, step))
                 {
                     total += getVelocityAtStep ? getVelocityAtStep(step, pitch) : 100;
@@ -5025,12 +6068,16 @@ public:
         grid->velocityGestureEnded = [this] { if (onVelocityGestureEnded) onVelocityGestureEnded(); };
         grid->getMaximumLaneHeight = [this]
         {
-            constexpr int noteGridMinimumHeight = 30 + 37 * 8 + 8;
+            const int noteGridMinimumHeight = grid->headerHeight() + 4 * grid->rowHeight() + 8;
             return juce::jmax(64, viewport.getHeight() - noteGridMinimumHeight);
         };
         grid->laneHeightChanged = [this] { resizeGridToViewport(); };
-        grid->setSize(58 + grid->visibleSteps() * 58,
-                      30 + 37 * 22 + 8 + grid->getAutomationLaneHeight());
+        grid->setSize(64 + grid->visibleSteps() * 58,440);
+        pitchScrollbar.setSingleStepSize(1);pitchScrollbar.addListener(this);
+        pitchScrollbar.setTitle("Piano Roll pitch range");pitchScrollbar.setDescription("Scroll all MIDI notes: C-1 through G9. Mouse wheel scrolls pitches; Shift-wheel scrolls time.");
+        addAndMakeVisible(pitchScrollbar);
+        grid->pitchViewportChanged=[this]{updatePitchScrollbar();};
+        viewport.setScrollBarsShown(false,true,false,true);
         viewport.setViewedComponent(grid, true);
         addAndMakeVisible(viewport);
         resizeGrip.setMouseCursor(juce::MouseCursor::BottomRightCornerResizeCursor);
@@ -5063,12 +6110,34 @@ public:
         setVisible(false);
     }
 
+    ~PianoRollWindow() override {pitchScrollbar.removeListener(this);}
+    void setPatternContext(const juce::String& track,int slot)
+    {
+        const auto context=track+":"+juce::String(slot);
+        if(context!=pitchContext){pitchContext=context;focusPatternPitches=true;}
+    }
+    void scrollBarMoved(juce::ScrollBar*,double position) override
+    {if(grid!=nullptr)grid->setPitchScrollPosition(position);}
     void refresh(const juce::String& patternName)
     {
         title.setText("PIANO ROLL  |  " + patternName, juce::dontSendNotification);
         if (grid == nullptr) return;
         resized();
+        if(focusPatternPitches && grid->noteAreaHeight()>=4*grid->rowHeight())
+        {
+            const auto notes=grid->getNotes?grid->getNotes():std::vector<ProjectDocument::PatternNote>{};
+            int low=127,high=0;for(const auto& note:notes){low=juce::jmin(low,note.pitch);high=juce::jmax(high,note.pitch);}
+            grid->centrePitch(notes.empty()?60:(low+high)/2);focusPatternPitches=false;
+        }
         grid->repaint();
+    }
+
+    void setEditHandlers(std::function<bool(const juce::KeyPress&)> shortcut,
+                         std::function<bool(int,int)> selected,std::function<void(int,int,bool)> select,
+                         std::function<void(int,int,int,int,bool)> range,std::function<void(int)> cursor)
+    {
+        grid->editShortcut=std::move(shortcut);grid->noteIsSelected=std::move(selected);grid->selectNote=std::move(select);
+        grid->selectNoteRange=std::move(range);grid->editCursorChanged=std::move(cursor);
     }
 
     void setPasteHandler(std::function<void()> handler)
@@ -5090,13 +6159,29 @@ public:
     std::function<void(int, int)> setVelocityAtStep;
     std::function<void()> onVelocityGestureStarted, onVelocityGestureEnded;
     std::function<void(const juce::String&)> onAutomationTargetChanged;
+    std::function<void(bool)> onThemeChanged;
+    void setLightTheme(bool enabled) { if (grid != nullptr) grid->setLightTheme(enabled); }
+    bool isLightTheme() const { return grid != nullptr && grid->isLightTheme(); }
+    void setGridOptions(int divisions, int emphasis)
+    {
+        if (grid != nullptr) grid->setGridOptions(divisions, emphasis);
+    }
+    void setAutomationFillEnabled(bool enabled)
+    {
+        if (grid != nullptr) grid->setAutomationFillEnabled(enabled);
+    }
     void setAutomationTargets(const juce::StringArray& labels, const juce::StringArray& ids, int selectedId = 1)
     {
         automationTargetSelector.clear(juce::dontSendNotification);
         automationTargetIds = ids;
-        for (int i = 0; i < labels.size(); ++i) automationTargetSelector.addItem(labels[i], i + 1);
-        if (labels.isEmpty()) automationTargetSelector.addItem("No automatable parameters", 1);
-        automationTargetSelector.setSelectedId(juce::jlimit(1, juce::jmax(1, labels.size()), selectedId),
+        automationTargetSelector.addItem("Velocity", 1);
+        automationTargetSelector.addItem("Pitch", 2);
+        automationTargetSelector.addItem("Aftertouch", 3);
+        automationTargetSelector.addItem("Modulation Wheel", 4);
+        automationTargetSelector.addSeparator();
+        for (int i = 0; i < labels.size(); ++i) automationTargetSelector.addItem(labels[i], i + 5);
+        if (labels.isEmpty()) automationTargetSelector.addItem("No automatable parameters", 5);
+        automationTargetSelector.setSelectedId(juce::jlimit(5, juce::jmax(5, labels.size() + 4), selectedId + 4),
                                                 juce::dontSendNotification);
         if (onAutomationTargetChanged && !ids.isEmpty()) onAutomationTargetChanged(ids[0]);
     }
@@ -5125,6 +6210,7 @@ public:
         keyboardButton.setVisible(false);
         noteNamesButton.setVisible(false);
         settingsButton.setBounds(footer.removeFromRight(28).reduced(1));
+        snapButton.setBounds(footer.removeFromRight(64).reduced(1));
         automationToggleButton.setBounds(footer.removeFromRight(86).reduced(1));
         velocityButton.setBounds(footer.removeFromRight(28).reduced(1));
         if (automationToggleButton.getToggleState())
@@ -5165,6 +6251,8 @@ public:
         const auto sideBottom = sideRail.getBottom();
         zoomOutButton.setBounds(sideX, juce::jmax(sideRail.getY(), sideBottom - 50), 25, 23);
         zoomInButton.setBounds(sideX, juce::jmax(sideRail.getY(), sideBottom - 26), 25, 23);
+        pitchScrollbar.setBounds(sideX+5,sideRail.getY()+grid->headerHeight(),16,
+            juce::jmax(16,sideRail.getHeight()-grid->headerHeight()-56));
         viewport.setBounds(area);
         resizeGridToViewport();
     }
@@ -5200,8 +6288,8 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        g.fillAll(juce::Colour::fromRGB(22, 32, 42));
-        g.setColour(juce::Colour::fromRGB(103, 139, 157));
+        g.fillAll(orbit::options::colour(22, 32, 42));
+        g.setColour(orbit::options::colour(103, 139, 157));
         g.drawRoundedRectangle(getLocalBounds().toFloat().reduced(0.5f), 5.0f, 1.0f);
     }
 
@@ -5226,7 +6314,7 @@ private:
         void mouseUp(const juce::MouseEvent&) override { if (onDragEnded) onDragEnded(); }
         void paint(juce::Graphics& g) override
         {
-            g.setColour(juce::Colour::fromRGB(112, 179, 201));
+            g.setColour(orbit::options::colour(112, 179, 201));
             for (int inset = 5; inset <= 13; inset += 4)
                 g.drawLine(static_cast<float>(getWidth() - inset), static_cast<float>(getHeight()),
                            static_cast<float>(getWidth()), static_cast<float>(getHeight() - inset), 1.5f);
@@ -5235,47 +6323,66 @@ private:
 
     void showSettings()
     {
-        juce::PopupMenu menu;
-        juce::PopupMenu subdivisions;
-        for (const int count : { 8, 16, 24, 32, 48, 64 })
-            subdivisions.addItem(100 + count, juce::String(count) + " subdivisions per bar",
-                                 true, grid != nullptr && grid->getSubdivisionsPerBar() == count);
-        menu.addSubMenu("Grid subdivisions per bar", subdivisions);
-        juce::PopupMenu emphasis;
-        for (const int count : { 1, 2, 4, 8, 16 })
-            emphasis.addItem(200 + count, "Highlight every " + juce::String(count) + " steps",
-                             true, grid != nullptr && grid->getHighlightEveryN() == count);
-        menu.addSubMenu("Highlight grid every", emphasis);
-        juce::Component::SafePointer<PianoRollWindow> safeThis(this);
-        menu.showMenuAsync({}, [safeThis](int result)
-        {
-            if (safeThis == nullptr || safeThis->grid == nullptr) return;
-            if (result >= 108 && result <= 164)
-                safeThis->grid->setGridOptions(result - 100, juce::jmin(safeThis->grid->getHighlightEveryN(), result - 100));
-            else if (result >= 201 && result <= 216)
-                safeThis->grid->setGridOptions(safeThis->grid->getSubdivisionsPerBar(), result - 200);
-        });
+        if (grid == nullptr) return;
+        juce::ToggleButton fillAutomationToggle("Fill automation with gradient");
+        fillAutomationToggle.setToggleState(grid->isAutomationFillEnabled(), juce::dontSendNotification);
+        fillAutomationToggle.setSize(280, 28);
+        juce::AlertWindow dialog("Piano Roll Settings", "Adjust grid and appearance.", juce::AlertWindow::NoIcon);
+        juce::StringArray themes { "Dark", "Light" };
+        juce::StringArray subdivisionChoices { "4", "8", "16", "32", "64", "128", "256" };
+        juce::StringArray emphasisChoices { "1", "2", "4", "8", "16" };
+        dialog.addComboBox("theme", themes, "Colour theme");
+        dialog.addComboBox("subdivisions", subdivisionChoices, "Subdivisions per bar");
+        dialog.addComboBox("emphasis", emphasisChoices, "Highlight every N steps");
+        dialog.addCustomComponent(&fillAutomationToggle);
+        dialog.addButton("Apply", 1, juce::KeyPress(juce::KeyPress::returnKey));
+        dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+        dialog.getComboBoxComponent("theme")->setSelectedItemIndex(grid->isLightTheme() ? 1 : 0);
+        const std::array<int, 7> subdivisionValues { 4, 8, 16, 32, 64, 128, 256 };
+        const std::array<int, 5> emphasisValues { 1, 2, 4, 8, 16 };
+        const auto subIt = std::find(subdivisionValues.begin(), subdivisionValues.end(), grid->getSubdivisionsPerBar());
+        const auto emphasisIt = std::find(emphasisValues.begin(), emphasisValues.end(), grid->getHighlightEveryN());
+        dialog.getComboBoxComponent("subdivisions")->setSelectedItemIndex(
+            subIt == subdivisionValues.end() ? 1 : static_cast<int>(std::distance(subdivisionValues.begin(), subIt)));
+        dialog.getComboBoxComponent("emphasis")->setSelectedItemIndex(
+            emphasisIt == emphasisValues.end() ? 2 : static_cast<int>(std::distance(emphasisValues.begin(), emphasisIt)));
+        if (dialog.runModalLoop() != 1) return;
+        grid->setLightTheme(dialog.getComboBoxComponent("theme")->getSelectedItemIndex() == 1);
+        grid->setGridOptions(
+            subdivisionValues[static_cast<size_t>(dialog.getComboBoxComponent("subdivisions")->getSelectedItemIndex())],
+            emphasisValues[static_cast<size_t>(dialog.getComboBoxComponent("emphasis")->getSelectedItemIndex())]);
+        if (onGridOptionsChanged)
+            onGridOptionsChanged(grid->getSubdivisionsPerBar(), grid->getHighlightEveryN());
+        if (onThemeChanged) onThemeChanged(grid->isLightTheme());
+        grid->setAutomationFillEnabled(fillAutomationToggle.getToggleState());
+        if (onAutomationFillChanged) onAutomationFillChanged(grid->isAutomationFillEnabled());
     }
 
+    void updatePitchScrollbar()
+    {
+        if(grid==nullptr)return;
+        pitchScrollbar.setRangeLimits(0,PianoRollGrid::pitchCount,juce::dontSendNotification);
+        pitchScrollbar.setCurrentRange(grid->getPitchScrollPosition(),juce::jmin(double(PianoRollGrid::pitchCount),grid->visiblePitchRows()),juce::dontSendNotification);
+    }
     void resizeGridToViewport(bool resetVerticalScroll = false)
     {
-        if (grid == nullptr) return;
-        constexpr int labelWidth = 58;
-        constexpr int headerHeight = 30;
-        const auto columns = grid->visibleSteps();
-        grid->setViewMetrics(viewport.getWidth(), viewport.getHeight());
-        const auto contentHeight = headerHeight + 37 * grid->rowHeight() + 8
-            + ((grid->isVelocityLaneVisible() || grid->isAutomationLaneVisible()) ? grid->getAutomationLaneHeight() : 0);
-        grid->setSize(labelWidth + columns * grid->stepWidth(), juce::jmax(viewport.getHeight(), contentHeight));
-        if (resetVerticalScroll)
-            viewport.setViewPosition(viewport.getViewPositionX(), 0);
+        if(grid==nullptr)return;juce::ignoreUnused(resetVerticalScroll);
+        grid->setViewMetrics(viewport.getWidth(),viewport.getHeight());
+        const int width=grid->labelWidth()+grid->visibleSteps()*grid->stepWidth();
+        const int height=juce::jmax(1,viewport.getHeight()-(width>viewport.getWidth()?viewport.getScrollBarThickness():0));
+        grid->setSize(width,height);grid->setPitchScrollPosition(grid->getPitchScrollPosition());
+        viewport.setViewPosition(viewport.getViewPositionX(),0);updatePitchScrollbar();
     }
 
     PianoRollGrid* grid = nullptr;
     juce::Viewport viewport;
+    juce::ScrollBar pitchScrollbar {true};
+    juce::String pitchContext;
+    bool focusPatternPitches = true;
     juce::Label title;
     juce::TextButton closeButton;
     PianoRollIconButton settingsButton { "Piano roll settings", PianoRollIconButton::Icon::Settings };
+    juce::TextButton snapButton { "Snap" };
     juce::TextButton zoomOutButton, zoomInButton, horizontalZoomOutButton, horizontalZoomInButton;
     ResizeGrip resizeGrip;
     PianoRollIconButton velocityButton { "Velocity lane", PianoRollIconButton::Icon::Velocity };
@@ -5380,7 +6487,7 @@ public:
     void paint(juce::Graphics& g) override
     {
         const auto area = getLocalBounds().toFloat();
-        g.fillAll(juce::Colour::fromRGB(24, 36, 45));
+        g.fillAll(orbit::options::colour(24, 36, 45));
         if (area.isEmpty()) return;
         constexpr int whiteCount = 14;
         const auto whiteWidth = area.getWidth() / static_cast<float>(whiteCount);
@@ -5392,10 +6499,10 @@ public:
         for (int i = 0; i < whiteCount; ++i)
         {
             auto key = juce::Rectangle<float>(i * whiteWidth, 0, whiteWidth, area.getHeight());
-            g.setColour(activePitch == whiteNoteForIndex(i) ? juce::Colour::fromRGB(105, 193, 218)
-                                                            : juce::Colour::fromRGB(226, 234, 237));
+            g.setColour(activePitch == whiteNoteForIndex(i) ? orbit::options::colour(105, 193, 218)
+                                                            : orbit::options::colour(226, 234, 237));
             g.fillRect(key.reduced(0.5f));
-            g.setColour(juce::Colour::fromRGB(41, 61, 72));
+            g.setColour(orbit::options::colour(41, 61, 72));
             g.drawRect(key, 1.0f);
         }
         constexpr std::array<int, 10> blackAfterWhite { 0, 1, 3, 4, 5, 7, 8, 10, 11, 12 };
@@ -5409,9 +6516,9 @@ public:
             constexpr std::array<int, 7> blackSemitones { 1, 3, -1, 6, 8, 10, -1 };
             const auto pitch = 60 + octave * 12 + blackSemitones[static_cast<size_t>(within)];
             auto key = juce::Rectangle<float>((whiteIndex + 1) * whiteWidth - blackWidth * 0.5f, 0, blackWidth, blackHeight);
-            g.setColour(activePitch == pitch ? juce::Colour::fromRGB(51, 158, 191) : juce::Colour::fromRGB(23, 34, 42));
+            g.setColour(activePitch == pitch ? orbit::options::colour(51, 158, 191) : orbit::options::colour(23, 34, 42));
             g.fillRoundedRectangle(key, 2.0f);
-            g.setColour(juce::Colour::fromRGB(82, 112, 126));
+            g.setColour(orbit::options::colour(82, 112, 126));
             g.drawRoundedRectangle(key, 2.0f, 1.0f);
         }
     }
@@ -5492,7 +6599,7 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        g.setColour(juce::Colour::fromRGB(183, 218, 233));
+        g.setColour(orbit::options::colour(183, 218, 233));
         const auto centreX = getWidth() * 0.5f;
         const auto centreY = getHeight() * 0.5f;
         for (int row = -1; row <= 1; ++row)
@@ -5513,14 +6620,27 @@ public:
             editor = std::make_unique<juce::GenericAudioProcessorEditor>(*external.getAudioPluginInstance());
         if (editor != nullptr)
         {
+            preferredWidth = juce::jmax(220, editor->getWidth());
+            preferredHeight = juce::jmax(120, editor->getHeight());
+            editor->setBounds(0, 0, preferredWidth, preferredHeight);
             addAndMakeVisible(*editor);
-            setSize(juce::jmax(220, editor->getWidth()), juce::jmax(120, editor->getHeight()));
+            setOpaque(false);
+            setSize(preferredWidth, preferredHeight);
         }
         else
         {
             setSize(320, 120);
         }
     }
+
+    void setRequestedScale(float scale)
+    {
+        requestedScale = scale;
+        resized();
+    }
+
+    int getPreferredWidth() const { return preferredWidth; }
+    int getPreferredHeight() const { return preferredHeight; }
 
     bool allowWindowResizing() override { return editor != nullptr && editor->isResizable(); }
     juce::ComponentBoundsConstrainer* getBoundsConstrainer() override
@@ -5529,152 +6649,1693 @@ public:
     }
     void resized() override
     {
-        if (editor != nullptr) editor->setBounds(getLocalBounds());
+        if (editor == nullptr) return;
+
+        const auto area = getLocalBounds();
+        if (area.isEmpty()) return;
+
+        // Start from the plug-in's reported editor size. Auto Fit only scales
+        // down when the plug-in is larger than the available instrument area;
+        // it never stretches a fixed-size editor to fill unused space.
+        const auto fitScale = juce::jmin(static_cast<float>(area.getWidth()) / preferredWidth,
+                                         static_cast<float>(area.getHeight()) / preferredHeight);
+        // Honour the actual host-reported editor dimensions even when a large
+        // VST needs to be scaled below 25% to fit the generator viewport.
+        // Clamping the lower end here could make the UI spill outside its
+        // dedicated area and collide with the generator header or resize edge.
+        const auto scale = juce::jmax(0.001f, requestedScale <= 0.0f
+            ? juce::jmin(1.0f, fitScale) : juce::jmin(requestedScale, fitScale));
+        if (std::abs(scale - appliedScale) > 0.001f)
+        {
+            editor->setScaleFactor(scale);
+            appliedScale = scale;
+        }
+
+        // Keep the plug-in's logical size intact. Resizing the component here
+        // can make VST3 editors renegotiate their preferred size on every host
+        // resize, which lets their native view escape the instrument viewport.
+        // Move only; the enclosing Viewport provides the hard clipping edge.
+        const auto editorSize = editor->getLocalBounds().toFloat();
+        const auto visibleEditorBounds = editorSize.transformedBy(editor->getTransform()).getSmallestIntegerContainer();
+        editor->setTopLeftPosition(area.getX() + (area.getWidth() - visibleEditorBounds.getWidth()) / 2,
+                                   area.getY() + (area.getHeight() - visibleEditorBounds.getHeight()) / 2);
     }
 
 private:
     std::unique_ptr<juce::AudioProcessorEditor> editor;
+    int preferredWidth = 320;
+    int preferredHeight = 120;
+    float requestedScale = 0.0f; // Auto Fit
+    float appliedScale = -1.0f;
+};
+
+class OrbitPluginWindowConstrainer final : public juce::ComponentBoundsConstrainer
+{
+public:
+    explicit OrbitPluginWindowConstrainer(std::function<juce::Rectangle<int>()> getSafeBoundsIn)
+        : getSafeBounds(std::move(getSafeBoundsIn))
+    {
+        setSizeLimits(1, 1, 10000, 10000);
+    }
+
+    void checkBounds(juce::Rectangle<int>& bounds,
+                     const juce::Rectangle<int>& previousBounds,
+                     const juce::Rectangle<int>& limits,
+                     bool isStretchingTop,
+                     bool isStretchingLeft,
+                     bool isStretchingBottom,
+                     bool isStretchingRight) override
+    {
+        auto safe = getSafeBounds ? getSafeBounds() : limits;
+        if (safe.isEmpty()) safe = limits;
+        if (safe.isEmpty()) return;
+
+        bounds.setWidth(juce::jlimit(juce::jmin(180, safe.getWidth()), safe.getWidth(), bounds.getWidth()));
+        bounds.setHeight(juce::jlimit(juce::jmin(120, safe.getHeight()), safe.getHeight(), bounds.getHeight()));
+        juce::ComponentBoundsConstrainer::checkBounds(bounds, previousBounds, safe,
+                                                       isStretchingTop, isStretchingLeft,
+                                                       isStretchingBottom, isStretchingRight);
+        bounds.setX(juce::jlimit(safe.getX(), juce::jmax(safe.getX(), safe.getRight() - bounds.getWidth()), bounds.getX()));
+        bounds.setY(juce::jlimit(safe.getY(), juce::jmax(safe.getY(), safe.getBottom() - bounds.getHeight()), bounds.getY()));
+    }
+
+private:
+    std::function<juce::Rectangle<int>()> getSafeBounds;
 };
 
 class OrbitPluginWindow final : public juce::DocumentWindow
 {
 public:
-    explicit OrbitPluginWindow(te::Plugin::WindowState& state)
-        : DocumentWindow(state.plugin.getName(), juce::Colour::fromRGB(20, 29, 38), closeButton),
-          pluginState(state), plugin(state.plugin)
+    explicit OrbitPluginWindow(te::Plugin::WindowState& state,
+                               std::function<juce::Rectangle<int>()> getSafeBoundsIn)
+        : DocumentWindow(state.plugin.getName(), orbit::options::colour(20, 29, 38), closeButton),
+          pluginState(state), plugin(state.plugin),
+          getSafeBounds(std::move(getSafeBoundsIn)), boundsConstrainer(getSafeBounds)
     {
         setUsingNativeTitleBar(true);
+        setConstrainer(&boundsConstrainer);
         if (auto* external = dynamic_cast<te::ExternalPlugin*>(&plugin))
             editor = std::make_unique<OrbitPluginEditorContent>(*external);
         if (editor != nullptr)
         {
+            const auto safe = getAvailableBounds();
+            const auto maxContentWidth = juce::jmax(1, safe.getWidth() - 24);
+            const auto maxContentHeight = juce::jmax(1, safe.getHeight() - 48);
+            const auto fitScale = juce::jmin(1.0f,
+                juce::jmin(static_cast<float>(maxContentWidth) / static_cast<float>(editor->getPreferredWidth()),
+                           static_cast<float>(maxContentHeight) / static_cast<float>(editor->getPreferredHeight())));
+            editor->setRequestedScale(fitScale);
+            editor->setSize(juce::jmax(1, juce::roundToInt(editor->getPreferredWidth() * fitScale)),
+                            juce::jmax(1, juce::roundToInt(editor->getPreferredHeight() * fitScale)));
             setContentNonOwned(editor.get(), true);
-            setResizable(editor->allowWindowResizing(), false);
-            if (editor->allowWindowResizing()) setConstrainer(editor->getBoundsConstrainer());
-            centreWithSize(juce::jmax(260, editor->getWidth()), juce::jmax(150, editor->getHeight()));
+            // Resizing this host window scales the plug-in inside the same
+            // bounded content area. A plug-in cannot enlarge the top-level
+            // window beyond Orbit's usable workspace.
+            setResizable(true, true);
         }
         else
         {
             auto* message = new juce::Label({}, "This plugin does not provide an editor.");
             message->setJustificationType(juce::Justification::centred);
             setContentOwned(message, true);
-            centreWithSize(360, 120);
+            setSize(360, 120);
         }
+        constrainToAvailableBounds();
         setVisible(true);
         toFront(false);
     }
 
     void closeButtonPressed() override { pluginState.closeWindowExplicitly(); }
 
+    void moved() override { constrainToAvailableBounds(); }
+
 private:
+    juce::Rectangle<int> getAvailableBounds() const
+    {
+        auto safe = getSafeBounds ? getSafeBounds() : juce::Rectangle<int>{};
+        if (safe.isEmpty())
+            if (const auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
+                safe = display->userArea;
+        return safe;
+    }
+
+    void constrainToAvailableBounds()
+    {
+        if (constrainingBounds) return;
+        const auto safe = getAvailableBounds();
+        if (safe.isEmpty()) return;
+        auto bounds = getBounds();
+        bounds.setWidth(juce::jmin(bounds.getWidth(), safe.getWidth()));
+        bounds.setHeight(juce::jmin(bounds.getHeight(), safe.getHeight()));
+        bounds.setX(juce::jlimit(safe.getX(), juce::jmax(safe.getX(), safe.getRight() - bounds.getWidth()), bounds.getX()));
+        bounds.setY(juce::jlimit(safe.getY(), juce::jmax(safe.getY(), safe.getBottom() - bounds.getHeight()), bounds.getY()));
+        if (bounds != getBounds())
+        {
+            constrainingBounds = true;
+            setBounds(bounds);
+            constrainingBounds = false;
+        }
+    }
+
     te::Plugin::WindowState& pluginState;
     te::Plugin& plugin;
-    std::unique_ptr<te::Plugin::EditorComponent> editor;
+    std::function<juce::Rectangle<int>()> getSafeBounds;
+    OrbitPluginWindowConstrainer boundsConstrainer;
+    std::unique_ptr<OrbitPluginEditorContent> editor;
+    bool constrainingBounds = false;
 };
 
-// A small, native sampler front-end for Orbit's first drum-rack iteration.
-// Each pad maps to one MIDI note; its 16-step row edits the normal pattern
-// data, so rack hits use the same playback, playlist, and save path as notes.
-class DrumRackWindow final : public juce::DocumentWindow
+class DrumRackStepGrid final : public juce::Component, public juce::SettableTooltipClient
 {
 public:
+    using StepIndices = std::vector<int>;
+    using StepVelocities = std::vector<std::pair<int, int>>;
+    std::function<void(int, int, bool)> stepChanged;
+    std::function<void(int, int, int)> velocityChanged;
+    std::function<void()> beginStepGesture;
+
+    DrumRackStepGrid()
+    {
+        setMouseCursor(juce::MouseCursor::PointingHandCursor);
+        setTooltip("Click to toggle. Drag to paint, right-drag to erase. Scroll over a hit to change its velocity.");
+    }
+
+    void setStepCount(int count)
+    {
+        stepCount = juce::jlimit(1, ProjectDocument::maximumPatternLengthSteps, count);
+        repaint();
+    }
+
+    void setRowLayout(int expandedPad, int expandedHeight)
+    {
+        expandedPadIndex = juce::isPositiveAndBelow(expandedPad, 16) ? expandedPad : -1;
+        expandedPadHeight = expandedPadIndex >= 0 ? juce::jmax(0, expandedHeight) : 0;
+        repaint();
+    }
+
+    void setSteps(int pad, const StepIndices& values)
+    {
+        if (!juce::isPositiveAndBelow(pad, 16)) return;
+        auto& row = steps[static_cast<size_t>(pad)];
+        row.clear();
+        for (const auto step : values)
+            if (juce::isPositiveAndBelow(step, stepCount)) row.insert(step);
+        auto& velocityRow = velocities[static_cast<size_t>(pad)];
+        for (auto it = velocityRow.begin(); it != velocityRow.end();)
+            if (row.find(it->first) == row.end()) it = velocityRow.erase(it);
+            else ++it;
+        for (const auto step : row)
+            if (velocityRow[step] == 0) velocityRow[step] = 100;
+        repaint();
+    }
+
+    void setVelocities(int pad, const StepVelocities& values)
+    {
+        if (!juce::isPositiveAndBelow(pad, 16)) return;
+        auto& row = velocities[static_cast<size_t>(pad)];
+        row.clear();
+        const auto& activeSteps = steps[static_cast<size_t>(pad)];
+        for (const auto [step, velocity] : values)
+            if (activeSteps.find(step) != activeSteps.end())
+                row[step] = juce::jlimit(1, 127, velocity);
+        for (const auto step : activeSteps)
+            if (row.find(step) == row.end()) row[step] = 100;
+        repaint();
+    }
+
+    bool hitTest(int x, int y) override
+    {
+        if (!getLocalBounds().contains(x, y)) return false;
+        const auto rowHeight = getBaseRowHeight();
+        for (int pad = 0; pad < 16; ++pad)
+        {
+            const auto top = getRowTop(pad, rowHeight);
+            if (static_cast<float>(y) >= top && static_cast<float>(y) < top + rowHeight)
+                return true;
+        }
+        return false;
+    }
+
+    void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override
+    {
+        const auto cell = cellAt(event.position);
+        if (cell.first < 0 || steps[static_cast<size_t>(cell.first)].find(cell.second)
+            == steps[static_cast<size_t>(cell.first)].end()) return;
+        auto& velocity = velocities[static_cast<size_t>(cell.first)][cell.second];
+        const auto delta = juce::roundToInt(wheel.deltaY * 32.0f);
+        if (delta == 0) return;
+        if (beginStepGesture) beginStepGesture();
+        velocity = juce::jlimit(1, 127, velocity + delta);
+        repaint();
+        if (velocityChanged) velocityChanged(cell.first, cell.second, velocity);
+    }
+
+    void mouseDown(const juce::MouseEvent& event) override
+    {
+        const auto cell = cellAt(event.position);
+        if (cell.first < 0) return;
+        if (beginStepGesture) beginStepGesture();
+        painting = true;
+        paintValue = event.mods.isRightButtonDown() ? false
+            : steps[static_cast<size_t>(cell.first)].find(cell.second)
+                == steps[static_cast<size_t>(cell.first)].end();
+        lastPaintedCell = {-1, -1};
+        paintCell(cell.first, cell.second);
+    }
+
+    void mouseDrag(const juce::MouseEvent& event) override
+    {
+        if (!painting) return;
+        const auto cell = cellAt(event.position);
+        if (cell.first >= 0) paintCell(cell.first, cell.second);
+    }
+
+    void mouseUp(const juce::MouseEvent&) override
+    {
+        painting = false;
+        lastPaintedCell = {-1, -1};
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        const auto rowHeight = getBaseRowHeight();
+        const auto cellWidth = static_cast<float>(getWidth()) / static_cast<float>(stepCount);
+        const auto clip = g.getClipBounds();
+        const auto firstVisibleStep = juce::jlimit(0, stepCount - 1,
+            static_cast<int>(std::floor(static_cast<double>(clip.getX()) / juce::jmax(0.0001f, cellWidth))));
+        const auto lastVisibleStep = juce::jlimit(firstVisibleStep, stepCount - 1,
+            static_cast<int>(std::ceil(static_cast<double>(clip.getRight()) / juce::jmax(0.0001f, cellWidth))));
+        const auto paintStride = juce::jmax(1, juce::roundToInt(
+            std::ceil(1.0 / static_cast<double>(juce::jmax(0.0001f, cellWidth)))));
+        constexpr float numberHeaderHeight = 10.0f;
+        for (int pad = 0; pad < 16; ++pad)
+        {
+            const auto y = getRowTop(pad, rowHeight);
+            g.setColour(pad % 2 == 0 ? orbit::options::colour(28, 43, 53)
+                                     : orbit::options::colour(31, 47, 57));
+            g.fillRect(0.0f, y, static_cast<float>(getWidth()), numberHeaderHeight);
+            for (int step = firstVisibleStep; step <= lastVisibleStep; step += paintStride)
+            {
+                const auto x = step * cellWidth;
+                g.setColour(step % 4 == 0 ? orbit::options::colour(186, 211, 221)
+                                          : orbit::options::colour(123, 158, 173));
+                g.setFont(juce::FontOptions(8.5f, juce::Font::bold));
+                g.drawText(juce::String(step + 1), juce::Rectangle<int>(juce::roundToInt(x),
+                    juce::roundToInt(y), juce::jmax(1, juce::roundToInt(cellWidth)),
+                    juce::roundToInt(numberHeaderHeight)), juce::Justification::centred, false);
+                const auto buttonCell = juce::Rectangle<float>(x + 1.0f, y + numberHeaderHeight + 1.0f,
+                    juce::jmax(1.0f, cellWidth - 2.0f),
+                    juce::jmax(1.0f, rowHeight - numberHeaderHeight - 4.0f));
+                g.setColour(step % 16 == 0 ? orbit::options::colour(56, 82, 96)
+                                           : orbit::options::colour(43, 62, 74));
+                g.fillRoundedRectangle(buttonCell, 3.0f);
+                g.setColour(step % 16 == 0 ? orbit::options::colour(83, 125, 144)
+                                           : orbit::options::colour(64, 93, 108));
+                g.drawRoundedRectangle(buttonCell, 3.0f, 1.0f);
+            }
+            for (const auto step : steps[static_cast<size_t>(pad)])
+            {
+                if (step < firstVisibleStep || step > lastVisibleStep) continue;
+                const auto x = static_cast<float>(step) * cellWidth;
+                const auto buttonCell = juce::Rectangle<float>(x + 1.0f, y + numberHeaderHeight + 1.0f,
+                    juce::jmax(1.0f, cellWidth - 2.0f),
+                    juce::jmax(1.0f, rowHeight - numberHeaderHeight - 4.0f));
+                const auto velocityIt = velocities[static_cast<size_t>(pad)].find(step);
+                const auto velocity = velocityIt == velocities[static_cast<size_t>(pad)].end()
+                    ? 100 : velocityIt->second;
+                g.setColour(step % 16 == 0 ? orbit::options::colour(55, 174, 211)
+                                           : orbit::options::colour(43, 150, 190));
+                g.fillRoundedRectangle(buttonCell, 3.0f);
+                g.setColour(orbit::options::colour(138, 225, 246));
+                g.drawRoundedRectangle(buttonCell, 3.0f, 1.0f);
+                g.setColour(orbit::options::colour(185, 239, 250));
+                g.fillRect(buttonCell.getX() + 3.0f, buttonCell.getBottom() - 4.0f,
+                    juce::jmax(1.0f, (buttonCell.getWidth() - 6.0f)
+                        * static_cast<float>(velocity) / 127.0f), 2.0f);
+            }
+            g.setColour(orbit::options::colour(74, 105, 120));
+            g.drawHorizontalLine(juce::roundToInt(y + rowHeight), 0.0f,
+                                 static_cast<float>(getWidth()));
+        }
+        const auto barStride = 16 * juce::jmax(1, juce::roundToInt(
+            std::ceil(1.0 / static_cast<double>(juce::jmax(0.0001f, cellWidth * 16.0f)))));
+        for (int bar = juce::jmax(16, ((firstVisibleStep + 15) / 16) * 16); bar <= lastVisibleStep; bar += barStride)
+        {
+            g.setColour(orbit::options::colour(105, 157, 177));
+            for (int pad = 0; pad < 16; ++pad)
+            {
+                const auto top = getRowTop(pad, rowHeight);
+                g.drawVerticalLine(juce::roundToInt(bar * cellWidth), top, top + rowHeight);
+            }
+        }
+    }
+
+private:
+    float getBaseRowHeight() const
+    {
+        return static_cast<float>(juce::jmax(0, getHeight() - expandedPadHeight)) / 16.0f;
+    }
+
+    float getRowTop(int pad, float rowHeight) const
+    {
+        return static_cast<float>(pad) * rowHeight
+            + (expandedPadIndex >= 0 && pad > expandedPadIndex ? static_cast<float>(expandedPadHeight) : 0.0f);
+    }
+
+    std::pair<int, int> cellAt(juce::Point<float> point) const
+    {
+        if (!getLocalBounds().toFloat().contains(point) || getWidth() <= 0 || getHeight() <= 0)
+            return {-1, -1};
+        const auto rowHeight = getBaseRowHeight();
+        if (rowHeight <= 0.0f) return {-1, -1};
+        int pad = -1;
+        float withinRow = 0.0f;
+        for (int candidate = 0; candidate < 16; ++candidate)
+        {
+            const auto top = getRowTop(candidate, rowHeight);
+            if (point.y >= top && point.y < top + rowHeight)
+            {
+                pad = candidate;
+                withinRow = point.y - top;
+                break;
+            }
+        }
+        if (pad < 0 || withinRow < 10.0f) return {-1, -1};
+        return {pad,
+                juce::jlimit(0, stepCount - 1, static_cast<int>(point.x * static_cast<float>(stepCount) / static_cast<float>(getWidth())))};
+    }
+
+    void paintCell(int pad, int step)
+    {
+        const std::pair<int, int> cell{pad, step};
+        if (cell == lastPaintedCell || !juce::isPositiveAndBelow(pad, 16)
+            || !juce::isPositiveAndBelow(step, stepCount)) return;
+        lastPaintedCell = cell;
+        auto& row = steps[static_cast<size_t>(pad)];
+        const bool isActive = row.find(step) != row.end();
+        if (isActive == paintValue) return;
+        if (paintValue)
+        {
+            row.insert(step);
+            velocities[static_cast<size_t>(pad)][step] = 100;
+        }
+        else
+        {
+            row.erase(step);
+            velocities[static_cast<size_t>(pad)].erase(step);
+        }
+        repaint();
+        if (stepChanged) stepChanged(pad, step, paintValue);
+    }
+
+    std::array<std::unordered_set<int>, 16> steps;
+    std::array<std::unordered_map<int, int>, 16> velocities;
+    std::pair<int, int> lastPaintedCell{-1, -1};
+    int stepCount = 16;
+    int expandedPadIndex = -1;
+    int expandedPadHeight = 0;
+    bool painting = false;
+    bool paintValue = true;
+};
+
+class DrumRackDragHandle final : public juce::Component
+{
+public:
+    std::function<void(juce::Point<int>)> onDragStart, onDrag;
+
+    DrumRackDragHandle() { setMouseCursor(juce::MouseCursor::DraggingHandCursor); }
+    void mouseDown(const juce::MouseEvent& event) override
+    {
+        auto* owner = getParentComponent();
+        auto* workspace = owner != nullptr ? owner->getParentComponent() : nullptr;
+        if (onDragStart && workspace != nullptr)
+            onDragStart(event.getEventRelativeTo(workspace).getPosition());
+    }
+    void mouseDrag(const juce::MouseEvent& event) override
+    {
+        auto* owner = getParentComponent();
+        auto* workspace = owner != nullptr ? owner->getParentComponent() : nullptr;
+        if (onDrag && workspace != nullptr)
+            onDrag(event.getEventRelativeTo(workspace).getPosition());
+    }
+};
+
+class DrumRackResizeHandle final : public juce::Component
+{
+public:
+    std::function<void()> onResizeStart;
+    std::function<void(juce::Point<int>)> onResize;
+
+    DrumRackResizeHandle() { setMouseCursor(juce::MouseCursor::BottomRightCornerResizeCursor); }
+    void mouseDown(const juce::MouseEvent&) override { if (onResizeStart) onResizeStart(); }
+    void mouseDrag(const juce::MouseEvent& event) override
+    {
+        if (onResize)
+            onResize({event.getDistanceFromDragStartX(), event.getDistanceFromDragStartY()});
+    }
+    void paint(juce::Graphics& g) override
+    {
+        auto area = getLocalBounds().toFloat().reduced(4.0f);
+        g.setColour(orbit::options::colour(120, 174, 195));
+        for (int inset = 0; inset < 3; ++inset)
+        {
+            const auto offset = static_cast<float>(inset * 4);
+            g.drawLine(area.getRight() - offset, area.getBottom(), area.getRight(), area.getBottom() - offset, 1.2f);
+        }
+    }
+};
+
+// A compact per-step velocity lane for the currently selected Drum Rack pad.
+// It shares the normal pattern velocity storage, so edits are saved and undone
+// through the same path as velocity changes made in the step grid.
+class DrumRackVelocityLane final : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    std::function<void()> beginGesture;
+    std::function<void(int, int)> velocityChanged;
+
+    DrumRackVelocityLane()
+    {
+        setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
+        setTooltip("Drag vertically on a hit to edit its velocity.");
+    }
+
+    void setData(int pad, int count, const DrumRackStepGrid::StepIndices& activeSteps,
+                 const DrumRackStepGrid::StepVelocities& stepVelocities)
+    {
+        selectedPad = pad;
+        stepCount = juce::jlimit(1, ProjectDocument::maximumPatternLengthSteps, count);
+        active.clear();
+        velocities.clear();
+        for (const auto step : activeSteps)
+            if (juce::isPositiveAndBelow(step, stepCount)) active.insert(step);
+        for (const auto [step, velocity] : stepVelocities)
+            if (active.find(step) != active.end()) velocities[step] = juce::jlimit(1, 127, velocity);
+        for (const auto step : active)
+            if (velocities.find(step) == velocities.end()) velocities[step] = 100;
+        repaint();
+    }
+
+    void mouseDown(const juce::MouseEvent& event) override
+    {
+        if (event.mods.isRightButtonDown()) return;
+        const auto step = stepAt(event.position.x);
+        if (step < 0 || active.find(step) == active.end()) return;
+        dragging = true;
+        if (beginGesture) beginGesture();
+        setVelocityAt(event.position, step);
+    }
+
+    void mouseDrag(const juce::MouseEvent& event) override
+    {
+        if (!dragging) return;
+        const auto step = stepAt(event.position.x);
+        if (step >= 0 && active.find(step) != active.end())
+            setVelocityAt(event.position, step);
+    }
+
+    void mouseUp(const juce::MouseEvent&) override { dragging = false; }
+
+    void paint(juce::Graphics& g) override
+    {
+        auto bounds = getLocalBounds();
+        g.setColour(orbit::options::colour(25, 39, 48));
+        g.fillRoundedRectangle(bounds.toFloat(), 4.0f);
+        g.setColour(orbit::options::colour(65, 96, 112));
+        g.drawRoundedRectangle(bounds.toFloat().reduced(0.5f), 4.0f, 1.0f);
+        constexpr int labelHeight = 15;
+        g.setColour(orbit::options::colour(177, 204, 215));
+        g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+        g.drawText("VELOCITY  ·  PAD " + juce::String(selectedPad + 1).paddedLeft('0', 2),
+                   bounds.removeFromTop(labelHeight).reduced(5, 0), juce::Justification::centredLeft);
+        auto lane = bounds.reduced(4, 2);
+        if (lane.isEmpty()) return;
+        const auto cellWidth = static_cast<float>(lane.getWidth()) / static_cast<float>(stepCount);
+        const auto laneHeight = static_cast<float>(lane.getHeight());
+        const auto showEvery = cellWidth >= 26.0f ? 1 : (cellWidth >= 9.0f ? 4 : 8);
+        const auto clip = g.getClipBounds().translated(-lane.getX(), -lane.getY());
+        const auto firstVisibleStep = juce::jlimit(0, stepCount - 1,
+            static_cast<int>(std::floor(static_cast<double>(clip.getX()) / juce::jmax(0.0001f, cellWidth))));
+        const auto lastVisibleStep = juce::jlimit(firstVisibleStep, stepCount - 1,
+            static_cast<int>(std::ceil(static_cast<double>(clip.getRight()) / juce::jmax(0.0001f, cellWidth))));
+        const auto paintStride = juce::jmax(1, juce::roundToInt(
+            std::ceil(1.0 / static_cast<double>(juce::jmax(0.0001f, cellWidth)))));
+        for (int step = firstVisibleStep; step <= lastVisibleStep; step += paintStride)
+        {
+            const auto x = lane.getX() + juce::roundToInt(static_cast<float>(step) * cellWidth);
+            if (step % 4 == 0)
+            {
+                g.setColour(orbit::options::colour(63, 91, 105));
+                g.drawVerticalLine(x, static_cast<float>(lane.getY()), static_cast<float>(lane.getBottom()));
+            }
+            if (step % showEvery == 0)
+            {
+                g.setColour(orbit::options::colour(133, 164, 178));
+                g.setFont(juce::FontOptions(8.0f));
+                g.drawText(juce::String(step + 1),
+                    juce::Rectangle<int>(x, lane.getY(), juce::jmax(1, juce::roundToInt(cellWidth)), 10),
+                    juce::Justification::centredTop, false);
+            }
+        }
+        for (const auto step : active)
+        {
+            if (step < firstVisibleStep || step > lastVisibleStep) continue;
+            const auto x = lane.getX() + juce::roundToInt(static_cast<float>(step) * cellWidth);
+            const auto velocityIt = velocities.find(step);
+            const auto value = juce::jlimit(1, 127, velocityIt == velocities.end() ? 100 : velocityIt->second);
+            const auto barHeight = juce::jmax(1.0f, (laneHeight - 11.0f)
+                * static_cast<float>(value) / 127.0f);
+            const auto barWidth = juce::jmax(2.0f, juce::jmin(cellWidth - 2.0f, 10.0f));
+            const auto bar = juce::Rectangle<float>(barWidth, barHeight).withCentre(
+                { static_cast<float>(x) + cellWidth * 0.5f,
+                  static_cast<float>(lane.getBottom()) - barHeight * 0.5f });
+            g.setColour(orbit::options::colour(50, 161, 197));
+            g.fillRoundedRectangle(bar, 2.0f);
+            g.setColour(orbit::options::colour(137, 224, 243));
+            g.drawRoundedRectangle(bar, 2.0f, 0.8f);
+        }
+    }
+
+private:
+    int stepAt(float x) const
+    {
+        if (getWidth() <= 0 || x < 0.0f || x >= static_cast<float>(getWidth())) return -1;
+        return juce::jlimit(0, stepCount - 1,
+            static_cast<int>(x * static_cast<float>(stepCount) / static_cast<float>(getWidth())));
+    }
+
+    void setVelocityAt(juce::Point<float> point, int step)
+    {
+        auto lane = getLocalBounds();
+        lane.removeFromTop(15);
+        lane = lane.reduced(4, 2);
+        const auto value = juce::jlimit(1, 127, juce::roundToInt(
+            1.0f + (1.0f - juce::jlimit(0.0f, 1.0f,
+                (point.y - static_cast<float>(lane.getY())) / static_cast<float>(juce::jmax(1, lane.getHeight())))) * 126.0f));
+        if (velocities[step] == value) return;
+        velocities[step] = value;
+        repaint();
+        if (velocityChanged) velocityChanged(step, value);
+    }
+
+    std::unordered_set<int> active;
+    std::unordered_map<int, int> velocities;
+    int selectedPad = 0;
+    int stepCount = 16;
+    bool dragging = false;
+};
+
+// A native sampler front-end for Orbit's Drum Rack.
+// Each pad maps to one MIDI note; its step row edits the normal pattern data,
+// so rack hits use the same playback, playlist, and save path as notes.
+class DrumRackWindow final : public juce::Component, private juce::Timer
+{
+public:
+    enum class PadControl { start, length, trimStart, trimEnd, tune, gain, pan, release,
+                            velocitySensitivity, velocityTune, velocityOffset, cutoff,
+                            trackLevel, playbackMode, reverse };
+    struct PadInfo
+    {
+        juce::File file;
+        juce::String name;
+        double durationSeconds = 0.0;
+        double startSeconds = 0.0;
+        double lengthSeconds = 0.0;
+        float gainDb = 0.0f;
+        float pan = 0.0f;
+        int tuneSemitones = 0;
+        float releaseMs = 10.0f;
+        float velocitySensitivity = 1.0f;
+        float velocityTune = 0.0f;
+        float velocityOffset = 0.0f;
+        float cutoffHz = 20000.0f;
+        float trackLevelDb = 0.0f;
+        bool oneShot = true;
+        bool looping = false;
+        bool reversed = false;
+    };
+
     DrumRackWindow(std::function<void(int)> loadSample,
                    std::function<void(int)> padSelected,
-                   std::function<void(int, int, bool)> setStep)
-        : DocumentWindow("Drum Rack", juce::Colour::fromRGB(25, 37, 46), closeButton),
-          loadSampleCallback(std::move(loadSample)), padSelectedCallback(std::move(padSelected)),
-          setStepCallback(std::move(setStep))
+                   std::function<void(int)> auditionPad,
+                   std::function<void(int, int, bool)> setStep,
+                   std::function<void(int, int, int)> setStepVelocity,
+                   std::function<void(int, PadControl, double)> setPadControl,
+                   std::function<void(int)> setStepCount,
+                   juce::Rectangle<int> initialBounds,
+                   std::function<void(juce::Rectangle<int>)> saveBounds)
+        : loadSampleCallback(std::move(loadSample)), padSelectedCallback(std::move(padSelected)),
+          auditionPadCallback(std::move(auditionPad)),
+          setStepCallback(std::move(setStep)), setStepVelocityCallback(std::move(setStepVelocity)),
+          setPadControlCallback(std::move(setPadControl)), saveBoundsCallback(std::move(saveBounds))
     {
-        setUsingNativeTitleBar(true);
-        content.setLoadSampleHandler([this] { if (loadSampleCallback) loadSampleCallback(selectedPad); });
+        setOpaque(true);
+        content.setLoadSampleHandler([this](int pad) { if (loadSampleCallback) loadSampleCallback(pad); });
         content.setPadSelectedHandler([this](int pad)
         {
             selectedPad = pad;
             refreshPadSelection();
             if (padSelectedCallback) padSelectedCallback(pad);
         });
+        content.setAuditionPadHandler([this](int pad)
+        {
+            if (auditionPadCallback) auditionPadCallback(pad);
+        });
+        content.setPadControlHandler([this](int pad, PadControl control, double value)
+        {
+            if (setPadControlCallback) setPadControlCallback(pad, control, value);
+        });
         content.setStepHandler([this](int pad, int step, bool enabled)
         {
             if (setStepCallback) setStepCallback(pad, step, enabled);
         });
-        setContentOwned(&content, false);
-        setResizable(true, true);
-        setResizeLimits(540, 440, 1100, 850);
-        centreWithSize(760, 570);
+        content.setVelocityHandler([this](int pad, int step, int velocity)
+        {
+            if (setStepVelocityCallback) setStepVelocityCallback(pad, step, velocity);
+        });
+        content.setUndoGestureHandler([this](const juce::String& label)
+        {
+            if (undoGestureHandler) undoGestureHandler(label);
+        });
+        content.setStepCountHandler(std::move(setStepCount));
+        content.setSampleEditorExpandedHandler([this](bool expanded)
+        {
+            auto* parent = getParentComponent();
+            if (parent == nullptr) return;
+            auto workspace = parent->getLocalBounds().withTrimmedTop(82).withTrimmedBottom(32).reduced(14, 10);
+            if (workspace.isEmpty()) return;
+            auto next = getBounds();
+            if (expanded)
+            {
+                if (heightBeforeSampleEditor == 0)
+                    heightBeforeSampleEditor = next.getHeight();
+                constexpr int expandedPreferredHeight = 1020;
+                next.setHeight(juce::jmax(next.getHeight(),
+                                          juce::jmin(expandedPreferredHeight, workspace.getHeight())));
+            }
+            else if (heightBeforeSampleEditor > 0)
+            {
+                next.setHeight(heightBeforeSampleEditor);
+                heightBeforeSampleEditor = 0;
+            }
+            next.setY(juce::jlimit(workspace.getY(), workspace.getBottom() - next.getHeight(), next.getY()));
+            applyParentBounds(next);
+        });
+        if (initialBounds.isEmpty())
+            setBounds(80, 100, 1320, 760);
+        else
+            setBounds(initialBounds);
+        addAndMakeVisible(content);
+        addAndMakeVisible(titleDragHandle);
+        addAndMakeVisible(generatorMenuControl);
+        addAndMakeVisible(closeControl);
+        addAndMakeVisible(resizeHandle);
+        titleDragHandle.onDragStart = [this](juce::Point<int> point)
+        {
+            dragOffset = point - getBounds().getPosition();
+        };
+        titleDragHandle.onDrag = [this](juce::Point<int> point)
+        {
+            auto next = getBounds();
+            next.setPosition(point - dragOffset);
+            applyParentBounds(next);
+        };
+        resizeHandle.onResize = [this](juce::Point<int> delta)
+        {
+            auto next = getBounds();
+            next.setSize(resizeStartSize.x + delta.x, resizeStartSize.y + delta.y);
+            applyParentBounds(next);
+        };
+        resizeHandle.onResizeStart = [this] { resizeStartSize = {getWidth(), getHeight()}; };
+        generatorMenuControl.setButtonText("Generator Options");
+        generatorMenuControl.setTextVisible(false);
+        generatorMenuControl.setTooltip("Generator options: settings, arpeggiator and shuffle");
+        generatorMenuControl.onClick = [this]
+        {
+            if (onGeneratorMenu) onGeneratorMenu(&generatorMenuControl);
+        };
+        closeControl.setButtonText("×");
+        closeControl.setTooltip("Close Drum Rack");
+        closeControl.setColour(juce::TextButton::buttonColourId, orbit::options::colour(34, 47, 57));
+        closeControl.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(147, 70, 67));
+        closeControl.setColour(juce::TextButton::textColourOffId, orbit::options::colour(218, 230, 236));
+        closeControl.onClick = [this]
+        {
+            savePlacement();
+            setVisible(false);
+        };
         setVisible(true);
-        toFront(false);
     }
 
-    void closeButtonPressed() override { setVisible(false); }
+    ~DrumRackWindow() override
+    {
+        stopTimer();
+        savePlacement();
+    }
 
-    void setPadSampleName(int pad, const juce::String& name) { content.setPadSampleName(pad, name); }
-    void setSteps(int pad, const std::array<bool, 16>& steps) { content.setSteps(pad, steps); }
+    void resized() override
+    {
+        auto header = getLocalBounds().removeFromTop(titleBarHeight);
+        generatorMenuControl.setBounds(header.removeFromLeft(titleBarHeight).reduced(2));
+        closeControl.setBounds(header.removeFromRight(titleBarHeight).reduced(3));
+        titleDragHandle.setBounds(header);
+        content.setBounds(0, titleBarHeight, getWidth(), juce::jmax(0, getHeight() - titleBarHeight));
+        resizeHandle.setBounds(getWidth() - 20, getHeight() - 20, 20, 20);
+        schedulePlacementSave();
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(orbit::options::colour(25, 37, 46));
+        g.setColour(orbit::options::colour(34, 48, 58));
+        g.fillRect(0, 0, getWidth(), titleBarHeight);
+        g.setColour(orbit::options::colour(156, 194, 210));
+        g.drawText("Drum Rack", titleBarHeight + 8, 0, juce::jmax(100, getWidth() - 80), titleBarHeight,
+                   juce::Justification::centredLeft);
+        g.setColour(orbit::options::colour(75, 111, 129));
+        g.drawRect(getLocalBounds().toFloat().reduced(0.5f), 1.0f);
+    }
+
+    void setPadInfo(int pad, const PadInfo& info) { content.setPadInfo(pad, info); }
+    void setSteps(int pad, const DrumRackStepGrid::StepIndices& steps) { content.setSteps(pad, steps); }
+    void setVelocities(int pad, const DrumRackStepGrid::StepVelocities& velocities)
+    { content.setVelocities(pad, velocities); }
+    void setStepCount(int count) { content.setStepCount(count); }
     int getSelectedPad() const { return selectedPad; }
+    std::function<void(const juce::String&)> undoGestureHandler;
+    std::function<void(juce::Component*)> onGeneratorMenu;
 
 private:
-    class Content final : public juce::Component
+    void applyParentBounds(juce::Rectangle<int> bounds)
     {
+        if (auto* parent = getParentComponent())
+        {
+            auto workspace = parent->getLocalBounds().withTrimmedTop(82).withTrimmedBottom(32).reduced(14, 10);
+            if (!workspace.isEmpty())
+            {
+                bounds.setSize(juce::jlimit(juce::jmin(760, workspace.getWidth()), workspace.getWidth(), bounds.getWidth()),
+                              juce::jlimit(juce::jmin(590, workspace.getHeight()), workspace.getHeight(), bounds.getHeight()));
+                bounds.setPosition(juce::jlimit(workspace.getX(), workspace.getRight() - bounds.getWidth(), bounds.getX()),
+                                   juce::jlimit(workspace.getY(), workspace.getBottom() - bounds.getHeight(), bounds.getY()));
+            }
+        }
+        setBounds(bounds);
+    }
+
+    static constexpr int titleBarHeight = 30;
+    int heightBeforeSampleEditor = 0;
+    void schedulePlacementSave()
+    {
+        if (isVisible() && !getBounds().isEmpty()) startTimer(350);
+    }
+
+    void timerCallback() override
+    {
+        stopTimer();
+        savePlacement();
+    }
+
+    void savePlacement()
+    {
+        if (saveBoundsCallback && !getBounds().isEmpty()) saveBoundsCallback(getBounds());
+    }
+
+    class Content final : public juce::Component, private juce::ChangeListener, private juce::Timer
+    {
+        class PadWaveformPreview final : public juce::Component, private juce::ChangeListener
+        {
+        public:
+            PadWaveformPreview(int padNumber, juce::AudioFormatManager& formats,
+                               juce::AudioThumbnailCache& cache)
+                : pad(padNumber), thumbnail(128, formats, cache)
+            {
+                thumbnail.addChangeListener(this);
+                setDescription("Waveform preview for pad " + juce::String(pad + 1)
+                    + ". Click to select this pad and open its sample editor. Select the pad first, then drag either waveform edge to trim it.");
+                setMouseCursor(juce::MouseCursor::PointingHandCursor);
+            }
+
+            ~PadWaveformPreview() override { thumbnail.removeChangeListener(this); }
+
+            std::function<void()> onClick;
+            std::function<void(bool, double)> onTrim;
+            std::function<void()> onTrimGestureStarted, onTrimGestureEnded;
+
+            void mouseDown(const juce::MouseEvent& event) override
+            {
+                if (selected && thumbnail.getTotalLength() > 0.0)
+                {
+                    const auto wave = getWaveBounds();
+                    const auto duration = thumbnail.getTotalLength();
+                    const auto startX = wave.getX() + juce::roundToInt(wave.getWidth()
+                        * juce::jlimit(0.0, 1.0, startSeconds / duration));
+                    const auto endX = wave.getX() + juce::roundToInt(wave.getWidth()
+                        * juce::jlimit(0.0, 1.0, (startSeconds + lengthSeconds) / duration));
+                    constexpr int handleHitRadius = 7;
+                    const auto mouseX = event.getPosition().x;
+                    const auto nearStart = std::abs(mouseX - startX) <= handleHitRadius;
+                    const auto nearEnd = std::abs(mouseX - endX) <= handleHitRadius;
+                    if (nearStart || nearEnd)
+                    {
+                        activeTrimHandle = nearStart && nearEnd
+                            ? (std::abs(mouseX - startX) <= std::abs(mouseX - endX) ? 1 : 2)
+                            : (nearStart ? 1 : 2);
+                        if (onTrimGestureStarted) onTrimGestureStarted();
+                        updateTrim(event.getPosition().x);
+                        return;
+                    }
+                }
+                if (onClick) onClick();
+            }
+
+            void mouseDrag(const juce::MouseEvent& event) override
+            {
+                if (activeTrimHandle != 0) updateTrim(event.getPosition().x);
+            }
+
+            void mouseUp(const juce::MouseEvent&) override
+            {
+                if (activeTrimHandle == 0) return;
+                activeTrimHandle = 0;
+                if (onTrimGestureEnded) onTrimGestureEnded();
+            }
+
+            void mouseMove(const juce::MouseEvent& event) override
+            {
+                if (!selected || thumbnail.getTotalLength() <= 0.0)
+                {
+                    setMouseCursor(juce::MouseCursor::PointingHandCursor);
+                    return;
+                }
+                const auto wave = getWaveBounds();
+                const auto duration = thumbnail.getTotalLength();
+                const auto startX = wave.getX() + juce::roundToInt(wave.getWidth()
+                    * juce::jlimit(0.0, 1.0, startSeconds / duration));
+                const auto endX = wave.getX() + juce::roundToInt(wave.getWidth()
+                    * juce::jlimit(0.0, 1.0, (startSeconds + lengthSeconds) / duration));
+                constexpr int handleHitRadius = 7;
+                const auto x = event.getPosition().x;
+                setMouseCursor(std::abs(x - startX) <= handleHitRadius || std::abs(x - endX) <= handleHitRadius
+                    ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::PointingHandCursor);
+            }
+
+            void setInfo(const PadInfo& info)
+            {
+                if (source != info.file)
+                {
+                    source = info.file;
+                    thumbnail.setSource(source.existsAsFile() ? new juce::FileInputSource(source) : nullptr);
+                }
+                startSeconds = info.startSeconds;
+                lengthSeconds = info.lengthSeconds;
+                repaint();
+            }
+
+            void setSelected(bool value)
+            {
+                selected = value;
+                repaint();
+            }
+
+            void paint(juce::Graphics& g) override
+            {
+                auto bounds = getLocalBounds().reduced(2, 3);
+                g.setColour(orbit::options::colour(22, 34, 42));
+                g.fillRoundedRectangle(bounds.toFloat(), 3.0f);
+                g.setColour(selected ? orbit::options::colour(78, 165, 194)
+                                     : orbit::options::colour(55, 79, 92));
+                g.drawRoundedRectangle(bounds.toFloat(), 3.0f, 1.0f);
+                const auto duration = thumbnail.getTotalLength();
+                if (duration <= 0.0) return;
+                auto wave = bounds.reduced(3, 4);
+                g.setColour(orbit::options::colour(65, 113, 132));
+                thumbnail.drawChannels(g, wave, 0.0, duration, 0.38f);
+                const auto start = juce::jlimit(0.0, duration, startSeconds);
+                const auto end = juce::jlimit(start, duration, startSeconds + lengthSeconds);
+                if (end > start)
+                {
+                    const auto active = wave.withX(wave.getX() + juce::roundToInt(wave.getWidth() * start / duration))
+                                            .withWidth(juce::jmax(1, juce::roundToInt(wave.getWidth() * (end - start) / duration)));
+                    g.setColour(orbit::options::colour(91, 204, 235));
+                    thumbnail.drawChannels(g, active, start, end, 0.9f);
+                }
+                if (selected)
+                {
+                    const auto startX = wave.getX() + juce::roundToInt(wave.getWidth() * start / duration);
+                    const auto endX = wave.getX() + juce::roundToInt(wave.getWidth() * end / duration);
+                    for (const auto x : { startX, endX })
+                    {
+                        const auto handle = juce::Rectangle<float>(static_cast<float>(x - 2),
+                            static_cast<float>(wave.getY() - 1), 4.0f,
+                            static_cast<float>(wave.getHeight() + 2));
+                        g.setColour(orbit::options::colour(224, 246, 251));
+                        g.fillRoundedRectangle(handle, 1.5f);
+                        g.setColour(orbit::options::colour(27, 91, 112));
+                        g.drawVerticalLine(x, handle.getY() + 3.0f, handle.getBottom() - 3.0f);
+                    }
+                }
+            }
+
+        private:
+            juce::Rectangle<int> getWaveBounds() const
+            {
+                return getLocalBounds().reduced(2, 3).reduced(3, 4);
+            }
+
+            void updateTrim(int mouseX)
+            {
+                if (activeTrimHandle == 0 || !onTrim) return;
+                const auto wave = getWaveBounds();
+                const auto fraction = juce::jlimit(0.0, 1.0,
+                    static_cast<double>(mouseX - wave.getX())
+                        / static_cast<double>(juce::jmax(1, wave.getWidth())));
+                onTrim(activeTrimHandle == 1, fraction);
+            }
+
+            void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(); }
+            const int pad;
+            juce::File source;
+            juce::AudioThumbnail thumbnail;
+            double startSeconds = 0.0, lengthSeconds = 0.0;
+            bool selected = false;
+            int activeTrimHandle = 0;
+        };
+
+        class PadRow final : public juce::Component
+        {
+            class ExpandButton final : public juce::Button
+            {
+            public:
+                ExpandButton() : Button("Show sample waveform editor") {}
+
+                void setExpanded(bool shouldExpand)
+                {
+                    expanded = shouldExpand;
+                    repaint();
+                }
+
+                void paintButton(juce::Graphics& g, bool highlighted, bool down) override
+                {
+                    auto bounds = getLocalBounds().toFloat().reduced(2.0f);
+                    const auto background = down ? orbit::options::colour(35, 119, 151)
+                        : (highlighted ? orbit::options::colour(55, 91, 107)
+                                       : orbit::options::colour(43, 62, 74));
+                    g.setColour(background);
+                    g.fillRoundedRectangle(bounds, 3.0f);
+                    g.setColour(orbit::options::colour(173, 203, 215));
+                    juce::Path triangle;
+                    if (expanded)
+                        triangle.addTriangle(bounds.getCentreX() - 4.0f, bounds.getCentreY() - 2.0f,
+                                             bounds.getCentreX() + 4.0f, bounds.getCentreY() - 2.0f,
+                                             bounds.getCentreX(), bounds.getCentreY() + 3.0f);
+                    else
+                        triangle.addTriangle(bounds.getCentreX() - 2.0f, bounds.getCentreY() - 4.0f,
+                                             bounds.getCentreX() - 2.0f, bounds.getCentreY() + 4.0f,
+                                             bounds.getCentreX() + 3.0f, bounds.getCentreY());
+                    g.fillPath(triangle);
+                }
+
+            private:
+                bool expanded = false;
+            };
+
+            class KnobLookAndFeel final : public juce::LookAndFeel_V4
+            {
+            public:
+                void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
+                                      float sliderPosition, float rotaryStartAngle,
+                                      float rotaryEndAngle, juce::Slider& slider) override
+                {
+                    // Keep Orion-like metal dials at the more legible earlier size;
+                    // the narrower cells below reduce the gaps between controls.
+                    const auto side = static_cast<float>(juce::jmax(12, juce::jmin(34,
+                        juce::jmin(width, height) - 6)));
+                    const auto bounds = juce::Rectangle<float>(0.0f, 0.0f, side, side)
+                        .withCentre({ static_cast<float>(x) + width * 0.5f,
+                                      static_cast<float>(y) + height * 0.5f });
+                    const auto centre = bounds.getCentre();
+                    const auto radius = bounds.getWidth() * 0.5f;
+
+                    const bool active = slider.isMouseOverOrDragging();
+                    g.setColour(orbit::options::colour(6, 12, 16).withAlpha(0.8f));
+                    g.fillEllipse(bounds.translated(0.0f, 1.0f));
+                    auto rim = bounds.reduced(1.0f);
+                    juce::ColourGradient rimGradient(orbit::options::colour(126, 139, 144),
+                        rim.getX(), rim.getY(), orbit::options::colour(36, 48, 54),
+                        rim.getRight(), rim.getBottom(), false);
+                    rimGradient.addColour(0.48, orbit::options::colour(73, 86, 91));
+                    g.setGradientFill(rimGradient);
+                    g.fillEllipse(rim);
+                    g.setColour(active ? orbit::options::colour(99, 165, 184)
+                                       : orbit::options::colour(102, 115, 120));
+                    g.drawEllipse(rim, 0.7f);
+
+                    auto face = bounds.reduced(3.0f);
+                    juce::ColourGradient faceGradient(orbit::options::colour(176, 184, 185),
+                        face.getX(), face.getY(), orbit::options::colour(105, 119, 125),
+                        face.getRight(), face.getBottom(), false);
+                    faceGradient.addColour(0.42, orbit::options::colour(145, 155, 157));
+                    faceGradient.addColour(0.76, orbit::options::colour(119, 131, 134));
+                    g.setGradientFill(faceGradient);
+                    g.fillEllipse(face);
+                    g.setColour(orbit::options::colour(201, 208, 209).withAlpha(0.58f));
+                    g.drawEllipse(face.reduced(0.5f), 0.6f);
+
+                    // Show value through the rotating index, as on Orion's knobs;
+                    // a cyan sweep made these compact controls look like meters.
+                    const auto currentAngle = rotaryStartAngle
+                        + sliderPosition * (rotaryEndAngle - rotaryStartAngle);
+
+                    const auto pointerInner = radius * 0.12f;
+                    const auto pointerOuter = radius * 0.66f;
+                    const juce::Point<float> pointerStart(centre.x + std::sin(currentAngle) * pointerInner,
+                                                          centre.y - std::cos(currentAngle) * pointerInner);
+                    const juce::Point<float> pointerEnd(centre.x + std::sin(currentAngle) * pointerOuter,
+                                                        centre.y - std::cos(currentAngle) * pointerOuter);
+                    g.setColour(orbit::options::colour(34, 44, 48));
+                    g.drawLine({ pointerStart.translated(0.8f, 0.8f),
+                                 pointerEnd.translated(0.8f, 0.8f) }, 2.5f);
+                    g.setColour(orbit::options::colour(229, 234, 233));
+                    g.drawLine({ pointerStart, pointerEnd }, 1.3f);
+                    g.setColour(orbit::options::colour(54, 66, 70));
+                    g.fillEllipse(juce::Rectangle<float>(3.4f, 3.4f).withCentre(centre));
+                    g.setColour(orbit::options::colour(157, 168, 168));
+                    g.drawEllipse(juce::Rectangle<float>(3.4f, 3.4f).withCentre(centre), 0.6f);
+                }
+            };
+
+        public:
+            PadRow(int padNumber, Content& owner)
+                : pad(padNumber), parent(owner)
+            {
+                configureButton(selectButton, juce::String(pad + 1).paddedLeft('0', 2));
+                selectButton.setTooltip("Select and audition pad " + juce::String(pad + 1));
+                selectButton.onClick = [this] { parent.selectPad(pad, true); };
+                addAndMakeVisible(selectButton);
+
+                configureButton(sampleButton, "");
+                sampleButton.setTooltip("Empty sample slot. Use the folder button to load a sample.");
+                sampleButton.setColour(juce::TextButton::buttonColourId, orbit::options::colour(54, 65, 71));
+                sampleButton.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(62, 75, 82));
+                sampleButton.setColour(juce::TextButton::textColourOffId, orbit::options::colour(211, 222, 226));
+                sampleButton.setColour(juce::TextButton::textColourOnId, orbit::options::colour(211, 222, 226));
+                sampleButton.setEnabled(false);
+                addAndMakeVisible(sampleButton);
+
+                sampleFolderButton.setTextVisible(false);
+                sampleFolderButton.setTooltip("Load a sample into this pad");
+                sampleFolderButton.onClick = [this]
+                {
+                    parent.selectPad(pad, false);
+                    if (parent.loadSample) parent.loadSample(pad);
+                };
+                addAndMakeVisible(sampleFolderButton);
+                expandButton.setTooltip("Show or hide this pad's sample waveform and trim controls");
+                expandButton.onClick = [this]
+                {
+                    parent.toggleSampleEditorForPad(pad);
+                };
+                addAndMakeVisible(expandButton);
+
+                configureButton(reverseButton, "REV");
+                reverseButton.setTooltip("Reverse this pad's sample");
+                reverseButton.onClick = [this]
+                {
+                    if (parent.padControlChanged)
+                    {
+                        parent.beginUndo("Reverse Drum Rack sample");
+                        parent.padControlChanged(pad, PadControl::reverse, 1.0);
+                    }
+                };
+                addAndMakeVisible(reverseButton);
+
+                playbackBox.addItem("Gate", 1);
+                playbackBox.addItem("Shot", 2);
+                playbackBox.addItem("Loop", 3);
+                playbackBox.setTooltip("Gate follows note length; Shot plays through; Loop repeats until note-off.");
+                playbackBox.setColour(juce::ComboBox::backgroundColourId, orbit::options::colour(28, 43, 53));
+                playbackBox.setColour(juce::ComboBox::outlineColourId, orbit::options::colour(70, 103, 119));
+                playbackBox.setColour(juce::ComboBox::textColourId, orbit::options::colour(220, 235, 242));
+                playbackBox.onChange = [this]
+                {
+                    if (!updating && playbackBox.getSelectedId() > 0 && parent.padControlChanged)
+                    {
+                        parent.beginUndo("Change Drum Rack playback mode");
+                        parent.padControlChanged(pad, PadControl::playbackMode,
+                                                 static_cast<double>(playbackBox.getSelectedId() - 1));
+                    }
+                };
+                addAndMakeVisible(playbackBox);
+
+                static constexpr std::array<const char*, 11> shortNames { "STA", "LEN", "TUN", "GAIN", "PAN", "DEC", "VLV", "VTN", "VOF", "CUT", "TRK" };
+                static constexpr std::array<const char*, 11> tips {
+                    "Start offset", "Sample length", "Pitch in semitones", "Gain in dB", "Pan",
+                    "Gate release / decay in milliseconds", "Velocity level response", "Velocity pitch response", "Velocity start offset",
+                    "Per-pad low-pass cutoff in Hz", "Per-pad track level in dB"
+                };
+                static constexpr std::array<PadControl, 11> controls {
+                    PadControl::start, PadControl::length, PadControl::tune, PadControl::gain, PadControl::pan,
+                    PadControl::release, PadControl::velocitySensitivity, PadControl::velocityTune, PadControl::velocityOffset,
+                    PadControl::cutoff, PadControl::trackLevel
+                };
+                static constexpr std::array<double, 11> minimum { 0.0, 0.01, -24.0, -24.0, -1.0, 0.0, 0.0, -24.0, 0.0, 20.0, -48.0 };
+                static constexpr std::array<double, 11> maximum { 1.0, 1.0, 24.0, 24.0, 1.0, 3000.0, 2.0, 24.0, 1.0, 20000.0, 24.0 };
+                static constexpr std::array<double, 11> interval { 0.001, 0.001, 1.0, 0.1, 0.01, 1.0, 0.01, 0.1, 0.01, 10.0, 0.1 };
+                for (size_t i = 0; i < sliders.size(); ++i)
+                {
+                    labels[i].setText(shortNames[i], juce::dontSendNotification);
+                    labels[i].setJustificationType(juce::Justification::centred);
+                    labels[i].setFont(juce::FontOptions(9.0f, juce::Font::bold));
+                    labels[i].setColour(juce::Label::textColourId, orbit::options::colour(180, 205, 218));
+                    labels[i].setTooltip(tips[i]);
+                    addAndMakeVisible(labels[i]);
+
+                    auto& slider = sliders[i];
+                    slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+                    // Keep the four primary controls prominent in the sequencer row.
+                    // Secondary per-pad controls remain available in Sample Editor.
+                    slider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+                    slider.setRange(minimum[i], maximum[i], interval[i]);
+                    slider.setMouseDragSensitivity(180);
+                    slider.setPopupDisplayEnabled(true, true, this, 900);
+                    if (controls[i] == PadControl::cutoff)
+                        slider.setSkewFactorFromMidPoint(1000.0);
+                    slider.setColour(juce::Slider::rotarySliderFillColourId, orbit::options::colour(64, 172, 207));
+                    slider.setColour(juce::Slider::thumbColourId, orbit::options::colour(166, 225, 242));
+                    slider.setColour(juce::Slider::textBoxTextColourId, orbit::options::colour(220, 235, 242));
+                    slider.setColour(juce::Slider::textBoxBackgroundColourId, orbit::options::colour(28, 43, 53));
+                    slider.setColour(juce::Slider::textBoxOutlineColourId, orbit::options::colour(70, 103, 119));
+                    slider.setLookAndFeel(&knobLookAndFeel);
+                    slider.setRotaryParameters(juce::MathConstants<float>::pi * 1.2f,
+                                               juce::MathConstants<float>::pi * 2.8f, true);
+                    const auto controlTip = juce::String(tips[i]);
+                    slider.setTooltip(controlTip);
+                    slider.onDragStart = [this] { parent.beginPadSliderGesture(); };
+                    slider.onDragEnd = [this] { parent.endPadSliderGesture(); };
+                    slider.onValueChange = [this, i, control = controls[i], controlTip]
+                    {
+                        sliders[i].setTooltip(controlTip + ": " + juce::String(sliders[i].getValue(), 2));
+                        if (!updating && parent.padControlChanged)
+                            parent.sliderChanged(pad, control, sliders[i].getValue());
+                    };
+                    if (isCompactControl(i))
+                    {
+                        addAndMakeVisible(labels[i]);
+                        addAndMakeVisible(slider);
+                    }
+                    else
+                    {
+                        labels[i].setVisible(false);
+                        slider.setVisible(false);
+                    }
+                }
+            }
+
+            ~PadRow() override
+            {
+                for (auto& slider : sliders) slider.setLookAndFeel(nullptr);
+            }
+
+            void setInfo(const PadInfo& info)
+            {
+                const auto duration = juce::jmax(0.001, info.durationSeconds);
+                const auto startRange = juce::jmax(0.001, duration - info.lengthSeconds);
+            const std::array<double, 11> values {
+                    juce::jlimit(0.0, 1.0, info.startSeconds / startRange),
+                    juce::jlimit(0.01, 1.0, info.lengthSeconds / duration),
+                    static_cast<double>(info.tuneSemitones), static_cast<double>(info.gainDb),
+                    static_cast<double>(info.pan), static_cast<double>(info.releaseMs),
+                    static_cast<double>(info.velocitySensitivity), static_cast<double>(info.velocityTune),
+                    static_cast<double>(info.velocityOffset), static_cast<double>(info.cutoffHz),
+                    static_cast<double>(info.trackLevelDb)
+                };
+                updating = true;
+                sampleButton.setButtonText(info.name);
+                sampleButton.setTooltip(info.name.isNotEmpty() ? info.name
+                    : "Empty sample slot. Use the folder button to load a sample into pad " + juce::String(pad + 1));
+                expandButton.setEnabled(info.file.existsAsFile());
+                reverseButton.setButtonText(info.reversed ? "REV*" : "REV");
+                for (size_t i = 0; i < sliders.size(); ++i)
+                {
+                    sliders[i].setValue(values[i], juce::dontSendNotification);
+                    sliders[i].setEnabled(info.file.existsAsFile());
+                }
+                playbackBox.setSelectedId(info.looping ? 3 : (info.oneShot ? 2 : 1), juce::dontSendNotification);
+                playbackBox.setEnabled(info.file.existsAsFile());
+                reverseButton.setEnabled(info.file.existsAsFile());
+                updating = false;
+            }
+
+            void setSelected(bool isSelected)
+            {
+                selected = isSelected;
+                selectButton.setToggleState(isSelected, juce::dontSendNotification);
+                repaint();
+            }
+
+            void setExpanded(bool isExpanded) { expandButton.setExpanded(isExpanded); }
+
+            void resized() override
+            {
+                auto area = getLocalBounds().reduced(2, 1);
+                selectButton.setBounds(area.removeFromLeft(42).reduced(1, 1));
+                area.removeFromLeft(2);
+                auto sampleControls = area.removeFromLeft(sampleControlWidth);
+                auto sampleNameRow = sampleControls.removeFromTop(sampleControls.getHeight() / 2);
+                auto expandBounds = sampleNameRow.removeFromRight(18);
+                auto folderBounds = sampleNameRow.removeFromRight(18);
+                sampleButton.setBounds(sampleNameRow.reduced(1, 1));
+                sampleFolderButton.setBounds(folderBounds.reduced(1, 1));
+                expandButton.setBounds(expandBounds.reduced(1, 1));
+                sampleControls.removeFromTop(1);
+                auto modeRow = sampleControls;
+                reverseButton.setBounds(modeRow.removeFromLeft(42).reduced(1, 1));
+                playbackBox.setBounds(modeRow.reduced(1, 1));
+                for (auto& label : labels) label.setBounds({});
+                for (auto& slider : sliders) slider.setBounds({});
+                const auto compactControlCellWidth = area.getWidth() / static_cast<int>(compactControlOrder.size());
+                for (const auto i : compactControlOrder)
+                {
+                    auto cell = area.removeFromLeft(compactControlCellWidth).reduced(1, 0);
+                    labels[i].setBounds(cell.removeFromTop(12));
+                    sliders[i].setBounds(cell);
+                }
+            }
+
+            void paint(juce::Graphics& g) override
+            {
+                g.fillAll(selected ? orbit::options::colour(41, 71, 84)
+                                   : orbit::options::colour(pad % 2 == 0 ? 30 : 33, 48, 59));
+                g.setColour(selected ? orbit::options::colour(77, 174, 205) : orbit::options::colour(55, 79, 92));
+                g.drawHorizontalLine(getHeight() - 1, 0.0f, static_cast<float>(getWidth()));
+            }
+
+        private:
+            static constexpr int sampleControlWidth = 108;
+            static constexpr std::array<size_t, 4> compactControlOrder { 3, 4, 2, 1 };
+
+            static bool isCompactControl(size_t index)
+            {
+                return std::find(compactControlOrder.begin(), compactControlOrder.end(), index)
+                    != compactControlOrder.end();
+            }
+
+            static void configureButton(juce::TextButton& button, const juce::String& text)
+            {
+                button.setButtonText(text);
+                button.setColour(juce::TextButton::buttonColourId, orbit::options::colour(43, 62, 74));
+                button.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(39, 129, 164));
+                button.setColour(juce::TextButton::textColourOffId, orbit::options::colour(216, 231, 238));
+                button.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+            }
+
+            const int pad;
+            Content& parent;
+            KnobLookAndFeel knobLookAndFeel;
+            juce::TextButton selectButton, sampleButton, reverseButton;
+            ToolbarButton sampleFolderButton{ToolbarButton::Symbol::open};
+            ExpandButton expandButton;
+            juce::ComboBox playbackBox;
+            std::array<juce::Label, 11> labels;
+            std::array<juce::Slider, 11> sliders;
+            bool updating = false, selected = false;
+        };
+
     public:
         Content()
         {
+            audioFormats.registerBasicFormats();
+            thumbnail.addChangeListener(this);
             setOpaque(true);
-            title.setText("DRUM RACK  ·  16 PADS", juce::dontSendNotification);
+            title.setText("DRUM RACK | 16 PADS", juce::dontSendNotification);
             title.setFont(juce::FontOptions(16.0f, juce::Font::bold));
-            title.setColour(juce::Label::textColourId, juce::Colour::fromRGB(221, 236, 244));
+            title.setColour(juce::Label::textColourId, orbit::options::colour(221, 236, 244));
             addAndMakeVisible(title);
-            configureButton(loadButton, "Load Sample…");
+            stepCountLabel.setText("STEPS", juce::dontSendNotification);
+            stepCountLabel.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+            stepCountLabel.setColour(juce::Label::textColourId, orbit::options::colour(184, 209, 220));
+            stepCountLabel.setJustificationType(juce::Justification::centredRight);
+            addAndMakeVisible(stepCountLabel);
+            // These are convenience choices only. Include the common long
+            // pattern examples directly; the editable field accepts any
+            // count supported by the project tick representation.
+            for (const int count : { 8, 16, 32, 64, 128, 256, 512, 1024, 2000,
+                                     2048, 4096, 4800, 8192 })
+                stepCountBox.addItem(juce::String(count), count);
+            stepCountBox.setEditableText(true);
+            stepCountBox.setText("16", juce::dontSendNotification);
+            stepCountBox.setTooltip("Pattern length in steps. Presets are shortcuts; type any count from 1 to 33,554,431.");
+            stepCountBox.onChange = [this]
+            {
+                const auto count = juce::jlimit(1, ProjectDocument::maximumPatternLengthSteps,
+                                                 stepCountBox.getText().getIntValue());
+                if (count > 0 && stepCountBox.getText().getIntValue() == count)
+                {
+                    stepCountBox.setText(juce::String(count), juce::dontSendNotification);
+                    stepGrid.setStepCount(count);
+                    velocityLane.setData(selectedPad, count,
+                        patternSteps[static_cast<size_t>(selectedPad)],
+                        patternVelocities[static_cast<size_t>(selectedPad)]);
+                    if (stepCountChanged) stepCountChanged(count);
+                    repaint();
+                }
+            };
+            addAndMakeVisible(stepCountBox);
+            configureButton(loadButton, "Load Sample...");
             addAndMakeVisible(loadButton);
+            for (auto* label : { &startLabel, &lengthLabel, &tuneLabel, &gainLabel, &trackLevelLabel, &cutoffLabel, &panLabel,
+                                 &releaseLabel, &velocityLevelLabel, &velocityTuneLabel, &velocityOffsetLabel,
+                                 &modeLabel })
+            {
+                label->setColour(juce::Label::textColourId, orbit::options::colour(184, 209, 220));
+                label->setFont(juce::FontOptions(11.0f, juce::Font::bold));
+                label->setJustificationType(juce::Justification::centredLeft);
+                addAndMakeVisible(*label);
+            }
+            configureSlider(startSlider, 0.0, 1.0, 0.001);
+            configureSlider(lengthSlider, 0.01, 1.0, 0.001);
+            configureSlider(tuneSlider, -24.0, 24.0, 1.0);
+            configureSlider(gainSlider, -24.0, 24.0, 0.1);
+            configureSlider(trackLevelSlider, -48.0, 24.0, 0.1);
+            configureSlider(cutoffSlider, 20.0, 20000.0, 10.0);
+            cutoffSlider.setSkewFactorFromMidPoint(1000.0);
+            configureSlider(panSlider, -1.0, 1.0, 0.01);
+            configureSlider(releaseSlider, 0.0, 3000.0, 1.0);
+            configureSlider(velocityLevelSlider, 0.0, 2.0, 0.01);
+            configureSlider(velocityTuneSlider, -24.0, 24.0, 0.1);
+            configureSlider(velocityOffsetSlider, 0.0, 1.0, 0.01);
+            for (auto* slider : { &startSlider, &lengthSlider, &tuneSlider, &gainSlider, &trackLevelSlider, &cutoffSlider, &panSlider,
+                                  &releaseSlider, &velocityLevelSlider, &velocityTuneSlider, &velocityOffsetSlider })
+                addAndMakeVisible(*slider);
+            modeLabel.setText("Playback", juce::dontSendNotification);
+            addAndMakeVisible(modeLabel);
+            playbackModeBox.addItem("Gate", 1);
+            playbackModeBox.addItem("One Shot", 2);
+            playbackModeBox.addItem("Loop", 3);
+            playbackModeBox.setTooltip("Gate follows note length; One Shot plays through; Loop repeats until note-off.");
+            playbackModeBox.setColour(juce::ComboBox::backgroundColourId, orbit::options::colour(28, 43, 53));
+            playbackModeBox.setColour(juce::ComboBox::outlineColourId, orbit::options::colour(70, 103, 119));
+            playbackModeBox.setColour(juce::ComboBox::textColourId, orbit::options::colour(220, 235, 242));
+            playbackModeBox.onChange = [this]
+            {
+                if (!updatingPadControls && padControlChanged && playbackModeBox.getSelectedId() > 0)
+                {
+                    beginUndo("Change Drum Rack playback mode");
+                    padControlChanged(selectedPad, PadControl::playbackMode,
+                                      static_cast<double>(playbackModeBox.getSelectedId() - 1));
+                }
+            };
+            addAndMakeVisible(playbackModeBox);
+            configureButton(reverseButton, "Reverse");
+            reverseButton.setTooltip("Reverse this pad's sample audio.");
+            reverseButton.onClick = [this]
+            {
+                if (padControlChanged)
+                {
+                    beginUndo("Reverse Drum Rack sample");
+                    padControlChanged(selectedPad, PadControl::reverse, 1.0);
+                }
+            };
+            addAndMakeVisible(reverseButton);
+
+            startLabel.setText("Start", juce::dontSendNotification);
+            lengthLabel.setText("Length", juce::dontSendNotification);
+            tuneLabel.setText("Tune (st)", juce::dontSendNotification);
+            gainLabel.setText("Gain (dB)", juce::dontSendNotification);
+            trackLevelLabel.setText("Track (dB)", juce::dontSendNotification);
+            cutoffLabel.setText("Cutoff (Hz)", juce::dontSendNotification);
+            panLabel.setText("Pan", juce::dontSendNotification);
+            releaseLabel.setText("Decay (ms)", juce::dontSendNotification);
+            velocityLevelLabel.setText("Velocity Level", juce::dontSendNotification);
+            velocityTuneLabel.setText("Velocity Tune", juce::dontSendNotification);
+            velocityOffsetLabel.setText("Velocity Start", juce::dontSendNotification);
+
+            startSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::start, startSlider.getValue()); };
+            lengthSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::length, lengthSlider.getValue()); };
+            tuneSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::tune, tuneSlider.getValue()); };
+            gainSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::gain, gainSlider.getValue()); };
+            trackLevelSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::trackLevel, trackLevelSlider.getValue()); };
+            cutoffSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::cutoff, cutoffSlider.getValue()); };
+            panSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::pan, panSlider.getValue()); };
+            releaseSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::release, releaseSlider.getValue()); };
+            velocityLevelSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::velocitySensitivity, velocityLevelSlider.getValue()); };
+            velocityTuneSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::velocityTune, velocityTuneSlider.getValue()); };
+            velocityOffsetSlider.onValueChange = [this] { sliderChanged(selectedPad, PadControl::velocityOffset, velocityOffsetSlider.getValue()); };
+            for (auto* slider : { &startSlider, &lengthSlider, &tuneSlider, &gainSlider, &trackLevelSlider, &cutoffSlider, &panSlider,
+                                  &releaseSlider, &velocityLevelSlider, &velocityTuneSlider, &velocityOffsetSlider })
+            {
+                slider->onDragStart = [this]
+                {
+                    sliderDragActive = true;
+                    undoGestureActive = true;
+                    beginUndo("Adjust Drum Rack pad");
+                };
+                slider->onDragEnd = [this] { sliderDragActive = false; flushPendingPadControl(); };
+            }
+
+            updateSampleEditorVisibility();
+
             for (int pad = 0; pad < 16; ++pad)
             {
-                auto button = std::make_unique<juce::TextButton>();
-                configureButton(*button, "PAD " + juce::String(pad + 1));
-                button->setClickingTogglesState(true);
-                button->setRadioGroupId(0x4f52);
-                button->setToggleState(pad == selectedPad, juce::dontSendNotification);
-                button->onClick = [this, pad] { selectedPad = pad; if (padSelected) padSelected(pad); repaint(); };
-                addAndMakeVisible(*button);
-                pads.push_back(std::move(button));
-                for (int step = 0; step < 16; ++step)
-                {
-                    auto stepButton = std::make_unique<juce::TextButton>();
-                    configureButton(*stepButton, {});
-                    stepButton->setClickingTogglesState(true);
-                    stepButton->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(43, 150, 190));
-                    stepButton->onClick = [this, pad, step, raw = stepButton.get()]
-                    { if (stepChanged) stepChanged(pad, step, raw->getToggleState()); };
-                    addAndMakeVisible(*stepButton);
-                    stepButtons.push_back(std::move(stepButton));
-                }
+                auto row = std::make_unique<PadRow>(pad, *this);
+                row->setSelected(pad == selectedPad);
+                addAndMakeVisible(*row);
+                rows.push_back(std::move(row));
             }
-            loadButton.onClick = [this] { if (loadSample) loadSample(); };
+            addAndMakeVisible(stepGrid);
+            stepGrid.stepChanged = [this](int pad, int step, bool enabled)
+            {
+                if (!juce::isPositiveAndBelow(pad, 16)) return;
+                auto& activeSteps = patternSteps[static_cast<size_t>(pad)];
+                const auto existing = std::find(activeSteps.begin(), activeSteps.end(), step);
+                auto& stepVelocities = patternVelocities[static_cast<size_t>(pad)];
+                const auto velocity = std::find_if(stepVelocities.begin(), stepVelocities.end(),
+                    [step](const auto& item) { return item.first == step; });
+                if (enabled)
+                {
+                    if (existing == activeSteps.end()) activeSteps.push_back(step);
+                    if (velocity == stepVelocities.end()) stepVelocities.emplace_back(step, 100);
+                }
+                else
+                {
+                    activeSteps.erase(std::remove(activeSteps.begin(), activeSteps.end(), step), activeSteps.end());
+                    stepVelocities.erase(std::remove_if(stepVelocities.begin(), stepVelocities.end(),
+                        [step](const auto& item) { return item.first == step; }), stepVelocities.end());
+                }
+                if (stepChanged) stepChanged(pad, step, enabled);
+            };
+            const auto rememberVelocity = [this](int pad, int step, int velocity)
+            {
+                if (!juce::isPositiveAndBelow(pad, 16)) return;
+                auto& values = patternVelocities[static_cast<size_t>(pad)];
+                const auto found = std::find_if(values.begin(), values.end(),
+                    [step](const auto& item) { return item.first == step; });
+                if (found == values.end()) values.emplace_back(step, velocity);
+                else found->second = velocity;
+            };
+            stepGrid.velocityChanged = [this, rememberVelocity](int pad, int step, int velocity)
+            {
+                rememberVelocity(pad, step, velocity);
+                if (velocityChanged) velocityChanged(pad, step, velocity);
+            };
+            stepGrid.beginStepGesture = [this]
+            { beginUndo("Edit Drum Rack pattern"); };
+            velocityLane.beginGesture = [this]
+            { beginUndo("Edit Drum Rack velocity"); };
+            velocityLane.velocityChanged = [this, rememberVelocity](int step, int velocity)
+            {
+                rememberVelocity(selectedPad, step, velocity);
+                if (velocityChanged) velocityChanged(selectedPad, step, velocity);
+            };
+            addAndMakeVisible(velocityLane);
+            velocityLane.setVisible(false);
+            loadButton.setVisible(false);
         }
 
-        void setLoadSampleHandler(std::function<void()> fn) { loadSample = std::move(fn); }
+        void setLoadSampleHandler(std::function<void(int)> fn) { loadSample = std::move(fn); }
         void setPadSelectedHandler(std::function<void(int)> fn) { padSelected = std::move(fn); }
+        void setAuditionPadHandler(std::function<void(int)> fn) { auditionPad = std::move(fn); }
         void setStepHandler(std::function<void(int, int, bool)> fn) { stepChanged = std::move(fn); }
-        void setSteps(int pad, const std::array<bool, 16>& values)
+        void setPadControlHandler(std::function<void(int, PadControl, double)> fn)
+        { padControlChanged = std::move(fn); }
+        void setVelocityHandler(std::function<void(int, int, int)> fn)
+        { velocityChanged = std::move(fn); }
+        void setUndoGestureHandler(std::function<void(const juce::String&)> fn)
+        { undoGesture = std::move(fn); }
+        void setStepCountHandler(std::function<void(int)> fn) { stepCountChanged = std::move(fn); }
+        void setSampleEditorExpandedHandler(std::function<void(bool)> fn)
+        { sampleEditorExpandedChanged = std::move(fn); }
+        void toggleSampleEditorForPad(int pad)
         {
             if (!juce::isPositiveAndBelow(pad, 16)) return;
-            for (int i = 0; i < 16; ++i)
-                stepButtons[static_cast<size_t>(pad * 16 + i)]->setToggleState(values[static_cast<size_t>(i)], juce::dontSendNotification);
+            if (sampleEditorVisible && selectedPad == pad)
+                sampleEditorVisible = false;
+            else
+            {
+                selectPad(pad, false);
+                sampleEditorVisible = true;
+            }
+            updateSampleEditorVisibility();
+            resized();
+            repaint();
+            if (sampleEditorExpandedChanged) sampleEditorExpandedChanged(sampleEditorVisible);
         }
-        void setPadSampleName(int pad, const juce::String& name)
+        void setStepCount(int count)
         {
-            if (!juce::isPositiveAndBelow(pad, static_cast<int>(pads.size()))) return;
-            pads[static_cast<size_t>(pad)]->setButtonText("PAD " + juce::String(pad + 1) + "\n" + name);
+            const auto selected = juce::jlimit(1, ProjectDocument::maximumPatternLengthSteps, count);
+            stepCountBox.setText(juce::String(selected), juce::dontSendNotification);
+            stepGrid.setStepCount(selected);
+            velocityLane.setData(selectedPad, selected,
+                patternSteps[static_cast<size_t>(selectedPad)], patternVelocities[static_cast<size_t>(selectedPad)]);
+            repaint();
+        }
+        void setSteps(int pad, const DrumRackStepGrid::StepIndices& values)
+        {
+            if (!juce::isPositiveAndBelow(pad, 16)) return;
+            patternSteps[static_cast<size_t>(pad)] = values;
+            stepGrid.setSteps(pad, values);
+            if (pad == selectedPad)
+                velocityLane.setData(selectedPad, stepCountBox.getText().getIntValue(), values,
+                                     patternVelocities[static_cast<size_t>(pad)]);
+        }
+        void setVelocities(int pad, const DrumRackStepGrid::StepVelocities& values)
+        {
+            if (!juce::isPositiveAndBelow(pad, 16)) return;
+            patternVelocities[static_cast<size_t>(pad)] = values;
+            stepGrid.setVelocities(pad, values);
+            if (pad == selectedPad)
+                velocityLane.setData(selectedPad, stepCountBox.getText().getIntValue(),
+                                     patternSteps[static_cast<size_t>(pad)], values);
+        }
+        void setPadInfo(int pad, const PadInfo& info)
+        {
+            if (!juce::isPositiveAndBelow(pad, static_cast<int>(rows.size()))) return;
+            const auto oldFile = padInfo[static_cast<size_t>(pad)].file;
+            padInfo[static_cast<size_t>(pad)] = info;
+            rows[static_cast<size_t>(pad)]->setInfo(info);
+            if (pad == selectedPad)
+            {
+                if (oldFile != info.file)
+                    thumbnail.setSource(info.file.existsAsFile() ? new juce::FileInputSource(info.file) : nullptr);
+                updatePadControls();
+            }
+            repaint();
         }
 
         void paint(juce::Graphics& g) override
         {
-            g.fillAll(juce::Colour::fromRGB(34, 49, 60));
-            g.setColour(juce::Colour::fromRGB(68, 101, 118));
+            g.fillAll(orbit::options::colour(34, 49, 60));
+            g.setColour(orbit::options::colour(68, 101, 118));
             g.drawRoundedRectangle(getLocalBounds().toFloat().reduced(8.0f), 8.0f, 1.0f);
-            g.setColour(juce::Colour::fromRGB(180, 205, 218));
+            g.setColour(orbit::options::colour(26, 40, 50));
+            g.fillRoundedRectangle(waveformBounds.toFloat(), 5.0f);
+            g.setColour(orbit::options::colour(69, 102, 119));
+            g.drawRoundedRectangle(waveformBounds.toFloat(), 5.0f, 1.0f);
+            const auto& selected = padInfo[static_cast<size_t>(selectedPad)];
+            if (selected.file.existsAsFile() && thumbnail.getTotalLength() > 0.0)
+            {
+                g.setColour(orbit::options::colour(88, 203, 235));
+                const auto inset = getSampleWaveformBounds();
+                thumbnail.drawChannels(g, inset, 0.0, thumbnail.getTotalLength(), 0.30f);
+                const auto duration = thumbnail.getTotalLength();
+                const auto& info = padInfo[static_cast<size_t>(selectedPad)];
+                if (duration > 0.0)
+                {
+                    const auto startFraction = juce::jlimit(0.0, 1.0, info.startSeconds / duration);
+                    const auto endFraction = juce::jlimit(startFraction, 1.0,
+                        (info.startSeconds + info.lengthSeconds) / duration);
+                    auto active = inset.withX(inset.getX() + juce::roundToInt(inset.getWidth() * startFraction))
+                                       .withWidth(juce::jmax(1, juce::roundToInt(inset.getWidth() * (endFraction - startFraction))));
+                    g.setColour(orbit::options::colour(88, 203, 235));
+                    thumbnail.drawChannels(g, active, info.startSeconds,
+                                           juce::jmin(duration, info.startSeconds + info.lengthSeconds), 0.95f);
+                    g.setColour(orbit::options::colour(205, 242, 250));
+                    g.drawVerticalLine(active.getX(), static_cast<float>(inset.getY()), static_cast<float>(inset.getBottom()));
+                    g.drawVerticalLine(active.getRight(), static_cast<float>(inset.getY()), static_cast<float>(inset.getBottom()));
+                    const auto handleY = inset.getCentreY() - 11;
+                    for (const auto x : { active.getX(), active.getRight() })
+                    {
+                        auto handle = juce::Rectangle<float>(static_cast<float>(x - 4), static_cast<float>(handleY), 8.0f, 22.0f);
+                        g.setColour(orbit::options::colour(224, 246, 251));
+                        g.fillRoundedRectangle(handle, 2.0f);
+                        g.setColour(orbit::options::colour(27, 91, 112));
+                        g.drawVerticalLine(x, handle.getY() + 5.0f, handle.getBottom() - 5.0f);
+                    }
+                }
+            }
+            else
+            {
+                g.setColour(orbit::options::colour(154, 179, 190));
+                g.setFont(juce::FontOptions(12.0f));
+                g.drawText("Select a pad and load a sample to preview its waveform",
+                           waveformBounds.reduced(10), juce::Justification::centred);
+            }
+            g.setColour(orbit::options::colour(180, 205, 218));
             g.setFont(juce::FontOptions(12.0f, juce::Font::bold));
-            g.drawText("PAD / SAMPLE", padHeaderBounds, juce::Justification::centredLeft);
-            for (int step = 0; step < 16; ++step)
-                g.drawText(juce::String(step + 1), stepHeaderBounds.withX(stepHeaderBounds.getX() + step * stepCellWidth)
-                               .withWidth(stepCellWidth), juce::Justification::centred);
+            g.drawText("PAD / SAMPLE / PARAMS", padHeaderBounds, juce::Justification::centredLeft);
+            g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+            g.setColour(orbit::options::colour(115, 151, 167));
+            g.drawText("STEP SEQUENCE", stepHeaderBounds, juce::Justification::centred);
+        }
+
+        void mouseDown(const juce::MouseEvent& event) override
+        {
+            if (!sampleEditorVisible || !waveformBounds.contains(event.getPosition())) return;
+            const auto& info = padInfo[static_cast<size_t>(selectedPad)];
+            if (!info.file.existsAsFile() || info.durationSeconds <= 0.0) return;
+
+            const auto wave = getSampleWaveformBounds();
+            const auto duration = juce::jmax(0.001, info.durationSeconds);
+            const auto startX = wave.getX() + juce::roundToInt(wave.getWidth() * info.startSeconds / duration);
+            const auto endX = wave.getX() + juce::roundToInt(wave.getWidth()
+                * (info.startSeconds + info.lengthSeconds) / duration);
+            const auto mouseX = event.getPosition().x;
+            constexpr int trimHandleHitRadius = 10;
+            const auto startDistance = std::abs(mouseX - startX);
+            const auto endDistance = std::abs(mouseX - endX);
+            if (juce::jmin(startDistance, endDistance) > trimHandleHitRadius)
+                return;
+            trimHandle = startDistance <= endDistance ? 1 : 2;
+            beginPadSliderGesture();
+            updateTrimFromMouse(mouseX);
+        }
+
+        void mouseMove(const juce::MouseEvent& event) override
+        {
+            if (!sampleEditorVisible || !waveformBounds.contains(event.getPosition()))
+            {
+                setMouseCursor(juce::MouseCursor::NormalCursor);
+                return;
+            }
+            const auto& info = padInfo[static_cast<size_t>(selectedPad)];
+            if (!info.file.existsAsFile() || info.durationSeconds <= 0.0)
+            {
+                setMouseCursor(juce::MouseCursor::NormalCursor);
+                return;
+            }
+
+            const auto wave = getSampleWaveformBounds();
+            const auto duration = juce::jmax(0.001, info.durationSeconds);
+            const auto startX = wave.getX() + juce::roundToInt(wave.getWidth() * info.startSeconds / duration);
+            const auto endX = wave.getX() + juce::roundToInt(wave.getWidth()
+                * (info.startSeconds + info.lengthSeconds) / duration);
+            constexpr int trimHandleHitRadius = 10;
+            const auto mouseX = event.getPosition().x;
+            setMouseCursor(std::abs(mouseX - startX) <= trimHandleHitRadius
+                           || std::abs(mouseX - endX) <= trimHandleHitRadius
+                ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
+        }
+
+        void mouseDrag(const juce::MouseEvent& event) override
+        {
+            if (trimHandle != 0) updateTrimFromMouse(event.getPosition().x);
+        }
+
+        void mouseUp(const juce::MouseEvent&) override
+        {
+            if (trimHandle == 0) return;
+            trimHandle = 0;
+            endPadSliderGesture();
         }
 
         void resized() override
@@ -5682,72 +8343,360 @@ private:
             auto area = getLocalBounds().reduced(18);
             auto header = area.removeFromTop(38);
             title.setBounds(header.removeFromLeft(330));
-            loadButton.setBounds(header.removeFromRight(150).reduced(0, 3));
-            area.removeFromTop(6);
-            const int padWidth = juce::jmin(190, area.getWidth() / 4);
-            auto stepHeader = area.removeFromTop(22);
+            stepCountBox.setBounds(header.removeFromRight(96).reduced(2, 4));
+            stepCountLabel.setBounds(header.removeFromRight(48).reduced(1, 0));
+            // Keep the pad strip compact so the step sequencer receives most
+            // of the horizontal space, as in Orion's rack layout.
+            const int padWidth = juce::jmin(330, juce::roundToInt(area.getWidth() * 0.35f));
+            auto stepHeader = area.removeFromTop(18);
             padHeaderBounds = stepHeader.removeFromLeft(padWidth);
             stepHeaderBounds = stepHeader;
-            stepCellWidth = stepHeaderBounds.getWidth() / 16;
-            const int rowHeight = area.getHeight() / 16;
+            const int maxEditorHeight = juce::jmax(0, area.getHeight() - 16 * 22);
+            const int editorHeight = sampleEditorVisible ? juce::jmin(sampleEditorHeight, maxEditorHeight) : 0;
+            const int rowHeight = juce::jmax(1, (area.getHeight() - editorHeight) / 16);
+            const int rowsAndEditorHeight = rowHeight * 16 + editorHeight;
+            stepGrid.setBounds(area.getX() + padWidth, area.getY(), area.getWidth() - padWidth, rowsAndEditorHeight);
+            stepGrid.setRowLayout(sampleEditorVisible ? selectedPad : -1, editorHeight);
             for (int i = 0; i < 16; ++i)
             {
-                const int y = area.getY() + i * rowHeight;
-                pads[static_cast<size_t>(i)]->setBounds(area.getX(), y + 1, padWidth - 5, rowHeight - 2);
-                for (int step = 0; step < 16; ++step)
-                {
-                    auto* button = stepButtons[static_cast<size_t>(i * 16 + step)].get();
-                    button->setBounds(area.getX() + padWidth + step * stepCellWidth + 1, y + 2,
-                                      stepCellWidth - 2, rowHeight - 4);
-                }
+                const int y = area.getY() + i * rowHeight + (sampleEditorVisible && i > selectedPad ? editorHeight : 0);
+                rows[static_cast<size_t>(i)]->setBounds(area.getX(), y, padWidth, rowHeight);
+            }
+
+            if (sampleEditorVisible && editorHeight > 0)
+            {
+                auto editor = juce::Rectangle<int>(area.getX(),
+                    area.getY() + (selectedPad + 1) * rowHeight,
+                    area.getWidth(), editorHeight);
+                waveformBounds = editor.removeFromTop(82).reduced(1, 0);
+                editor.removeFromTop(4);
+                auto controls = editor.removeFromTop(105);
+                auto controlRow = controls.removeFromTop(35);
+                const auto firstRowWidth = controlRow.getWidth() / 6;
+                layoutSlider(controlRow, startLabel, startSlider, "Start", firstRowWidth);
+                layoutSlider(controlRow, lengthLabel, lengthSlider, "Length", firstRowWidth);
+                layoutSlider(controlRow, tuneLabel, tuneSlider, "Tune (st)", firstRowWidth);
+                layoutSlider(controlRow, gainLabel, gainSlider, "Gain (dB)", firstRowWidth);
+                layoutSlider(controlRow, trackLevelLabel, trackLevelSlider, "Track (dB)", firstRowWidth);
+                layoutSlider(controlRow, cutoffLabel, cutoffSlider, "Cutoff (Hz)", firstRowWidth);
+                controlRow = controls.removeFromTop(35);
+                const auto secondRowWidth = controlRow.getWidth() / 5;
+                layoutSlider(controlRow, panLabel, panSlider, "Pan", secondRowWidth);
+                layoutSlider(controlRow, releaseLabel, releaseSlider, "Decay (ms)", secondRowWidth);
+                layoutSlider(controlRow, velocityLevelLabel, velocityLevelSlider, "Vel Level", secondRowWidth);
+                layoutSlider(controlRow, velocityTuneLabel, velocityTuneSlider, "Vel Tune", secondRowWidth);
+                layoutSlider(controlRow, velocityOffsetLabel, velocityOffsetSlider, "Vel Start", secondRowWidth);
+                controlRow = controls.removeFromTop(35);
+                modeLabel.setBounds(controlRow.removeFromLeft(80).reduced(3, 0));
+                playbackModeBox.setBounds(controlRow.removeFromLeft(150).reduced(3, 3));
+                reverseButton.setBounds(controlRow.removeFromLeft(150).reduced(3, 3));
+                editor.removeFromTop(3);
+                velocityLane.setBounds(editor);
+            }
+            else
+            {
+                waveformBounds = {};
+                velocityLane.setBounds({});
             }
         }
 
         int selectedPad = 0;
     private:
+        void changeListenerCallback(juce::ChangeBroadcaster*) override { repaint(waveformBounds); }
+        void timerCallback() override { flushPendingPadControl(!sliderDragActive); }
+
+        juce::Rectangle<int> getSampleWaveformBounds() const
+        {
+            return waveformBounds.reduced(7, 8);
+        }
+
+        void updateTrimFromMouse(int mouseX)
+        {
+            if (trimHandle == 0 || !juce::isPositiveAndBelow(selectedPad, 16)) return;
+            auto& info = padInfo[static_cast<size_t>(selectedPad)];
+            if (info.durationSeconds <= 0.0) return;
+            const auto wave = getSampleWaveformBounds();
+            const auto fraction = juce::jlimit(0.0, 1.0,
+                static_cast<double>(mouseX - wave.getX()) / static_cast<double>(juce::jmax(1, wave.getWidth())));
+            const auto position = fraction * info.durationSeconds;
+            const auto minimumLength = juce::jmin(0.01, info.durationSeconds);
+            if (trimHandle == 1)
+            {
+                const auto end = info.startSeconds + info.lengthSeconds;
+                info.startSeconds = juce::jlimit(0.0, juce::jmax(0.0, end - minimumLength), position);
+                info.lengthSeconds = end - info.startSeconds;
+                const auto startRange = juce::jmax(minimumLength, info.durationSeconds - info.lengthSeconds);
+                startSlider.setValue(juce::jlimit(0.0, 1.0, info.startSeconds / startRange), juce::dontSendNotification);
+                lengthSlider.setValue(juce::jlimit(0.01, 1.0, info.lengthSeconds / info.durationSeconds), juce::dontSendNotification);
+                if (padControlChanged)
+                    padControlChanged(selectedPad, PadControl::trimStart, fraction);
+            }
+            else
+            {
+                const auto end = juce::jlimit(info.startSeconds + minimumLength, info.durationSeconds, position);
+                info.lengthSeconds = end - info.startSeconds;
+                lengthSlider.setValue(juce::jlimit(0.01, 1.0, info.lengthSeconds / info.durationSeconds), juce::dontSendNotification);
+                if (padControlChanged)
+                    padControlChanged(selectedPad, PadControl::trimEnd, fraction);
+            }
+            for (auto& row : rows)
+                if (row != nullptr) row->repaint();
+            repaint(waveformBounds);
+        }
+
+        void beginUndo(const juce::String& label)
+        {
+            if (undoGesture) undoGesture(label);
+        }
+
+        void flushPendingPadControl(bool finishGesture = true)
+        {
+            stopTimer();
+            if (hasPendingPadControl && padControlChanged)
+                padControlChanged(pendingPad, pendingControl, pendingValue);
+            hasPendingPadControl = false;
+            if (finishGesture)
+                undoGestureActive = false;
+        }
+
+        static void configureSlider(juce::Slider& slider, double minimum, double maximum, double interval)
+        {
+            slider.setSliderStyle(juce::Slider::LinearHorizontal);
+            slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 48, 18);
+            slider.setRange(minimum, maximum, interval);
+            slider.setColour(juce::Slider::trackColourId, orbit::options::colour(64, 172, 207));
+            slider.setColour(juce::Slider::thumbColourId, orbit::options::colour(166, 225, 242));
+            slider.setColour(juce::Slider::textBoxTextColourId, orbit::options::colour(220, 235, 242));
+            slider.setColour(juce::Slider::textBoxBackgroundColourId, orbit::options::colour(28, 43, 53));
+            slider.setColour(juce::Slider::textBoxOutlineColourId, orbit::options::colour(70, 103, 119));
+        }
+
+        static void layoutSlider(juce::Rectangle<int>& row, juce::Label& label,
+                                 juce::Slider& slider, const juce::String& text, int width)
+        {
+            auto cell = row.removeFromLeft(width).reduced(3, 0);
+            label.setText(text, juce::dontSendNotification);
+            label.setBounds(cell.removeFromTop(14));
+            slider.setBounds(cell);
+        }
+
+        void sliderChanged(int pad, PadControl control, double value)
+        {
+            if (updatingPadControls) return;
+            if (!undoGestureActive)
+            {
+                undoGestureActive = true;
+                beginUndo("Adjust Drum Rack pad");
+            }
+            pendingPad = pad;
+            pendingControl = control;
+            pendingValue = value;
+            hasPendingPadControl = true;
+            if (!isTimerRunning())
+                startTimer(sliderDragActive ? 32 : 220);
+        }
+
+        void beginPadSliderGesture()
+        {
+            sliderDragActive = true;
+            undoGestureActive = true;
+            beginUndo("Adjust Drum Rack pad");
+            if (hasPendingPadControl && !isTimerRunning())
+                startTimer(32);
+        }
+
+        void endPadSliderGesture()
+        {
+            sliderDragActive = false;
+            flushPendingPadControl();
+        }
+
+        void selectPad(int pad, bool audition)
+        {
+            if (!juce::isPositiveAndBelow(pad, 16)) return;
+            selectedPad = pad;
+            const auto& info = padInfo[static_cast<size_t>(pad)];
+            thumbnail.setSource(info.file.existsAsFile() ? new juce::FileInputSource(info.file) : nullptr);
+            velocityLane.setData(pad, stepCountBox.getText().getIntValue(),
+                                 patternSteps[static_cast<size_t>(pad)],
+                                 patternVelocities[static_cast<size_t>(pad)]);
+            updatePadControls();
+            for (int i = 0; i < static_cast<int>(rows.size()); ++i)
+                rows[static_cast<size_t>(i)]->setSelected(i == pad);
+            updateSampleEditorVisibility();
+            if (padSelected) padSelected(pad);
+            if (audition && auditionPad) auditionPad(pad);
+            repaint();
+        }
+
+        void updatePadControls()
+        {
+            if (!juce::isPositiveAndBelow(selectedPad, 16)) return;
+            const auto& info = padInfo[static_cast<size_t>(selectedPad)];
+            updatingPadControls = true;
+            const auto duration = juce::jmax(0.001, info.durationSeconds);
+            const auto startRange = juce::jmax(0.001, duration - info.lengthSeconds);
+            startSlider.setValue(juce::jlimit(0.0, 1.0, info.startSeconds / startRange), juce::dontSendNotification);
+            lengthSlider.setValue(juce::jlimit(0.01, 1.0, info.lengthSeconds / duration), juce::dontSendNotification);
+            tuneSlider.setValue(info.tuneSemitones, juce::dontSendNotification);
+            gainSlider.setValue(info.gainDb, juce::dontSendNotification);
+            trackLevelSlider.setValue(info.trackLevelDb, juce::dontSendNotification);
+            cutoffSlider.setValue(info.cutoffHz, juce::dontSendNotification);
+            panSlider.setValue(info.pan, juce::dontSendNotification);
+            playbackModeBox.setSelectedId(info.looping ? 3 : (info.oneShot ? 2 : 1), juce::dontSendNotification);
+            releaseSlider.setValue(info.releaseMs, juce::dontSendNotification);
+            velocityLevelSlider.setValue(info.velocitySensitivity, juce::dontSendNotification);
+            velocityTuneSlider.setValue(info.velocityTune, juce::dontSendNotification);
+            velocityOffsetSlider.setValue(info.velocityOffset, juce::dontSendNotification);
+            reverseButton.setButtonText(info.reversed ? "Restore Sample" : "Reverse");
+            const bool hasSample = info.file.existsAsFile();
+            for (auto* slider : { &startSlider, &lengthSlider, &tuneSlider, &gainSlider, &trackLevelSlider, &cutoffSlider, &panSlider })
+                slider->setEnabled(hasSample);
+            playbackModeBox.setEnabled(hasSample);
+            for (auto* slider : { &releaseSlider, &velocityLevelSlider, &velocityTuneSlider, &velocityOffsetSlider })
+                slider->setEnabled(hasSample);
+            reverseButton.setEnabled(hasSample);
+            updatingPadControls = false;
+        }
+
         void configureButton(juce::TextButton& button, const juce::String& text)
         {
             button.setButtonText(text);
-            button.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(43, 62, 74));
-            button.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(39, 129, 164));
-            button.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(216, 231, 238));
+            button.setColour(juce::TextButton::buttonColourId, orbit::options::colour(43, 62, 74));
+            button.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(39, 129, 164));
+            button.setColour(juce::TextButton::textColourOffId, orbit::options::colour(216, 231, 238));
             button.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
         }
-        juce::Label title;
-        juce::TextButton loadButton;
-        std::vector<std::unique_ptr<juce::TextButton>> pads, stepButtons;
-        std::function<void()> loadSample;
+
+        void updateSampleEditorVisibility()
+        {
+            const std::array<juce::Component*, 25> editorComponents {
+                &startLabel, &lengthLabel, &tuneLabel, &gainLabel, &trackLevelLabel, &cutoffLabel,
+                &panLabel, &releaseLabel, &velocityLevelLabel, &velocityTuneLabel, &velocityOffsetLabel, &modeLabel,
+                &startSlider, &lengthSlider, &tuneSlider, &gainSlider, &trackLevelSlider, &cutoffSlider,
+                &panSlider, &releaseSlider, &velocityLevelSlider, &velocityTuneSlider, &velocityOffsetSlider,
+                &playbackModeBox, &reverseButton
+            };
+            for (auto* component : editorComponents)
+                component->setVisible(sampleEditorVisible);
+            velocityLane.setVisible(sampleEditorVisible);
+            for (int i = 0; i < static_cast<int>(rows.size()); ++i)
+                rows[static_cast<size_t>(i)]->setExpanded(sampleEditorVisible && i == selectedPad);
+        }
+        static constexpr int sampleEditorHeight = 270;
+        juce::Label title, stepCountLabel;
+        juce::Label startLabel, lengthLabel, tuneLabel, gainLabel, trackLevelLabel, cutoffLabel, panLabel, releaseLabel,
+                    velocityLevelLabel, velocityTuneLabel, velocityOffsetLabel, modeLabel;
+        juce::TextButton loadButton, reverseButton;
+        juce::ComboBox playbackModeBox, stepCountBox;
+        juce::Slider startSlider, lengthSlider, tuneSlider, gainSlider, trackLevelSlider, cutoffSlider, panSlider,
+                     releaseSlider, velocityLevelSlider, velocityTuneSlider, velocityOffsetSlider;
+        std::vector<std::unique_ptr<PadRow>> rows;
+        DrumRackStepGrid stepGrid;
+        DrumRackVelocityLane velocityLane;
+        juce::AudioFormatManager audioFormats;
+        juce::AudioThumbnailCache thumbnailCache { 8 };
+        juce::AudioThumbnail thumbnail { 512, audioFormats, thumbnailCache };
+        std::array<PadInfo, 16> padInfo{};
+        std::array<DrumRackStepGrid::StepIndices, 16> patternSteps;
+        std::array<DrumRackStepGrid::StepVelocities, 16> patternVelocities;
+        std::function<void(int)> loadSample;
         std::function<void(int)> padSelected;
+        std::function<void(int)> auditionPad;
         std::function<void(int, int, bool)> stepChanged;
-        juce::Rectangle<int> padHeaderBounds, stepHeaderBounds;
-        int stepCellWidth = 1;
+        std::function<void(int, int, int)> velocityChanged;
+        std::function<void(int, PadControl, double)> padControlChanged;
+        std::function<void(const juce::String&)> undoGesture;
+        std::function<void(int)> stepCountChanged;
+        std::function<void(bool)> sampleEditorExpandedChanged;
+        juce::Rectangle<int> waveformBounds, padHeaderBounds, stepHeaderBounds;
+        int trimHandle = 0;
+        bool updatingPadControls = false;
+        bool sampleEditorVisible = false;
+        bool sliderDragActive = false;
+        bool undoGestureActive = false;
+        bool hasPendingPadControl = false;
+        int pendingPad = 0;
+        PadControl pendingControl = PadControl::start;
+        double pendingValue = 0.0;
     } content;
+
+    DrumRackDragHandle titleDragHandle;
+    ToolbarButton generatorMenuControl{ToolbarButton::Symbol::dropdown};
+    juce::TextButton closeControl;
+    DrumRackResizeHandle resizeHandle;
+    juce::Point<int> dragOffset;
+    juce::Point<int> resizeStartSize;
 
     void refreshPadSelection() { content.repaint(); }
     std::function<void(int)> loadSampleCallback;
     std::function<void(int)> padSelectedCallback;
+    std::function<void(int)> auditionPadCallback;
     std::function<void(int, int, bool)> setStepCallback;
+    std::function<void(int, int, int)> setStepVelocityCallback;
+    std::function<void(int, PadControl, double)> setPadControlCallback;
+    std::function<void(juce::Rectangle<int>)> saveBoundsCallback;
     int selectedPad = 0;
 };
 
 class OrbitUIBehaviour final : public te::UIBehaviour
 {
 public:
+    explicit OrbitUIBehaviour(std::function<juce::Rectangle<int>()> getPluginWindowSafeBoundsIn)
+        : getPluginWindowSafeBounds(std::move(getPluginWindowSafeBoundsIn))
+    {
+    }
+
     std::unique_ptr<juce::Component> createPluginWindow(te::PluginWindowState& state) override
     {
         if (auto* pluginState = dynamic_cast<te::Plugin::WindowState*>(&state))
-            return std::make_unique<OrbitPluginWindow>(*pluginState);
+            return std::make_unique<OrbitPluginWindow>(*pluginState, getPluginWindowSafeBounds);
         return {};
     }
+
+private:
+    std::function<juce::Rectangle<int>()> getPluginWindowSafeBounds;
+};
+
+class OrbitAudioEngineBehaviour final : public te::EngineBehaviour
+{
+public:
+    explicit OrbitAudioEngineBehaviour(std::function<bool()> isMultiCoreAudioEnabledIn)
+        : isMultiCoreAudioEnabled(std::move(isMultiCoreAudioEnabledIn))
+    {
+    }
+
+    int getNumberOfCPUsToUseForAudio() override
+    {
+        return isMultiCoreAudioEnabled && !isMultiCoreAudioEnabled()
+            ? 1 : juce::jmax(1, juce::SystemStats::getNumCpus());
+    }
+
+private:
+    std::function<bool()> isMultiCoreAudioEnabled;
 };
 
 class ProjectView final : public juce::Component, private juce::Timer
 {
 public:
     enum class PlaybackMode { pattern, song };
-    void mouseDown(const juce::MouseEvent&) override { bringGeneratorToFront(); }
-    ProjectView() : engine("Orbit", std::make_unique<OrbitUIBehaviour>(), nullptr)
+    struct PatternPlaybackMutedAudioClip
     {
+        juce::String trackId;
+        juce::String clipId;
+        bool wasMuted = false;
+    };
+    void mouseDown(const juce::MouseEvent&) override { bringGeneratorToFront(); }
+    bool keyPressed(const juce::KeyPress& key) override { return handleEditShortcut(key); }
+    ProjectView() : engine("Orbit", std::make_unique<OrbitUIBehaviour>([this]
+    {
+        return getPluginWindowSafeBounds();
+    }), std::make_unique<OrbitAudioEngineBehaviour>([this]
+    {
+        return project.isMultiCoreAudioEnabled();
+    }))
+    {
+        engine.getPluginManager().createBuiltInType<orbit::generator::MidiPlugin>();
         // Moving the overlapping playlist, generator, and piano roll panels
         // exposes this component repeatedly. Paint it as an opaque backing so
         // old child pixels cannot remain as scrambled strips during a drag.
@@ -5759,6 +8708,7 @@ public:
         applicationProperties.setStorageParameters(settingsOptions);
         if (auto* settings = applicationProperties.getUserSettings())
             showHints = settings->getBoolValue("showHints", true);
+        initialiseOptions();
         tooltipWindow = std::make_unique<juce::TooltipWindow>(this, showHints ? 650 : 2147483647);
 
         title.setText("Orbit", juce::dontSendNotification);
@@ -5774,10 +8724,11 @@ public:
         for (int i = 0; i < static_cast<int>(menuDefinitions.size()); ++i)
         {
             auto* button = menuDefinitions[static_cast<size_t>(i)].first;
+            button->setWantsKeyboardFocus(false);
             button->setButtonText(menuDefinitions[static_cast<size_t>(i)].second);
-            button->setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(42, 48, 54));
-            button->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(57, 67, 75));
-            button->setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(224, 231, 235));
+            button->setColour(juce::TextButton::buttonColourId, orbit::options::colour(42, 48, 54));
+            button->setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(57, 67, 75));
+            button->setColour(juce::TextButton::textColourOffId, orbit::options::colour(224, 231, 235));
             button->setColour(juce::TextButton::textColourOnId, juce::Colours::white);
             button->onClick = [this, i, button] { showMenu(*button, i); };
             addAndMakeVisible(*button);
@@ -5804,9 +8755,8 @@ public:
         updatePlaybackModeButtons();
         configureButton(mixerButton, "Mixer", [this] { toggleMixerView(); });
         configureButton(masterButton, "Master", [this] { showMixer(true); });
-        configureButton(recordButton, "Record", [] {});
-        recordButton.setEnabled(false);
-        recordButton.setTooltip("Audio recording is not implemented yet.");
+        configureButton(recordButton, "Record MIDI", [this] { toggleMidiRecording(); });
+        recordButton.setTooltip("Record MIDI into armed generators, or the selected instrument. Stop to commit one undoable take.");
         playButton.setTextVisible(false);
         stopButton.setTextVisible(false);
         recordButton.setTextVisible(false);
@@ -5838,17 +8788,13 @@ public:
         });
         generatorMuteButton.setClickingTogglesState(true);
         generatorSoloButton.setClickingTogglesState(true);
-        generatorMuteButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(136, 70, 66));
-        generatorSoloButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(151, 123, 53));
+        generatorMuteButton.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(136, 70, 66));
+        generatorSoloButton.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(151, 123, 53));
         generatorMuteButton.setTooltip("Mute this generator.");
         generatorSoloButton.setTooltip("Solo this generator.");
-        configureButton(generatorSettingsButton, "Pattern Settings", [this]
-        {
-            juce::PopupMenu settings;
-            settings.addItem(1, "Pattern settings will be added in a later iteration", false);
-            settings.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&generatorSettingsButton), [](int) {});
-        });
+        configureButton(generatorSettingsButton, "Generator Options", [this] { showGeneratorMenu(); });
         generatorSettingsButton.setTextVisible(false);
+        generatorSettingsButton.setTooltip("Generator options: settings, arpeggiator and shuffle");
         configureButton(openPresetButton, "Open Pattern Preset", [this]
         {
             status.setText("Pattern preset loading is not implemented yet.", juce::dontSendNotification);
@@ -5863,12 +8809,16 @@ public:
         patternPresetSelector.setSelectedId(1, juce::dontSendNotification);
         patternPresetSelector.setTooltip("Selected pattern preset.");
         patternLengthDisplay.setText("016", juce::dontSendNotification);
-        patternLengthDisplay.setJustificationType(juce::Justification::centred);
-        patternLengthDisplay.setTooltip("Current pattern length: 16 steps.");
-        patternLengthDisplay.setColour(juce::Label::textColourId, juce::Colour::fromRGB(203, 221, 229));
-        patternLengthDisplay.setColour(juce::Label::backgroundColourId, juce::Colour::fromRGB(25, 36, 43));
-        patternLengthDisplay.setColour(juce::Label::outlineColourId, juce::Colour::fromRGB(91, 122, 136));
-        patternLengthDisplay.setBorderSize({1, 4, 1, 4});
+        patternLengthDisplay.setJustification(juce::Justification::centred);
+        patternLengthDisplay.setInputRestrictions(8, "0123456789");
+        patternLengthDisplay.setSelectAllWhenFocused(true);
+        patternLengthDisplay.setTooltip("Pattern length in steps. Type any positive step count.");
+        patternLengthDisplay.setColour(juce::TextEditor::textColourId, orbit::options::colour(203, 221, 229));
+        patternLengthDisplay.setColour(juce::TextEditor::backgroundColourId, orbit::options::colour(25, 36, 43));
+        patternLengthDisplay.setColour(juce::TextEditor::outlineColourId, orbit::options::colour(91, 122, 136));
+        patternLengthDisplay.setBorder({1, 4, 1, 4});
+        patternLengthDisplay.onReturnKey = [this] { commitPatternLengthInput(); };
+        patternLengthDisplay.onFocusLost = [this] { commitPatternLengthInput(); };
         addAndMakeVisible(patternPresetSelector);
         addAndMakeVisible(patternLengthDisplay);
         configureButton(patternLengthDownButton, "-", [this] { adjustPatternLength(-1); });
@@ -5888,23 +8838,23 @@ public:
         addAndMakeVisible(masterVolumeKnob);
         barReadoutLabel.setText("001", juce::dontSendNotification);
         barReadoutLabel.setJustificationType(juce::Justification::centred);
-        barReadoutLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(203, 221, 229));
-        barReadoutLabel.setColour(juce::Label::backgroundColourId, juce::Colour::fromRGB(25, 36, 43));
-        barReadoutLabel.setColour(juce::Label::outlineColourId, juce::Colour::fromRGB(91, 122, 136));
+        barReadoutLabel.setColour(juce::Label::textColourId, orbit::options::colour(203, 221, 229));
+        barReadoutLabel.setColour(juce::Label::backgroundColourId, orbit::options::colour(25, 36, 43));
+        barReadoutLabel.setColour(juce::Label::outlineColourId, orbit::options::colour(91, 122, 136));
         barReadoutLabel.setBorderSize({1, 4, 1, 4});
         barReadoutLabel.setTooltip("Current song position in bars.");
         barLabel.setText("BAR", juce::dontSendNotification);
-        barLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(176, 193, 203));
+        barLabel.setColour(juce::Label::textColourId, orbit::options::colour(176, 193, 203));
         barLabel.setFont(juce::FontOptions(10.0f, juce::Font::bold));
         addAndMakeVisible(barLabel);
         addAndMakeVisible(barReadoutLabel);
         configureButton(loopButton, "LOOP", [this] { setLoopEnabled(loopButton.getToggleState()); });
         loopButton.setClickingTogglesState(true);
-        loopButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
+        loopButton.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(36, 132, 174));
         loopButton.setTooltip("Toggle the transport loop range.");
         configureButton(metronomeButton, "METRO", [this] { setMetronomeEnabled(metronomeButton.getToggleState()); });
         metronomeButton.setClickingTogglesState(true);
-        metronomeButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
+        metronomeButton.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(36, 132, 174));
         metronomeButton.setTooltip("Toggle Tracktion Engine's click track.");
         loopStartSlider.setSliderStyle(juce::Slider::IncDecButtons);
         loopStartSlider.setRange(1, PlaylistGrid::barCount, 1);
@@ -5916,7 +8866,7 @@ public:
         timeSignatureLabel.setText("4/4", juce::dontSendNotification);
         for (auto* label : { &loopStartLabel, &loopLengthLabel, &timeSignatureLabel })
         {
-            label->setColour(juce::Label::textColourId, juce::Colour::fromRGB(176, 193, 203));
+            label->setColour(juce::Label::textColourId, orbit::options::colour(176, 193, 203));
             label->setFont(juce::FontOptions(10.0f, juce::Font::bold));
             addAndMakeVisible(*label);
         }
@@ -5938,7 +8888,7 @@ public:
         addAndMakeVisible(loopLengthSlider);
 
         tempoLabel.setText("BPM", juce::dontSendNotification);
-        tempoLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 207, 221));
+        tempoLabel.setColour(juce::Label::textColourId, orbit::options::colour(183, 207, 221));
         addAndMakeVisible(tempoLabel);
         tempoSlider.setSliderStyle(juce::Slider::IncDecButtons);
         tempoSlider.setRange(20.0, 300.0, 1.0);
@@ -5947,6 +8897,7 @@ public:
         tempoSlider.onValueChange = [this]
         {
             if (edit == nullptr || !hasProject) return;
+            if (!finishMidiRecording()) return;
             const auto bpm = tempoSlider.getValue();
             if (auto* tempo = edit->tempoSequence.getTempo(0)) tempo->setBpm(bpm);
             project.setInitialTempoBpm(bpm);
@@ -5971,20 +8922,20 @@ public:
         addAndMakeVisible(trackSelector);
 
         status.setText("Create a project, add an instrument, then add a pattern.", juce::dontSendNotification);
-        status.setColour(juce::Label::textColourId, juce::Colour::fromRGB(170, 204, 222));
+        status.setColour(juce::Label::textColourId, orbit::options::colour(170, 204, 222));
         addAndMakeVisible(status);
         projectDetails.setColour(juce::Label::textColourId, juce::Colours::white);
-        musicalDetails.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 199, 210));
-        audioDetails.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 199, 210));
+        musicalDetails.setColour(juce::Label::textColourId, orbit::options::colour(183, 199, 210));
+        audioDetails.setColour(juce::Label::textColourId, orbit::options::colour(183, 199, 210));
         addAndMakeVisible(projectDetails);
         addAndMakeVisible(musicalDetails);
         addAndMakeVisible(audioDetails);
 
         generatorDragHandle.setText("Instrument 1 · Pattern A1", juce::dontSendNotification);
         generatorDragHandle.setFont(juce::FontOptions(13.0f, juce::Font::bold));
-        generatorDragHandle.setColour(juce::Label::textColourId, juce::Colour::fromRGB(213, 229, 239));
+        generatorDragHandle.setColour(juce::Label::textColourId, orbit::options::colour(213, 229, 239));
         generatorDragHandle.setJustificationType(juce::Justification::centredLeft);
-        generatorDragHandle.setBorderSize(juce::BorderSize<int>(0, 28, 0, 24));
+        generatorDragHandle.setBorderSize(juce::BorderSize<int>(0, 28, 0, 72));
         generatorDragHandle.setTitle("Move generator");
         // This dedicated title label owns the move gesture and forwards its
         // coordinates to ProjectView, avoiding parent hit-test ambiguity.
@@ -5997,6 +8948,18 @@ public:
         addAndMakeVisible(generatorDragHandle);
         generatorDragHandle.addMouseListener(this, true);
 
+        // The blank portion of the pattern toolbar is also a move target, so
+        // users do not have to aim for the thin title strip to reposition it.
+        generatorToolbarDragHandle.setTitle("Move generator");
+        generatorToolbarDragHandle.setInterceptsMouseClicks(true, false);
+        generatorToolbarDragHandle.setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+        generatorToolbarDragHandle.setTooltip("Drag this toolbar area to move the generator.");
+        generatorToolbarDragHandle.dragStarted = [this](juce::Point<int> point) { beginGeneratorDrag(point); };
+        generatorToolbarDragHandle.dragged = [this](juce::Point<int> point) { moveGeneratorPanel(point); };
+        generatorToolbarDragHandle.dragEnded = [this] { endGeneratorDrag(); };
+        addAndMakeVisible(generatorToolbarDragHandle);
+        generatorToolbarDragHandle.addMouseListener(this, true);
+
         generatorResizeHandle.resizeStarted = [this](juce::Point<int> point) { beginGeneratorResize(point); };
         generatorResizeHandle.resizedByDrag = [this](juce::Point<int> point) { resizeGeneratorPanel(point); };
         generatorResizeHandle.resizeEnded = [this] { endGeneratorResize(); };
@@ -6004,11 +8967,76 @@ public:
         addAndMakeVisible(generatorResizeHandle);
         generatorResizeHandle.addMouseListener(this, true);
 
+        // Host VST editors can contain oversized native controls. Keep them in
+        // a clipped child viewport below the generator header and toolbar.
+        instrumentEditorClip.setOpaque(false);
+        instrumentEditorClip.setInterceptsMouseClicks(false, true);
+        instrumentEditorClip.setScrollBarsShown(false, false);
+        addAndMakeVisible(instrumentEditorClip);
+        instrumentEditorClip.setVisible(false);
+
         generatorCollapseButton.setKind(PlaylistWindowIconButton::Kind::minimize);
         generatorCollapseButton.setTooltip("Collapse the generator to its pattern controls");
         generatorCollapseButton.onClick = [this] { toggleGeneratorCollapsed(); };
         addAndMakeVisible(generatorCollapseButton);
         generatorCollapseButton.setVisible(false);
+
+        generatorDeleteButton.setKind(PlaylistWindowIconButton::Kind::close);
+        generatorDeleteButton.setTooltip("Delete this generator, its patterns, and its Playlist clips");
+        generatorDeleteButton.onClick = [this] { deleteSelectedGenerator(); };
+        addAndMakeVisible(generatorDeleteButton);
+        generatorDeleteButton.setVisible(false);
+
+        generatorToolbarToggleButton.setButtonText("−");
+        generatorToolbarToggleButton.setTooltip("Hide the pattern controls to make more room for the instrument GUI");
+        generatorToolbarToggleButton.setColour(juce::TextButton::buttonColourId, orbit::options::colour(35, 54, 65));
+        generatorToolbarToggleButton.setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(55, 114, 131));
+        generatorToolbarToggleButton.setColour(juce::TextButton::textColourOffId, orbit::options::colour(213, 229, 239));
+        generatorToolbarToggleButton.onClick = [this]
+        {
+            patternToolbarCollapsed = !patternToolbarCollapsed;
+            generatorToolbarToggleButton.setButtonText(patternToolbarCollapsed ? "+" : "−");
+            generatorToolbarToggleButton.setTooltip(patternToolbarCollapsed
+                ? "Show the pattern controls" : "Hide the pattern controls to make more room for the instrument GUI");
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("generatorPatternToolbarCollapsed", patternToolbarCollapsed);
+                settings->saveIfNeeded();
+            }
+            resized();
+            repaint();
+        };
+        addAndMakeVisible(generatorToolbarToggleButton);
+        generatorToolbarToggleButton.setVisible(false);
+
+        pluginScaleSelector.addItem("Auto Fit", 1);
+        pluginScaleSelector.addItem("50%", 2);
+        pluginScaleSelector.addItem("70%", 3);
+        pluginScaleSelector.addItem("85%", 4);
+        pluginScaleSelector.addItem("100%", 5);
+        pluginScaleSelector.addItem("115%", 6);
+        pluginScaleSelector.addItem("130%", 7);
+        pluginScaleSelector.addItem("150%", 8);
+        pluginScaleSelector.setSelectedId(1, juce::dontSendNotification);
+        pluginScaleSelector.setTooltip("Scale the instrument GUI. Auto Fit shrinks oversized plug-in editors to the available space.");
+        pluginScaleSelector.onChange = [this]
+        {
+            const auto id = pluginScaleSelector.getSelectedId();
+            const auto scale = id == 1 ? 0.0f : static_cast<float>(pluginScaleSelector.getText().getDoubleValue() / 100.0);
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("pluginEditorScaleChoice", id);
+                settings->saveIfNeeded();
+            }
+            if (auto* pluginEditor = dynamic_cast<OrbitPluginEditorContent*>(activeInstrumentEditor.get()))
+                pluginEditor->setRequestedScale(scale);
+            resized();
+        };
+        if (auto* settings = applicationProperties.getUserSettings())
+            pluginScaleSelector.setSelectedId(juce::jlimit(1, 8, settings->getIntValue("pluginEditorScaleChoice", 1)),
+                                              juce::dontSendNotification);
+        addAndMakeVisible(pluginScaleSelector);
+        pluginScaleSelector.setVisible(false);
 
         patternTitle.setText("Select an instrument generator to edit patterns", juce::dontSendNotification);
         patternTitle.setColour(juce::Label::textColourId, juce::Colours::white);
@@ -6048,7 +9076,7 @@ public:
             patternBankButtons[static_cast<size_t>(i)] = std::make_unique<juce::TextButton>(juce::String::charToString(static_cast<juce::juce_wchar>('A' + i)));
             auto* bankButton = patternBankButtons[static_cast<size_t>(i)].get();
             bankButton->setClickingTogglesState(true);
-            bankButton->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
+            bankButton->setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(36, 132, 174));
             bankButton->setTooltip("Select pattern bank " + juce::String::charToString(static_cast<juce::juce_wchar>('A' + i)));
             bankButton->onClick = [this, i] { selectPatternBank(i); };
             bankButton->setEnabled(false);
@@ -6058,7 +9086,7 @@ public:
             patternSlotButtons[static_cast<size_t>(i)] = std::make_unique<juce::TextButton>(juce::String(i + 1));
             auto* slotButton = patternSlotButtons[static_cast<size_t>(i)].get();
             slotButton->setClickingTogglesState(true);
-            slotButton->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(55, 114, 131));
+            slotButton->setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(55, 114, 131));
             slotButton->setTooltip("Select pattern slot " + juce::String(i + 1));
             slotButton->onClick = [this, i] { selectPatternSlot(i); };
             slotButton->setEnabled(false);
@@ -6114,13 +9142,53 @@ public:
                 findAudioClipAtBar(row, bar, nullptr, &lengthBars);
                 return lengthBars;
             },
+            [this](int row, int bar)
+            {
+                if (auto* clip = findAudioClipAtBar(row, bar, nullptr, nullptr))
+                    return clip->getOriginalFile();
+                return juce::File{};
+            },
+            [this](int row, int bar)
+            {
+                if (auto* clip = findAudioClipAtBar(row, bar, nullptr, nullptr))
+                    return clip->getIsReversed();
+                return false;
+            },
             [this](int row, int bar, juce::Component* target)
             {
                 showPlaylistAudioContextMenu(row, bar, target);
             });
         playlistWindow->setTrackColourProvider([this](int row) { return project.getTrackColour(row); });
+        playlistWindow->setTrackGradientHighlightProvider(
+            [this](int row) { return project.getTrackGradientHighlight(row); });
+        playlistWindow->setTrackReorderHandler(
+            [this](int source, int destination) { reorderPlaylistTrack(source, destination); });
         if (auto* settings = applicationProperties.getUserSettings())
+        {
+            playlistShowPatternGrid = settings->getBoolValue("playlistShowPatternGrid", false);
             playlistWindow->setLightTheme(settings->getBoolValue("playlistLightTheme", false));
+            playlistWindow->setTrackHeaderWidth(settings->getIntValue("playlistTrackHeaderWidth", 250));
+        }
+        playlistWindow->setTrackHeaderWidthChangedHandler([this](int width)
+        {
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("playlistTrackHeaderWidth", width);
+                applicationProperties.saveIfNeeded();
+            }
+        });
+        playlistWindow->setShowPatternGrid(playlistShowPatternGrid);
+        playlistWindow->setTrackGridNotesProvider([this](int row) { return project.getTrackShowGridNotes(row); });
+        playlistWindow->setPatternGridChangedHandler([this](bool enabled)
+        {
+            playlistShowPatternGrid = enabled;
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("playlistShowPatternGrid", enabled);
+                applicationProperties.saveIfNeeded();
+            }
+            if (playlistWindow != nullptr) playlistWindow->refresh();
+        });
         playlistWindow->setThemeChangedHandler([this](bool enabled)
         {
             if (auto* settings = applicationProperties.getUserSettings())
@@ -6139,6 +9207,34 @@ public:
         playlistWindow->setTrackContextMenuHandler(
             [this](int row, juce::Component* target) { showPlaylistTrackContextMenu(row, target); });
         playlistWindow->setClipPreview([this](int row, int bar) { return getPlaylistPreviewNotes(row, bar); });
+        playlistWindow->setPatternClipHandlers(
+            [this](int row, int bar)
+            {
+                if (!juce::isPositiveAndBelow(row, project.getTrackCount())) return -1;
+                return project.getPlaylistClipStartBar(project.getTrackId(row), bar);
+            },
+            [this](int row, int bar)
+            {
+                if (!juce::isPositiveAndBelow(row, project.getTrackCount())) return 0;
+                return project.getPlaylistClipLengthBars(project.getTrackId(row), bar);
+            },
+            [this](int row, int bar)
+            {
+                if (!juce::isPositiveAndBelow(row, project.getTrackCount())) return 16;
+                const auto trackId = project.getTrackId(row);
+                const auto patternIndex = project.getPatternIndexForId(trackId,
+                    project.getPlaylistPatternId(trackId, bar));
+                return patternIndex >= 0 ? project.getPatternLengthSteps(trackId, patternIndex) : 16;
+            },
+            [this](int row, int startBar, int lengthBars)
+            {
+                resizePlaylistPatternClip(row, startBar, lengthBars);
+            });
+        playlistWindow->setPatternRangePaintHandler(
+            [this](int row, int firstBar, int lastBar)
+            {
+                paintPlaylistClipRange(row, firstBar, lastBar);
+            });
         playlistWindow->setSongAutomationCallbacks(
             [this](int trackIndex, int songStep)
             {
@@ -6159,7 +9255,8 @@ public:
                 project.setSongAutomationPoint(project.getTrackId(trackIndex), automationPluginName,
                     automationParameterId, automationParameterName, songStep, value);
                 isDirty = true;
-                updateEngineAutomation();
+                if (automationPluginName == "MIDI") rebuildPatternClip();
+                else updateEngineAutomation();
                 status.setText("Song Playlist automation point updated. Save to keep the change.", juce::dontSendNotification);
             });
         playlistWindow->setAutomationModeChanged([this](bool enabled)
@@ -6181,8 +9278,9 @@ public:
             else if (!playlistRestoreBounds.isEmpty())
                 playlistPanelBounds = playlistRestoreBounds;
             resized();
+            savePlaylistPanelState();
         };
-        playlistWindow->onMaximizeToggled = [this] { togglePlaylistMaximized(); };
+        playlistWindow->onMaximizeToggled = [this] { togglePlaylistMaximized(); savePlaylistPanelState(); };
         playlistWindow->onClose = [this]
         {
             if (playlistWindow != nullptr) playlistWindow->setVisible(false);
@@ -6193,8 +9291,6 @@ public:
             }
         };
         addAndMakeVisible(*playlistWindow);
-        // The Playlist remains available from the toolbar without obscuring
-        // the blank workspace when Orbit first opens.
         playlistWindow->setVisible(false);
         auditionKeyboard.setTitle("Play the selected instrument directly. Click or drag across keys to audition notes.");
         auditionKeyboard.onNote = [this](int pitch, bool isDown) { auditionSelectedInstrument(pitch, isDown); };
@@ -6205,26 +9301,41 @@ public:
             [this] { return project.getPatternLengthSteps(selectedProjectTrackId(), selectedPatternIndex()); },
             [this](int pitch, int step)
             {
-                if (pitch < minimumPitch || pitch > maximumPitch || step < 0 || step >= 64) return false;
-                return noteGrid[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(step)];
+                if (pitch < minimumPitch || pitch > maximumPitch || step < 0 || step >= ProjectDocument::maximumPatternLengthSteps) return false;
+                const auto& row = noteGrid[static_cast<size_t>(pitch - minimumPitch)];
+                return row.contains(step);
             },
             [this] { return allNotesSelected; },
             [this](int pitch, int step)
             {
                 return project.getPatternNoteLength(selectedProjectTrackId(), selectedPatternIndex(), pitch, step);
             },
+            [this]
+            {
+                return project.getPatternNotes(selectedProjectTrackId(), selectedPatternIndex());
+            },
             [this](int pitch, int step, bool erase) { togglePianoRollNote(pitch, step, erase); },
             [this](int pitch, int step, int length) { setPianoRollNoteLength(pitch, step, length); },
-            [this] { pianoRollGestureChanged = false; pianoRollGestureActive = true; },
+            [this](int fromPitch, int fromStep, int toPitch, int toStep)
+            { return movePianoRollNote(fromPitch, fromStep, toPitch, toStep); },
+            [this]
+            {
+                pianoRollGestureSnapshot = captureProjectSnapshot();
+                pianoRollGestureChanged = false;
+                pianoRollGestureActive = true;
+            },
             [this]
             {
                 const bool changed = pianoRollGestureChanged;
                 pianoRollGestureActive = false;
                 pianoRollGestureChanged = false;
+                if (changed && pianoRollGestureSnapshot)
+                    rememberUndoSnapshot(std::move(*pianoRollGestureSnapshot), "Edit piano roll notes");
+                pianoRollGestureSnapshot.reset();
                 if (changed)
                 {
                     if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
-                    rebuildPatternClip();
+                    refreshSelectedPatternClips();
                 }
             },
             [this](int pitch, bool isDown)
@@ -6245,6 +9356,11 @@ public:
                 }
             });
         pianoRollWindow->setPasteHandler([this] { pastePatternNotes(); });
+        pianoRollWindow->setEditHandlers([this](const auto& key){return handleEditShortcut(key,true);},
+            [this](int pitch,int tick){return selectedNoteKeys.contains({pitch,tick});},
+            [this](int pitch,int tick,bool add){selectPatternNote(pitch,tick,add);},
+            [this](int begin,int end,int low,int high,bool add){selectPatternNoteRange(begin,end,low,high,add);},
+            [this](int tick){notePasteTick=tick;});
         pianoRollWindow->automationValue = [this](int step)
         {
             const auto trackId = selectedProjectTrackId();
@@ -6284,7 +9400,8 @@ public:
         pianoRollWindow->onAutomationGestureStarted = [this] { rememberUndo("Edit pattern automation"); };
         pianoRollWindow->onAutomationGestureEnded = [this]
         {
-            updateEngineAutomation();
+            if (automationPluginName == "MIDI") rebuildPatternClip();
+            else updateEngineAutomation();
             status.setText("Pattern automation updated. Save to keep the change.", juce::dontSendNotification);
         };
         pianoRollWindow->getVelocityAtStep = [this](int step, int pitch)
@@ -6319,6 +9436,39 @@ public:
             automationParameterName = parts.size() > 2 ? parts[2] : juce::String{};
             if (pianoRollWindow != nullptr) pianoRollWindow->repaint();
         };
+        if (auto* settings = applicationProperties.getUserSettings())
+        {
+            pianoRollWindow->setLightTheme(settings->getBoolValue("pianoRollLightTheme", false));
+            pianoRollWindow->setGridOptions(settings->getIntValue("pianoRollSubdivisionsPerBar", 16),
+                                             settings->getIntValue("pianoRollGridEmphasis", 4));
+            pianoRollWindow->setAutomationFillEnabled(settings->getBoolValue("pianoRollAutomationFill", false));
+        }
+        syncMeterGrid(true);
+        pianoRollWindow->onGridOptionsChanged = [this](int divisions, int emphasis)
+        {
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("pianoRollSubdivisionsPerBar", divisions);
+                settings->setValue("pianoRollGridEmphasis", emphasis);
+                settings->saveIfNeeded();
+            }
+        };
+        pianoRollWindow->onThemeChanged = [this](bool enabled)
+        {
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("pianoRollLightTheme", enabled);
+                settings->saveIfNeeded();
+            }
+        };
+        pianoRollWindow->onAutomationFillChanged = [this](bool enabled)
+        {
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("pianoRollAutomationFill", enabled);
+                settings->saveIfNeeded();
+            }
+        };
         refreshPianoRollAutomationTargets();
         pianoRollWindow->onClose = [this] { closePianoRollView(); };
         // A maximized piano roll is still the editor embedded in its
@@ -6341,9 +9491,11 @@ public:
                 pianoRollBounds = bounds;
                 resized();
                 repaint();
+                savePianoRollState();
                 return;
             }
             pianoRollBounds = bounds;
+            savePianoRollState();
         };
         pianoRollWindow->addMouseListener(this, true);
         addAndMakeVisible(*pianoRollWindow);
@@ -6354,6 +9506,20 @@ public:
         generatorDockViewport.setVisible(false);
 
         mixerWindow = std::make_unique<MixerWindow>();
+        if (auto* settings = applicationProperties.getUserSettings())
+        {
+            mixerWindow->setEqSectionVisible(settings->getBoolValue("mixerEqVisible", true));
+            mixerWindow->setMixerSkin(settings->getIntValue("mixerSkin", 0));
+        }
+        mixerWindow->onAppearanceChanged = [this](bool showEq, int skin)
+        {
+            if (auto* settings = applicationProperties.getUserSettings())
+            {
+                settings->setValue("mixerEqVisible", showEq);
+                settings->setValue("mixerSkin", skin);
+                settings->saveIfNeeded();
+            }
+        };
         addAndMakeVisible(*mixerWindow);
         mixerWindow->setVisible(false);
         mixerWindow->onFocus = [this]
@@ -6418,12 +9584,14 @@ public:
             layoutMixerHandles();
             repaint();
         };
-        for (auto* control : std::array<juce::Component*, 14> {
+        for (auto* control : std::array<juce::Component*, 15> {
                  &pianoRollButton, &generatorMuteButton, &generatorSoloButton, &generatorSettingsButton,
                  &patternPresetSelector, &openPresetButton, &savePresetButton, &patternLengthDownButton,
                  &patternLengthDisplay, &patternLengthUpButton, &trackSelector,
-                 &generatorCollapseButton, &generatorDragHandle, &generatorResizeHandle })
+                 &generatorCollapseButton, &generatorDeleteButton, &generatorDragHandle, &generatorResizeHandle })
             control->addMouseListener(this, true);
+        generatorToolbarToggleButton.addMouseListener(this, true);
+        pluginScaleSelector.addMouseListener(this, true);
         for (auto& button : patternBankButtons) button->addMouseListener(this, true);
         for (auto& button : patternSlotButtons) button->addMouseListener(this, true);
         mixerMoveHandle.dragStarted = [this](juce::Point<int> point)
@@ -6553,7 +9721,7 @@ public:
             steps[static_cast<size_t>(i)] = std::make_unique<juce::TextButton>(juce::String(i + 1));
             auto* step = steps[static_cast<size_t>(i)].get();
             step->setClickingTogglesState(true);
-            step->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(36, 132, 174));
+            step->setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(36, 132, 174));
             step->setEnabled(false);
             step->onClick = [this, i] { updatePatternStep(i, steps[static_cast<size_t>(i)]->getToggleState()); };
             addAndMakeVisible(*step);
@@ -6569,8 +9737,8 @@ public:
         addAndMakeVisible(mixerTitle);
         levelLabel.setText("Level", juce::dontSendNotification);
         panLabel.setText("Pan", juce::dontSendNotification);
-        levelLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 199, 210));
-        panLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(183, 199, 210));
+        levelLabel.setColour(juce::Label::textColourId, orbit::options::colour(183, 199, 210));
+        panLabel.setColour(juce::Label::textColourId, orbit::options::colour(183, 199, 210));
         addAndMakeVisible(levelLabel);
         addAndMakeVisible(panLabel);
         levelSlider.setSliderStyle(juce::Slider::LinearHorizontal);
@@ -6608,12 +9776,12 @@ public:
         addAndMakeVisible(panSlider);
 
         meterStatus.setText("Track output: no recent audio activity", juce::dontSendNotification);
-        meterStatus.setColour(juce::Label::textColourId, juce::Colour::fromRGB(170, 204, 222));
+        meterStatus.setColour(juce::Label::textColourId, orbit::options::colour(170, 204, 222));
         addAndMakeVisible(meterStatus);
 
-        buildLabel.setText("Build 131  -  v0.3.110", juce::dontSendNotification);
+        buildLabel.setText("Build 236  -  v0.3.215", juce::dontSendNotification);
         buildLabel.setJustificationType(juce::Justification::centredRight);
-        buildLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(154, 181, 196));
+        buildLabel.setColour(juce::Label::textColourId, orbit::options::colour(154, 181, 196));
         addAndMakeVisible(buildLabel);
         setSize(1220, 760);
         const std::array<juce::Component*, 18> hiddenComponents {{
@@ -6631,12 +9799,37 @@ public:
         auto* settings = applicationProperties.getUserSettings();
         if (settings != nullptr)
         {
-            // Window visibility is a session choice, not part of the startup
-            // document. Always launch on the uncluttered workspace.
-            settings->setValue("playlistWindowOpen", false);
-            settings->setValue("mixerWindowOpen", false);
-            settings->saveIfNeeded();
+            playlistBoundsInitialised = false;
+            initialisePlaylistPanelBounds();
+            patternToolbarCollapsed = settings->getBoolValue("generatorPatternToolbarCollapsed", false);
+            generatorToolbarToggleButton.setButtonText(patternToolbarCollapsed ? "+" : "−");
+            if (settings->getIntValue("generatorPanelWidth", 0) > 0)
+                generatorPanelBounds = { settings->getIntValue("generatorPanelX", 14),
+                    settings->getIntValue("generatorPanelY", 92),
+                    settings->getIntValue("generatorPanelWidth", 1040),
+                    settings->getIntValue("generatorPanelHeight", 560) };
+            if (settings->getBoolValue("pianoRollBoundsSet", false))
+                pianoRollBounds = { settings->getIntValue("pianoRollX", 28),
+                    settings->getIntValue("pianoRollY", 180),
+                    settings->getIntValue("pianoRollWidth", 1000),
+                    settings->getIntValue("pianoRollHeight", 600) };
+            if (settings->getBoolValue("pianoRollRestoreBoundsSet", false))
+                pianoRollRestoreBounds = { settings->getIntValue("pianoRollRestoreX", 14),
+                    settings->getIntValue("pianoRollRestoreY", 92),
+                    settings->getIntValue("pianoRollRestoreWidth", 1040),
+                    settings->getIntValue("pianoRollRestoreHeight", 560) };
+            if (settings->getBoolValue("playlistWindowOpen", false)) showPlaylist();
+            if (settings->getBoolValue("mixerWindowOpen", false))
+                showMixer(settings->getBoolValue("mixerMasterMode", false));
+            if (settings->getBoolValue("pianoRollWindowOpen", false) && instrumentTrack != nullptr)
+            {
+                restoringSavedGuiLayout = true;
+                showPianoRoll();
+                restoringSavedGuiLayout = false;
+            }
         }
+        restoreMidiDevices();
+        if (optionBool("virtualKeyboard", false)) toggleVirtualKeyboard();
         startTimerHz(juce::jlimit(2, 60, settings != nullptr ? settings->getIntValue("updateRateHz", 30) : 30));
         lastAutoSaveMs = juce::Time::getMillisecondCounter();
         if (settings != nullptr && settings->getBoolValue("scanVst3AtStartup", false))
@@ -6652,8 +9845,11 @@ public:
     ~ProjectView() override
     {
         stopTimer();
+        shutdownOptions();
         if (mixerWindow != nullptr) mixerWindow->detachMeters();
         detachTrackMeter();
+        auditionPatternPlayback = false;
+        restorePlaylistAudioClipsAfterPatternPlayback();
         if (edit != nullptr)
             edit->getTransport().stop(false, false);
     }
@@ -6662,6 +9858,9 @@ public:
     {
         updateAudioStatus();
         updateMeterStatus();
+        syncInputQuantization();
+        syncOptionsDevices();
+        syncMeterGrid();
         if (edit != nullptr)
         {
             auto& transport = edit->getTransport();
@@ -6671,19 +9870,27 @@ public:
             const auto secondsPerBar = (60.0 / juce::jmax(20.0, project.getInitialTempoBpm()))
                 * signature.numerator * (4.0 / juce::jmax(1, signature.denominator));
             const auto currentBar = juce::jmax(1, static_cast<int>(std::floor(juce::jmax(0.0, seconds) / secondsPerBar)) + 1);
-            barReadoutLabel.setText(juce::String(currentBar).paddedLeft('0', 3), juce::dontSendNotification);
-            if (playing && playbackMode == PlaybackMode::song)
+            if (playbackMode == PlaybackMode::song || !playing)
+                barReadoutLabel.setText(transportTimeText(seconds, currentBar), juce::dontSendNotification);
+            if (playing && playbackMode == PlaybackMode::song && !midiTake.active)
                 rememberSongPatternsAt(seconds);
+            if (midiTake.active)
+            {
+                bool boundary=midiTake.full || !playing;
+                for(const auto& target:midiTake.targets)
+                    boundary|=target.song && recordingTick()>=target.lengthTicks;
+                if(boundary)finishMidiRecording();
+            }
             const auto bpm = project.getInitialTempoBpm();
             const auto patternSteps = juce::jmax(1, project.getPatternLengthSteps(
                 selectedProjectTrackId(), selectedPatternIndex()));
             const auto step = std::fmod(seconds * (bpm / 60.0) * 4.0, static_cast<double>(patternSteps));
             if (pianoRollWindow != nullptr) pianoRollWindow->setPlayheadStep(step, playing);
-            if (playlistWindow != nullptr) playlistWindow->setPlayheadPosition(seconds, bpm, playing);
+            if (playlistWindow != nullptr && playbackMode == PlaybackMode::song)
+                playlistWindow->setPlayheadPosition(seconds, bpm, playing);
             if (!playing && auditionPatternPlayback)
             {
-                auditionPatternPlayback = false;
-                refreshEnginePlaylist();
+                finishPatternPlayback();
                 playButton.setButtonText("Play");
             }
         }
@@ -6692,7 +9899,7 @@ public:
             const auto intervalMinutes = juce::jlimit(0, 240, settings->getIntValue("autoSaveMinutes", 0));
             const auto now = juce::Time::getMillisecondCounter();
             const auto intervalMs = static_cast<juce::uint32>(intervalMinutes * 60 * 1000);
-            if (intervalMinutes > 0 && hasProject && edit != nullptr && isDirty && project.hasFile()
+            if (intervalMinutes > 0 && hasProject && edit != nullptr && !midiTake.active && isDirty && project.hasFile()
                 && static_cast<juce::uint32>(now - lastAutoSaveMs) >= intervalMs)
             {
                 lastAutoSaveMs = now;
@@ -6703,51 +9910,51 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        g.fillAll(juce::Colour::fromRGB(72, 96, 108));
+        paintWallpaper(g);
         if (!generatorPanelBounds.isEmpty())
         {
             const bool showingExpandedRoll = pianoRollMaximized && pianoRollWindow != nullptr && pianoRollWindow->isVisible();
-            g.setColour(showingExpandedRoll ? juce::Colour::fromRGB(22, 32, 42)
-                                             : juce::Colour::fromRGB(45, 65, 77));
+            g.setColour(showingExpandedRoll ? orbit::options::colour(22, 32, 42)
+                                             : orbit::options::colour(45, 65, 77));
             g.fillRect(generatorPanelBounds);
-            g.setColour(showingExpandedRoll ? juce::Colour::fromRGB(103, 139, 157)
-                                             : juce::Colour::fromRGB(106, 137, 151));
+            g.setColour(showingExpandedRoll ? orbit::options::colour(103, 139, 157)
+                                             : orbit::options::colour(106, 137, 151));
             g.drawRect(generatorPanelBounds, 1.0f);
             if (!showingExpandedRoll)
             {
-                auto titleBar = generatorPanelBounds.withHeight(22).toFloat();
-                g.setColour(juce::Colour::fromRGB(45, 65, 77));
+                auto titleBar = generatorPanelBounds.withHeight(30).toFloat();
+                g.setColour(orbit::options::colour(45, 65, 77));
                 g.fillRoundedRectangle(titleBar, 7.0f);
                 g.fillRect(titleBar.withY(titleBar.getBottom() - 7.0f));
-                g.setColour(juce::Colour::fromRGB(157, 193, 208));
+                g.setColour(orbit::options::colour(157, 193, 208));
                 for (int row = 0; row < 3; ++row)
                     for (int column = 0; column < 2; ++column)
-                        g.fillEllipse(static_cast<float>(generatorPanelBounds.getX() + 9 + column * 5),
+                        g.fillEllipse(static_cast<float>(generatorPanelBounds.getX() + 41 + column * 5),
                                       static_cast<float>(generatorPanelBounds.getY() + 6 + row * 5), 2.0f, 2.0f);
             }
         }
         if (!generatorInstrumentBounds.isEmpty() && (pianoRollWindow == nullptr || !pianoRollWindow->isVisible()))
         {
-            g.setColour(juce::Colour::fromRGB(45, 65, 77));
+            g.setColour(orbit::options::colour(45, 65, 77));
             g.fillRoundedRectangle(generatorInstrumentBounds.toFloat(), 5.0f);
-            g.setColour(juce::Colour::fromRGB(96, 129, 145));
+            g.setColour(orbit::options::colour(96, 129, 145));
             g.drawRoundedRectangle(generatorInstrumentBounds.toFloat(), 5.0f, 1.0f);
             auto instrumentHeader = generatorInstrumentBounds.withHeight(30).reduced(10, 0);
-            g.setColour(juce::Colour::fromRGB(182, 207, 220));
+            g.setColour(orbit::options::colour(182, 207, 220));
             g.setFont(13.0f);
             g.drawText("INSTRUMENT GUI", instrumentHeader.removeFromLeft(170), juce::Justification::centredLeft);
-            g.setColour(juce::Colour::fromRGB(124, 166, 184));
+            g.setColour(orbit::options::colour(124, 166, 184));
             g.drawText(getInstrumentHeaderText(), instrumentHeader, juce::Justification::centredRight);
-            g.setColour(juce::Colour::fromRGB(72, 99, 113));
+            g.setColour(orbit::options::colour(72, 99, 113));
             g.drawHorizontalLine(generatorInstrumentBounds.getY() + 32,
                                  static_cast<float>(generatorInstrumentBounds.getX() + 10),
                                  static_cast<float>(generatorInstrumentBounds.getRight() - 10));
         }
-        g.setColour(juce::Colour::fromRGB(51, 60, 67));
+        g.setColour(orbit::options::colour(51, 60, 67));
         g.fillRect(0, 0, getWidth(), 28);
-        g.setColour(juce::Colour::fromRGB(27, 32, 37));
+        g.setColour(orbit::options::colour(27, 32, 37));
         g.fillRect(0, 28, getWidth(), 54);
-        g.setColour(juce::Colour::fromRGB(35, 54, 65));
+        g.setColour(orbit::options::colour(35, 54, 65));
         g.fillRect(0, getHeight() - 22, getWidth(), 22);
     }
 
@@ -6799,12 +10006,13 @@ public:
     {
         if (!draggingGenerator) return;
         auto available = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
-        const auto x = juce::jlimit(available.getX(),
-            juce::jmax(available.getX(), available.getRight() - generatorPanelBounds.getWidth()),
-            point.x - generatorDragOffset.x);
-        const auto y = juce::jlimit(available.getY(),
-            juce::jmax(available.getY(), available.getBottom() - generatorPanelBounds.getHeight()),
-            point.y - generatorDragOffset.y);
+        // Let the panel move past workspace edges while keeping its title bar
+        // reachable, matching the mixer window's off-screen movement behavior.
+        const auto minX = 48 - generatorPanelBounds.getWidth();
+        const auto maxX = juce::jmax(minX, getWidth() - 48);
+        const auto x = juce::jlimit(minX, maxX, point.x - generatorDragOffset.x);
+        const auto y = juce::jlimit(available.getY(), juce::jmax(available.getY(), available.getBottom() - 30),
+                                    point.y - generatorDragOffset.y);
         generatorPanelBounds.setPosition(x, y);
         if (generatorCollapsed && !expandedGeneratorBounds.isEmpty())
             expandedGeneratorBounds.setPosition(x, y);
@@ -6821,6 +10029,7 @@ public:
     void endGeneratorResize()
     {
         resizingGenerator = false;
+        savePianoRollState();
         status.setText("Generator resized. The piano roll grid fits the updated panel.", juce::dontSendNotification);
     }
 
@@ -6828,6 +10037,7 @@ public:
     {
         draggingGenerator = false;
         reportGeneratorMove();
+        savePianoRollState();
     }
 
     void reportGeneratorMove()
@@ -6846,7 +10056,7 @@ public:
             setMouseCursor(juce::MouseCursor::BottomRightCornerResizeCursor);
         else
             setMouseCursor(!generatorPanelBounds.isEmpty()
-                           && generatorPanelBounds.withHeight(22).contains(point)
+                           && generatorPanelBounds.withHeight(patternToolbarCollapsed ? 30 : 86).contains(point)
                                ? juce::MouseCursor::DraggingHandCursor
                                : juce::MouseCursor::NormalCursor);
     }
@@ -6886,7 +10096,7 @@ public:
         nextButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(3);
         recordButton.setBounds(transportRow.removeFromLeft(34).withY(controlY).withHeight(30)); transportRow.removeFromLeft(9);
         loopButton.setBounds(transportRow.removeFromLeft(52).withY(controlY).withHeight(26)); transportRow.removeFromLeft(5);
-        auto barBounds = transportRow.removeFromLeft(58);
+        auto barBounds = transportRow.removeFromLeft(edit!=nullptr && int(edit->state.getProperty("orbitTimeDisplay",0))!=0 ? 118 : 58);
         barLabel.setBounds(barBounds.withY(transportRow.getY()).withHeight(12));
         barReadoutLabel.setBounds(barBounds.withY(controlY).withHeight(24));
         transportRow.removeFromLeft(5);
@@ -6955,18 +10165,36 @@ public:
             const auto panelHeight = juce::jlimit(juce::jmin(minimumPanelHeight, area.getHeight()),
                                                   area.getHeight(), generatorPanelBounds.getHeight());
             generatorPanelBounds.setSize(panelWidth, panelHeight);
-            generatorPanelBounds.setX(juce::jlimit(area.getX(), juce::jmax(area.getX(), area.getRight() - panelWidth), generatorPanelBounds.getX()));
-            generatorPanelBounds.setY(juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - panelHeight), generatorPanelBounds.getY()));
+            const auto minPanelX = 48 - panelWidth;
+            const auto maxPanelX = juce::jmax(minPanelX, getWidth() - 48);
+            generatorPanelBounds.setX(juce::jlimit(minPanelX, maxPanelX, generatorPanelBounds.getX()));
+            generatorPanelBounds.setY(juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - 30), generatorPanelBounds.getY()));
             generatorResizeHandle.setBounds(generatorPanelBounds.getRight() - 18,
                 generatorPanelBounds.getBottom() - 18, 18, 18);
             auto panel = generatorPanelBounds;
-            auto generatorHeader = panel.removeFromTop(22);
-            generatorCollapseButton.setBounds(generatorHeader.removeFromRight(24).reduced(1));
+            auto generatorHeader = panel.removeFromTop(30);
+            // Generator options belong to the header, so hiding pattern
+            // controls or rolling up the instrument never hides its menu.
+            generatorSettingsButton.setBounds(generatorHeader.removeFromLeft(30).reduced(2));
+            generatorSettingsButton.setVisible(true);
+            // Keep the close/delete control at the far right with a larger hit
+            // target. The embedded editor is always confined below this row.
+            generatorDeleteButton.setBounds(generatorHeader.removeFromRight(30).reduced(1));
+            generatorCollapseButton.setBounds(generatorHeader.removeFromRight(30).reduced(1));
+            const auto selectedTrackIndex = getGeneratorTracks().indexOf(instrumentTrack);
+            generatorDeleteButton.setVisible(instrumentTrack != nullptr
+                && juce::isPositiveAndBelow(selectedTrackIndex, project.getTrackCount())
+                && project.getTrackKind(selectedTrackIndex) != ProjectDocument::TrackKind::audio);
+            generatorToolbarToggleButton.setBounds(generatorHeader.removeFromRight(24).reduced(1));
+            generatorToolbarToggleButton.setVisible(instrumentTrack != nullptr && !generatorCollapsed);
             trackSelector.setBounds({});
             generatorDragHandle.setBounds(generatorHeader);
             trackSelector.setVisible(false);
             patternTitle.setBounds(0, 0, 0, 0);
-            auto patternControls = panel.removeFromTop(56).reduced(8, 0);
+            const auto patternToolbarBounds = panel.removeFromTop(patternToolbarCollapsed ? 0 : 56);
+            generatorToolbarDragHandle.setBounds(patternToolbarBounds);
+            generatorToolbarDragHandle.setVisible(instrumentTrack != nullptr && !generatorCollapsed && !patternToolbarCollapsed);
+            auto patternControls = patternToolbarBounds.reduced(8, 0);
             constexpr int bankButtonWidth = 23;
             constexpr int bankButtonPitch = 25;
             constexpr int bankButtonHeight = 18;
@@ -6986,27 +10214,33 @@ public:
                                                                        bankButtonWidth, bankButtonHeight);
             }
             patternControls.removeFromLeft(8 * bankButtonPitch + 6);
-            const auto controlY = patternControls.getY() + 13;
-            pianoRollButton.setBounds(patternControls.removeFromLeft(136).withHeight(27).withY(controlY));
+            const auto patternControlY = patternControls.getY() + 13;
+            pianoRollButton.setBounds(patternControls.removeFromLeft(136).withHeight(27).withY(patternControlY));
             patternControls.removeFromLeft(4);
-            generatorSettingsButton.setBounds(patternControls.removeFromLeft(28).withHeight(27).withY(controlY));
-            patternControls.removeFromLeft(4);
-            patternPresetSelector.setBounds(patternControls.removeFromLeft(128).withHeight(27).withY(controlY));
+            patternPresetSelector.setBounds(patternControls.removeFromLeft(128).withHeight(27).withY(patternControlY));
             patternControls.removeFromLeft(3);
-            openPresetButton.setBounds(patternControls.removeFromLeft(28).withHeight(27).withY(controlY));
+            openPresetButton.setBounds(patternControls.removeFromLeft(28).withHeight(27).withY(patternControlY));
             patternControls.removeFromLeft(2);
-            savePresetButton.setBounds(patternControls.removeFromLeft(28).withHeight(27).withY(controlY));
+            savePresetButton.setBounds(patternControls.removeFromLeft(28).withHeight(27).withY(patternControlY));
             patternControls.removeFromLeft(5);
-            patternLengthDownButton.setBounds(patternControls.removeFromLeft(20).withHeight(27).withY(controlY));
-            patternLengthDisplay.setBounds(patternControls.removeFromLeft(42).withHeight(27).withY(controlY));
-            patternLengthUpButton.setBounds(patternControls.removeFromLeft(20).withHeight(27).withY(controlY));
-            for (auto* control : std::array<juce::Component*, 10> {
-                     &pianoRollButton, &generatorMuteButton, &generatorSoloButton, &generatorSettingsButton,
+            patternLengthDownButton.setBounds(patternControls.removeFromLeft(20).withHeight(27).withY(patternControlY));
+            patternLengthDisplay.setBounds(patternControls.removeFromLeft(64).withHeight(27).withY(patternControlY));
+            patternLengthUpButton.setBounds(patternControls.removeFromLeft(20).withHeight(27).withY(patternControlY));
+            patternControls.removeFromLeft(6);
+            pluginScaleSelector.setBounds(patternControls.removeFromLeft(96).withHeight(27).withY(patternControlY));
+            const auto dragAreaX = pluginScaleSelector.getRight() + 4;
+            generatorToolbarDragHandle.setBounds({ dragAreaX, patternToolbarBounds.getY(),
+                juce::jmax(0, patternToolbarBounds.getRight() - dragAreaX), patternToolbarBounds.getHeight() });
+            const auto hasScalablePlugin = dynamic_cast<OrbitPluginEditorContent*>(activeInstrumentEditor.get()) != nullptr;
+            pluginScaleSelector.setVisible(!generatorCollapsed && !patternToolbarCollapsed && hasScalablePlugin);
+            const auto controlsVisible = !generatorCollapsed && !patternToolbarCollapsed && instrumentTrack != nullptr;
+            for (auto* control : std::array<juce::Component*, 9> {
+                     &pianoRollButton, &generatorMuteButton, &generatorSoloButton,
                      &patternPresetSelector, &openPresetButton, &savePresetButton, &patternLengthDownButton,
                      &patternLengthDisplay, &patternLengthUpButton })
-                control->setVisible(!generatorCollapsed && instrumentTrack != nullptr);
-            for (auto& button : patternBankButtons) button->setVisible(!generatorCollapsed && instrumentTrack != nullptr);
-            for (auto& button : patternSlotButtons) button->setVisible(!generatorCollapsed && instrumentTrack != nullptr);
+                control->setVisible(controlsVisible);
+            for (auto& button : patternBankButtons) button->setVisible(controlsVisible);
+            for (auto& button : patternSlotButtons) button->setVisible(controlsVisible);
             generatorInstrumentBounds = generatorCollapsed ? juce::Rectangle<int>{}
                 : generatorPanelBounds.withTrimmedLeft(12).withTrimmedRight(12)
                     .withY(patternControls.getBottom() + 8).withBottom(generatorPanelBounds.getBottom() - 10);
@@ -7036,18 +10270,23 @@ public:
             if (activeInstrumentEditor != nullptr)
             {
                 auto editorBounds = generatorInstrumentBounds;
+                const bool isExternalPluginEditor = dynamic_cast<OrbitPluginEditorContent*>(activeInstrumentEditor.get()) != nullptr;
                 if (!generatorCollapsed)
                 {
                     editorBounds.setRight(juce::jmax(editorBounds.getX(), generatorPanelBounds.getRight() - 8));
-                    editorBounds.setBottom(juce::jmax(editorBounds.getY(), generatorPanelBounds.getBottom() - 54));
+                    editorBounds.setBottom(juce::jmax(editorBounds.getY(), generatorPanelBounds.getBottom()
+                        - (isExternalPluginEditor ? 10 : 54)));
                 }
-                activeInstrumentEditor->setBounds(editorBounds);
-                activeInstrumentEditor->setVisible(!generatorCollapsed
-                                                   && (pianoRollWindow == nullptr || !pianoRollWindow->isVisible()));
+                instrumentEditorClip.setBounds(editorBounds);
+                activeInstrumentEditor->setBounds(0, 0, instrumentEditorClip.getWidth(), instrumentEditorClip.getHeight());
+                const auto editorVisible = !generatorCollapsed
+                    && (pianoRollWindow == nullptr || !pianoRollWindow->isVisible());
+                instrumentEditorClip.setVisible(editorVisible);
+                activeInstrumentEditor->setVisible(editorVisible);
                 const auto keyboardBounds = generatorPanelBounds.withTrimmedLeft(12).withTrimmedRight(12)
                     .withBottom(generatorPanelBounds.getBottom() - 8).removeFromBottom(38);
                 auditionKeyboard.setBounds(keyboardBounds);
-                auditionKeyboard.setVisible(!generatorCollapsed
+                auditionKeyboard.setVisible(!isExternalPluginEditor && !generatorCollapsed
                     && (pianoRollWindow == nullptr || !pianoRollWindow->isVisible()));
             }
             else auditionKeyboard.setVisible(false);
@@ -7055,13 +10294,18 @@ public:
         else
         {
             generatorPanelBounds = {};
+            instrumentEditorClip.setVisible(false);
             if (activeInstrumentEditor != nullptr)
                 activeInstrumentEditor->setVisible(false);
             auditionKeyboard.setVisible(false);
             if (pianoRollWindow != nullptr) pianoRollWindow->setVisible(false);
             generatorDragHandle.setVisible(false);
+            generatorToolbarDragHandle.setVisible(false);
             generatorResizeHandle.setVisible(false);
             generatorCollapseButton.setVisible(false);
+            generatorDeleteButton.setVisible(false);
+            generatorToolbarToggleButton.setVisible(false);
+            pluginScaleSelector.setVisible(false);
             trackSelector.setVisible(false);
             for (auto& button : patternBankButtons) button->setVisible(false);
             for (auto& button : patternSlotButtons) button->setVisible(false);
@@ -7077,9 +10321,41 @@ public:
             playlistWindow->toFront(false);
         else if (generatorDockViewport.isVisible())
             generatorDockViewport.toFront(false);
+        if (drumRackWindow != nullptr && drumRackWindow->isVisible())
+        {
+            const auto rackArea = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(32).reduced(14, 10);
+            if (!rackArea.isEmpty())
+            {
+                auto bounds = drumRackWindow->getBounds();
+                bounds.setSize(juce::jlimit(juce::jmin(760, rackArea.getWidth()), rackArea.getWidth(), bounds.getWidth()),
+                               juce::jlimit(juce::jmin(590, rackArea.getHeight()), rackArea.getHeight(), bounds.getHeight()));
+                bounds.setPosition(juce::jlimit(rackArea.getX(), rackArea.getRight() - bounds.getWidth(), bounds.getX()),
+                                   juce::jlimit(rackArea.getY(), rackArea.getBottom() - bounds.getHeight(), bounds.getY()));
+                drumRackWindow->setBounds(bounds);
+            }
+            drumRackWindow->toFront(false);
+        }
     }
 
 private:
+    juce::Rectangle<int> getPluginWindowSafeBounds() const
+    {
+        // Plugin windows are separate desktop windows, so reserve Orbit's
+        // menu/transport rows and keep them inside the visible project area.
+        auto safe = getScreenBounds().reduced(8);
+        safe.removeFromTop(82);
+        safe.removeFromBottom(24);
+        if (safe.isEmpty())
+        {
+            if (const auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
+            {
+                safe = display->userArea.reduced(8);
+                safe.removeFromTop(82);
+            }
+        }
+        return safe;
+    }
+
     struct ProjectSnapshot
     {
         ProjectDocument document;
@@ -7090,6 +10366,8 @@ private:
         int bank = 0;
         int slot = 0;
         int pitch = 60;
+        std::set<std::pair<int,int>> noteKeys;
+        int pasteTick = 0;
     };
 
     struct UndoEntry
@@ -7098,23 +10376,749 @@ private:
         juce::String label;
     };
 
+    using PatternTickNote = orbit::editing::Note;
+
     struct PatternClipboard
     {
         bool hasNotes = false;
         int lengthSteps = 16;
-        std::array<std::array<bool, 64>, 37> notes{};
-        std::array<std::array<int, 64>, 37> lengths{};
-        std::array<std::array<int, 64>, 37> velocities{};
+        int originTick = 0;
+        bool wholePattern = true;
+        std::vector<PatternTickNote> notes;
     };
 
     struct PatternData
     {
         bool created = false;
         int lengthSteps = 16;
-        std::array<std::array<bool, 64>, 37> notes{};
-        std::array<std::array<int, 64>, 37> lengths{};
-        std::array<std::array<int, 64>, 37> velocities{};
+        std::vector<PatternTickNote> notes;
     };
+
+    using OptionsPanel = orbit::options::Panel;
+
+    #include "Generator/GeneratorHostMethods.h"
+    #include "Recording/RecordingHostMethods.h"
+
+    bool optionBool(const juce::String& key, bool fallback = false)
+    {
+        if (auto* s = applicationProperties.getUserSettings()) return s->getBoolValue("options."+key, fallback);
+        return fallback;
+    }
+    int optionInt(const juce::String& key, int fallback = 0)
+    {
+        if (auto* s = applicationProperties.getUserSettings()) return s->getIntValue("options."+key, fallback);
+        return fallback;
+    }
+    juce::String optionString(const juce::String& key, const juce::String& fallback = {})
+    {
+        if (auto* s = applicationProperties.getUserSettings()) return s->getValue("options."+key, fallback);
+        return fallback;
+    }
+    void saveOption(const juce::String& key, const juce::var& value)
+    {
+        if (auto* s = applicationProperties.getUserSettings()) s->setValue("options."+key, value);
+        applicationProperties.saveIfNeeded();
+    }
+    void openOptionsTool(const juce::String& titleText, std::unique_ptr<OptionsPanel> panel,
+                         std::function<bool(const OptionsPanel&)> action, bool projectSpecific = false)
+    {
+        auto* content = panel.get();
+        const auto projectId = project.getProjectId();
+        juce::DialogWindow::LaunchOptions launch;
+        launch.dialogTitle = titleText; launch.dialogBackgroundColour = orbit::options::colour(27,43,55);
+        launch.componentToCentreAround = this; launch.useNativeTitleBar = true; launch.resizable = false;
+        launch.content.setOwned(panel.release());
+        const juce::Component::SafePointer<juce::DialogWindow> window(launch.launchAsync());
+        const juce::Component::SafePointer<ProjectView> owner(this);
+        content->apply.onClick = [owner, window, content, projectId, projectSpecific, action = std::move(action)]
+        {
+            if (owner == nullptr || window == nullptr) return;
+            if (projectSpecific && owner->project.getProjectId() != projectId)
+            { content->setMessage("The project changed. Close this panel and reopen it for the current project."); return; }
+            if (action(*content)) window->exitModalState(1);
+            else content->setMessage(owner->status.getText());
+        };
+        content->cancel.onClick = [window] { if (window != nullptr) window->exitModalState(0); };
+    }
+    juce::PopupMenu makeOptionsMenu()
+    {
+        juce::PopupMenu menu, skins, wallpapers;
+        for (int i : { orbit::options::navyBlueSkin, orbit::options::lightBlueSkin })
+            skins.addItem(5500+i, orbit::options::skinNames[i], true, skinIsSelected(i));
+        skins.addSeparator();
+        for (int i=0; i<orbit::options::navyBlueSkin; ++i)
+            skins.addItem(5500+i, orbit::options::skinNames[i], true, skinIsSelected(i));
+        menu.addSubMenu("Skins", skins);
+        wallpapers.addItem(5600,"None",true,optionInt("wallpaper")==0);
+        wallpapers.addItem(5601,"Slate Gradient",true,optionInt("wallpaper")==1);
+        wallpapers.addItem(5602,"Blueprint Grid",true,optionInt("wallpaper")==2);
+        wallpapers.addItem(5603,"Choose Image...",true,optionInt("wallpaper")==3);
+        wallpapers.addSeparator();
+        for (int i=0;i<3;++i) wallpapers.addItem(5610+i,juce::StringArray{"Fit","Fill","Tile"}[i],true,optionInt("wallpaperMode",1)==i);
+        menu.addSubMenu("Wallpapers", wallpapers); menu.addSeparator();
+        menu.addItem(504,"Audio Input Settings..."); menu.addItem(503,"Audio Output Settings...");
+        menu.addSeparator();
+        menu.addItem(505,"MIDI In Settings..."); menu.addItem(506,"MIDI In Controllers...");
+        menu.addItem(517,"Enable MIDI Out",true,optionBool("midiOut"));
+        juce::PopupMenu::Item keyboard("Virtual MIDI Keyboard"); keyboard.itemID=519;
+        keyboard.isTicked=virtualKeyboard!=nullptr && virtualKeyboard->isVisible();keyboard.shortcutKeyDescription="F12";menu.addItem(std::move(keyboard));
+        menu.addSeparator(); menu.addItem(507,"Sample Paths..."); menu.addItem(508,"VST Paths...");
+        menu.addSeparator(); menu.addItem(509,"Time Signature...",hasProject); menu.addItem(510,"Timebase...",hasProject);
+        menu.addSeparator();menu.addItem(501,"Loop",hasProject,loopButton.getToggleState());
+        menu.addItem(502,"Metronome",hasProject,metronomeButton.getToggleState());
+        menu.addItem(516,"Audio / MIDI Diagnostics...");menu.addItem(518,"MIDI Out Settings...");
+        menu.addItem(511,"Preferences...");menu.addItem(512,"Project Settings...",hasProject);menu.addItem(513,"Playlist Settings...");
+        return menu;
+    }
+    void initialiseOptions()
+    {
+        orbit::options::currentSkin=juce::jlimit(0,orbit::options::skinNames.size()-1,optionInt("skin"));
+        optionsLookAndFeel.refresh(); setLookAndFeel(&optionsLookAndFeel);
+        juce::LookAndFeel::setDefaultLookAndFeel(&optionsLookAndFeel);
+        const auto file=optionString("wallpaperFile");
+        if(file.isNotEmpty()) wallpaperImage=juce::ImageFileFormat::loadFrom(juce::File(file));
+        midiInbox.deliver=[this](const auto& events,bool lost)
+        {
+            if(lost)releaseLiveMidi();
+            for(const auto& event:events)processLiveMidi(event.message,event.device,event.receivedAtMs);
+        };
+        engine.getDeviceManager().deviceManager.addMidiInputDeviceCallback({},&midiInbox);
+        optionsReady=true;
+        engine.getDeviceManager().setCpuLimitBeforeMuting(optionInt("cpuLimit",98)/100.0);
+    }
+    void shutdownOptions()
+    {
+        optionsReady=false;
+        engine.getDeviceManager().deviceManager.removeMidiInputDeviceCallback({},&midiInbox);
+        midiInbox.clear(); midiInbox.deliver={};
+        if(virtualKeyboard!=nullptr) {virtualKeyboard->release(); virtualKeyboard.reset();}
+        releaseLiveMidi();
+        for(int i=0;i<engine.getDeviceManager().getNumMidiOutDevices();++i)
+            if(auto* out=engine.getDeviceManager().getMidiOutDevice(i))out->sendNoteOffMessages();
+        setLookAndFeel(nullptr); juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
+    }
+    bool skinIsSelected(int index)
+    {
+        if(optionInt("skin")!=index)return false;
+        const auto preset=orbit::options::workspaceAppearance(index);
+        if(!preset)return true;
+        auto* settings=applicationProperties.getUserSettings();
+        if(settings==nullptr)return false;
+        return settings->getBoolValue("playlistLightTheme",false)==preset->lightCanvas
+            && settings->getBoolValue("pianoRollLightTheme",false)==preset->lightCanvas
+            && settings->getIntValue("mixerSkin",0)==preset->mixerSkin;
+    }
+    void setSkin(int index)
+    {
+        orbit::options::currentSkin=juce::jlimit(0,orbit::options::skinNames.size()-1,index);
+        if(auto* settings=applicationProperties.getUserSettings())
+        {
+            settings->setValue("options.skin",orbit::options::currentSkin);
+            if(const auto preset=orbit::options::workspaceAppearance(orbit::options::currentSkin))
+            {
+                settings->setValue("playlistLightTheme",preset->lightCanvas);
+                settings->setValue("pianoRollLightTheme",preset->lightCanvas);
+                settings->setValue("mixerSkin",preset->mixerSkin);
+                if(playlistWindow!=nullptr)playlistWindow->setLightTheme(preset->lightCanvas);
+                if(pianoRollWindow!=nullptr)pianoRollWindow->setLightTheme(preset->lightCanvas);
+                if(mixerWindow!=nullptr)mixerWindow->setMixerSkin(preset->mixerSkin);
+            }
+            applicationProperties.saveIfNeeded();
+        }
+        optionsLookAndFeel.refresh();
+        std::function<void(juce::Component&)> refresh=[&](juce::Component& c)
+        {
+            // These colours were explicitly cached by the existing custom controls.
+            if(auto* button=dynamic_cast<juce::TextButton*>(&c))
+            {
+                button->setColour(juce::TextButton::buttonColourId,orbit::options::colour(38,56,68));
+                button->setColour(juce::TextButton::buttonOnColourId,orbit::options::colour(37,112,143));
+                button->setColour(juce::TextButton::textColourOffId,orbit::options::colour(225,239,247));
+            }
+            c.repaint();
+            for(auto* child:c.getChildren())refresh(*child);
+        };
+        sendLookAndFeelChange(); refresh(*this);
+        for(int i=0;i<juce::Desktop::getInstance().getNumComponents();++i)
+            if(auto* c=juce::Desktop::getInstance().getComponent(i);c!=nullptr && c!=getTopLevelComponent())c->sendLookAndFeelChange();
+        status.setText("Skin: "+orbit::options::skinNames[orbit::options::currentSkin],juce::dontSendNotification);
+    }
+    void setWallpaper(int kind)
+    {saveOption("wallpaper",kind);repaint();}
+    void chooseWallpaper()
+    {
+        fileChooser=std::make_unique<juce::FileChooser>("Choose a workspace wallpaper",juce::File::getSpecialLocation(juce::File::userPicturesDirectory),"*.png;*.jpg;*.jpeg;*.gif");
+        const juce::Component::SafePointer<ProjectView> owner(this);
+        fileChooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[owner](const auto& chooser)
+        {
+            if(owner==nullptr)return;const auto file=chooser.getResult();if(!file.existsAsFile())return;
+            if(file.getSize()>32*1024*1024){owner->showError("Wallpaper","Choose an image smaller than 32 MiB.");return;}
+            auto image=juce::ImageFileFormat::loadFrom(file);
+            if(!image.isValid() || image.getWidth()>8192 || image.getHeight()>8192)
+            {owner->showError("Wallpaper","Choose a supported image no larger than 8192 pixels per side.");return;}
+            owner->wallpaperImage=std::move(image);owner->saveOption("wallpaperFile",file.getFullPathName());owner->setWallpaper(3);
+        });
+    }
+    void paintWallpaper(juce::Graphics& g)
+    {
+        g.fillAll(orbit::options::colour(72,96,108)); const int kind=optionInt("wallpaper");
+        if(kind==1)
+        {
+            g.setGradientFill(juce::ColourGradient(orbit::options::colour(28,45,60),0,80,orbit::options::colour(80,112,126),float(getWidth()),float(getHeight()),false));g.fillRect(getLocalBounds());
+        }
+        else if(kind==2)
+        {
+            g.fillAll(orbit::options::colour(28,45,60));g.setColour(orbit::options::colour(68,98,116).withAlpha(0.5f));
+            for(int x=0;x<getWidth();x+=32)g.drawVerticalLine(x,0,float(getHeight()));
+            for(int y=0;y<getHeight();y+=32)g.drawHorizontalLine(y,0,float(getWidth()));
+        }
+        else if(kind==3 && wallpaperImage.isValid())
+        {
+            const int mode=optionInt("wallpaperMode",1);
+            if(mode==2){g.setTiledImageFill(wallpaperImage,0,0,1);g.fillRect(getLocalBounds());}
+            else g.drawImageWithin(wallpaperImage,0,0,getWidth(),getHeight(),juce::RectanglePlacement(mode==1?juce::RectanglePlacement::fillDestination:juce::RectanglePlacement::centred));
+        }
+    }
+    void showHardwareSettings(bool input)
+    {
+        audioSettingsWindow=std::make_unique<AudioSettingsWindow>(engine.getDeviceManager().deviceManager,input?"Audio Input Device / Channels":"Audio Output Device / Rate / Buffer",input);
+        audioSettingsWindow->setVisible(true);audioSettingsWindow->toFront(true);
+        // This window is opened from an already modal Options form. Place it
+        // on the modal stack so JUCE allows device controls to receive input.
+        audioSettingsWindow->enterModalState(true,nullptr,false);
+    }
+    void showAudioOutputOptions()
+    {
+        auto panel=std::make_unique<OptionsPanel>("Choose the audio device, output channels, sample rate and buffer size. Device changes take effect immediately in the device window.");
+        panel->button("hardware","Device / Sample Rate / Buffer...").onClick=[this]{showHardwareSettings(false);};
+        panel->check("cores","Use multiple CPU cores for this project",project.isMultiCoreAudioEnabled());
+        panel->number("cpu","CPU protection threshold (%)",optionInt("cpuLimit",98),50,100);
+        panel->check("clip","Limit output peaks to 0 dBFS",optionBool("outputClip"));
+        openOptionsTool("Audio Output Settings",std::move(panel),[this](const auto& p)
+        {
+            const bool changed=project.isMultiCoreAudioEnabled()!=p.checked("cores");
+            if(changed){rememberUndo("Change audio processing");project.setMultiCoreAudioEnabled(p.checked("cores"));isDirty=true;}
+            saveOption("cpuLimit",int(p.value("cpu")));saveOption("outputClip",p.checked("clip"));
+            engine.getDeviceManager().setCpuLimitBeforeMuting(p.value("cpu")/100.0);
+            engine.getDeviceManager().enableOutputClipping(p.checked("clip"));
+            if(changed){engine.getDeviceManager().updateNumCPUs();if(edit!=nullptr)edit->restartPlayback();}
+            engine.getDeviceManager().saveSettings();status.setText("Audio output settings applied.",juce::dontSendNotification);return true;
+        },true);
+    }
+    void showAudioInputOptions()
+    {
+        auto panel=std::make_unique<OptionsPanel>("Configure audio input channels and recording format. Enable monitoring only when your microphone/speakers are safe from feedback. Record captures MIDI takes; audio recording is not yet available.");
+        panel->button("hardware","Input Device / Channels...").onClick=[this]{showHardwareSettings(true);};
+        panel->check("enabled","Enable audio input",optionBool("audioInput"));
+        panel->check("monitor","Monitor assigned audio inputs",optionBool("audioMonitor"));
+        panel->check("mono","Use mono input channels",optionBool("audioMono"));
+        panel->choice("depth","Recording bit depth",{"16 bit","24 bit","32 bit"},optionInt("audioDepth",1));
+        panel->number("latency","Additional input latency (samples)",optionInt("inputLatency"),-96000,96000);
+        panel->check("route","Assign inputs to the selected audio track",false);
+        openOptionsTool("Audio Input Settings",std::move(panel),[this](const auto& p)
+        {
+            if(p.checked("route") && (instrumentTrack==nullptr || project.getTrackKind(getGeneratorTracks().indexOf(instrumentTrack))!=ProjectDocument::TrackKind::audio))
+            {status.setText("Select an audio track before assigning audio inputs.",juce::dontSendNotification);return false;}
+            auto hardware=enableAudioInputChannels(p.checked("enabled"));
+            if(hardware.failed()){status.setText(hardware.getErrorMessage(),juce::dontSendNotification);return false;}
+            releaseLiveMidi();
+            if(p.checked("route"))rememberUndo("Assign audio input");
+            saveOption("audioInput",p.checked("enabled"));saveOption("audioMonitor",p.checked("monitor"));
+            saveOption("audioMono",p.checked("mono"));saveOption("audioDepth",p.index("depth"));saveOption("inputLatency",int(p.value("latency")));
+            applyAudioInputPolicy();
+            if(p.checked("route") && edit!=nullptr)
+            {
+                edit->getTransport().ensureContextAllocated();
+                for(auto* input:edit->getAllInputDevices())if(input!=nullptr && dynamic_cast<te::WaveInputDevice*>(&input->getInputDevice())!=nullptr)
+                {auto result=input->setTarget(instrumentTrack->itemID,true,nullptr);if(!result){status.setText(result.error(),juce::dontSendNotification);return false;}}
+                isDirty=true;
+            }
+            engine.getDeviceManager().saveSettings();status.setText("Audio input settings applied.",juce::dontSendNotification);return true;
+        },true);
+    }
+    juce::Result enableAudioInputChannels(bool enabled)
+    {
+        auto& manager=engine.getDeviceManager().deviceManager;auto* device=manager.getCurrentAudioDevice();
+        if(device==nullptr)return enabled?juce::Result::fail("Choose an audio device and input channels first."):juce::Result::ok();
+        auto setup=manager.getAudioDeviceSetup();
+        if(!enabled)
+        {
+            if(!setup.inputChannels.isZero())saveOption("inputChannelMask",setup.inputChannels.toString(16));
+            setup.inputChannels.clear();setup.useDefaultInputChannels=false;
+        }
+        else if(setup.inputChannels.isZero())
+        {
+            setup.inputChannels.parseString(optionString("inputChannelMask"),16);setup.useDefaultInputChannels=false;
+            if(setup.inputChannels.isZero())
+            {
+                const int available=device->getInputChannelNames().size();
+                if(available==0)return juce::Result::fail("Choose an input device and channels in Input Device / Channels first.");
+                setup.inputChannels.setRange(0,juce::jmin(2,available),true);
+            }
+        }
+        if(setup==manager.getAudioDeviceSetup())return juce::Result::ok();
+        const auto error=manager.setAudioDeviceSetup(setup,true);
+        return error.isEmpty()?juce::Result::ok():juce::Result::fail(error);
+    }
+    void applyAudioInputPolicy()
+    {
+        auto& dm=engine.getDeviceManager();
+        juce::StringArray ids;
+        for(auto* input:dm.getWaveInputDevices())if(!input->isTrackDevice())ids.add(input->getDeviceID());
+        for(const auto& id:ids)
+            if(auto* input=dynamic_cast<te::WaveInputDevice*>(dm.findInputDeviceForID(id)))
+            {
+                input->setMonitorMode(optionBool("audioMonitor")?te::InputDevice::MonitorMode::on:te::InputDevice::MonitorMode::off);
+                input->setBitDepth(juce::Array<int>{16,24,32}[juce::jlimit(0,2,optionInt("audioDepth",1))]);
+                const double rate=juce::jmax(1.0,dm.getSampleRate());input->setRecordAdjustmentMs(optionInt("inputLatency")*1000.0/rate);
+                bool active=false;
+                if(auto* hardware=dm.deviceManager.getCurrentAudioDevice())
+                    for(const auto& channel:input->getChannels())active|=hardware->getActiveInputChannels()[channel.indexInDevice];
+                // This call may destroy/recreate the WaveInputDevice. It must be last.
+                input->setEnabled(optionBool("audioInput") && active);
+            }
+        // Stereo-pair changes rebuild the device list, so never retain pointers across them.
+        for(const auto& id:ids)
+            if(auto* input=dynamic_cast<te::WaveInputDevice*>(dm.findInputDeviceForID(id));input!=nullptr && input->isStereoPair()==optionBool("audioMono"))
+                input->setStereoPair(!optionBool("audioMono"));
+    }
+    void restoreMidiDevices()
+    {
+        auto& manager=engine.getDeviceManager().deviceManager;
+        const auto enabled=juce::StringArray::fromLines(optionString("midiInputs"));
+        for(const auto& device:juce::MidiInput::getAvailableDevices())manager.setMidiInputDeviceEnabled(device.identifier,enabled.contains(device.identifier));
+        if(optionBool("audioInput"))enableAudioInputChannels(true);
+        syncOptionsDevices(true);
+    }
+    void syncOptionsDevices(bool force=false)
+    {
+        if(!optionsReady)return;
+        auto& dm=engine.getDeviceManager();
+        juce::String signature=juce::String(dm.getSampleRate(),0)+";";
+        for(const auto& device:dm.getMidiInDevices())signature+=device->getDeviceID()+":"+juce::String(int(device->isEnabled()))+";";
+        for(int i=0;i<dm.getNumMidiOutDevices();++i)signature+=dm.getMidiOutDevice(i)->getDeviceID()+";";
+        for(auto* device:dm.getWaveInputDevices())signature+=device->getDeviceID()+";";
+        if(!force && signature==midiDeviceSignature)return;
+        const auto enabled=juce::StringArray::fromLines(optionString("midiInputs"));
+        for(const auto& device:juce::MidiInput::getAvailableDevices())
+            dm.deviceManager.setMidiInputDeviceEnabled(device.identifier,enabled.contains(device.identifier));
+        for(const auto& device:dm.getMidiInDevices())if(device->getDeviceType()==te::InputDevice::physicalMidiDevice)device->setEnabled(false);
+        const auto outputId=optionString("midiOutputDevice");juce::StringArray outputIds;
+        for(int i=0;i<dm.getNumMidiOutDevices();++i)outputIds.add(dm.getMidiOutDevice(i)->getDeviceID());
+        for(const auto& id:outputIds)
+            if(auto* out=dynamic_cast<te::MidiOutputDevice*>(dm.findOutputDeviceForID(id)))
+            {
+                out->setSendingClock(optionBool("midiOut") && optionBool("midiClock") && id==outputId);
+                // Enabling/disabling can recreate all MIDI output devices. Never
+                // retain or use the pointer after this call.
+                out->setEnabled(optionBool("midiOut") && id==outputId);
+            }
+        applyAudioInputPolicy();
+        dm.enableOutputClipping(optionBool("outputClip"));midiDeviceSignature=signature;
+    }
+    void showMidiInputOptions()
+    {
+        auto panel=std::make_unique<OptionsPanel>("Enable the MIDI devices you want to play. Easy mode follows the selected generator. Advanced mode routes by each generator's MIDI channel.");
+        const auto devices=juce::MidiInput::getAvailableDevices();auto& manager=engine.getDeviceManager().deviceManager;
+        for(int i=0;i<devices.size();++i)panel->check("device"+juce::String(i),devices[i].name,manager.isMidiInputDeviceEnabled(devices[i].identifier));
+        if(devices.isEmpty())panel->setMessage("No MIDI input devices are connected. Connect a device, then reopen this panel. You can still use the Virtual MIDI Keyboard.");
+        panel->choice("mode","MIDI input mode",{"Easy (selected generator)","Advanced (generator channels)"},optionInt("midiMode"));
+        juce::StringArray channels{"Omni"};for(int i=1;i<=16;++i)channels.add(juce::String(i));
+        panel->choice("channel","Selected generator channel",channels,instrumentTrack!=nullptr?int(instrumentTrack->state.getProperty("orbitMidiChannel",0)):0).setEnabled(instrumentTrack!=nullptr);
+        panel->check("bend","Receive pitch bend",optionBool("receiveBend",true));
+        panel->check("pressure","Receive aftertouch",optionBool("receivePressure",true));
+        panel->check("program","Receive program changes",optionBool("receiveProgram"));
+        panel->check("transport","Receive Start / Stop / Song Position",optionBool("receiveTransport"));
+        panel->choice("pedals","Sustain / sostenuto / soft pedals",{"Off","Normal polarity","Inverted polarity"},optionInt("pedals",1));
+        const auto trackId=selectedProjectTrackId();
+        openOptionsTool("MIDI In Settings",std::move(panel),[this,devices,trackId](const auto& p)
+        {
+            releaseLiveMidi();juce::StringArray enabled;auto& manager=engine.getDeviceManager().deviceManager;
+            juce::StringArray previous;
+            for(const auto& device:devices)if(manager.isMidiInputDeviceEnabled(device.identifier))previous.add(device.identifier);
+            for(int i=0;i<devices.size();++i)
+            {
+                const bool on=p.checked("device"+juce::String(i));manager.setMidiInputDeviceEnabled(devices[i].identifier,on);
+                if(on && !manager.isMidiInputDeviceEnabled(devices[i].identifier))
+                {
+                    for(const auto& device:devices)manager.setMidiInputDeviceEnabled(device.identifier,previous.contains(device.identifier));
+                    status.setText("Could not open MIDI input: "+devices[i].name+". Check its connection and try again.",juce::dontSendNotification);return false;
+                }
+                if(on)enabled.add(devices[i].identifier);
+            }
+            saveOption("midiInputs",enabled.joinIntoString("\n"));saveOption("midiMode",p.index("mode"));
+            saveOption("receiveBend",p.checked("bend"));saveOption("receivePressure",p.checked("pressure"));saveOption("receiveProgram",p.checked("program"));
+            saveOption("receiveTransport",p.checked("transport"));saveOption("pedals",p.index("pedals"));
+            if(auto* track=engineTrackForProjectId(trackId);track!=nullptr && int(track->state.getProperty("orbitMidiChannel",0))!=p.index("channel"))
+            {rememberUndo("Change generator MIDI channel");track->state.setProperty("orbitMidiChannel",p.index("channel"),nullptr);isDirty=true;}
+            syncOptionsDevices(true);engine.getDeviceManager().saveSettings();status.setText("MIDI input settings applied.",juce::dontSendNotification);return true;
+        },true);
+    }
+    te::AudioTrack* engineTrackForProjectId(const juce::String& id)
+    {
+        const auto tracks=getGeneratorTracks();
+        for(int i=0;i<tracks.size() && i<project.getTrackCount();++i)if(project.getTrackId(i)==id)return tracks[i];
+        return nullptr;
+    }
+    void releaseLiveMidi()
+    {
+        if(releasingLiveMidi)return;
+        finishMidiRecording();
+        const juce::ScopedValueSetter<bool> releasing(releasingLiveMidi,true);
+        midiInbox.clear();
+        if(virtualKeyboard!=nullptr)virtualKeyboard->release();
+        if(edit!=nullptr)
+            for(const auto& id:liveMidiRecipients)if(auto* track=engineTrackForProjectId(id))
+                for(int channel=1;channel<=16;++channel)
+                {track->injectLiveMidiMessage(juce::MidiMessage::controllerEvent(channel,64,0),{});track->injectLiveMidiMessage(juce::MidiMessage::allNotesOff(channel),{});}
+        liveMidiNotes.clear();liveMidiRecipients.clear();
+        for(int i=0;i<engine.getDeviceManager().getNumMidiOutDevices();++i)
+            if(auto* out=engine.getDeviceManager().getMidiOutDevice(i);out!=nullptr && out->isEnabled())
+            {
+                for(int channel=1;channel<=16;++channel)
+                {out->fireMessage(juce::MidiMessage::controllerEvent(channel,64,0));out->fireMessage(juce::MidiMessage::allNotesOff(channel));}
+                out->sendNoteOffMessages();
+            }
+    }
+    void processLiveMidi(juce::MidiMessage message,const juce::String& device={},double receivedAtMs=0)
+    {
+        if(edit==nullptr || !hasProject || releasingLiveMidi)return;
+        const int channel=message.getChannel();
+        if(message.isController())
+        {
+            lastControllerDevice=device;lastControllerNumber=message.getControllerNumber();lastControllerChannel=channel;
+            if(generatorLearnTarget.isNotEmpty() && !message.isAllNotesOff() && !message.isAllSoundOff())
+            {
+                auto bindings=controllerBindings();
+                std::erase_if(bindings,[this](const auto& b){return b.target==generatorLearnTarget;});
+                bindings.push_back({device,generatorLearnTarget,channel,message.getControllerNumber(),0,1});
+                saveControllerBindings(bindings);generatorLearnTarget.clear();
+                status.setText("Generator controller linked to CC "+juce::String(message.getControllerNumber())+". The next movement controls its target.",juce::dontSendNotification);return;
+            }
+            if(learnControllerPanel!=nullptr)
+            {
+                learnControllerPanel->numbers.at("cc")->setValue(lastControllerNumber);
+                learnControllerPanel->choices.at("channel")->setSelectedItemIndex(channel);
+                if(auto it=learnControllerDevices.indexOf(device);it>=0)learnControllerPanel->choices.at("device")->setSelectedItemIndex(it);
+                learnControllerPanel->setMessage("Controller learned. Choose a target, then Apply to save the assignment.");learnControllerPanel=nullptr;return;
+            }
+            if(device.isNotEmpty() && !message.isAllNotesOff() && !message.isAllSoundOff())applyControllerBindings(message,device);
+        }
+        if(message.isPitchWheel() && !optionBool("receiveBend",true))return;
+        if((message.isAftertouch() || message.isChannelPressure()) && !optionBool("receivePressure",true))return;
+        if(message.isProgramChange() && !optionBool("receiveProgram"))return;
+        if(message.isController() && (message.getControllerNumber()==64 || message.getControllerNumber()==66 || message.getControllerNumber()==67))
+        {
+            const int mode=optionInt("pedals",1);if(mode==0)return;
+            if(mode==2 && device.isNotEmpty())message=juce::MidiMessage::controllerEvent(channel,message.getControllerNumber(),127-message.getControllerValue());
+        }
+        if(message.isMidiStart() || message.isMidiContinue() || message.isMidiStop() || message.isSongPositionPointer())
+        {
+            if(!optionBool("receiveTransport"))return;
+            if(message.isMidiStop()){edit->getTransport().stop(false,false);releaseLiveMidi();}
+            else if(message.isSongPositionPointer())edit->getTransport().setPosition(tracktion::TimePosition::fromSeconds(message.getSongPositionPointerMidiBeat()*0.25*60/project.getInitialTempoBpm()));
+            else if(!edit->getTransport().isPlaying())
+            {
+                const auto resume=edit->getTransport().getPosition();togglePlayback();
+                if(message.isMidiContinue() && edit->getTransport().isPlaying())edit->getTransport().setPosition(resume);
+            }
+            return;
+        }
+        if(channel<1 || channel>16 || message.isSysEx())return;
+        juce::StringArray targets;
+        const auto key=std::make_tuple(device,channel,message.isNoteOnOrOff()?message.getNoteNumber():-1);
+        if(message.isNoteOff())
+        {
+            if(auto it=liveMidiNotes.find(key);it!=liveMidiNotes.end()){targets=it->second;liveMidiNotes.erase(it);}
+        }
+        else if(midiTake.active)targets=recordingTargets(channel);
+        else if(optionInt("midiMode")==0){if(canEditPattern())targets.add(selectedProjectTrackId());}
+        else
+        {
+            const auto tracks=getGeneratorTracks();
+            for(int i=0;i<tracks.size() && i<project.getTrackCount();++i)
+                if(project.getTrackKind(i)!=ProjectDocument::TrackKind::audio)
+                {const int assigned=tracks[i]->state.getProperty("orbitMidiChannel",0);if(assigned==0 || assigned==channel)targets.add(project.getTrackId(i));}
+        }
+        // Pedal release and panic must reach the original recipient after a focus change.
+        if(message.isController() || message.isAllNotesOff() || message.isAllSoundOff())for(const auto& id:liveMidiRecipients)targets.addIfNotAlreadyThere(id);
+        if(message.isAllNotesOff() || message.isAllSoundOff())
+            std::erase_if(liveMidiNotes,[channel](const auto& n){return std::get<1>(n.first)==channel;});
+        if(message.isNoteOn())
+        {
+            if(auto it=liveMidiNotes.find(key);it!=liveMidiNotes.end())
+                for(const auto& id:it->second)if(auto* track=engineTrackForProjectId(id))track->injectLiveMidiMessage(juce::MidiMessage::noteOff(channel,message.getNoteNumber()),{});
+            liveMidiNotes[key]=targets;++midiAuditionNoteOns;
+        }
+        captureRecordingEvent(message,device,targets,receivedAtMs);
+        if(!targets.isEmpty() && edit->getTransport().getCurrentPlaybackContext()==nullptr)edit->getTransport().ensureContextAllocated();
+        message.setTimeStamp(0); // Live messages enter the engine's next render block.
+        for(const auto& id:targets)if(auto* track=engineTrackForProjectId(id))
+        {track->injectLiveMidiMessage(message,{});liveMidiRecipients.addIfNotAlreadyThere(id);}
+        if(optionBool("midiOut"))
+        {
+            const auto outputId=optionString("midiOutputDevice");bool engineRoute=false;
+            for(const auto& id:targets)if(auto* track=engineTrackForProjectId(id))engineRoute|=track->getOutput().getOutputDeviceID()==outputId;
+            if(!engineRoute)
+                if(auto* out=dynamic_cast<te::MidiOutputDevice*>(engine.getDeviceManager().findOutputDeviceForID(outputId));out!=nullptr && out->isEnabled())out->fireMessage(message);
+        }
+        lastMidiActivity="MIDI channel "+juce::String(channel)+" / "+juce::String(targets.size())+" generator(s)";
+    }
+    void toggleVirtualKeyboard()
+    {
+        if(virtualKeyboard==nullptr)
+        {
+            const juce::Component::SafePointer<ProjectView> owner(this);
+            virtualKeyboard=std::make_unique<orbit::options::VirtualKeyboard>([owner](const auto& m){if(owner!=nullptr)owner->processLiveMidi(m);},[owner]{if(owner!=nullptr)owner->saveOption("virtualKeyboard",false);});
+        }
+        const bool visible=!virtualKeyboard->isVisible();
+        if(!visible)virtualKeyboard->release();
+        virtualKeyboard->setVisible(visible);if(visible)virtualKeyboard->toFront(true);saveOption("virtualKeyboard",visible);
+    }
+    void setMidiOutputEnabled(bool enabled)
+    {
+        if(enabled && optionString("midiOutputDevice").isEmpty()){showMidiOutputOptions();return;}
+        if(!enabled)releaseLiveMidi();saveOption("midiOut",enabled);syncOptionsDevices(true);
+        if(enabled)
+        {
+            auto* output=engine.getDeviceManager().findOutputDeviceForID(optionString("midiOutputDevice"));
+            if(output==nullptr || !output->isEnabled())
+            {status.setText("The selected MIDI output is unavailable. Reconnect it or choose another in MIDI Out Settings.",juce::dontSendNotification);return;}
+        }
+        status.setText(enabled?"MIDI output enabled.":"MIDI output disabled.",juce::dontSendNotification);
+    }
+    void showMidiOutputOptions()
+    {
+        auto panel=std::make_unique<OptionsPanel>("Choose an external MIDI output for live MIDI thru and optional MIDI clock. Route a generator to this device to send its pattern/song MIDI instead of audio.");
+        auto& dm=engine.getDeviceManager();dm.rescanMidiDeviceList();
+        juce::StringArray names,ids;
+        for(int i=0;i<dm.getNumMidiOutDevices();++i){auto* out=dm.getMidiOutDevice(i);names.add(out->getName());ids.add(out->getDeviceID());}
+        panel->choice("device","MIDI output device",names,juce::jmax(0,ids.indexOf(optionString("midiOutputDevice"))));
+        panel->check("enabled","Enable MIDI output",optionBool("midiOut"));
+        panel->check("clock","Send MIDI clock / start / stop",optionBool("midiClock"));
+        panel->choice("route","Selected generator output",{"Keep current routing","Route to MIDI output","Restore default audio output"},0).setEnabled(instrumentTrack!=nullptr);
+        panel->number("delay","Output timing adjustment (ms)",optionInt("midiOutputDelay"),-500,500);
+        if(ids.isEmpty()){panel->setMessage("No MIDI output devices are connected. Connect a device and reopen this panel.");panel->apply.setEnabled(false);}
+        const auto trackId=selectedProjectTrackId();
+        openOptionsTool("MIDI Out Settings",std::move(panel),[this,ids,trackId](const auto& p)
+        {
+            if(!juce::isPositiveAndBelow(p.index("device"),ids.size()))return false;
+            if(p.index("route")==1 && !p.checked("enabled"))
+            {status.setText("Enable MIDI output before routing a generator to it.",juce::dontSendNotification);return false;}
+            const auto id=ids[p.index("device")];
+            if(engine.getDeviceManager().findOutputDeviceForID(id)==nullptr)
+            {status.setText("The MIDI output disconnected. Reopen this panel after reconnecting it.",juce::dontSendNotification);return false;}
+            releaseLiveMidi();saveOption("midiOutputDevice",id);
+            saveOption("midiOut",p.checked("enabled"));saveOption("midiClock",p.checked("clock"));saveOption("midiOutputDelay",int(p.value("delay")));
+            syncOptionsDevices(true);
+            if(auto* out=dynamic_cast<te::MidiOutputDevice*>(engine.getDeviceManager().findOutputDeviceForID(id)))out->setPreDelayMs(int(p.value("delay")));
+            if(auto* track=engineTrackForProjectId(trackId);track!=nullptr && p.index("route")!=0)
+            {
+                rememberUndo("Change generator MIDI output");
+                if(p.index("route")==1)track->getOutput().setOutputToDeviceID(id);else track->getOutput().setOutputToDefaultDevice(false);
+                isDirty=true;
+            }
+            engine.getDeviceManager().saveSettings();status.setText("MIDI output settings applied.",juce::dontSendNotification);return true;
+        },true);
+    }
+    struct ControllerBinding {juce::String device,target;int channel=0,cc=1;float low=0,high=1;};
+    std::vector<ControllerBinding> controllerBindings()
+    {
+        std::vector<ControllerBinding> result;auto json=juce::JSON::parse(optionString("controllers","[]"));
+        if(auto* array=json.getArray())for(const auto& v:*array)
+        {
+            ControllerBinding b{v["device"].toString(),v["target"].toString(),int(v["channel"]),int(v["cc"]),float(v["low"]),float(v["high"])};
+            if(b.channel>=0 && b.channel<=16 && b.cc>=0 && b.cc<=127 && b.target.isNotEmpty() && std::isfinite(b.low) && std::isfinite(b.high)){b.low=juce::jlimit(0.0f,1.0f,b.low);b.high=juce::jlimit(0.0f,1.0f,b.high);result.push_back(std::move(b));}
+        }
+        return result;
+    }
+    void saveControllerBindings(const std::vector<ControllerBinding>& bindings)
+    {
+        juce::Array<juce::var> array;
+        for(const auto& b:bindings)
+        {
+            auto* o=new juce::DynamicObject();o->setProperty("device",b.device);o->setProperty("target",b.target);
+            o->setProperty("channel",b.channel);o->setProperty("cc",b.cc);o->setProperty("low",b.low);o->setProperty("high",b.high);array.add(juce::var(o));
+        }
+        saveOption("controllers",juce::JSON::toString(juce::var(array)));
+    }
+    void showMidiControllers()
+    {
+        auto bindings=controllerBindings();juce::StringArray existing{"New assignment"};
+        for(const auto& b:bindings)existing.add("CC "+juce::String(b.cc)+" / Ch "+(b.channel==0?"Omni":juce::String(b.channel))+" / "+b.target);
+        auto panel=std::make_unique<OptionsPanel>("Assign MIDI CCs to mixer/transport controls or a parameter on the selected instrument. Learn captures the next CC. Apply saves the selected assignment.");
+        auto& slot=panel->choice("slot","Assignment",existing,0);
+        juce::StringArray deviceNames{"Any input"},deviceIds{juce::String{}};
+        for(const auto& d:juce::MidiInput::getAvailableDevices()){deviceNames.add(d.name);deviceIds.add(d.identifier);}
+        for(const auto& b:bindings)if(b.device.isNotEmpty() && !deviceIds.contains(b.device)){deviceIds.add(b.device);deviceNames.add("Disconnected: "+b.device);}
+        panel->choice("device","Input device",deviceNames,0);
+        juce::StringArray channels{"Omni"};for(int i=1;i<=16;++i)channels.add(juce::String(i));panel->choice("channel","MIDI channel",channels,0);
+        panel->number("cc","Controller number",juce::jmax(0,lastControllerNumber),0,127);
+        juce::StringArray targets{"Selected track volume","Selected track pan","Master volume","Tempo","Play / Stop","Stop"};
+        juce::StringArray targetIds{"volume","pan","master","tempo","play","stop"};
+        if(auto* plugin=selectedInstrumentPlugin())for(auto* parameter:plugin->getAutomatableParameters())if(parameter!=nullptr)
+        {targets.add(plugin->getName()+" / "+parameter->getParameterName());targetIds.add("parameter\n"+plugin->getName()+"\n"+parameter->paramID);}
+        for(const auto& b:bindings)if(!targetIds.contains(b.target)){targetIds.add(b.target);targets.add("Unavailable parameter: "+b.target.replaceCharacter('\n','/'));}
+        panel->choice("target","Target",targets,0);panel->number("low","Minimum (%)",0,0,100);panel->number("high","Maximum (%)",100,0,100);
+        panel->check("remove","Remove selected assignment",false);
+        auto* form=panel.get();const juce::Component::SafePointer<OptionsPanel> safePanel(form);
+        slot.onChange=[safePanel,bindings,deviceIds,targetIds]
+        {
+            if(safePanel==nullptr)return;const int index=safePanel->index("slot")-1;if(!juce::isPositiveAndBelow(index,int(bindings.size())))return;
+            const auto& b=bindings[size_t(index)];safePanel->choices.at("device")->setSelectedItemIndex(juce::jmax(0,deviceIds.indexOf(b.device)));
+            safePanel->choices.at("channel")->setSelectedItemIndex(b.channel);safePanel->numbers.at("cc")->setValue(b.cc);
+            safePanel->choices.at("target")->setSelectedItemIndex(targetIds.indexOf(b.target));safePanel->numbers.at("low")->setValue(b.low*100);safePanel->numbers.at("high")->setValue(b.high*100);
+        };
+        panel->button("learn","Learn Next MIDI CC").onClick=[this,safePanel,deviceIds]
+        {generatorLearnTarget.clear();learnControllerPanel=safePanel;learnControllerDevices=deviceIds;if(safePanel!=nullptr)safePanel->setMessage("Move a controller on an enabled MIDI input. The next CC fills the device, channel and controller fields.");};
+        openOptionsTool("MIDI In Controllers",std::move(panel),[this,deviceIds,targetIds](const auto& p)
+        {
+            auto bindings=controllerBindings();const int slot=p.index("slot")-1;
+            if(p.checked("remove"))
+            {if(juce::isPositiveAndBelow(slot,int(bindings.size())))bindings.erase(bindings.begin()+slot);}
+            else
+            {
+                if(!juce::isPositiveAndBelow(p.index("target"),targetIds.size()))return false;
+                ControllerBinding b{deviceIds[p.index("device")],targetIds[p.index("target")],p.index("channel"),int(p.value("cc")),float(p.value("low")/100),float(p.value("high")/100)};
+                if(juce::isPositiveAndBelow(slot,int(bindings.size())))bindings[size_t(slot)]=b;else bindings.push_back(std::move(b));
+            }
+            saveControllerBindings(bindings);controllerButtons.clear();lastControllerUndoTarget.clear();learnControllerPanel=nullptr;status.setText("MIDI controller assignments saved.",juce::dontSendNotification);return true;
+        });
+    }
+    void applyControllerBindings(const juce::MidiMessage& message,const juce::String& device)
+    {
+        for(const auto& b:controllerBindings())
+        {
+            if(b.cc!=message.getControllerNumber() || (b.channel!=0 && b.channel!=message.getChannel()) || (b.device.isNotEmpty() && b.device!=device))continue;
+            const float value=juce::jlimit(0.0f,1.0f,b.low+(b.high-b.low)*message.getControllerValue()/127.0f);
+            if(b.target.startsWith("generator\n")){applyGeneratorController(b.target,value);continue;}
+            if(b.target=="play" || b.target=="stop")
+            {
+                const auto key=b.target+"/"+device+"/"+juce::String(b.channel)+"/"+juce::String(b.cc);const bool down=message.getControllerValue()>=64;
+                const bool previous=controllerButtons[key];controllerButtons[key]=down;if(!down || previous)continue;
+                if(b.target=="play")togglePlayback();else {edit->getTransport().stop(false,false);releaseLiveMidi();}continue;
+            }
+            te::AutomatableParameter* parameter=nullptr;
+            if(b.target.startsWith("parameter\n"))if(auto* plugin=selectedInstrumentPlugin())
+            {
+                const auto parts=juce::StringArray::fromLines(b.target);
+                if(parts.size()==3 && plugin->getName()==parts[1])for(auto* candidate:plugin->getAutomatableParameters())if(candidate->paramID==parts[2])parameter=candidate;
+                if(parameter==nullptr)continue;
+            }
+            if(parameter==nullptr && b.target!="volume" && b.target!="pan" && b.target!="master" && b.target!="tempo")continue;
+            if((b.target=="volume" || b.target=="pan") && instrumentTrack==nullptr)continue;
+            double before=0,after=value;
+            if(parameter!=nullptr)before=parameter->getCurrentNormalisedValue();
+            else if(b.target=="volume"){if(instrumentTrack->getVolumePlugin()==nullptr)continue;before=instrumentTrack->getVolumePlugin()->getVolumeDb();after=-60.0+66.0*value;}
+            else if(b.target=="pan"){if(instrumentTrack->getVolumePlugin()==nullptr)continue;before=instrumentTrack->getVolumePlugin()->getPan();after=value*2-1;}
+            else if(b.target=="master"){before=getMasterGainDb();after=-60.0+66.0*value;}
+            else if(b.target=="tempo"){before=tempoSlider.getValue();after=20+280*value;}
+            if(std::abs(before-after)<0.00001)continue;
+            const auto now=juce::Time::getMillisecondCounter();const auto target=selectedProjectTrackId()+b.target;
+            if(target!=lastControllerUndoTarget || now-lastControllerUndoMs>500){rememberUndo("MIDI controller "+juce::String(b.cc));lastControllerUndoTarget=target;}
+            lastControllerUndoMs=now;
+            if(parameter!=nullptr)parameter->setNormalisedParameter(value,juce::sendNotificationSync);
+            else if(b.target=="volume")setTrackGainDb(getMixerTracks().indexOf(instrumentTrack),-60.0f+66.0f*value);
+            else if(b.target=="pan")setTrackPan(getMixerTracks().indexOf(instrumentTrack),value*2-1);
+            else if(b.target=="master")setMasterGainDb(-60.0f+66.0f*value);
+            else if(b.target=="tempo")tempoSlider.setValue(20+280*value,juce::sendNotificationSync);
+            isDirty=true;
+        }
+    }
+    int midiExportPpq() const
+    {return edit!=nullptr?juce::jlimit(24,15360,int(edit->state.getProperty("orbitMidiExportPpq",te::Edit::ticksPerQuarterNote))):te::Edit::ticksPerQuarterNote;}
+    juce::String transportTimeText(double seconds,int bar)
+    {
+        const int format=edit!=nullptr?int(edit->state.getProperty("orbitTimeDisplay",0)):0;
+        barLabel.setText(format==1?"TIME":format==2?"POSITION":"BAR",juce::dontSendNotification);
+        if(format==1)return juce::String(seconds,2)+" s";
+        if(format==2)
+        {
+            const auto meter=project.getInitialTimeSignature();const double quarter=seconds*project.getInitialTempoBpm()/60;
+            const double beat=std::fmod(quarter*meter.denominator/4,meter.numerator);
+            return juce::String(bar)+":"+juce::String(1+int(beat))+":"+juce::String(int(std::fmod(beat,1.0)*4/meter.denominator*midiExportPpq()));
+        }
+        return juce::String(bar).paddedLeft('0',3);
+    }
+    void showTimebaseOptions()
+    {
+        if(edit==nullptr)return;
+        auto panel=std::make_unique<OptionsPanel>("Set MIDI file resolution and the transport clock display. Existing notes retain their timing. Lower MIDI resolutions round exported note positions.");
+        panel->number("ppq","MIDI export ticks per quarter",midiExportPpq(),24,15360);
+        panel->choice("display","Transport display",{"Bars","Seconds","Bars : beats : ticks"},int(edit->state.getProperty("orbitTimeDisplay",0)));
+        openOptionsTool("Timebase",std::move(panel),[this](const auto& p)
+        {
+            if(edit==nullptr)return false;
+            if(midiExportPpq()!=int(p.value("ppq")) || int(edit->state.getProperty("orbitTimeDisplay",0))!=p.index("display"))
+            {rememberUndo("Change timebase");edit->state.setProperty("orbitMidiExportPpq",int(p.value("ppq")),nullptr);edit->state.setProperty("orbitTimeDisplay",p.index("display"),nullptr);isDirty=true;}
+            resized();status.setText("Timebase settings applied without moving existing notes.",juce::dontSendNotification);return true;
+        },true);
+    }
+    void showMeterOptions()
+    {
+        if(edit==nullptr || !hasProject)return;
+        const auto current=project.getInitialTimeSignature();auto panel=std::make_unique<OptionsPanel>("Set the initial time signature and optional triplet subdivisions for the piano roll. Existing note positions are retained.");
+        panel->number("numerator","Beats per bar",current.numerator,1,32);
+        const juce::Array<int> units{1,2,4,8,16,32};panel->choice("denominator","Beat unit",{"1","2","4","8","16","32"},juce::jmax(0,units.indexOf(current.denominator)));
+        panel->check("triplet","Triplet subdivisions",bool(edit->state.getProperty("orbitTripletGrid",false)));
+        openOptionsTool("Time Signature",std::move(panel),[this,units](const auto& p)
+        {
+            if(edit==nullptr)return false;const int numerator=int(p.value("numerator")),denominator=units[p.index("denominator")];
+            const auto old=project.getInitialTimeSignature();const bool triplet=p.checked("triplet");
+            if(old.numerator==numerator && old.denominator==denominator && bool(edit->state.getProperty("orbitTripletGrid",false))==triplet)return true;
+            rememberUndo("Change time signature");project.setInitialTimeSignature(numerator,denominator);
+            if(auto* meter=edit->tempoSequence.getTimeSig(0))meter->setStringTimeSig(juce::String(numerator)+"/"+juce::String(denominator));
+            edit->state.setProperty("orbitTripletGrid",triplet,nullptr);
+            syncMeterGrid(true);
+            updateLoopRange();isDirty=true;refreshProjectView("Time signature updated. Existing note timing retained.");return true;
+        },true);
+    }
+
+    void syncMeterGrid(bool force=false)
+    {
+        if(edit==nullptr || pianoRollWindow==nullptr || !edit->state.hasProperty("orbitTripletGrid"))return;
+        const int policy=bool(edit->state.getProperty("orbitTripletGrid",false))?1:0;
+        if(force || policy!=lastMeterGridPolicy){pianoRollWindow->setGridOptions(policy?24:16,policy?6:4);lastMeterGridPolicy=policy;}
+    }
+    juce::File firstSampleFolder()
+    {
+        if(auto* settings=applicationProperties.getUserSettings())
+        {
+            juce::StringArray paths;paths.addTokens(settings->getValue("samplePaths"),";\n\r","\"");
+            for(auto path:paths){path=path.trim();if(path.isNotEmpty() && juce::File::isAbsolutePath(path) && juce::File(path).isDirectory())return juce::File(path);}
+        }
+        return juce::File::getSpecialLocation(juce::File::userMusicDirectory);
+    }
+
+    bool canEditPattern() const
+    {
+        const int index=getGeneratorTracks().indexOf(instrumentTrack);
+        return edit!=nullptr && instrumentTrack!=nullptr && juce::isPositiveAndBelow(index,project.getTrackCount())
+            && project.getTrackKind(index)!=ProjectDocument::TrackKind::audio;
+    }
+    juce::PopupMenu makeEditMenu()
+    {
+        juce::PopupMenu menu;
+        const bool text=focusedEditText()!=nullptr;
+        const bool pattern=canEditPattern(), populated=pattern && hasPattern;
+        const juce::String modifier=juce::SystemStats::getOperatingSystemType() & juce::SystemStats::MacOSX ? "Cmd+" : "Ctrl+";
+        const auto add=[&](int id,const juce::String& title,bool enabled,const juce::String& shortcut={})
+        {
+            juce::PopupMenu::Item item(title);item.itemID=id;item.isEnabled=enabled;item.shortcutKeyDescription=shortcut;menu.addItem(std::move(item));
+        };
+        add(201,undoHistory.empty()?"Undo":"Undo "+undoHistory.back().label,text || !undoHistory.empty(),modifier+"Z");
+        add(202,redoHistory.empty()?"Redo":"Redo "+redoHistory.back().label,text || !redoHistory.empty(),modifier+"Shift+Z / Ctrl+Y");
+        menu.addSeparator();add(203,"Cut",text || (populated && !editableNotes().empty()),modifier+"X");
+        add(204,"Copy",text || (populated && !editableNotes().empty()),modifier+"C");
+        add(205,"Paste",text || (pattern && patternClipboard.hasNotes),modifier+"V");
+        add(213,"Select All",text || populated,modifier+"A");menu.addSeparator();
+        add(206,"Randomize",pattern,modifier+"R");add(207,"Randomize Options...",pattern);
+        add(208,"Humanize...",populated || selectedInstrumentPlugin()!=nullptr,"Ctrl+H");
+        add(209,"Quantize...",edit!=nullptr,"Ctrl+Q");add(210,"Transpose...",populated);
+        add(211,"Scale Velocities...",populated);add(212,"Length...",populated);
+        add(214,"Apply Groove Template...",populated);add(215,"Apply Pluck Template...",populated);
+        return menu;
+    }
 
     void showMenu(juce::TextButton& source, int menuKind)
     {
@@ -7123,35 +11127,42 @@ private:
         {
             menu.addItem(101, "New Project...");
             menu.addItem(102, "Open Project...");
-            menu.addItem(103, "Save Project");
+            menu.addItem(112, "Merge Project...", hasProject);
             menu.addSeparator();
+            menu.addItem(103, "Save Project", hasProject);
+            menu.addItem(113, "Save Project As...", hasProject);
+            menu.addItem(114, "Save As Template...", hasProject);
+            menu.addSeparator();
+            menu.addItem(111, "Stream To File...", hasProject && edit != nullptr);
+            juce::PopupMenu importMenu;
+            importMenu.addItem(115, "MIDI Track...", hasProject);
+            importMenu.addItem(116, "MIDI Song...", hasProject);
+            importMenu.addItem(117, "Audio File...", hasProject);
+            menu.addSubMenu("Import", importMenu, hasProject);
+            juce::PopupMenu exportMenu;
+            exportMenu.addItem(118, "Pattern as MIDI File...", hasProject && hasPattern && patternClip != nullptr);
+            exportMenu.addItem(119, "Song as MIDI File...", hasProject && edit != nullptr);
+            menu.addSubMenu("Export", exportMenu, hasProject);
+            menu.addSeparator();
+            menu.addItem(110, "Preferences...");
             menu.addItem(106, "Project Settings...", hasProject);
+            juce::PopupMenu recentMenu;
+            const auto recentFiles = getRecentProjectFiles();
+            for (int i = 0; i < juce::jmin(10, recentFiles.size()); ++i)
+            {
+                const auto& recent = recentFiles.getReference(i);
+                recentMenu.addItem(8000 + i, recent.getFileNameWithoutExtension()
+                    + "  —  " + recent.getParentDirectory().getFullPathName(), recent.existsAsFile());
+            }
+            if (recentFiles.isEmpty())
+                recentMenu.addItem(8010, "No recent projects", false);
+            menu.addSubMenu("Recent Projects", recentMenu);
             menu.addSeparator();
-            menu.addItem(104, "Export MIDI...", hasProject && hasPattern && patternClip != nullptr);
-            menu.addSeparator();
-            menu.addItem(105, "Quit Orbit");
+            menu.addItem(105, "Exit Orbit");
         }
         else if (menuKind == 1) // Edit
         {
-            menu.addItem(201, undoHistory.empty() ? "Undo" : "Undo " + undoHistory.back().label,
-                         !undoHistory.empty());
-            menu.addItem(202, redoHistory.empty() ? "Redo" : "Redo " + redoHistory.back().label,
-                         !redoHistory.empty());
-            menu.addSeparator();
-            menu.addItem(203, "Cut Pattern Notes", hasPattern);
-            menu.addItem(204, "Copy Pattern Notes", hasPattern);
-            menu.addItem(205, "Paste Pattern Notes", instrumentTrack != nullptr && patternClipboard.hasNotes);
-            menu.addItem(213, "Select All Notes", hasPattern);
-            menu.addSeparator();
-            menu.addItem(206, "Randomize", instrumentTrack != nullptr);
-            menu.addItem(207, "Randomize Options...", instrumentTrack != nullptr);
-            menu.addItem(208, "Humanize...", hasPattern);
-            menu.addItem(209, "Quantize...", hasPattern);
-            menu.addItem(210, "Transpose...", hasPattern);
-            menu.addItem(211, "Scale Velocities...", hasPattern);
-            menu.addItem(212, "Length...", hasPattern);
-            menu.addItem(214, "Apply Groove Template... (not available yet)", false);
-            menu.addItem(215, "Apply Pluck Template... (not available yet)", false);
+            menu = makeEditMenu();
         }
         else if (menuKind == 2) // View
         {
@@ -7232,27 +11243,7 @@ private:
         }
         else if (menuKind == 4) // Options
         {
-            menu.addItem(501, "Loop", hasProject, loopButton.getToggleState());
-            menu.addItem(502, "Metronome", hasProject, metronomeButton.getToggleState());
-            menu.addSeparator();
-            menu.addItem(503, "Audio Output Settings...");
-            menu.addItem(516, "Audio / MIDI Diagnostics...");
-            menu.addItem(504, "Audio Input Settings...");
-            menu.addSeparator();
-            menu.addItem(505, "MIDI Input Settings...");
-            menu.addItem(506, "MIDI In Controllers... (not available)", false);
-            menu.addSeparator();
-            menu.addItem(507, "Sample Paths...");
-            menu.addItem(508, "VST Paths...");
-            menu.addItem(514, "Skins (not available yet)", false);
-            menu.addItem(515, "Wallpapers (not available yet)", false);
-            menu.addSeparator();
-            menu.addItem(509, "Time Signature...", hasProject);
-            menu.addItem(510, "Timebase... (coming in a later pass)", false);
-            menu.addSeparator();
-            menu.addItem(511, "Preferences...");
-            menu.addItem(512, "Project Settings...", hasProject);
-            menu.addItem(513, "Playlist Settings...");
+            menu = makeOptionsMenu();
         }
         else if (menuKind == 5) // Window
         {
@@ -7288,11 +11279,40 @@ private:
     void handleMenuResult(int menuKind, int item)
     {
         if (item == 0) return;
+        if (menuKind == 4 && item >= 5500 && item < 5500 + orbit::options::skinNames.size()) { setSkin(item-5500); return; }
+        if (menuKind == 4 && item >= 5600 && item <= 5602) { setWallpaper(item-5600); return; }
+        if (menuKind == 4 && item >= 5610 && item <= 5612) { saveOption("wallpaperMode", item-5610); repaint(); return; }
+        if (menuKind == 1)
+            if (auto* text = focusedEditText())
+            {
+                switch (item)
+                {
+                    case 201: text->undo(); return; case 202: text->redo(); return;
+                    case 203: text->cutToClipboard(); return; case 204: text->copyToClipboard(); return;
+                    case 205: text->pasteFromClipboard(); return; case 213: text->selectAll(); return;
+                    default: break;
+                }
+            }
+        if (menuKind == 0 && item >= 8000 && item < 8010)
+        {
+            const auto recentFiles = getRecentProjectFiles();
+            const auto recentIndex = item - 8000;
+            if (juce::isPositiveAndBelow(recentIndex, recentFiles.size()))
+                openProjectFile(recentFiles.getReference(recentIndex));
+            return;
+        }
         const int vst3Index = item - 1000;
-        if (juce::isPositiveAndBelow(vst3Index, vst3MenuDescriptions.size()))
+        if (menuKind == 3 && juce::isPositiveAndBelow(vst3Index, vst3MenuDescriptions.size()))
         {
             addVst3Instrument(vst3MenuDescriptions.getReference(vst3Index));
             return;
+        }
+        if (menuKind == 1)
+        {
+            const bool pattern = canEditPattern();
+            if ((item == 203 || item == 204 || item == 213 || (item >= 210 && item <= 215)) && (!pattern || !hasPattern)) return;
+            if ((item == 205 || item == 206 || item == 207) && !pattern) return;
+            if ((item == 208 || item == 209) && edit == nullptr) return;
         }
         switch (item)
         {
@@ -7309,10 +11329,22 @@ private:
             case 211: showScaleVelocitiesDialog(); break;
             case 212: showLengthDialog(); break;
             case 213: selectAllPatternNotes(); break;
+            case 214: showGrooveTemplateDialog(); break;
+            case 215: showPluckTemplateDialog(); break;
             case 101: createProject(); break;
             case 102: openProject(); break;
             case 103: saveProject(); break;
-            case 104: exportMidi(); break;
+            case 104: exportMidi(false); break;
+            case 110: showPreferences(); break;
+            case 111: showStreamToFileDialog(); break;
+            case 112: mergeProject(); break;
+            case 113: saveProjectAs(); break;
+            case 114: saveProjectAsTemplate(); break;
+            case 115: importMidiTrack(); break;
+            case 116: importMidiSong(); break;
+            case 117: importAudioFile(); break;
+            case 118: exportMidi(false); break;
+            case 119: exportMidi(true); break;
             case 106: case 512: showProjectSettings(); break;
             case 511: showPreferences(); break;
             case 513: showPlaylistSettings(); break;
@@ -7321,7 +11353,8 @@ private:
             case 302: showMixer(); break;
             case 303: showMixer(true); break;
             case 304: showPianoRoll(); break;
-            case 305: case 503: showAudioSettings(); break;
+            case 305: showAudioSettings(); break;
+            case 503: showAudioOutputOptions(); break;
             case 516: showAudioDiagnostics(); break;
             case 308: showTempoDialog(); break;
             case 309: case 509: showTimeSignatureDialog(); break;
@@ -7330,7 +11363,14 @@ private:
                 if (auto* window = dynamic_cast<juce::ResizableWindow*>(getTopLevelComponent()))
                     window->setFullScreen(!window->isFullScreen());
                 break;
-            case 504: case 505: showAudioSettings(); break;
+            case 504: showAudioInputOptions(); break;
+            case 505: showMidiInputOptions(); break;
+            case 506: showMidiControllers(); break;
+            case 510: showTimebaseOptions(); break;
+            case 517: setMidiOutputEnabled(!optionBool("midiOut", false)); break;
+            case 518: showMidiOutputOptions(); break;
+            case 519: toggleVirtualKeyboard(); break;
+            case 5603: chooseWallpaper(); break;
             case 507: showSamplePathsDialog(); break;
             case 508: showVstPathsDialog(); break;
             case 306:
@@ -7369,7 +11409,11 @@ private:
             case 604: showPianoRoll(); break;
             case 613:
                 if (instrumentTrack != nullptr)
+                {
                     openDrumRackWindow(selectedProjectTrackId());
+                    if (drumRackWindow != nullptr)
+                        drumRackWindow->toFront(true);
+                }
                 break;
             case 605:
                 if (playlistWindow != nullptr) playlistWindow->setVisible(false);
@@ -7430,7 +11474,18 @@ private:
             description->setReturnKeyStartsNewLine(true);
         }
         dialog.addTextEditor("creatorUrl", project.getCreatorUrl(), "Creator webpage URL:");
-        dialog.addTextBlock("Changes are stored in the Orbit project file. Instrument bundling and alternate tuning tables are not available yet.");
+        dialog.addTextBlock("Mixer and playback options are saved with this project.");
+        juce::ToggleButton delayCompensationToggle("Plugin delay compensation");
+        delayCompensationToggle.setSize(300, 24);
+        delayCompensationToggle.setToggleState(project.isPluginDelayCompensationEnabled(), juce::dontSendNotification);
+        delayCompensationToggle.setTooltip("Aligns playback paths to account for the latency reported by plug-ins.");
+        dialog.addCustomComponent(&delayCompensationToggle);
+        juce::ToggleButton multiCoreToggle("Use multiple CPU cores for audio");
+        multiCoreToggle.setSize(300, 24);
+        multiCoreToggle.setToggleState(project.isMultiCoreAudioEnabled(), juce::dontSendNotification);
+        multiCoreToggle.setTooltip("Uses the available CPU cores to process the audio graph.");
+        dialog.addCustomComponent(&multiCoreToggle);
+        dialog.addTextBlock("Changing playback options rebuilds the audio graph. Instrument bundling and alternate tuning tables are not available yet.");
         dialog.addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
         dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
         if (dialog.runModalLoop() != 1) return;
@@ -7438,12 +11493,25 @@ private:
         const auto name = dialog.getTextEditorContents("name").trim();
         const auto description = dialog.getTextEditorContents("description").trim();
         const auto creatorUrl = dialog.getTextEditorContents("creatorUrl").trim();
+        const auto delayCompensationEnabled = delayCompensationToggle.getToggleState();
+        const auto multiCoreEnabled = multiCoreToggle.getToggleState();
+        const auto multiCoreWasEnabled = project.isMultiCoreAudioEnabled();
         if (name == project.getName() && description == project.getDescription()
-            && creatorUrl == project.getCreatorUrl()) return;
+            && creatorUrl == project.getCreatorUrl()
+            && delayCompensationEnabled == project.isPluginDelayCompensationEnabled()
+            && multiCoreEnabled == project.isMultiCoreAudioEnabled()) return;
         rememberUndo("Change project settings");
         project.setName(name);
         project.setDescription(description);
         project.setCreatorUrl(creatorUrl);
+        project.setPluginDelayCompensationEnabled(delayCompensationEnabled);
+        project.setMultiCoreAudioEnabled(multiCoreEnabled);
+        if (edit != nullptr)
+        {
+            edit->setLatencyCompensationEnabled(delayCompensationEnabled);
+            if (multiCoreEnabled != multiCoreWasEnabled)
+                edit->restartPlayback();
+        }
         isDirty = true;
         refreshProjectView("Project settings updated. Save to keep the change.");
     }
@@ -7608,9 +11676,15 @@ private:
     juce::String getInstrumentHeaderText() const
     {
         if (instrumentTrack != nullptr)
+        {
             for (auto* plugin : instrumentTrack->pluginList)
+            {
                 if (auto* external = dynamic_cast<te::ExternalPlugin*>(plugin))
                     return external->getName() + "  ·  VST3 INSTRUMENT";
+                if (dynamic_cast<te::SamplerPlugin*>(plugin) != nullptr)
+                    return "DRUM RACK  ·  SAMPLER";
+            }
+        }
         return "4OSC  ·  BUILT-IN SYNTH";
     }
 
@@ -7663,6 +11737,7 @@ private:
         instrumentTrack = track;
         patternClip = nullptr;
         updateActiveInstrumentEditor();
+        fitGeneratorPanelToPluginEditor();
         refreshTrackSelector();
         readPatternSteps();
         refreshPianoRollAutomationTargets();
@@ -7722,39 +11797,7 @@ private:
         tempoSlider.setValue(bpm, juce::sendNotificationSync);
     }
 
-    void showTimeSignatureDialog()
-    {
-        if (!hasProject || edit == nullptr) return;
-        const auto current = project.getInitialTimeSignature();
-        juce::AlertWindow dialog("Time Signature", "Set the project's initial meter.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("numerator", juce::String(current.numerator), "Beats per bar:");
-        dialog.addTextEditor("denominator", juce::String(current.denominator), "Beat unit (1, 2, 4, 8, 16, 32):");
-        dialog.addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
-        dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
-        if (dialog.runModalLoop() != 1) return;
-
-        const auto numerator = juce::jlimit(1, 32, dialog.getTextEditorContents("numerator").getIntValue());
-        auto denominator = dialog.getTextEditorContents("denominator").getIntValue();
-        if (denominator != 1 && denominator != 2 && denominator != 4 && denominator != 8
-            && denominator != 16 && denominator != 32)
-            denominator = 4;
-        if (current.numerator == numerator && current.denominator == denominator) return;
-
-        rememberUndo("Change time signature");
-        project.setInitialTimeSignature(numerator, denominator);
-        if (auto* initialMeter = edit->tempoSequence.getTimeSig(0))
-            initialMeter->setStringTimeSig(juce::String(numerator) + "/" + juce::String(denominator));
-        updateLoopRange();
-        const auto signatureText = juce::String(numerator) + "/" + juce::String(denominator);
-        timeSignatureLabel.setText(signatureText, juce::dontSendNotification);
-        musicalDetails.setText("Tracks: " + juce::String(project.getTrackCount()) + "   |   "
-                                   + juce::String(tempoSlider.getValue(), 1) + " BPM   |   " + signatureText
-                                   + "   |   Built-in 4OSC   |   64 patterns per generator",
-                               juce::dontSendNotification);
-        isDirty = true;
-        status.setText("Time signature changed. Save to keep the change.", juce::dontSendNotification);
-    }
+    void showTimeSignatureDialog() { showMeterOptions(); }
 
     void showModules()
     {
@@ -7789,90 +11832,110 @@ private:
         if (playlistWindow != nullptr) playlistWindow->showSettings();
     }
 
+    void clearNoteSelection()
+    {
+        selectedNoteKeys.clear();allNotesSelected=false;
+        noteSelectionTrackId=selectedProjectTrackId();noteSelectionPattern=selectedPatternIndex();
+    }
+    void syncNoteSelection()
+    {
+        const auto id=selectedProjectTrackId();const int slot=selectedPatternIndex();
+        if(id!=noteSelectionTrackId || slot!=noteSelectionPattern){clearNoteSelection();notePasteTick=0;}
+        std::set<std::pair<int,int>> present;
+        for(const auto& n:project.getPatternNotes(id,slot))present.emplace(n.pitch,n.startTick);
+        std::erase_if(selectedNoteKeys,[&](const auto& key){return !present.contains(key);});
+        allNotesSelected=!present.empty() && present==selectedNoteKeys;
+    }
+    void selectPatternNote(int pitch,int tick,bool additive)
+    {
+        syncNoteSelection();
+        if(pitch<0){clearNoteSelection();if(pianoRollWindow!=nullptr)pianoRollWindow->refresh(getSelectedPatternTitle());return;}
+        const std::pair<int,int> key{pitch,tick};
+        if(!additive)selectedNoteKeys.clear();
+        if(additive && selectedNoteKeys.contains(key))selectedNoteKeys.erase(key);else selectedNoteKeys.insert(key);
+        notePasteTick=tick;syncNoteSelection();
+        if(pianoRollWindow!=nullptr)pianoRollWindow->refresh(getSelectedPatternTitle());
+    }
+    void selectPatternNoteRange(int firstTick,int lastTick,int lowPitch,int highPitch,bool additive)
+    {
+        syncNoteSelection();if(!additive)selectedNoteKeys.clear();
+        for(const auto& n:project.getPatternNotes(selectedProjectTrackId(),selectedPatternIndex()))
+            if(n.pitch>=lowPitch && n.pitch<=highPitch && n.startTick<lastTick
+                && static_cast<juce::int64>(n.startTick)+n.lengthTicks>firstTick)selectedNoteKeys.emplace(n.pitch,n.startTick);
+        notePasteTick=firstTick;syncNoteSelection();
+        if(pianoRollWindow!=nullptr)pianoRollWindow->refresh(getSelectedPatternTitle());
+    }
     void selectAllPatternNotes()
     {
-        if (instrumentTrack == nullptr || !hasPattern) return;
-        const auto hasAnyNotes = std::any_of(noteGrid.begin(), noteGrid.end(), [](const auto& pitchSteps)
-        {
-            return std::any_of(pitchSteps.begin(), pitchSteps.end(), [](bool active) { return active; });
-        });
-        allNotesSelected = hasAnyNotes;
-        if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
-        status.setText(hasAnyNotes ? "Selected all notes in the current pattern."
-                                   : "The current pattern has no notes to select.",
-                       juce::dontSendNotification);
+        clearNoteSelection();
+        for(const auto& n:project.getPatternNotes(selectedProjectTrackId(),selectedPatternIndex()))selectedNoteKeys.emplace(n.pitch,n.startTick);
+        syncNoteSelection();if(pianoRollWindow!=nullptr)pianoRollWindow->refresh(getSelectedPatternTitle());
+        status.setText(selectedNoteKeys.empty()?"The current pattern has no notes to select.":"Selected all notes in the current pattern.",juce::dontSendNotification);
     }
-
+    void deleteSelectedPatternNotes()
+    {
+        if(instrumentTrack==nullptr || !hasPattern || selectedNoteKeys.empty())return;
+        rememberUndo("Delete selected notes");
+        for(const auto& [pitch,tick]:selectedNoteKeys)project.removePatternNoteTicks(selectedProjectTrackId(),selectedPatternIndex(),pitch,tick);
+        clearNoteSelection();finishPatternEdit("Deleted selected notes.");
+    }
+    static juce::TextEditor* focusedEditText()
+    {
+        auto* focused=juce::Component::getCurrentlyFocusedComponent();
+        if(auto* text=dynamic_cast<juce::TextEditor*>(focused))return text;
+        return focused!=nullptr?focused->findParentComponentOfClass<juce::TextEditor>():nullptr;
+    }
+    bool handleEditShortcut(const juce::KeyPress& key,bool fromGrid=false)
+    {
+        if(key.getKeyCode()==juce::KeyPress::F12Key){toggleVirtualKeyboard();return true;}
+        if(focusedEditText()!=nullptr)return false;
+        const auto mods=key.getModifiers();const auto c=juce::CharacterFunctions::toLowerCase(key.getTextCharacter());
+        if(mods.isCommandDown() || mods.isCtrlDown())
+        {
+            int command=0;
+            if(c=='z')command=mods.isShiftDown()?202:201;else if(c=='y')command=202;
+            else if(c=='x')command=203;else if(c=='c')command=204;else if(c=='v')command=205;
+            else if(c=='a')command=213;else if(c=='r')command=206;else if(c=='h' && mods.isCtrlDown())command=208;
+            else if(c=='q' && mods.isCtrlDown())command=209; // Keep macOS Cmd-Q available for Quit.
+            if(command!=0){handleMenuResult(1,command);return true;}
+        }
+        if(fromGrid && key.getKeyCode()==juce::KeyPress::escapeKey){clearNoteSelection();if(pianoRollWindow!=nullptr)pianoRollWindow->refresh(getSelectedPatternTitle());return true;}
+        if(fromGrid && (key.getKeyCode()==juce::KeyPress::deleteKey || key.getKeyCode()==juce::KeyPress::backspaceKey)){deleteSelectedPatternNotes();return true;}
+        return false;
+    }
     void copyOrCutPatternNotes(bool cut)
     {
-        if (instrumentTrack == nullptr || edit == nullptr || !hasPattern) return;
-        patternClipboard = {};
-        patternClipboard.lengthSteps = selectedPatternLength();
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        bool foundNote = false;
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                const auto enabled = project.getPatternNote(trackId, patternIndex, pitch, step);
-                patternClipboard.notes[row][column] = enabled;
-                if (enabled)
-                {
-                    foundNote = true;
-                    patternClipboard.lengths[row][column] = project.getPatternNoteLength(trackId, patternIndex, pitch, step);
-                    patternClipboard.velocities[row][column] = project.getPatternNoteVelocity(trackId, patternIndex, pitch, step);
-                }
-            }
-        patternClipboard.hasNotes = foundNote;
-        if (!cut || !foundNote) return;
-
-        rememberUndo("Cut pattern notes");
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-                if (patternClipboard.notes[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(step)])
-                    project.setPatternNote(trackId, patternIndex, pitch, step, false);
-        readPatternSteps();
-        allNotesSelected = false;
-        refreshPatternLengthDisplay();
-        loadSelectedPitchSteps();
-        isDirty = true;
-        rebuildPatternClip();
-        status.setText("Cut notes from Pattern " + juce::String::charToString(static_cast<juce::juce_wchar>('A' + patternIndex / 8))
-                       + juce::String(patternIndex % 8 + 1) + ".", juce::dontSendNotification);
+        if(instrumentTrack==nullptr || edit==nullptr || !hasPattern)return;
+        auto notes=editableNotes();if(notes.empty())return;
+        patternClipboard.notes=std::move(notes);patternClipboard.hasNotes=true;
+        patternClipboard.lengthSteps=project.getPatternLengthSteps(selectedProjectTrackId(),selectedPatternIndex());
+        patternClipboard.wholePattern=selectedNoteKeys.empty() || allNotesSelected;
+        patternClipboard.originTick=patternClipboard.wholePattern?0:std::min_element(patternClipboard.notes.begin(),patternClipboard.notes.end(),[](const auto& a,const auto& b){return a.startTick<b.startTick;})->startTick;
+        if(!cut){status.setText("Copied "+juce::String(patternClipboard.notes.size())+" note(s).",juce::dontSendNotification);return;}
+        rememberUndo("Cut notes");
+        for(const auto& n:patternClipboard.notes)project.removePatternNoteTicks(selectedProjectTrackId(),selectedPatternIndex(),n.pitch,n.startTick);
+        clearNoteSelection();finishPatternEdit("Cut selected notes.");
     }
-
     void pastePatternNotes()
     {
-        if (instrumentTrack == nullptr || edit == nullptr || !patternClipboard.hasNotes) return;
-        rememberUndo("Paste pattern notes");
-        allNotesSelected = false;
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        project.setPatternCreated(trackId, patternIndex, true);
-        project.setPatternLengthSteps(trackId, patternIndex, patternClipboard.lengthSteps);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                const auto enabled = patternClipboard.notes[row][column];
-                project.setPatternNote(trackId, patternIndex, pitch, step, enabled);
-                if (enabled)
-                {
-                    project.setPatternNoteLength(trackId, patternIndex, pitch, step,
-                        patternClipboard.lengths[row][column]);
-                    project.setPatternNoteVelocity(trackId, patternIndex, pitch, step,
-                        patternClipboard.velocities[row][column]);
-                }
-            }
-        readPatternSteps();
-        refreshPatternLengthDisplay();
-        loadSelectedPitchSteps();
-        isDirty = true;
-        rebuildPatternClip();
-        status.setText("Pasted notes into the selected pattern.", juce::dontSendNotification);
+        if(instrumentTrack==nullptr || edit==nullptr || !patternClipboard.hasNotes)return;
+        const auto id=selectedProjectTrackId();const int slot=selectedPatternIndex();
+        std::vector<PatternTickNote> pasted=patternClipboard.notes;
+        for(auto& n:pasted)
+        {
+            const auto start=static_cast<juce::int64>(n.startTick)-patternClipboard.originTick+notePasteTick;
+            if(start<0 || start>=orbit::editing::maximumTick || n.lengthTicks>orbit::editing::maximumTick-start)
+            {status.setText("Paste would exceed the pattern's timing range. Move the edit cursor earlier.",juce::dontSendNotification);return;}
+            n.startTick=int(start);
+        }
+        rememberUndo("Paste notes");clearNoteSelection();
+        project.setPatternCreated(id,slot,true);
+        if(patternClipboard.wholePattern)
+            project.setPatternLengthSteps(id,slot,juce::jmax(project.getPatternLengthSteps(id,slot),
+                int(juce::jmin<juce::int64>(ProjectDocument::maximumPatternLengthSteps,
+                    (static_cast<juce::int64>(notePasteTick)+static_cast<juce::int64>(patternClipboard.lengthSteps)*64+63)/64))));
+        for(const auto& n:pasted){project.appendPatternNoteTicks(id,slot,n.pitch,n.startTick,n.lengthTicks,n.velocity);selectedNoteKeys.emplace(n.pitch,n.startTick);}
+        finishPatternEdit("Pasted "+juce::String(pasted.size())+" note(s).");
     }
 
     PatternData capturePatternData(const juce::String& trackId, int patternIndex) const
@@ -7880,18 +11943,16 @@ private:
         PatternData data;
         data.created = project.isPatternCreated(trackId, patternIndex);
         data.lengthSteps = project.getPatternLengthSteps(trackId, patternIndex);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                data.notes[row][column] = project.getPatternNote(trackId, patternIndex, pitch, step);
-                if (data.notes[row][column])
-                {
-                    data.lengths[row][column] = project.getPatternNoteLength(trackId, patternIndex, pitch, step);
-                    data.velocities[row][column] = project.getPatternNoteVelocity(trackId, patternIndex, pitch, step);
-                }
-            }
+        const auto sourceNotes = project.getPatternNotes(trackId, patternIndex);
+        for (const auto& note : sourceNotes)
+        {
+            const auto noteEnd = static_cast<juce::int64>(note.startTick) + note.lengthTicks;
+            const auto noteEndSteps = static_cast<int>(juce::jmin<juce::int64>(
+                ProjectDocument::maximumPatternLengthSteps,
+                noteEnd / 64 + (noteEnd % 64 != 0 ? 1 : 0)));
+            data.lengthSteps = juce::jmax(data.lengthSteps, noteEndSteps);
+            data.notes.push_back({ note.pitch, note.startTick, note.lengthTicks, note.velocity });
+        }
         return data;
     }
 
@@ -7899,21 +11960,17 @@ private:
     {
         project.setPatternCreated(trackId, patternIndex, data.created);
         project.setPatternLengthSteps(trackId, patternIndex, data.lengthSteps);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                const auto enabled = data.notes[row][column];
-                project.setPatternNote(trackId, patternIndex, pitch, step, enabled);
-                if (enabled)
-                {
-                    project.setPatternNoteLength(trackId, patternIndex, pitch, step,
-                        juce::jlimit(1, 64 - step, data.lengths[row][column]));
-                    project.setPatternNoteVelocity(trackId, patternIndex, pitch, step,
-                        juce::jlimit(1, 127, data.velocities[row][column]));
-                }
-            }
+        for (const auto& note : project.getPatternNotes(trackId, patternIndex))
+            project.removePatternNoteTicks(trackId, patternIndex, note.pitch, note.startTick);
+        constexpr auto maximumTicks = ProjectDocument::maximumPatternLengthSteps * 64;
+        for (const auto& note : data.notes)
+        {
+            if (note.pitch < 0 || note.pitch > 127
+                || !juce::isPositiveAndBelow(note.startTick, maximumTicks)) continue;
+            const auto length = juce::jlimit(1, maximumTicks - note.startTick, note.lengthTicks);
+            project.appendPatternNoteTicks(trackId, patternIndex, note.pitch, note.startTick,
+                length, juce::jlimit(1, 127, note.velocity));
+        }
     }
 
     void finishPatternEdit(const juce::String& message)
@@ -7926,238 +11983,318 @@ private:
         status.setText(message + " Save to keep the change.", juce::dontSendNotification);
     }
 
-    void showRandomizeOptions()
+    double editSetting(const juce::String& name, double fallback)
     {
-        juce::AlertWindow dialog("Randomize Options", "Set the note range and density used by Randomize.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("density", juce::String(randomDensityPercent), "Density (percent):");
-        dialog.addTextEditor("low", juce::String(randomPitchLow), "Lowest pitch (MIDI note):");
-        dialog.addTextEditor("high", juce::String(randomPitchHigh), "Highest pitch (MIDI note):");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        randomDensityPercent = juce::jlimit(1, 100, dialog.getTextEditorContents("density").getIntValue());
-        randomPitchLow = juce::jlimit(minimumPitch, maximumPitch, dialog.getTextEditorContents("low").getIntValue());
-        randomPitchHigh = juce::jlimit(randomPitchLow, maximumPitch, dialog.getTextEditorContents("high").getIntValue());
-        status.setText("Randomize options saved.", juce::dontSendNotification);
+        if (auto* settings = applicationProperties.getUserSettings()) return settings->getDoubleValue("edit." + name, fallback);
+        return fallback;
     }
-
+    void saveEditSetting(const juce::String& name, double value)
+    {
+        if (auto* settings = applicationProperties.getUserSettings()) settings->setValue("edit." + name, value);
+    }
+    void openEditTool(const juce::String& title, std::unique_ptr<EditToolPanel> panel,
+                      std::function<bool(const EditToolPanel&)> action)
+    {
+        auto* content = panel.get();
+        juce::DialogWindow::LaunchOptions options;
+        options.dialogTitle = title; options.dialogBackgroundColour = orbit::options::colour(27,43,55);
+        options.componentToCentreAround = this; options.useNativeTitleBar = true; options.resizable = false;
+        options.content.setOwned(panel.release());
+        auto* window = options.launchAsync();
+        const juce::Component::SafePointer<ProjectView> safeThis(this);
+        const juce::Component::SafePointer<juce::DialogWindow> safeWindow(window);
+        content->apply.onClick = [safeThis, safeWindow, content, action = std::move(action)]
+        {
+            if (safeThis == nullptr || safeWindow == nullptr) return;
+            if (action(*content)) safeWindow->exitModalState(1);
+            else content->setMessage(safeThis->status.getText());
+        };
+        content->cancel.onClick = [safeWindow] { if (safeWindow != nullptr) safeWindow->exitModalState(0); };
+    }
+    std::vector<PatternTickNote> editableNotes() const
+    {
+        auto data = capturePatternData(selectedProjectTrackId(), selectedPatternIndex());
+        if (!selectedNoteKeys.empty())
+            std::erase_if(data.notes, [this](const auto& n) { return !selectedNoteKeys.contains({n.pitch,n.startTick}); });
+        return data.notes;
+    }
+    bool applyPatternTool(const juce::String& label, const std::function<void(std::vector<PatternTickNote>&)>& action)
+    {
+        if (instrumentTrack == nullptr || edit == nullptr || !hasPattern) return false;
+        auto data = capturePatternData(selectedProjectTrackId(),selectedPatternIndex());
+        auto changed = editableNotes();
+        if (changed.empty()) return false;
+        auto original = changed; action(changed);
+        if (changed == original) { status.setText("No note changes were needed.",juce::dontSendNotification); return false; }
+        const bool selection = !selectedNoteKeys.empty();
+        if (selection)
+        {
+            size_t next = 0;
+            for (auto& n : data.notes) if (selectedNoteKeys.contains({n.pitch,n.startTick})) n = changed[next++];
+        }
+        else data.notes = std::move(changed);
+        rememberUndo(label);
+        if (selection)
+        {
+            selectedNoteKeys.clear();
+            for (const auto& n : changed) selectedNoteKeys.emplace(n.pitch,n.startTick);
+        }
+        writePatternData(selectedProjectTrackId(),selectedPatternIndex(),data);
+        finishPatternEdit(label + "."); return true;
+    }
+    te::Plugin* selectedInstrumentPlugin() const
+    {
+        if (instrumentTrack == nullptr) return nullptr;
+        for (auto* plugin : instrumentTrack->pluginList)
+            if (dynamic_cast<te::FourOscPlugin*>(plugin) != nullptr || dynamic_cast<te::SamplerPlugin*>(plugin) != nullptr
+                || (dynamic_cast<te::ExternalPlugin*>(plugin) != nullptr && dynamic_cast<te::ExternalPlugin*>(plugin)->isSynth())) return plugin;
+        return nullptr;
+    }
+    bool isDrumGenerator(int index) const
+    {
+        if (!juce::isPositiveAndBelow(index,project.getTrackCount())) return false;
+        const auto tracks = getGeneratorTracks();
+        if (!juce::isPositiveAndBelow(index,tracks.size())) return false;
+        return tracks[index]->state.getProperty(juce::Identifier("orbitDrumRack"),false)
+            || findSamplerPlugin(project.getTrackId(index)) != nullptr;
+    }
+    int editDrumPad() const
+    {
+        return drumRackWindow!=nullptr && drumRackTrackId==selectedProjectTrackId()?drumRackWindow->getSelectedPad():0;
+    }
+    bool canVaryInstrumentControls() const
+    {
+        auto* plugin=selectedInstrumentPlugin();
+        if(auto* sampler=dynamic_cast<te::SamplerPlugin*>(plugin))return findDrumRackSoundIndex(sampler,editDrumPad())>=0;
+        return plugin!=nullptr && plugin->getNumAutomatableParameters()>0;
+    }
+    bool varyInstrumentControls(double amount, bool replace)
+    {
+        auto* plugin = selectedInstrumentPlugin(); if (plugin == nullptr || amount <= 0) return false;
+        bool changed = false;
+        std::uniform_real_distribution<float> random(0,1);
+        if (auto* sampler=dynamic_cast<te::SamplerPlugin*>(plugin))
+        {
+            const int pad=editDrumPad(),sound=findDrumRackSoundIndex(sampler,pad);
+            if(sound<0)return false;
+            const auto vary=[&](float before,float low,float high,bool logarithmic)
+            {
+                const float normalized=logarithmic?std::log(before/low)/std::log(high/low):(before-low)/(high-low);
+                const float target=replace?random(editRandom):juce::jlimit(0.0f,1.0f,
+                    normalized+static_cast<float>(amount/100.0)*(random(editRandom)*2-1));
+                return logarithmic?low*std::pow(high/low,target):low+(high-low)*target;
+            };
+            sampler->setSoundGains(sound,sampler->getSoundGainDb(sound),vary(sampler->getSoundPan(sound),-1,1,false));
+            sampler->setSoundCutoffHz(sound,vary(juce::jlimit(40.0f,20000.0f,sampler->getSoundCutoffHz(sound)),40,20000,true));
+            sampler->setSoundReleaseMs(sound,vary(juce::jlimit(0.0f,2000.0f,sampler->getSoundReleaseMs(sound)),0,2000,false));
+            sampler->setSoundVelocityParams(sound,vary(sampler->getSoundVelocitySensitivity(sound),0,1,false),
+                sampler->getSoundVelocityTune(sound),sampler->getSoundVelocityOffset(sound));
+            if(drumRackWindow!=nullptr && drumRackTrackId==selectedProjectTrackId())drumRackWindow->setPadInfo(pad,getDrumRackPadInfo(sampler,pad));
+            return true;
+        }
+        for (auto* parameter : plugin->getAutomatableParameters())
+        {
+            if (parameter == nullptr || parameter->getValueRange().getLength() <= 0) continue;
+            const auto name = parameter->getParameterName().toLowerCase();
+            // Keep loudness, pitch and bypass stable while exploring timbre.
+            if (name.contains("volume") || name.contains("gain") || name.contains("level") || name.contains("pitch")
+                || name.contains("tune") || name.contains("transpose") || name.contains("bypass")) continue;
+            const auto before = parameter->getCurrentValue();
+            const auto normalized = parameter->valueRange.convertTo0to1(before);
+            const auto target = replace ? random(editRandom) : juce::jlimit(0.0f,1.0f,
+                normalized + static_cast<float>(amount / 100.0) * (random(editRandom)*2-1));
+            const auto value = parameter->valueRange.snapToLegalValue(parameter->valueRange.convertFrom0to1(target));
+            if (value == before) continue;
+            parameter->parameterChangeGestureBegin(); parameter->setParameter(value,juce::sendNotification);
+            parameter->parameterChangeGestureEnd(); changed = true;
+        }
+        return changed;
+    }
+    void showRandomizeOptions(bool randomizeAfter = false)
+    {
+        auto panel=std::make_unique<EditToolPanel>("Generate a new pattern, explore instrument controls, or do both. Volume and pitch controls stay unchanged.");
+        panel->check("pattern","Current pattern",editSetting("random.pattern",1)!=0);
+        auto& controls=panel->check("controls","Current instrument controls",canVaryInstrumentControls() && editSetting("random.controls",0)!=0); controls.setEnabled(canVaryInstrumentControls());
+        panel->choice("algorithm","Pattern algorithm",{"Trance Flavor 1","Trance Flavor 2","Pure Random","Chord / scale"},int(editSetting("random.algorithm",0)));
+        juce::StringArray sets;for (const auto& set:orbit::editing::pitchSets()) sets.add(juce::String::fromUTF8(set.name.c_str()));
+        panel->choice("pitchSet","Chord / scale",sets,int(editSetting("random.pitchSet",0)));
+        panel->choice("root","Root",{"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"},int(editSetting("random.root",0)));
+        panel->number("density","Density (%)",editSetting("random.density",45),0,100);
+        panel->number("low","Lowest MIDI note",editSetting("random.low",48),0,127);
+        panel->number("high","Highest MIDI note",editSetting("random.high",72),0,127);
+        if(findSamplerPlugin(selectedProjectTrackId())!=nullptr)
+            panel->check("selectedPad","Selected drum pad only",editSetting("random.selectedPad",1)!=0);
+        panel->check("ask","Ask this every time",editSetting("random.ask",0)!=0);
+        panel->apply.setButtonText(randomizeAfter?"Randomize":"Save Options");
+        openEditTool("Randomize Options",std::move(panel),[this,randomizeAfter](const auto& p)
+        {
+            if (!p.checked("pattern") && !p.checked("controls")) {status.setText("Choose a randomization target.",juce::dontSendNotification);return false;}
+            if (p.value("low")>p.value("high")) {status.setText("The lowest note must not exceed the highest note.",juce::dontSendNotification);return false;}
+            for (auto key:{"pattern","controls","ask"})saveEditSetting("random."+juce::String(key),p.checked(key)?1:0);
+            for (auto key:{"algorithm","pitchSet","root"})saveEditSetting("random."+juce::String(key),p.index(key));
+            for (auto key:{"density","low","high"})saveEditSetting("random."+juce::String(key),p.value(key));
+            if(findSamplerPlugin(selectedProjectTrackId())!=nullptr)saveEditSetting("random.selectedPad",p.checked("selectedPad"));
+            if(randomizeAfter) performRandomize();return true;
+        });
+    }
     void randomizeCurrentPattern()
     {
-        if (instrumentTrack == nullptr || edit == nullptr) return;
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        const auto length = data.lengthSteps;
-        auto& random = juce::Random::getSystemRandom();
-        for (int step = 0; step < length; ++step)
-        {
-            if (random.nextInt(100) >= randomDensityPercent) continue;
-            const auto pitch = random.nextInt(juce::Range<int>(randomPitchLow, randomPitchHigh + 1));
-            const auto row = static_cast<size_t>(pitch - minimumPitch);
-            const auto column = static_cast<size_t>(step);
-            data.notes[row][column] = true;
-            data.lengths[row][column] = 1;
-            data.velocities[row][column] = random.nextInt(juce::Range<int>(70, 121));
-        }
-        data.created = true;
-        rememberUndo("Randomize pattern");
-        writePatternData(trackId, patternIndex, data);
-        finishPatternEdit("Pattern randomized.");
+        if(instrumentTrack==nullptr || edit==nullptr)return;
+        if(editSetting("random.ask",0)!=0){showRandomizeOptions(true);return;} performRandomize();
     }
-
+    void performRandomize()
+    {
+        if(instrumentTrack==nullptr || edit==nullptr)return;
+        const bool pattern=editSetting("random.pattern",1)!=0, controls=editSetting("random.controls",0)!=0;
+        auto data=capturePatternData(selectedProjectTrackId(),selectedPatternIndex());
+        if(pattern)
+        {
+            if(data.lengthSteps>65536){status.setText("Randomize supports patterns up to 65,536 steps. Shorten this pattern first.",juce::dontSendNotification);return;}
+            std::vector<int> pads;
+            const bool drum=isDrumGenerator(getGeneratorTracks().indexOf(instrumentTrack));
+            const bool selectedPad=drum && editSetting("random.selectedPad",1)!=0;
+            if(selectedPad)pads.push_back(48+editDrumPad());
+            else if(drum)for(int i=0;i<16;++i)pads.push_back(48+i);
+            auto generated=orbit::editing::randomPattern(data.lengthSteps,int(editSetting("random.density",45)),int(editSetting("random.low",48)),int(editSetting("random.high",72)),int(editSetting("random.root",0)),
+                static_cast<orbit::editing::RandomAlgorithm>(juce::jlimit(0,3,int(editSetting("random.algorithm",0)))),int(editSetting("random.pitchSet",0)),editRandom,pads);
+            if(selectedPad)
+            {
+                std::erase_if(data.notes,[&](const auto& n){return n.pitch==pads.front();});
+                data.notes.insert(data.notes.end(),generated.begin(),generated.end());
+            }
+            else data.notes=std::move(generated);
+            data.created=true;
+        }
+        if(!pattern && (!controls || !canVaryInstrumentControls()))
+        {status.setText("Choose Current Pattern, or select an instrument/pad with editable controls.",juce::dontSendNotification);return;}
+        rememberUndo("Randomize");
+        if(pattern){clearNoteSelection();writePatternData(selectedProjectTrackId(),selectedPatternIndex(),data);}
+        if(controls)varyInstrumentControls(100,true);
+        finishPatternEdit("Randomized selected targets.");
+    }
     void humanizeCurrentPattern()
     {
-        if (instrumentTrack == nullptr || edit == nullptr || !hasPattern) return;
-        juce::AlertWindow dialog("Humanize", "Vary note start times by up to one step and velocities by the selected amount.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("timing", "1", "Timing variation (steps, 0–4):");
-        dialog.addTextEditor("velocity", "8", "Velocity variation (0–32):");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto timing = juce::jlimit(0, 4, dialog.getTextEditorContents("timing").getIntValue());
-        const auto velocity = juce::jlimit(0, 32, dialog.getTextEditorContents("velocity").getIntValue());
-        if (timing == 0 && velocity == 0) return;
-
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        PatternData result = data;
-        for (auto& row : result.notes) row.fill(false);
-        auto& random = juce::Random::getSystemRandom();
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < data.lengthSteps; ++step)
+        auto panel=std::make_unique<EditToolPanel>("Vary selected notes, or the whole pattern when none are selected. One tick is 1/256 of a quarter note.");
+        panel->number("timing","Note position (max ticks)",editSetting("humanize.timing",2),0,1024);
+        panel->number("velocity","Note velocity (max amount)",editSetting("humanize.velocity",10),0,126);
+        auto& controls=panel->number("controls","Module controls (max %)",canVaryInstrumentControls()?editSetting("humanize.controls",0):0,0,100); controls.setEnabled(canVaryInstrumentControls());
+        openEditTool("Humanize",std::move(panel),[this](const auto& p)
+        {
+            auto data=capturePatternData(selectedProjectTrackId(),selectedPatternIndex());auto notes=editableNotes();
+            orbit::editing::humanize(notes,int(p.value("timing")),int(p.value("velocity")),editRandom);
+            const auto old=editableNotes();const bool controls=p.value("controls")>0 && canVaryInstrumentControls();
+            if(notes!=old || controls)
             {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                if (!data.notes[row][column]) continue;
-                const auto shift = timing == 0 ? 0 : random.nextInt(2 * timing + 1) - timing;
-                const auto movedStep = juce::jlimit(0, data.lengthSteps - 1, step + shift);
-                const auto movedColumn = static_cast<size_t>(movedStep);
-                result.notes[row][movedColumn] = true;
-                result.lengths[row][movedColumn] = data.lengths[row][column];
-                result.velocities[row][movedColumn] = juce::jlimit(1, 127,
-                    data.velocities[row][column] + (velocity == 0 ? 0 : random.nextInt(2 * velocity + 1) - velocity));
+                rememberUndo("Humanize");size_t i=0;for(auto& n:data.notes)if(selectedNoteKeys.empty() || selectedNoteKeys.contains({n.pitch,n.startTick}))n=notes[i++];
+                const bool selection=!selectedNoteKeys.empty();selectedNoteKeys.clear();if(selection)for(const auto& n:notes)selectedNoteKeys.emplace(n.pitch,n.startTick);
+                writePatternData(selectedProjectTrackId(),selectedPatternIndex(),data);if(controls)varyInstrumentControls(p.value("controls"),false);finishPatternEdit("Humanized pattern and selected controls.");
             }
-        rememberUndo("Humanize pattern");
-        writePatternData(trackId, patternIndex, result);
-        finishPatternEdit("Pattern humanized.");
+            for(auto key:{"timing","velocity","controls"})saveEditSetting("humanize."+juce::String(key),p.value(key));return true;
+        });
     }
-
+    static const std::vector<int>& quantizeResolutions(){static const std::vector<int> values{4,8,12,16,24,32,48,64,96,128,256};return values;}
+    void syncInputQuantization()
+    {
+        if(edit==nullptr)return;
+        const bool enabled=edit->state.getProperty(juce::Identifier("orbitInputQuantize"),false);
+        const int resolution=edit->state.getProperty(juce::Identifier("orbitInputQuantizeResolution"),16);
+        const int divisor=juce::jmax(1,resolution/4);
+        const juce::String type=enabled?(divisor==1?juce::String("1 beat"):"1/"+juce::String(divisor)+" beat"):juce::String("(none)");
+        const bool durations=edit->state.getProperty(juce::Identifier("orbitInputQuantizeDurations"),false);
+        for(auto* input:edit->getAllInputDevices())if(input!=nullptr)
+            if(auto* midi=dynamic_cast<te::MidiInputDevice*>(&input->getInputDevice()))
+                if(midi->quantisation.getType(false)!=type || midi->quantisation.getProportion()!=1.0f
+                    || midi->quantisation.isQuantisingNoteOffs()!=durations)
+                {
+                    midi->quantisation.setType(type);midi->quantisation.setProportion(1);
+                    midi->quantisation.setIsQuantisingNoteOffs(durations);
+                }
+    }
     void showQuantizeDialog()
     {
-        if (!hasPattern) return;
-        juce::AlertWindow dialog("Quantize", "Snap note starts to a rhythmic grid.", juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("resolution", "16", "Resolution (notes per bar):");
-        dialog.addTextEditor("durations", "0", "Also quantize durations? 1 = yes, 0 = no:");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto resolution = juce::jlimit(1, 64, dialog.getTextEditorContents("resolution").getIntValue());
-        const auto quantizeDurations = dialog.getTextEditorContents("durations").getIntValue() != 0;
-        const auto grid = juce::jmax(1, 16 / resolution);
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        PatternData result = data;
-        for (auto& row : result.notes) row.fill(false);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < data.lengthSteps; ++step)
+        auto panel=std::make_unique<EditToolPanel>("Quantize note starts and durations independently. Input quantization configures the engine's MIDI recording grid.");
+        panel->choice("resolution","Resolution",{"Quarter","Eighth","Eighth triplet","Sixteenth","Sixteenth triplet","32nd","32nd triplet","64th","64th triplet","128th","256th"},int(editSetting("quantize.index",3)));
+        panel->check("starts","Start times",editSetting("quantize.starts",1)!=0);panel->check("durations","Durations",editSetting("quantize.durations",0)!=0);
+        panel->check("record","Auto-quantize while recording",edit!=nullptr && bool(edit->state.getProperty(juce::Identifier("orbitInputQuantize"),false)));
+        openEditTool("Quantize",std::move(panel),[this](const auto& p)
+        {
+            const int resolution=quantizeResolutions()[size_t(p.index("resolution"))];
+            // Save input policy in the native engine state so project undo/load restores it.
+            const bool policyChanged=bool(edit->state.getProperty(juce::Identifier("orbitInputQuantize"),false))!=p.checked("record")
+                || (p.checked("record") && (int(edit->state.getProperty(juce::Identifier("orbitInputQuantizeResolution"),16))!=resolution
+                    || bool(edit->state.getProperty(juce::Identifier("orbitInputQuantizeDurations"),false))!=p.checked("durations")));
+            auto data=capturePatternData(selectedProjectTrackId(),selectedPatternIndex());auto notes=editableNotes();const auto before=notes;
+            orbit::editing::quantize(notes,resolution,p.checked("starts"),p.checked("durations"));
+            if(notes!=before || policyChanged)
             {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                if (!data.notes[row][column]) continue;
-                const auto snapped = juce::jlimit(0, data.lengthSteps - 1, ((step + grid / 2) / grid) * grid);
-                const auto outColumn = static_cast<size_t>(snapped);
-                result.notes[row][outColumn] = true;
-                result.lengths[row][outColumn] = quantizeDurations
-                    ? juce::jmax(1, ((data.lengths[row][column] + grid / 2) / grid) * grid)
-                    : data.lengths[row][column];
-                result.velocities[row][outColumn] = data.velocities[row][column];
+                rememberUndo("Quantize");size_t i=0;for(auto& n:data.notes)if(selectedNoteKeys.empty() || selectedNoteKeys.contains({n.pitch,n.startTick}))n=notes[i++];
+                const bool selection=!selectedNoteKeys.empty();selectedNoteKeys.clear();if(selection)for(const auto& n:notes)selectedNoteKeys.emplace(n.pitch,n.startTick);
+                writePatternData(selectedProjectTrackId(),selectedPatternIndex(),data);
+                edit->state.setProperty(juce::Identifier("orbitInputQuantize"),p.checked("record"),nullptr);
+                edit->state.setProperty(juce::Identifier("orbitInputQuantizeResolution"),resolution,nullptr);
+                edit->state.setProperty(juce::Identifier("orbitInputQuantizeDurations"),p.checked("durations"),nullptr);
+                syncInputQuantization();finishPatternEdit("Quantized selected note fields.");
             }
-        rememberUndo("Quantize pattern");
-        writePatternData(trackId, patternIndex, result);
-        finishPatternEdit("Pattern quantized.");
+            saveEditSetting("quantize.index",p.index("resolution"));saveEditSetting("quantize.starts",p.checked("starts"));saveEditSetting("quantize.durations",p.checked("durations"));return true;
+        });
     }
-
+    bool transposePatterns(int amount,int scope)
+    {
+        struct Change{juce::String track;int pattern;PatternData data;};std::vector<Change> changes;
+        for(int t=0;t<project.getTrackCount();++t)
+        {
+            const auto id=project.getTrackId(t);
+            if((scope!=2 && id!=selectedProjectTrackId()) || (scope==2 && isDrumGenerator(t)) || project.getTrackKind(t)==ProjectDocument::TrackKind::audio)continue;
+            const int first=scope==0?selectedPatternIndex():0,last=scope==0?first+1:ProjectDocument::patternSlotCount;
+            for(int slot=first;slot<last;++slot)
+            {
+                auto data=capturePatternData(id,slot);if(data.notes.empty())continue;
+                for(auto& n:data.notes)
+                {
+                    if(scope==0 && !selectedNoteKeys.empty() && !selectedNoteKeys.contains({n.pitch,n.startTick}))continue;
+                    if(n.pitch+amount<0 || n.pitch+amount>127){status.setText("Transpose would move notes outside MIDI 0–127. Choose a smaller shift.",juce::dontSendNotification);return false;}
+                    n.pitch+=amount;
+                }
+                changes.push_back({id,slot,std::move(data)});
+            }
+        }
+        if(amount==0 || changes.empty())return true;
+        rememberUndo("Transpose");for(const auto& change:changes)writePatternData(change.track,change.pattern,change.data);
+        std::set<std::pair<int,int>> selected;for(const auto& key:selectedNoteKeys)selected.emplace(key.first+amount,key.second);selectedNoteKeys=std::move(selected);
+        finishPatternEdit("Transposed selected scope.");return true;
+    }
     void showTransposeDialog()
     {
-        if (!hasPattern) return;
-        juce::AlertWindow dialog("Transpose", "Transpose this pattern or more patterns on the selected generator.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("semitones", "1", "Semitones:");
-        dialog.addTextEditor("scope", "0", "Scope: 0 current pattern, 1 generator, 2 all generators:");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto amount = juce::jlimit(-48, 48, dialog.getTextEditorContents("semitones").getIntValue());
-        const auto scope = juce::jlimit(0, 2, dialog.getTextEditorContents("scope").getIntValue());
-        if (amount == 0) return;
-        const auto selectedTrack = selectedProjectTrackId();
-        rememberUndo("Transpose pattern");
-        for (int t = 0; t < project.getTrackCount(); ++t)
-        {
-            const auto trackId = project.getTrackId(t);
-            if (scope != 2 && trackId != selectedTrack) continue;
-            const auto first = scope == 0 ? selectedPatternIndex() : 0;
-            const auto last = scope == 0 ? first + 1 : 64;
-            for (int pattern = first; pattern < last; ++pattern)
-            {
-                auto data = capturePatternData(trackId, pattern);
-                if (!data.created) continue;
-                PatternData result = data;
-                for (auto& row : result.notes) row.fill(false);
-                for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                    for (int step = 0; step < 64; ++step)
-                    {
-                        const auto row = static_cast<size_t>(pitch - minimumPitch);
-                        const auto column = static_cast<size_t>(step);
-                        if (!data.notes[row][column]) continue;
-                        const auto newPitch = pitch + amount;
-                        if (newPitch < minimumPitch || newPitch > maximumPitch) continue;
-                        const auto newRow = static_cast<size_t>(newPitch - minimumPitch);
-                        result.notes[newRow][column] = true;
-                        result.lengths[newRow][column] = data.lengths[row][column];
-                        result.velocities[newRow][column] = data.velocities[row][column];
-                    }
-                writePatternData(trackId, pattern, result);
-            }
-        }
-        finishPatternEdit("Transpose applied.");
+        auto panel=std::make_unique<EditToolPanel>("Transpose selected notes or patterns. The all-generators scope leaves Drum Racks unchanged.");
+        panel->number("semitones","Semitones",0,-127,127);panel->choice("scope","Transpose",{"Current pattern / selection","All patterns on this generator","All generators (except drums)"},int(editSetting("transpose.scope",0)));
+        openEditTool("Transpose",std::move(panel),[this](const auto& p){if(!transposePatterns(int(p.value("semitones")),p.index("scope")))return false;saveEditSetting("transpose.scope",p.index("scope"));return true;});
     }
-
     void showScaleVelocitiesDialog()
     {
-        if (!hasPattern) return;
-        juce::AlertWindow dialog("Scale Velocities", "Scale note velocities across the selected pattern.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("begin", "1", "Begin velocity (1–127):");
-        dialog.addTextEditor("end", "127", "End velocity (1–127):");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto begin = juce::jlimit(1, 127, dialog.getTextEditorContents("begin").getIntValue());
-        const auto end = juce::jlimit(1, 127, dialog.getTextEditorContents("end").getIntValue());
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        std::vector<std::pair<int, int>> locations;
-        for (int step = 0; step < 64; ++step)
-            for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                if (data.notes[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(step)])
-                    locations.emplace_back(pitch, step);
-        if (locations.empty()) return;
-        rememberUndo("Scale velocities");
-        for (size_t i = 0; i < locations.size(); ++i)
-        {
-            const auto fraction = locations.size() <= 1 ? 0.0 : static_cast<double>(i) / (locations.size() - 1);
-            const auto velocity = juce::roundToInt(begin + (end - begin) * fraction);
-            project.setPatternNoteVelocity(trackId, patternIndex, locations[i].first, locations[i].second, velocity);
-        }
-        finishPatternEdit("Note velocities scaled.");
+        auto panel=std::make_unique<EditToolPanel>("Create a velocity ramp from the first selected note time to the last. Chord notes at the same time receive the same value.");
+        panel->number("begin","Begin velocity",editSetting("velocities.begin",1),1,127);panel->number("end","End velocity",editSetting("velocities.end",127),1,127);
+        openEditTool("Scale Velocities",std::move(panel),[this](const auto& p){applyPatternTool("Scale velocities",[&](auto& notes){orbit::editing::scaleVelocities(notes,int(p.value("begin")),int(p.value("end")));});saveEditSetting("velocities.begin",p.value("begin"));saveEditSetting("velocities.end",p.value("end"));return true;});
     }
-
     void showLengthDialog()
     {
-        if (!hasPattern) return;
-        juce::AlertWindow dialog("Length", "Scale pattern note positions and/or durations.",
-                                 juce::MessageBoxIconType::NoIcon);
-        dialog.addTextEditor("percent", "100", "Scale percent:");
-        dialog.addTextEditor("starts", "0", "Scale start times? 1 = yes, 0 = no:");
-        dialog.addTextEditor("durations", "1", "Scale durations? 1 = yes, 0 = no:");
-        dialog.addButton("OK", 1);
-        dialog.addButton("Cancel", 0);
-        if (dialog.runModalLoop() != 1) return;
-        const auto percent = juce::jlimit(10, 800, dialog.getTextEditorContents("percent").getIntValue());
-        const auto scaleStarts = dialog.getTextEditorContents("starts").getIntValue() != 0;
-        const auto scaleDurations = dialog.getTextEditorContents("durations").getIntValue() != 0;
-        if (!scaleStarts && !scaleDurations) return;
-        const auto trackId = selectedProjectTrackId();
-        const auto patternIndex = selectedPatternIndex();
-        auto data = capturePatternData(trackId, patternIndex);
-        PatternData result = data;
-        for (auto& row : result.notes) row.fill(false);
-        if (scaleStarts)
-            result.lengthSteps = juce::jlimit(1, 64, juce::roundToInt(data.lengthSteps * percent / 100.0));
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-            {
-                const auto row = static_cast<size_t>(pitch - minimumPitch);
-                const auto column = static_cast<size_t>(step);
-                if (!data.notes[row][column]) continue;
-                const auto moved = scaleStarts ? juce::jlimit(0, result.lengthSteps - 1,
-                    juce::roundToInt(step * percent / 100.0)) : step;
-                const auto outColumn = static_cast<size_t>(moved);
-                result.notes[row][outColumn] = true;
-                result.lengths[row][outColumn] = scaleDurations
-                    ? juce::jlimit(1, 64 - moved, juce::roundToInt(data.lengths[row][column] * percent / 100.0))
-                    : data.lengths[row][column];
-                result.velocities[row][outColumn] = data.velocities[row][column];
-            }
-        rememberUndo("Scale pattern length");
-        writePatternData(trackId, patternIndex, result);
-        finishPatternEdit("Pattern length updated.");
+        auto panel=std::make_unique<EditToolPanel>("Scale selected note start times, durations, or both. Unchecked fields keep their exact tick values.");
+        panel->number("percent","Percent",editSetting("length.percent",100),1,1600);panel->check("starts","Start times",editSetting("length.starts",1)!=0);panel->check("durations","Durations",editSetting("length.durations",0)!=0);
+        openEditTool("Scale Lengths",std::move(panel),[this](const auto& p){applyPatternTool("Scale lengths",[&](auto& notes){orbit::editing::scaleLengths(notes,p.value("percent"),p.checked("starts"),p.checked("durations"));});saveEditSetting("length.percent",p.value("percent"));saveEditSetting("length.starts",p.checked("starts"));saveEditSetting("length.durations",p.checked("durations"));return true;});
+    }
+    void showGrooveTemplateDialog()
+    {
+        auto panel=std::make_unique<EditToolPanel>("Apply a rhythmic feel to selected notes. Position, length and velocity strengths are independent.");
+        panel->choice("template","Groove template",{"None","1 & 2 softer (velocity only)","3 & 4 softer (velocity only)","Jazz Swing","Nice Bassline","Salsa","Shuffle"},int(editSetting("groove.template",0)));
+        panel->choice("resolution","Resolution",{"Half","Quarter","Eighth","Sixteenth","32nd","64th"},int(editSetting("groove.resolution",2)));
+        for(auto key:{"Position","Length","Velocity"})panel->strength(key,key,editSetting("groove."+juce::String(key),juce::String(key)=="Velocity"?50:100));
+        openEditTool("Apply Groove Template",std::move(panel),[this](const auto& p){applyPatternTool("Apply groove template",[&](auto& notes){orbit::editing::groove(notes,static_cast<orbit::editing::Groove>(p.index("template")),2<<p.index("resolution"),p.value("Position")/100,p.value("Length")/100,p.value("Velocity")/100);});saveEditSetting("groove.template",p.index("template"));saveEditSetting("groove.resolution",p.index("resolution"));for(auto key:{"Position","Length","Velocity"})saveEditSetting("groove."+juce::String(key),p.value(key));return true;});
+    }
+    void showPluckTemplateDialog()
+    {
+        auto panel=std::make_unique<EditToolPanel>("Strum notes that share a start time. Position spreads a chord by up to half a beat; velocity shapes the pick accent.");
+        panel->choice("template","Chord pluck template",{"Linear Move (up)","Linear Move (down)","Curved Move (up)","Curved Move (down)","Alternating strings","Random strings"},int(editSetting("pluck.template",0)));
+        panel->strength("Position","Position",editSetting("pluck.Position",35));panel->strength("Velocity","Velocity",editSetting("pluck.Velocity",30));
+        openEditTool("Apply Chord Pluck Template",std::move(panel),[this](const auto& p){applyPatternTool("Apply pluck template",[&](auto& notes){orbit::editing::pluck(notes,static_cast<orbit::editing::Pluck>(p.index("template")),p.value("Position")/100,p.value("Velocity")/100,editRandom);});saveEditSetting("pluck.template",p.index("template"));for(auto key:{"Position","Velocity"})saveEditSetting("pluck."+juce::String(key),p.value(key));return true;});
     }
 
     void insertBuiltInInstrument()
@@ -8177,6 +12314,7 @@ private:
         snapshot.bank = selectedBankIndex;
         snapshot.slot = selectedSlotIndex;
         snapshot.pitch = selectedPitch();
+        snapshot.noteKeys = selectedNoteKeys; snapshot.pasteTick = notePasteTick;
         if (snapshot.hadProject)
         {
             edit->flushState();
@@ -8190,12 +12328,17 @@ private:
         return snapshot;
     }
 
-    void rememberUndo(const juce::String& label)
+    void rememberUndoSnapshot(ProjectSnapshot snapshot, const juce::String& label)
     {
-        undoHistory.push_back({ captureProjectSnapshot(), label });
+        undoHistory.push_back({ std::move(snapshot), label });
         if (undoHistory.size() > 50)
             undoHistory.erase(undoHistory.begin());
         redoHistory.clear();
+    }
+
+    void rememberUndo(const juce::String& label)
+    {
+        rememberUndoSnapshot(captureProjectSnapshot(), label);
     }
 
     void restoreProjectSnapshot(const ProjectSnapshot& snapshot, const juce::String& message)
@@ -8205,10 +12348,14 @@ private:
         edit.reset();
         if (snapshot.hadProject && snapshot.editState.isValid())
             edit = te::loadEditFromState(engine, snapshot.editState.createCopy());
+        if (edit != nullptr)
+            edit->setLatencyCompensationEnabled(project.isPluginDelayCompensationEnabled());
         hasProject = snapshot.hadProject && edit != nullptr;
         isDirty = snapshot.dirty;
         selectedBankIndex = snapshot.bank;
         selectedSlotIndex = snapshot.slot;
+        selectedNoteKeys = snapshot.noteKeys; notePasteTick = snapshot.pasteTick;
+        noteSelectionTrackId = snapshot.selectedTrackId; noteSelectionPattern = snapshot.bank * 8 + snapshot.slot;
         pitchSelector.setSelectedId(pitchToItemId(snapshot.pitch), juce::dontSendNotification);
         for (int i = 0; i < 8; ++i)
         {
@@ -8235,11 +12382,15 @@ private:
             }
         }
         refreshTrackSelector();
+        syncInputQuantization();
+        syncMeterGrid(true);
+        engine.getDeviceManager().updateNumCPUs();
         refreshProjectView(message);
     }
 
     void undoProjectAction()
     {
+        if(!finishMidiRecording())return;
         if (undoHistory.empty()) return;
         auto current = captureProjectSnapshot();
         const auto label = undoHistory.back().label;
@@ -8251,6 +12402,7 @@ private:
 
     void redoProjectAction()
     {
+        if(!finishMidiRecording())return;
         if (redoHistory.empty()) return;
         auto current = captureProjectSnapshot();
         const auto label = redoHistory.back().label;
@@ -8262,6 +12414,7 @@ private:
 
     void rewindPlayback()
     {
+        if(!finishMidiRecording())return;
         if (edit == nullptr) return;
         edit->getTransport().stop(false, false);
         edit->getTransport().setPosition(tracktion::TimePosition::fromSeconds(0.0));
@@ -8271,6 +12424,7 @@ private:
 
     void skipTransport(int bars)
     {
+        if(!finishMidiRecording())return;
         if (edit == nullptr) return;
         auto& transport = edit->getTransport();
         const auto barSeconds = 240.0 / juce::jmax(20.0, tempoSlider.getValue());
@@ -8373,14 +12527,14 @@ private:
     void loadSelectedPitchSteps()
     {
         const auto pitch = selectedPitch();
+        const auto& row = noteGrid[static_cast<size_t>(pitch - minimumPitch)];
         for (int i = 0; i < 16; ++i)
-            steps[static_cast<size_t>(i)]->setToggleState(noteGrid[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(i)],
-                                                          juce::dontSendNotification);
+            steps[static_cast<size_t>(i)]->setToggleState(row.contains(i), juce::dontSendNotification);
         const auto titleText = getSelectedPatternTitle();
         generatorDragHandle.setText(titleText, juce::dontSendNotification);
         patternTitle.setText({}, juce::dontSendNotification);
         refreshPatternLengthDisplay();
-        if (pianoRollWindow != nullptr) pianoRollWindow->refresh(titleText);
+        if (pianoRollWindow != nullptr) {pianoRollWindow->setPatternContext(selectedProjectTrackId(),selectedPatternIndex());pianoRollWindow->refresh(titleText);}
     }
 
     juce::String getSelectedPatternTitle() const
@@ -8394,20 +12548,44 @@ private:
 
     int selectedPatternLength() const
     {
-        return juce::jlimit(1, 64, project.getPatternLengthSteps(selectedProjectTrackId(), selectedPatternIndex()));
+        return juce::jlimit(1, ProjectDocument::maximumPatternLengthSteps, project.getPatternLengthSteps(selectedProjectTrackId(), selectedPatternIndex()));
     }
 
     void refreshPatternLengthDisplay()
     {
         const auto length = selectedPatternLength();
         patternLengthDisplay.setText(juce::String(length).paddedLeft('0', 3), juce::dontSendNotification);
-        patternLengthDisplay.setTooltip("Pattern length: " + juce::String(length) + " steps. Use + and - to adjust.");
+        patternLengthDisplay.setTooltip("Pattern length: " + juce::String(length) + " steps. Type a new positive count.");
+    }
+
+    void commitPatternLengthInput()
+    {
+        if (instrumentTrack == nullptr || edit == nullptr) return;
+        const auto requested = patternLengthDisplay.getText().getIntValue();
+        if (requested <= 0)
+        {
+            refreshPatternLengthDisplay();
+            return;
+        }
+        const auto nextLength = juce::jlimit(1, ProjectDocument::maximumPatternLengthSteps, requested);
+        if (nextLength != selectedPatternLength())
+        {
+            rememberUndo("Change pattern length");
+            project.setPatternLengthSteps(selectedProjectTrackId(), selectedPatternIndex(), nextLength);
+            isDirty = true;
+            if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
+            rebuildPatternClip();
+            status.setText("Pattern length: " + juce::String(nextLength) + " steps.", juce::dontSendNotification);
+        }
+        refreshPatternLengthDisplay();
     }
 
     void adjustPatternLength(int delta)
     {
         if (instrumentTrack == nullptr || edit == nullptr) return;
-        const auto nextLength = juce::jlimit(1, 64, selectedPatternLength() + delta);
+        const auto currentLength = selectedPatternLength();
+        const auto nextLength = juce::jlimit(1, ProjectDocument::maximumPatternLengthSteps,
+                                             currentLength + juce::jlimit(-currentLength, ProjectDocument::maximumPatternLengthSteps - currentLength, delta));
         if (nextLength == selectedPatternLength()) return;
         rememberUndo("Change pattern length");
         project.setPatternLengthSteps(selectedProjectTrackId(), selectedPatternIndex(), nextLength);
@@ -8438,9 +12616,15 @@ private:
         allGeneratorsMinimized = false;
         refreshPianoRollAutomationTargets();
         pianoRollWindow->refresh(getSelectedPatternTitle());
-        pianoRollRestoreBounds = generatorPanelBounds;
-        pianoRollMaximized = true;
-        generatorPanelBounds = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(50).reduced(14, 10);
+        if (!restoringSavedGuiLayout || pianoRollRestoreBounds.isEmpty())
+            pianoRollRestoreBounds = generatorPanelBounds;
+        if (restoringSavedGuiLayout)
+            pianoRollMaximized = applicationProperties.getUserSettings()->getBoolValue("pianoRollMaximized", true);
+        else
+        {
+            pianoRollMaximized = true;
+            generatorPanelBounds = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(50).reduced(14, 10);
+        }
         pianoRollButton.setButtonText("INSTRUMENT");
         pianoRollButton.setTooltip("Return to the VST or built-in instrument");
         pianoRollWindow->setVisible(true);
@@ -8448,6 +12632,8 @@ private:
         if (activeInstrumentEditor != nullptr) activeInstrumentEditor->setVisible(false);
         resized();
         bringGeneratorToFront();
+        pianoRollWindow->toFront(false);
+        savePianoRollState();
         // The maximized roll expands the generator panel beyond the embedded
         // plugin editor. Invalidate both extents so the newly exposed strip is
         // repainted with the same panel background instead of showing stale
@@ -8473,6 +12659,7 @@ private:
             activeInstrumentEditor->repaint();
         }
         bringGeneratorToFront();
+        savePianoRollState();
         // Clearing the roll's former maximized area is necessary to prevent
         // its background from lingering beside a narrower instrument GUI.
         repaint(previousPanelBounds.getUnion(generatorPanelBounds));
@@ -8518,28 +12705,39 @@ private:
         repaint();
     }
 
-    void togglePianoRollNote(int pitch, int step, bool erase)
+    void togglePianoRollNote(int pitch, int startTick, bool erase)
     {
         if (instrumentTrack == nullptr || pitch < minimumPitch || pitch > maximumPitch
-            || !juce::isPositiveAndBelow(step, 64)) return;
+            || !juce::isPositiveAndBelow(startTick, ProjectDocument::maximumPatternLengthSteps * 64)) return;
+        if (!pianoRollGestureActive)
+            rememberUndo(erase ? "Erase piano roll note" : "Draw piano roll note");
         if (!hasPattern)
         {
             project.setPatternCreated(selectedProjectTrackId(), selectedPatternIndex(), true);
             hasPattern = true;
         }
         const auto row = static_cast<size_t>(pitch - minimumPitch);
-        const auto column = static_cast<size_t>(step);
-        const bool enabled = !erase;
-        if (noteGrid[row][column] == enabled) return;
+        const auto step = juce::jlimit(0, ProjectDocument::maximumPatternLengthSteps - 1, juce::roundToInt(startTick / 64.0));
+        const auto trackId = selectedProjectTrackId();
+        const auto patternIndex = selectedPatternIndex();
+        if (erase)
+        {
+            project.removePatternNoteTicks(trackId, patternIndex, pitch, startTick);
+            noteGrid[row].erase(step);
+        }
+        else
+        {
+            project.setPatternNoteTicks(trackId, patternIndex, pitch, startTick, 64, 100);
+            noteGrid[row].insert(step);
+        }
         allNotesSelected = false;
-        noteGrid[row][column] = enabled;
-        project.setPatternNote(selectedProjectTrackId(), selectedPatternIndex(), pitch, step, enabled);
         if (pitch == selectedPitch() && step < static_cast<int>(steps.size()))
-            steps[column]->setToggleState(enabled, juce::dontSendNotification);
+            steps[static_cast<size_t>(step)]->setToggleState(!erase, juce::dontSendNotification);
         isDirty = true;
         if (pianoRollGestureActive)
         {
             pianoRollGestureChanged = true;
+            invalidatePlaylistPatternPreview(trackId, patternIndex);
             status.setText(erase ? "Piano roll note removed." : "Piano roll note added.", juce::dontSendNotification);
             return;
         }
@@ -8548,22 +12746,55 @@ private:
         rebuildPatternClip();
     }
 
-    void setPianoRollNoteLength(int pitch, int step, int length)
+    void setPianoRollNoteLength(int pitch, int startTick, int lengthTicks)
     {
-        if (instrumentTrack == nullptr || !juce::isPositiveAndBelow(step, 64)) return;
-        project.setPatternNoteLength(selectedProjectTrackId(), selectedPatternIndex(), pitch, step, length);
+        if (instrumentTrack == nullptr || pitch < minimumPitch || pitch > maximumPitch
+            || !juce::isPositiveAndBelow(startTick, ProjectDocument::maximumPatternLengthSteps * 64)) return;
+        if (!project.setPatternNoteStackLengthTicks(selectedProjectTrackId(), selectedPatternIndex(),
+                                                    pitch, startTick, lengthTicks)) return;
         isDirty = true;
+        refreshPatternLengthDisplay();
         if (pianoRollGestureActive)
         {
             pianoRollGestureChanged = true;
+            invalidatePlaylistPatternPreview(selectedProjectTrackId(), selectedPatternIndex());
             return;
         }
         if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
         rebuildPatternClip();
     }
 
+    bool movePianoRollNote(int fromPitch, int fromTick, int toPitch, int toTick)
+    {
+        if (instrumentTrack == nullptr || fromPitch < minimumPitch || fromPitch > maximumPitch
+            || toPitch < minimumPitch || toPitch > maximumPitch
+            || !juce::isPositiveAndBelow(fromTick, ProjectDocument::maximumPatternLengthSteps * 64) || !juce::isPositiveAndBelow(toTick, ProjectDocument::maximumPatternLengthSteps * 64))
+            return false;
+        const auto sourceRow = static_cast<size_t>(fromPitch - minimumPitch);
+        const auto trackId = selectedProjectTrackId();
+        const auto patternIndex = selectedPatternIndex();
+        if (!project.movePatternNoteStack(trackId, patternIndex, fromPitch, fromTick, toPitch, toTick)) return false;
+        allNotesSelected = false;
+        const auto sourceStep = juce::jlimit(0, ProjectDocument::maximumPatternLengthSteps - 1, juce::roundToInt(fromTick / 64.0));
+        const auto destinationStep = juce::jlimit(0, ProjectDocument::maximumPatternLengthSteps - 1, juce::roundToInt(toTick / 64.0));
+        noteGrid[sourceRow].erase(sourceStep);
+        noteGrid[static_cast<size_t>(toPitch - minimumPitch)].insert(destinationStep);
+        isDirty = true;
+        if (pianoRollGestureActive)
+        {
+            pianoRollGestureChanged = true;
+            invalidatePlaylistPatternPreview(trackId, patternIndex);
+            status.setText("Piano roll note moved.", juce::dontSendNotification);
+            return true;
+        }
+        if (pianoRollWindow != nullptr) pianoRollWindow->refresh(getSelectedPatternTitle());
+        rebuildPatternClip();
+        return true;
+    }
+
     void createProject()
     {
+        if(!finishMidiRecording())return;
         if (hasProject && isDirty)
         {
             auto* dialog = new juce::AlertWindow("Create New Project?",
@@ -8590,6 +12821,8 @@ private:
         resetPatternButtons();
         project = ProjectDocument::createNew();
         edit = te::loadEditFromState(engine, te::createEmptyEdit(engine));
+        if (edit != nullptr)
+            edit->setLatencyCompensationEnabled(project.isPluginDelayCompensationEnabled());
         hasProject = edit != nullptr;
         isDirty = true;
         undoHistory.clear();
@@ -8612,61 +12845,117 @@ private:
                 startLocation = configuredFile.isDirectory() ? configuredFile : configuredFile.getParentDirectory();
             }
         }
-        fileChooser = std::make_unique<juce::FileChooser>("Open an Orbit project", startLocation, "*.orbit");
+        fileChooser = std::make_unique<juce::FileChooser>("Open an Orbit project or template", startLocation,
+                                                           "*.orbit;*.orbittemplate");
         fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
             [this](const juce::FileChooser& chooser)
             {
                 const auto file = chooser.getResult();
                 if (file == juce::File{}) return;
-                if (hasProject && isDirty)
-                {
-                    auto* dialog = new juce::AlertWindow("Open another project?",
-                        "Discard the unsaved changes and open the selected project?",
-                        juce::MessageBoxIconType::WarningIcon, this);
-                    dialog->addButton("Discard and Open", 1);
-                    dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-                    dialog->centreAroundComponent(this, 440, 160);
-                    dialog->enterModalState(true, juce::ModalCallbackFunction::create(
-                        [safeThis = juce::Component::SafePointer<ProjectView>(this), file](int result)
-                        {
-                            if (safeThis != nullptr && result == 1)
-                                safeThis->loadProjectFile(file);
-                        }), true);
-                    return;
-                }
-                loadProjectFile(file);
+                openProjectFile(file);
             });
     }
 
-    void loadProjectFile(const juce::File& file)
+    juce::Array<juce::File> getRecentProjectFiles()
+    {
+        juce::Array<juce::File> files;
+        if (auto* settings = applicationProperties.getUserSettings())
+        {
+            juce::StringArray paths;
+            paths.addLines(settings->getValue("recentProjectPaths"));
+            for (const auto& path : paths)
+            {
+                const juce::File file(path);
+                if (file.existsAsFile()) files.add(file);
+                if (files.size() == 10) break;
+            }
+        }
+        return files;
+    }
+
+    void rememberRecentProject(const juce::File& file)
+    {
+        if (!file.existsAsFile()) return;
+        if (auto* settings = applicationProperties.getUserSettings())
+        {
+            juce::StringArray paths;
+            paths.add(file.getFullPathName());
+            juce::StringArray oldPaths;
+            oldPaths.addLines(settings->getValue("recentProjectPaths"));
+            for (const auto& path : oldPaths)
+                if (!path.equalsIgnoreCase(file.getFullPathName()) && paths.size() < 10)
+                    paths.add(path);
+            settings->setValue("recentProjectPaths", paths.joinIntoString("\n"));
+            settings->setValue("defaultProjectPath", file.getParentDirectory().getFullPathName());
+            applicationProperties.saveIfNeeded();
+        }
+    }
+
+    void openProjectFile(const juce::File& file)
+    {
+        if(!finishMidiRecording())return;
+        if (hasProject && isDirty)
+        {
+            auto* dialog = new juce::AlertWindow("Open another project?",
+                "Discard the unsaved changes and open the selected project?",
+                juce::MessageBoxIconType::WarningIcon, this);
+            dialog->addButton("Discard and Open", 1);
+            dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+            dialog->centreAroundComponent(this, 440, 160);
+            dialog->enterModalState(true, juce::ModalCallbackFunction::create(
+                [safeThis = juce::Component::SafePointer<ProjectView>(this), file](int result)
+                {
+                    if (safeThis != nullptr && result == 1)
+                        safeThis->finishOpeningProject(file);
+                }), true);
+            return;
+        }
+        finishOpeningProject(file);
+    }
+
+    void finishOpeningProject(const juce::File& file)
+    {
+        if (!loadProjectFile(file)) return;
+        rememberRecentProject(file);
+        if (file.hasFileExtension("orbittemplate"))
+        {
+            project.clearFileAssociation();
+            isDirty = true;
+            refreshProjectView("Opened template copy: " + file.getFileName() + ". Save As to create a project file.");
+        }
+    }
+
+    bool loadProjectFile(const juce::File& file)
     {
         juce::String error;
         auto loaded = ProjectDocument::loadFromFile(file, error);
         if (!loaded)
         {
             showError("Could not open project", error);
-            return;
+            return false;
         }
         auto engineState = loaded->getTracktionEditState();
         if (!engineState.isValid())
         {
             showError("Older project format", "This project has no saved audio-engine state yet. Create a new project for the instrument workflow.");
-            return;
+            return false;
         }
         auto restoredEdit = te::loadEditFromState(engine, engineState);
         if (restoredEdit == nullptr)
         {
             showError("Could not open audio session", "Tracktion Engine could not restore this project's audio state.");
-            return;
+            return false;
         }
         resetPatternButtons();
         edit = std::move(restoredEdit);
         project = std::move(*loaded);
+        edit->setLatencyCompensationEnabled(project.isPluginDelayCompensationEnabled());
         hasProject = true;
         isDirty = false;
         undoHistory.clear();
         redoHistory.clear();
         migratePlaylistState();
+        syncInputQuantization();
         ensureExistingFxReturns();
         findFirstInstrumentTrack();
         updateActiveInstrumentEditor();
@@ -8674,6 +12963,7 @@ private:
         readPatternSteps();
         refreshMixerControls();
         refreshProjectView("Opened project and restored its Tracktion session.");
+        return true;
     }
 
     void saveProject()
@@ -8681,88 +12971,72 @@ private:
         if (!hasProject || edit == nullptr) return;
         const auto currentFile = project.getFile();
         if (currentFile.existsAsFile()) { saveToFile(currentFile); return; }
+        chooseProjectFile(false, false);
+    }
+
+    juce::File getSuggestedProjectFile(const juce::String& extension)
+    {
         auto suggestedFile = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
-                                 .getChildFile("Untitled Project.orbit");
+                                 .getChildFile("Untitled Project." + extension);
         if (auto* settings = applicationProperties.getUserSettings())
         {
             const auto configured = settings->getValue("defaultProjectPath").trim();
             if (configured.isNotEmpty())
             {
                 auto configuredFile = juce::File(configured);
-                if (configuredFile.isDirectory()) configuredFile = configuredFile.getChildFile("Untitled Project.orbit");
-                if (configuredFile.getFileName().isNotEmpty()) suggestedFile = configuredFile;
+                if (configuredFile.isDirectory())
+                    configuredFile = configuredFile.getChildFile("Untitled Project." + extension);
+                if (configuredFile.getFileName().isNotEmpty())
+                    suggestedFile = configuredFile.withFileExtension(extension);
             }
         }
-        fileChooser = std::make_unique<juce::FileChooser>("Save Orbit project", suggestedFile, "*.orbit");
-        fileChooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
-            [this](const juce::FileChooser& chooser)
-            {
-                auto file = chooser.getResult();
-                if (file == juce::File{}) return;
-                if (!file.hasFileExtension("orbit")) file = file.withFileExtension("orbit");
-                saveToFile(file);
-            });
+        return suggestedFile;
     }
 
-    void exportMidi()
+    void saveProjectAs() { if (!finishMidiRecording()) return; if (hasProject && edit != nullptr) chooseProjectFile(false, true); }
+    void saveProjectAsTemplate() { if (!finishMidiRecording()) return; if (hasProject && edit != nullptr) chooseProjectFile(true, true); }
+
+    void chooseProjectFile(bool asTemplate, bool forceChooser)
     {
-        if (!hasPattern || patternClip == nullptr || edit == nullptr)
+        if (!hasProject || edit == nullptr) return;
+        const auto extension = asTemplate ? "orbittemplate" : "orbit";
+        if (!asTemplate && !forceChooser && project.getFile().existsAsFile())
         {
-            showError("No MIDI pattern", "Create or open a project with a MIDI pattern before exporting.");
+            saveToFile(project.getFile());
             return;
         }
-
-        const auto suggestedName = project.getName().isNotEmpty() ? project.getName() + ".mid" : "Orbit Pattern.mid";
-        fileChooser = std::make_unique<juce::FileChooser>("Export MIDI pattern",
-            juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile(suggestedName), "*.mid");
+        fileChooser = std::make_unique<juce::FileChooser>(asTemplate ? "Save Orbit template" : "Save Orbit project",
+            getSuggestedProjectFile(extension), juce::String("*.") + extension);
         fileChooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
-            [this](const juce::FileChooser& chooser)
+            [this, asTemplate, extension](const juce::FileChooser& chooser)
             {
                 auto file = chooser.getResult();
                 if (file == juce::File{}) return;
-                if (!file.hasFileExtension("mid")) file = file.withFileExtension("mid");
-
-                auto notes = patternClip->getSequence().exportToPlaybackMidiSequence(
-                    *patternClip, te::MidiList::TimeBase::beatsRaw, false);
-                if (notes.getNumEvents() == 0)
+                if (!file.hasFileExtension(extension)) file = file.withFileExtension(extension);
+                if (!asTemplate)
                 {
-                    showError("Nothing to export", "The pattern contains no MIDI notes.");
+                    saveToFile(file);
                     return;
                 }
-
-                for (int i = 0; i < notes.getNumEvents(); ++i)
+                edit->flushState();
+                for (auto* track : getMixerTracks()) syncTrackMixerState(track);
+                syncMasterMixerState();
+                project.setTracktionEditState(edit->state);
+                auto templateProject = project;
+                templateProject.setName(file.getFileNameWithoutExtension());
+                juce::String error;
+                if (!templateProject.saveToFile(file, error))
                 {
-                    auto* event = notes.getEventPointer(i);
-                    event->message.setTimeStamp(event->message.getTimeStamp() * te::Edit::ticksPerQuarterNote);
-                }
-                notes.updateMatchedPairs();
-
-                juce::MidiMessageSequence tempo;
-                auto tempoEvent = juce::MidiMessage::tempoMetaEvent(juce::roundToInt(60000000.0 / project.getInitialTempoBpm()));
-                tempoEvent.setTimeStamp(0.0);
-                tempo.addEvent(tempoEvent);
-                const auto meter = project.getInitialTimeSignature();
-                auto meterEvent = juce::MidiMessage::timeSignatureMetaEvent(meter.numerator, meter.denominator);
-                meterEvent.setTimeStamp(0.0);
-                tempo.addEvent(meterEvent);
-
-                juce::MidiFile midiFile;
-                midiFile.addTrack(tempo);
-                midiFile.addTrack(notes);
-                midiFile.setTicksPerQuarterNote(te::Edit::ticksPerQuarterNote);
-                juce::FileOutputStream output(file);
-                if (!output.openedOk() || !midiFile.writeTo(output))
-                {
-                    showError("MIDI export failed", "Orbit could not write the MIDI file.");
+                    showError("Could not save template", error);
                     return;
                 }
-                output.flush();
-                status.setText("Exported MIDI pattern: " + file.getFileName(), juce::dontSendNotification);
+                status.setText("Saved project template: " + file.getFileName(), juce::dontSendNotification);
             });
     }
 
     void saveToFile(const juce::File& file)
     {
+        if(!finishMidiRecording())return;
         project.setName(file.getFileNameWithoutExtension());
         for (auto* track : getMixerTracks()) syncTrackMixerState(track);
         syncMasterMixerState();
@@ -8771,7 +13045,647 @@ private:
         juce::String error;
         if (!project.saveToFile(file, error)) { showError("Could not save project", error); return; }
         isDirty = false;
-        refreshProjectView("Saved project with instrument and MIDI state: " + file.getFileName());
+        rememberRecentProject(file);
+        refreshProjectView("Saved project: " + file.getFileName());
+    }
+
+    void exportMidi(bool entireSong = false)
+    {
+        if (edit == nullptr || (!entireSong && (!hasPattern || patternClip == nullptr)))
+        {
+            showError("No MIDI to export", "Create or open a project with MIDI content before exporting.");
+            return;
+        }
+
+        const juce::String suffix = entireSong ? " Song.mid" : " Pattern.mid";
+        const auto suggestedName = project.getName().isNotEmpty() ? project.getName() + suffix : juce::String("Orbit") + suffix;
+        fileChooser = std::make_unique<juce::FileChooser>(entireSong ? "Export MIDI song" : "Export MIDI pattern",
+            juce::File::getSpecialLocation(juce::File::userDocumentsDirectory).getChildFile(suggestedName), "*.mid");
+        fileChooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
+            [this, entireSong](const juce::FileChooser& chooser)
+            {
+                auto file = chooser.getResult();
+                if (file == juce::File{}) return;
+                if (!file.hasFileExtension("mid")) file = file.withFileExtension("mid");
+
+                juce::MidiMessageSequence tempo;
+                auto tempoEvent = juce::MidiMessage::tempoMetaEvent(
+                    juce::roundToInt(60000000.0 / project.getInitialTempoBpm()));
+                tempoEvent.setTimeStamp(0.0);
+                tempo.addEvent(tempoEvent);
+                const auto meter = project.getInitialTimeSignature();
+                auto meterEvent = juce::MidiMessage::timeSignatureMetaEvent(meter.numerator, meter.denominator);
+                meterEvent.setTimeStamp(0.0);
+                tempo.addEvent(meterEvent);
+
+                std::vector<juce::MidiMessageSequence> noteTracks;
+                if (entireSong)
+                {
+                    for (int trackIndex = 0; trackIndex < project.getTrackCount(); ++trackIndex)
+                    {
+                        if (project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio) continue;
+                        const auto trackId = project.getTrackId(trackIndex);
+                        juce::MidiMessageSequence trackNotes;
+                        for (int bar = 0; bar < PlaylistGrid::barCount; ++bar)
+                        {
+                            const auto patternId = project.getPlaylistPatternId(trackId, bar);
+                            if (patternId.isEmpty() || project.getPlaylistClipStartBar(trackId, bar) != bar) continue;
+                            const auto patternIndex = project.getPatternIndexForId(trackId, patternId);
+                            if (patternIndex < 0) continue;
+                            appendPatternToMidiSequence(trackNotes, trackId, patternIndex, bar * 4.0);
+                        }
+                        trackNotes.updateMatchedPairs();
+                        if (trackNotes.getNumEvents() > 0) noteTracks.push_back(std::move(trackNotes));
+                    }
+                }
+                else
+                {
+                    juce::MidiMessageSequence selectedNotes;
+                    appendPatternToMidiSequence(selectedNotes, selectedProjectTrackId(), selectedPatternIndex(), 0.0);
+                    selectedNotes.updateMatchedPairs();
+                    if (selectedNotes.getNumEvents() > 0) noteTracks.push_back(std::move(selectedNotes));
+                }
+
+                if (noteTracks.empty())
+                {
+                    showError("Nothing to export", entireSong
+                        ? "No MIDI pattern clips are placed in the song Playlist."
+                        : "The selected pattern contains no MIDI notes.");
+                    return;
+                }
+
+                auto midiFile = encodeMidiExport(tempo, std::move(noteTracks));
+                juce::FileOutputStream output(file);
+                if (!output.openedOk() || !midiFile.writeTo(output))
+                {
+                    showError("MIDI export failed", "Orbit could not write the MIDI file.");
+                    return;
+                }
+                output.flush();
+                status.setText("Exported MIDI " + juce::String(entireSong ? "song: " : "pattern: ")
+                                   + file.getFileName(), juce::dontSendNotification);
+            });
+    }
+
+    juce::MidiFile encodeMidiExport(const juce::MidiMessageSequence& tempo,
+                                    std::vector<juce::MidiMessageSequence> tracks)
+    {
+        juce::MidiFile file;file.addTrack(tempo);const int ppq=midiExportPpq();
+        for(auto& sequence:tracks)
+        {
+            sequence.updateMatchedPairs();std::vector<double> times;
+            for(int i=0;i<sequence.getNumEvents();++i)
+                times.push_back(std::round(sequence.getEventTime(i)*ppq));
+            for(int i=0;i<sequence.getNumEvents();++i)
+                if(sequence.getEventPointer(i)->message.isNoteOn())
+                {
+                    const int off=sequence.getIndexOfMatchingKeyUp(i);
+                    if(off>=0)times[size_t(off)]=juce::jmax(times[size_t(off)],times[size_t(i)]+1);
+                }
+            for(int i=0;i<sequence.getNumEvents();++i)sequence.getEventPointer(i)->message.setTimeStamp(times[size_t(i)]);
+            sequence.sort();sequence.updateMatchedPairs();file.addTrack(sequence);
+        }
+        file.setTicksPerQuarterNote(ppq);return file;
+    }
+
+    void appendPatternToMidiSequence(juce::MidiMessageSequence& destination, const juce::String& trackId,
+                                     int patternIndex, double offsetBeats)
+    {
+        for (const auto& note : project.getPatternNotes(trackId, patternIndex))
+        {
+            const auto startBeat = offsetBeats + note.startTick / 256.0;
+            const auto endBeat = startBeat + note.lengthTicks / 256.0;
+            const auto pitch = juce::jlimit(0, 127, note.pitch);
+            const auto velocity = juce::jlimit(1, 127, note.velocity);
+            destination.addEvent(juce::MidiMessage::noteOn(1, pitch, static_cast<juce::uint8>(velocity)), startBeat);
+            destination.addEvent(juce::MidiMessage::noteOff(1, pitch), endBeat);
+        }
+    }
+
+    struct ImportedMidiTrack
+    {
+        juce::String name;
+        std::vector<ProjectDocument::PatternNote> notes;
+        int lengthSteps = 1;
+    };
+
+    struct ImportedMidiSong
+    {
+        double tempoBpm = 0.0;
+        ProjectDocument::TimeSignature meter;
+        std::vector<ImportedMidiTrack> tracks;
+    };
+
+    std::optional<ImportedMidiSong> readMidiForImport(const juce::File& file)
+    {
+        juce::FileInputStream input(file);
+        juce::MidiFile midi;
+        if (!input.openedOk() || !midi.readFrom(input, true))
+        {
+            showError("Could not import MIDI", "Orbit could not read the selected Standard MIDI File.");
+            return std::nullopt;
+        }
+        const auto timeFormat = midi.getTimeFormat();
+        if (timeFormat <= 0)
+        {
+            showError("Unsupported MIDI timing", "This MIDI file uses SMPTE timecode. Orbit's pattern grid imports beat-based MIDI (PPQN).");
+            return std::nullopt;
+        }
+
+        ImportedMidiSong imported;
+        juce::MidiMessageSequence tempos;
+        midi.findAllTempoEvents(tempos);
+        if (tempos.getNumEvents() > 0 && tempos.getEventTime(0) <= 0.0)
+        {
+            const auto secondsPerQuarter = tempos.getEventPointer(0)->message.getTempoSecondsPerQuarterNote();
+            if (secondsPerQuarter > 0.0 && std::isfinite(secondsPerQuarter))
+                imported.tempoBpm = 60.0 / secondsPerQuarter;
+        }
+        juce::MidiMessageSequence meters;
+        midi.findAllTimeSigEvents(meters);
+        if (meters.getNumEvents() > 0 && meters.getEventTime(0) <= 0.0)
+            meters.getEventPointer(0)->message.getTimeSignatureInfo(imported.meter.numerator,
+                                                                     imported.meter.denominator);
+
+        const auto ticksToPatternTicks = 256.0 / static_cast<double>(timeFormat);
+        const auto maximumTicks = static_cast<juce::int64>(ProjectDocument::maximumPatternLengthSteps) * 64;
+        for (int trackIndex = 0; trackIndex < midi.getNumTracks(); ++trackIndex)
+        {
+            const auto* sequence = midi.getTrack(trackIndex);
+            if (sequence == nullptr) continue;
+            ImportedMidiTrack track;
+            track.name = "MIDI Track " + juce::String(trackIndex + 1);
+            juce::int64 maxEnd = 0;
+            for (int eventIndex = 0; eventIndex < sequence->getNumEvents(); ++eventIndex)
+            {
+                const auto* event = sequence->getEventPointer(eventIndex);
+                if (event == nullptr || !event->message.isNoteOn()) continue;
+                const auto matchedOff = sequence->getIndexOfMatchingKeyUp(eventIndex);
+                const auto startMidiTicks = juce::jmax(0.0, sequence->getEventTime(eventIndex));
+                const auto endMidiTicks = matchedOff > eventIndex
+                    ? juce::jmax(startMidiTicks + 1.0, sequence->getEventTime(matchedOff))
+                    : startMidiTicks + juce::jmax(1, timeFormat / 4);
+                const auto startTick = juce::jlimit<juce::int64>(0, maximumTicks - 1,
+                    static_cast<juce::int64>(std::llround(startMidiTicks * ticksToPatternTicks)));
+                const auto endTick = juce::jlimit<juce::int64>(startTick + 1, maximumTicks,
+                    static_cast<juce::int64>(std::llround(endMidiTicks * ticksToPatternTicks)));
+                ProjectDocument::PatternNote note;
+                note.pitch = event->message.getNoteNumber();
+                note.startTick = static_cast<int>(startTick);
+                note.lengthTicks = static_cast<int>(endTick - startTick);
+                note.velocity = juce::jlimit(1, 127,
+                    juce::roundToInt(event->message.getFloatVelocity() * 127.0f));
+                track.notes.push_back(note);
+                maxEnd = juce::jmax(maxEnd, endTick);
+            }
+            if (track.notes.empty()) continue;
+            track.lengthSteps = static_cast<int>(juce::jlimit<juce::int64>(1,
+                ProjectDocument::maximumPatternLengthSteps, (maxEnd + 63) / 64));
+            imported.tracks.push_back(std::move(track));
+        }
+        if (imported.tracks.empty())
+        {
+            showError("No MIDI notes found", "The selected MIDI file contains no note events to import.");
+            return std::nullopt;
+        }
+        return imported;
+    }
+
+    void importMidiTrack()
+    {
+        if (!hasProject) return;
+        fileChooser = std::make_unique<juce::FileChooser>("Import MIDI track",
+            juce::File::getSpecialLocation(juce::File::userMusicDirectory), "*.mid;*.midi");
+        fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+            [this](const juce::FileChooser& chooser)
+            {
+                const auto file = chooser.getResult();
+                if (file == juce::File{}) return;
+                auto parsed = readMidiForImport(file);
+                if (!parsed) return;
+                auto song = std::make_shared<ImportedMidiSong>(std::move(*parsed));
+                if (song->tracks.size() == 1)
+                {
+                    applyMidiTrack(song->tracks.front(), song->tempoBpm, song->meter);
+                    return;
+                }
+                juce::StringArray labels;
+                for (const auto& track : song->tracks) labels.add(track.name);
+                auto* dialog = new juce::AlertWindow("Import MIDI Track", "Choose one source track to import into the selected pattern.",
+                                                       juce::MessageBoxIconType::NoIcon, this);
+                dialog->addComboBox("sourceTrack", labels, "MIDI track:");
+                dialog->addButton("Import", 1, juce::KeyPress(juce::KeyPress::returnKey));
+                dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+                dialog->centreAroundComponent(this, 520, 190);
+                const juce::Component::SafePointer<ProjectView> safeThis(this);
+                const juce::Component::SafePointer<juce::AlertWindow> safeDialog(dialog);
+                dialog->enterModalState(true, juce::ModalCallbackFunction::create(
+                    [safeThis, safeDialog, song](int result)
+                    {
+                        if (safeThis == nullptr || safeDialog == nullptr || result != 1) return;
+                        auto* choice = safeDialog->getComboBoxComponent("sourceTrack");
+                        if (choice == nullptr) return;
+                        const auto index = choice->getSelectedId() - 1;
+                        if (juce::isPositiveAndBelow(index, static_cast<int>(song->tracks.size())))
+                            safeThis->applyMidiTrack(song->tracks[static_cast<size_t>(index)], song->tempoBpm, song->meter);
+                    }), true);
+            });
+    }
+
+    void importMidiSong()
+    {
+        if (!hasProject) return;
+        fileChooser = std::make_unique<juce::FileChooser>("Import MIDI song",
+            juce::File::getSpecialLocation(juce::File::userMusicDirectory), "*.mid;*.midi");
+        fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+            [this](const juce::FileChooser& chooser)
+            {
+                const auto file = chooser.getResult();
+                if (file == juce::File{}) return;
+                auto parsed = readMidiForImport(file);
+                if (parsed) applyMidiSong(*parsed);
+            });
+    }
+
+    bool ensureInstrumentSelectedForMidi()
+    {
+        const auto tracks = getGeneratorTracks();
+        const auto trackIndex = tracks.indexOf(instrumentTrack);
+        if (instrumentTrack == nullptr || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
+            || project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio)
+            addInstrumentTrack();
+        return instrumentTrack != nullptr && !selectedProjectTrackId().isEmpty();
+    }
+
+    void replacePatternWithMidiNotes(const juce::String& trackId, int patternIndex,
+                                     const ImportedMidiTrack& midiTrack)
+    {
+        for (const auto& oldNote : project.getPatternNotes(trackId, patternIndex))
+            project.removePatternNoteTicks(trackId, patternIndex, oldNote.pitch, oldNote.startTick);
+        project.setPatternLengthSteps(trackId, patternIndex, 1);
+        project.setPatternCreated(trackId, patternIndex, true);
+        for (const auto& note : midiTrack.notes)
+            project.setPatternNoteTicks(trackId, patternIndex, note.pitch, note.startTick,
+                                        note.lengthTicks, note.velocity);
+        project.setPatternLengthSteps(trackId, patternIndex, midiTrack.lengthSteps);
+    }
+
+    void applyMidiTrack(const ImportedMidiTrack& midiTrack, double tempoBpm,
+                        ProjectDocument::TimeSignature meter)
+    {
+        if (!hasProject || !ensureInstrumentSelectedForMidi()) return;
+        rememberUndo("Import MIDI Track");
+        if (tempoBpm > 0.0) project.setInitialTempoBpm(tempoBpm);
+        if (meter.numerator > 0 && meter.denominator > 0)
+            project.setInitialTimeSignature(meter.numerator, meter.denominator);
+        const auto trackId = selectedProjectTrackId();
+        const auto patternIndex = selectedPatternIndex();
+        replacePatternWithMidiNotes(trackId, patternIndex, midiTrack);
+        project.setTrackSelectedPatternIndex(trackId, patternIndex);
+        isDirty = true;
+        readPatternSteps();
+        rebuildPatternClip();
+        refreshProjectView("Imported " + juce::String(midiTrack.notes.size()) + " MIDI notes into "
+            + project.getTrackName(getGeneratorTracks().indexOf(instrumentTrack)) + " / "
+            + project.getPatternName(trackId, patternIndex) + ".");
+    }
+
+    void applyMidiSong(const ImportedMidiSong& midiSong)
+    {
+        if (!hasProject || midiSong.tracks.empty()) return;
+        rememberUndo("Import MIDI Song");
+        if (midiSong.tempoBpm > 0.0) project.setInitialTempoBpm(midiSong.tempoBpm);
+        if (midiSong.meter.numerator > 0 && midiSong.meter.denominator > 0)
+            project.setInitialTimeSignature(midiSong.meter.numerator, midiSong.meter.denominator);
+        int importedCount = 0;
+        const auto patternIndex = selectedPatternIndex();
+        for (const auto& midiTrack : midiSong.tracks)
+        {
+            addInstrumentTrack();
+            if (instrumentTrack == nullptr) continue;
+            const auto engineTracks = getGeneratorTracks();
+            const auto trackIndex = engineTracks.indexOf(instrumentTrack);
+            if (!juce::isPositiveAndBelow(trackIndex, project.getTrackCount())) continue;
+            const auto trackId = project.getTrackId(trackIndex);
+            project.setTrackName(trackIndex, midiTrack.name);
+            instrumentTrack->setName(midiTrack.name);
+            replacePatternWithMidiNotes(trackId, patternIndex, midiTrack);
+            project.setTrackSelectedPatternIndex(trackId, patternIndex);
+            const auto bars = juce::jmax(1, midiTrack.lengthSteps / 16 + (midiTrack.lengthSteps % 16 != 0 ? 1 : 0));
+            project.setPlaylistClip(trackId, project.getPatternId(trackId, patternIndex), 0, bars, true);
+            ++importedCount;
+        }
+        if (importedCount == 0)
+        {
+            showError("MIDI import failed", "Orbit could not create any instrument tracks from this MIDI file.");
+            return;
+        }
+        isDirty = true;
+        readPatternSteps();
+        rebuildPatternClip();
+        refreshProjectView("Imported " + juce::String(importedCount) + " MIDI tracks and placed their patterns at bar 1.");
+    }
+
+    void mergeProject()
+    {
+        if (!hasProject || edit == nullptr) return;
+        fileChooser = std::make_unique<juce::FileChooser>("Merge project tracks",
+            juce::File::getSpecialLocation(juce::File::userDocumentsDirectory), "*.orbit;*.orbittemplate;*.sfs");
+        fileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+            [this](const juce::FileChooser& chooser)
+            {
+                const auto file = chooser.getResult();
+                if (file == juce::File{}) return;
+                if (file.hasFileExtension("sfs"))
+                {
+                    const juce::Component::SafePointer<ProjectView> safeThis(this);
+                    orbit::import::launchOrionSfsPreview(file, this,
+                        [safeThis](const orbit::import::ProjectImportPlan& plan, std::string& error)
+                        {
+                            return safeThis != nullptr && safeThis->commitRecoveredPatterns(plan, error);
+                        });
+                    return;
+                }
+                juce::String error;
+                auto source = ProjectDocument::loadFromFile(file, error);
+                if (!source)
+                {
+                    showError("Could not read merge source", error);
+                    return;
+                }
+                juce::StringArray names;
+                for (int i = 0; i < source->getTrackCount(); ++i)
+                {
+                    auto kind = source->getTrackKind(i) == ProjectDocument::TrackKind::audio ? "Audio"
+                              : source->getTrackKind(i) == ProjectDocument::TrackKind::midi ? "MIDI" : "Instrument";
+                    names.add(source->getTrackName(i) + "  (" + kind + ")");
+                }
+                if (names.isEmpty())
+                {
+                    showError("No tracks to merge", "The selected project contains no importable tracks.");
+                    return;
+                }
+                const juce::Component::SafePointer<ProjectView> safeThis(this);
+                juce::DialogWindow::LaunchOptions options;
+                options.dialogTitle = "Merge Project";
+                options.dialogBackgroundColour = orbit::options::colour(27, 39, 49);
+                options.componentToCentreAround = this;
+                options.resizable = true;
+                options.content = juce::OptionalScopedPointer<juce::Component>(
+                    new MergeTracksDialog(names, [safeThis, file](const std::vector<int>& selected, bool removeFx)
+                    {
+                        if (safeThis != nullptr) safeThis->mergeSelectedProjectTracks(file, selected, removeFx);
+                    }), true);
+                options.launchAsync();
+            });
+    }
+
+    bool commitRecoveredPatterns(const orbit::import::ProjectImportPlan& plan, std::string& error)
+    {
+        if (!hasProject || edit == nullptr)
+        {
+            error = "Create or open an Orbit project before merging recovered patterns.";
+            return false;
+        }
+        orbit::import::PreparedProjectImportSession staged;
+        if (!orbit::import::prepareProjectImportSession(engine, project, *edit, plan, staged, error)) return false;
+        // Replacing the Edit stops its transport. Commit a song arrangement,
+        // not transient audition clips or their temporary audio mutes. Wait
+        // until preparation succeeds so a refused import leaves audition alone.
+        auto stagedAudioMutes = patternPlaybackMutedAudioClips;
+        if (auditionPatternPlayback)
+        {
+            edit->getTransport().stop(false, false);
+            finishPatternPlayback();
+        }
+        rememberUndo("Import SFS Content");
+        resetPatternButtons();
+        project = std::move(staged.document);
+        edit = std::move(staged.edit);
+        // The prepared Edit was copied before audition finished. Restore the
+        // existing clips by stable ID; newly recovered clips have no saved mute.
+        patternPlaybackMutedAudioClips = std::move(stagedAudioMutes);
+        restorePlaylistAudioClipsAfterPatternPlayback();
+        playButton.setButtonText("Play");
+        const auto tracks = getGeneratorTracks();
+        if (juce::isPositiveAndBelow(staged.selectedTrackIndex, tracks.size()))
+            instrumentTrack = tracks[staged.selectedTrackIndex];
+        isDirty = true;
+        const auto selectedPattern = project.getTrackSelectedPatternIndex(project.getTrackId(staged.selectedTrackIndex));
+        selectedBankIndex = selectedPattern / 8;
+        selectedSlotIndex = selectedPattern % 8;
+        for (int i = 0; i < 8; ++i)
+        {
+            patternBankButtons[static_cast<size_t>(i)]->setToggleState(i == selectedBankIndex, juce::dontSendNotification);
+            patternSlotButtons[static_cast<size_t>(i)]->setToggleState(i == selectedSlotIndex, juce::dontSendNotification);
+        }
+        refreshTrackSelector();
+        readPatternSteps();
+        refreshMixerControls();
+        refreshEnginePlaylist();
+        refreshProjectView("Recovered selected SFS content. Assign instruments to note tracks; dry audio uses relinked files and plugin state was not recovered.");
+        return true;
+    }
+
+    void mergeSelectedProjectTracks(const juce::File& file, const std::vector<int>& selectedTracks, bool removeUnusedFx)
+    {
+        juce::String error;
+        auto sourceProject = ProjectDocument::loadFromFile(file, error);
+        if (!sourceProject)
+        {
+            showError("Could not read merge source", error);
+            return;
+        }
+        auto sourceEdit = te::loadEditFromState(engine, sourceProject->getTracktionEditState());
+        if (sourceEdit == nullptr)
+        {
+            showError("Could not restore merge source", "Tracktion Engine could not read the source project's audio session.");
+            return;
+        }
+        juce::Array<te::AudioTrack*> sourceTracks;
+        for (auto* track : te::getAudioTracks(*sourceEdit))
+            if (static_cast<int>(track->state.getProperty(juce::Identifier("orbitFxReturnBus"), -1)) < 0
+                && static_cast<int>(track->state.getProperty(juce::Identifier("orbitMixerBus"), -1)) < 0)
+                sourceTracks.add(track);
+        if (sourceTracks.size() < sourceProject->getTrackCount())
+        {
+            showError("Could not map source tracks", "The source project does not contain matching Tracktion tracks for its Orbit track list.");
+            return;
+        }
+
+        rememberUndo("Merge Project Tracks");
+        int importedCount = 0;
+        te::AudioTrack* lastInstrument = nullptr;
+        for (const auto sourceIndex : selectedTracks)
+        {
+            if (!juce::isPositiveAndBelow(sourceIndex, sourceProject->getTrackCount())
+                || !juce::isPositiveAndBelow(sourceIndex, sourceTracks.size())) continue;
+            auto state = sourceTracks.getUnchecked(sourceIndex)->state.createCopy();
+            te::EditItemID::remapIDs(state, nullptr, *edit);
+            auto inserted = edit->insertTrack(te::TrackInsertPoint::getEndOfTracks(*edit), state, nullptr);
+            auto* importedEngineTrack = dynamic_cast<te::AudioTrack*>(inserted.get());
+            if (importedEngineTrack == nullptr) continue;
+            importedEngineTrack->setName(sourceProject->getTrackName(sourceIndex));
+            importedEngineTrack->getOutput().setOutputToDefaultDevice(false);
+            const auto importedTrackId = project.importTrackFrom(*sourceProject, sourceIndex, removeUnusedFx);
+            if (importedTrackId.isEmpty())
+            {
+                edit->deleteTrack(importedEngineTrack);
+                continue;
+            }
+            if (sourceProject->getTrackKind(sourceIndex) != ProjectDocument::TrackKind::audio)
+                lastInstrument = importedEngineTrack;
+            ++importedCount;
+        }
+        if (importedCount == 0)
+        {
+            showError("Merge did not complete", "Orbit could not insert the selected tracks.");
+            return;
+        }
+        if (lastInstrument != nullptr) instrumentTrack = lastInstrument;
+        edit->restartPlayback();
+        isDirty = true;
+        refreshTrackSelector();
+        readPatternSteps();
+        refreshMixerControls();
+        refreshEnginePlaylist();
+        if (playlistWindow != nullptr) playlistWindow->refresh();
+        refreshProjectView("Merged " + juce::String(importedCount) + " track(s) from " + file.getFileName()
+            + ". Referenced media remains at its original path; plugin availability depends on this system.");
+    }
+
+    struct AudioRenderFormatChoice
+    {
+        juce::AudioFormat* format = nullptr;
+        int bitDepth = 24;
+        juce::String extension;
+        juce::String label;
+    };
+
+    void showStreamToFileDialog()
+    {
+        if (!hasProject || edit == nullptr) return;
+        std::vector<AudioRenderFormatChoice> choices;
+        juce::StringArray labels;
+        auto& formatManager = engine.getAudioFileFormatManager();
+        for (auto* format : formatManager.getWriteFormats())
+        {
+            if (format == nullptr) continue;
+            const auto extensions = format->getFileExtensions();
+            if (extensions.isEmpty()) continue;
+            const auto depths = format->getPossibleBitDepths();
+            for (const auto depth : depths)
+            {
+                if (depth != 16 && depth != 24 && depth != 32) continue;
+                const auto extension = extensions[0].trimCharactersAtStart(".");
+                const auto label = format->getFormatName() + " · " + juce::String(depth) + "-bit (" + extension + ")";
+                choices.push_back({ format, depth, extension, label });
+                labels.add(label);
+            }
+        }
+        if (choices.empty())
+        {
+            showError("Audio rendering unavailable", "No writable audio formats are registered in this build of Orbit.");
+            return;
+        }
+        juce::StringArray rates { "44100 Hz", "48000 Hz", "96000 Hz", "192000 Hz" };
+        juce::StringArray scopes { "Entire Song Mix", "Instrument Tracks (combined)", "All Track Channels (combined)" };
+        auto* dialog = new juce::AlertWindow("Stream To File", "Render the current project to an audio file.",
+                                              juce::MessageBoxIconType::NoIcon, this);
+        dialog->addComboBox("renderFormat", labels, "Format / bit depth:");
+        dialog->addComboBox("sampleRate", rates, "Sample rate:");
+        dialog->addComboBox("renderScope", scopes, "Render scope:");
+        dialog->addTextBlock("Only audio encoders available in this Orbit build are listed. Track scopes create a combined mix.");
+        auto monoToggle = std::make_shared<juce::ToggleButton>("Render mono");
+        dialog->addCustomComponent(monoToggle.get());
+        dialog->addButton("Render...", 1, juce::KeyPress(juce::KeyPress::returnKey));
+        dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+        dialog->centreAroundComponent(this, 560, 330);
+        const juce::Component::SafePointer<ProjectView> safeThis(this);
+        const juce::Component::SafePointer<juce::AlertWindow> safeDialog(dialog);
+        dialog->enterModalState(true, juce::ModalCallbackFunction::create(
+            [safeThis, safeDialog, choices, monoToggle](int result)
+            {
+                if (safeThis == nullptr || safeDialog == nullptr || result != 1) return;
+                auto* formatBox = safeDialog->getComboBoxComponent("renderFormat");
+                auto* rateBox = safeDialog->getComboBoxComponent("sampleRate");
+                auto* scopeBox = safeDialog->getComboBoxComponent("renderScope");
+                if (formatBox == nullptr || rateBox == nullptr || scopeBox == nullptr) return;
+                const auto selectedFormat = formatBox->getSelectedId() - 1;
+                const auto rateIndex = rateBox->getSelectedId() - 1;
+                const auto scopeIndex = scopeBox->getSelectedId() - 1;
+                static constexpr double sampleRates[] { 44100.0, 48000.0, 96000.0, 192000.0 };
+                if (juce::isPositiveAndBelow(selectedFormat, static_cast<int>(choices.size()))
+                    && juce::isPositiveAndBelow(rateIndex, 4) && juce::isPositiveAndBelow(scopeIndex, 3))
+                    safeThis->chooseRenderDestination(choices[static_cast<size_t>(selectedFormat)],
+                        sampleRates[rateIndex], scopeIndex, monoToggle->getToggleState());
+            }), true);
+    }
+
+    void chooseRenderDestination(const AudioRenderFormatChoice& choice, double sampleRate, int scope, bool mono)
+    {
+        if (renderHandle != nullptr)
+        {
+            showError("Render already running", "Wait for the current audio render to finish before starting another.");
+            return;
+        }
+        const auto suggestedName = project.getName().isNotEmpty() ? project.getName() + "." + choice.extension
+                                                                   : "Orbit Mix." + choice.extension;
+        fileChooser = std::make_unique<juce::FileChooser>("Save rendered audio",
+            juce::File::getSpecialLocation(juce::File::userMusicDirectory).getChildFile(suggestedName),
+            juce::String("*.") + choice.extension);
+        fileChooser->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
+            [this, choice, sampleRate, scope, mono](const juce::FileChooser& chooser)
+            {
+                auto file = chooser.getResult();
+                if (file == juce::File{} || edit == nullptr) return;
+                if (!file.hasFileExtension(choice.extension)) file = file.withFileExtension(choice.extension);
+                te::Renderer::Parameters parameters(*edit);
+                parameters.destFile = file;
+                parameters.audioFormat = choice.format;
+                parameters.sampleRateForAudio = sampleRate;
+                parameters.bitDepth = choice.bitDepth;
+                parameters.mustRenderInMono = mono;
+                parameters.usePlugins = true;
+                parameters.useMasterPlugins = true;
+                parameters.time = { tracktion::TimePosition::fromSeconds(0.0), edit->getLength() };
+                if (scope != 0)
+                {
+                    const auto allTracks = te::getAllTracks(*edit);
+                    const auto generators = getGeneratorTracks();
+                    for (int i = 0; i < allTracks.size(); ++i)
+                    {
+                        auto* audioTrack = dynamic_cast<te::AudioTrack*>(allTracks[i]);
+                        if (audioTrack == nullptr || !generators.contains(audioTrack)) continue;
+                        const auto generatorIndex = generators.indexOf(audioTrack);
+                        if (scope == 2 || (juce::isPositiveAndBelow(generatorIndex, project.getTrackCount())
+                            && project.getTrackKind(generatorIndex) != ProjectDocument::TrackKind::audio))
+                            parameters.tracksToDo.setBit(i);
+                    }
+                    if (parameters.tracksToDo.isZero())
+                    {
+                        showError("No tracks to render", "The selected render scope contains no eligible tracks.");
+                        return;
+                    }
+                }
+                status.setText("Rendering audio to " + file.getFileName() + "...", juce::dontSendNotification);
+                const juce::Component::SafePointer<ProjectView> safeThis(this);
+                renderHandle = te::EditRenderer::render(std::move(parameters),
+                    [safeThis, file](tl::expected<juce::File, std::string> result)
+                    {
+                        const auto succeeded = result.has_value();
+                        const auto failure = succeeded ? juce::String{} : juce::String::fromUTF8(result.error().c_str());
+                        juce::MessageManager::callAsync([safeThis, file, succeeded, failure]
+                        {
+                            if (safeThis == nullptr) return;
+                            safeThis->renderHandle.reset();
+                            if (succeeded)
+                                safeThis->status.setText("Rendered audio: " + file.getFileName(), juce::dontSendNotification);
+                            else
+                                safeThis->showError("Audio render failed", failure.isNotEmpty() ? failure : "Tracktion Engine could not render the selected mix.");
+                        });
+                    });
+            });
     }
 
     void addInstrumentTrack()
@@ -8816,7 +13730,7 @@ private:
             && project.getTrackKind(trackSelector.getSelectedId() - 1) == ProjectDocument::TrackKind::audio)
             targetTrackIndex = trackSelector.getSelectedId() - 1;
         fileChooser = std::make_unique<juce::FileChooser>("Import audio file",
-            juce::File::getSpecialLocation(juce::File::userMusicDirectory),
+            firstSampleFolder(),
             "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg");
         auto* chooser = fileChooser.get();
         chooser->launchAsync(juce::FileBrowserComponent::openMode
@@ -8932,6 +13846,229 @@ private:
         return nullptr;
     }
 
+    static juce::ValueTree findSamplerSoundState(te::SamplerPlugin* sampler, int soundIndex)
+    {
+        if (sampler == nullptr || soundIndex < 0) return {};
+        int current = 0;
+        for (auto child : sampler->state)
+            if (child.hasType(juce::Identifier("SOUND")) && current++ == soundIndex)
+                return child;
+        return {};
+    }
+
+    int findDrumRackSoundIndex(te::SamplerPlugin* sampler, int pad) const
+    {
+        if (sampler == nullptr || !juce::isPositiveAndBelow(pad, 16)) return -1;
+        const auto note = 48 + pad;
+        for (int sound = 0; sound < sampler->getNumSounds(); ++sound)
+            if (sampler->getMinKey(sound) == note && sampler->getMaxKey(sound) == note)
+                return sound;
+        return -1;
+    }
+
+    DrumRackWindow::PadInfo getDrumRackPadInfo(te::SamplerPlugin* sampler, int pad) const
+    {
+        DrumRackWindow::PadInfo info;
+        const auto soundIndex = findDrumRackSoundIndex(sampler, pad);
+        if (soundIndex < 0) return info;
+        const auto sample = sampler->getSoundFile(soundIndex);
+        info.file = sample.getFile();
+        info.name = sampler->getSoundName(soundIndex);
+        info.durationSeconds = sample.getLength();
+        info.startSeconds = sampler->getSoundStartTime(soundIndex);
+        info.lengthSeconds = sampler->getSoundLength(soundIndex);
+        info.gainDb = sampler->getSoundGainDb(soundIndex);
+        info.pan = sampler->getSoundPan(soundIndex);
+        info.tuneSemitones = 48 + pad - sampler->getKeyNote(soundIndex);
+        info.releaseMs = sampler->getSoundReleaseMs(soundIndex);
+        info.velocitySensitivity = sampler->getSoundVelocitySensitivity(soundIndex);
+        info.velocityTune = sampler->getSoundVelocityTune(soundIndex);
+        info.velocityOffset = sampler->getSoundVelocityOffset(soundIndex);
+        info.cutoffHz = sampler->getSoundCutoffHz(soundIndex);
+        info.trackLevelDb = sampler->getSoundTrackLevelDb(soundIndex);
+        info.oneShot = sampler->isSoundOpenEnded(soundIndex);
+        info.looping = sampler->isSoundLooping(soundIndex);
+        if (const auto soundState = findSamplerSoundState(sampler, soundIndex); soundState.isValid())
+            info.reversed = static_cast<bool>(soundState.getProperty(juce::Identifier("orbitReversed"), false));
+        return info;
+    }
+
+    void refreshDrumRackPadInfoLater(const juce::String& trackId, int pad)
+    {
+        juce::Component::SafePointer<ProjectView> safeThis(this);
+        juce::MessageManager::callAsync([safeThis, trackId, pad]
+        {
+            if (safeThis == nullptr || safeThis->drumRackWindow == nullptr) return;
+            safeThis->drumRackWindow->setPadInfo(pad,
+                safeThis->getDrumRackPadInfo(safeThis->findSamplerPlugin(trackId), pad));
+        });
+    }
+
+    static juce::File createReversedSample(const juce::File& source)
+    {
+        if (!source.existsAsFile()) return {};
+        juce::AudioFormatManager formats;
+        formats.registerBasicFormats();
+        std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(source));
+        if (reader == nullptr || reader->lengthInSamples <= 0 || reader->numChannels == 0) return {};
+
+        auto outputFolder = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                                .getChildFile("Orbit").getChildFile("Drum Rack Renders");
+        if (!outputFolder.createDirectory()) return {};
+        const auto output = outputFolder.getChildFile(juce::Uuid().toString() + " - Reversed.wav");
+        std::unique_ptr<juce::OutputStream> outputStream(output.createOutputStream());
+        if (outputStream == nullptr) return {};
+
+        juce::WavAudioFormat wav;
+        const auto channels = juce::jlimit(1, 2, static_cast<int>(reader->numChannels));
+        std::unique_ptr<juce::AudioFormatWriter> writer(wav.createWriterFor(outputStream.get(), reader->sampleRate,
+            static_cast<unsigned int>(channels), 24, reader->metadataValues, 0));
+        if (writer == nullptr) return {};
+        outputStream.release(); // AudioFormatWriter owns the stream from this point.
+
+        constexpr int blockSize = 8192;
+        juce::AudioBuffer<float> block(channels, blockSize);
+        int64_t written = 0;
+        while (written < reader->lengthInSamples)
+        {
+            const auto frames = static_cast<int>(juce::jmin<int64_t>(blockSize, reader->lengthInSamples - written));
+            const auto readStart = reader->lengthInSamples - written - frames;
+            block.clear();
+            if (!reader->read(&block, 0, frames, readStart, true, true))
+            {
+                output.deleteFile();
+                return {};
+            }
+            for (int channel = 0; channel < channels; ++channel)
+                std::reverse(block.getWritePointer(channel), block.getWritePointer(channel) + frames);
+            if (!writer->writeFromAudioSampleBuffer(block, 0, frames))
+            {
+                output.deleteFile();
+                return {};
+            }
+            written += frames;
+        }
+        writer.reset();
+        return output.existsAsFile() ? output : juce::File{};
+    }
+
+    void setDrumRackPadControl(const juce::String& trackId, int pad,
+                               DrumRackWindow::PadControl control, double value)
+    {
+        auto* sampler = findSamplerPlugin(trackId);
+        const auto soundIndex = findDrumRackSoundIndex(sampler, pad);
+        if (soundIndex < 0) return;
+
+        if (control == DrumRackWindow::PadControl::reverse)
+        {
+            auto soundState = findSamplerSoundState(sampler, soundIndex);
+            const juce::Identifier reversedKey("orbitReversed"), originalKey("orbitOriginalSource");
+            if (static_cast<bool>(soundState.getProperty(reversedKey, false)))
+            {
+                const auto originalPath = soundState.getProperty(originalKey).toString();
+                if (!juce::File(originalPath).existsAsFile())
+                {
+                    status.setText("The original sample for this reversed pad could not be found.", juce::dontSendNotification);
+                    return;
+                }
+                sampler->setSoundMedia(soundIndex, originalPath);
+                soundState.setProperty(reversedKey, false, sampler->getUndoManager());
+            }
+            else
+            {
+                const auto originalPath = sampler->getSoundMedia(soundIndex);
+                const auto reversedFile = createReversedSample(sampler->getSoundFile(soundIndex).getFile());
+                if (!reversedFile.existsAsFile())
+                {
+                    status.setText("Orbit could not render a reversed copy of this sample.", juce::dontSendNotification);
+                    return;
+                }
+                soundState.setProperty(originalKey, originalPath, sampler->getUndoManager());
+                soundState.setProperty(reversedKey, true, sampler->getUndoManager());
+                sampler->setSoundMedia(soundIndex, reversedFile.getFullPathName());
+            }
+        }
+        else if (control == DrumRackWindow::PadControl::tune)
+        {
+            const auto padNote = 48 + pad;
+            const auto rootNote = juce::jlimit(0, 127, padNote - juce::roundToInt(value));
+            sampler->setSoundParams(soundIndex, rootNote, padNote, padNote);
+        }
+        else if (control == DrumRackWindow::PadControl::gain || control == DrumRackWindow::PadControl::pan)
+        {
+            const auto gain = control == DrumRackWindow::PadControl::gain
+                ? static_cast<float>(value) : sampler->getSoundGainDb(soundIndex);
+            const auto pan = control == DrumRackWindow::PadControl::pan
+                ? static_cast<float>(value) : sampler->getSoundPan(soundIndex);
+            sampler->setSoundGains(soundIndex, gain, pan);
+        }
+        else if (control == DrumRackWindow::PadControl::trackLevel)
+            sampler->setSoundTrackLevelDb(soundIndex, static_cast<float>(value));
+        else if (control == DrumRackWindow::PadControl::cutoff)
+            sampler->setSoundCutoffHz(soundIndex, static_cast<float>(value));
+        else if (control == DrumRackWindow::PadControl::playbackMode)
+        {
+            const auto mode = juce::jlimit(0, 2, juce::roundToInt(value));
+            sampler->setSoundOpenEnded(soundIndex, mode == 1);
+            sampler->setSoundLooping(soundIndex, mode == 2);
+        }
+        else if (control == DrumRackWindow::PadControl::release)
+            sampler->setSoundReleaseMs(soundIndex, static_cast<float>(value));
+        else if (control == DrumRackWindow::PadControl::velocitySensitivity
+                 || control == DrumRackWindow::PadControl::velocityTune
+                 || control == DrumRackWindow::PadControl::velocityOffset)
+        {
+            const auto sensitivity = control == DrumRackWindow::PadControl::velocitySensitivity
+                ? static_cast<float>(value) : sampler->getSoundVelocitySensitivity(soundIndex);
+            const auto velocityTune = control == DrumRackWindow::PadControl::velocityTune
+                ? static_cast<float>(value) : sampler->getSoundVelocityTune(soundIndex);
+            const auto velocityOffset = control == DrumRackWindow::PadControl::velocityOffset
+                ? static_cast<float>(value) : sampler->getSoundVelocityOffset(soundIndex);
+            sampler->setSoundVelocityParams(soundIndex, sensitivity, velocityTune, velocityOffset);
+        }
+        else if (control == DrumRackWindow::PadControl::start || control == DrumRackWindow::PadControl::length
+                 || control == DrumRackWindow::PadControl::trimStart || control == DrumRackWindow::PadControl::trimEnd)
+        {
+            const auto duration = sampler->getSoundFile(soundIndex).getLength();
+            if (duration > 0.0)
+            {
+                auto start = sampler->getSoundStartTime(soundIndex);
+                auto length = sampler->getSoundLength(soundIndex);
+                if (length <= 0.0 || length > duration) length = duration;
+                if (control == DrumRackWindow::PadControl::trimStart)
+                {
+                    const auto end = start + length;
+                    const auto minimumLength = juce::jmin(0.005, duration);
+                    start = juce::jlimit(0.0, juce::jmax(0.0, end - minimumLength), value * duration);
+                    length = end - start;
+                }
+                else if (control == DrumRackWindow::PadControl::trimEnd)
+                {
+                    const auto minimumLength = juce::jmin(0.005, duration);
+                    const auto end = juce::jlimit(start + minimumLength, duration, value * duration);
+                    length = end - start;
+                }
+                else if (control == DrumRackWindow::PadControl::start)
+                    start = juce::jlimit(0.0, juce::jmax(0.0, duration - length), value * juce::jmax(0.0, duration - length));
+                else
+                {
+                    const auto minimumLength = juce::jmin(0.005, duration);
+                    length = juce::jlimit(minimumLength, duration, value * duration);
+                    start = juce::jmin(start, juce::jmax(0.0, duration - length));
+                }
+                sampler->setSoundExcerpt(soundIndex, start, length);
+            }
+        }
+
+        if (drumRackWindow != nullptr)
+        {
+            drumRackWindow->setPadInfo(pad, getDrumRackPadInfo(sampler, pad));
+            refreshDrumRackPadInfoLater(trackId, pad);
+        }
+        isDirty = true;
+        status.setText("Drum Rack pad updated. Save to keep the change.", juce::dontSendNotification);
+    }
+
     void addDrumRackTrack()
     {
         if (!hasProject || edit == nullptr) return;
@@ -8970,16 +14107,39 @@ private:
         isDirty = true;
         openDrumRackWindow(project.getTrackId(project.getTrackCount() - 1));
         refreshProjectView("Added a sampler-backed Drum Rack. Load samples into pads, then program its steps.");
+        // Refreshing the generator panel can change child z-order. Raise the
+        // embedded rack after refresh so it stays immediately accessible.
+        if (drumRackWindow != nullptr)
+            drumRackWindow->toFront(true);
     }
 
     void openDrumRackWindow(const juce::String& trackId)
     {
+        if (drumRackWindow != nullptr && drumRackTrackId == trackId)
+        {
+            auto* currentSampler = findSamplerPlugin(trackId);
+            const auto slot = selectedPatternIndex();
+            drumRackWindow->setStepCount(project.getPatternLengthSteps(trackId, slot));
+            for (int pad = 0; pad < 16; ++pad)
+            {
+                drumRackWindow->setPadInfo(pad, getDrumRackPadInfo(currentSampler, pad));
+                drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, slot, pad));
+                drumRackWindow->setVelocities(pad, getDrumRackVelocities(trackId, slot, pad));
+            }
+            drumRackWindow->setVisible(true);
+            resized();
+            drumRackWindow->toFront(true);
+            return;
+        }
+
+        if (drumRackWindow != nullptr)
+            drumRackWindow->setVisible(false);
         drumRackTrackId = trackId;
         drumRackWindow = std::make_unique<DrumRackWindow>(
             [this, trackId](int pad)
             {
                 const auto note = 48 + pad;
-                fileChooser = std::make_unique<juce::FileChooser>("Load a drum sample", juce::File{},
+                fileChooser = std::make_unique<juce::FileChooser>("Load a drum sample", firstSampleFolder(),
                                                                   "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg");
                 fileChooser->launchAsync(juce::FileBrowserComponent::openMode
                                              | juce::FileBrowserComponent::canSelectFiles,
@@ -8989,6 +14149,7 @@ private:
                         if (!file.existsAsFile()) return;
                         auto* sampler = findSamplerPlugin(trackId);
                         if (sampler == nullptr) return;
+                        rememberUndo("Load Drum Rack sample");
                         for (int index = sampler->getNumSounds(); --index >= 0;)
                             if (sampler->getKeyNote(index) == note) sampler->removeSound(index);
                         const auto error = sampler->addSound(file.getFullPathName(), file.getFileNameWithoutExtension(),
@@ -9000,7 +14161,17 @@ private:
                         }
                         const int soundIndex = sampler->getNumSounds() - 1;
                         sampler->setSoundParams(soundIndex, note, note, note);
-                        drumRackWindow->setPadSampleName(pad, file.getFileNameWithoutExtension());
+                        // Drum hits should finish as one-shots even though the
+                        // sequencer emits a short MIDI note for each step.
+                        sampler->setSoundOpenEnded(soundIndex, true);
+                        sampler->setSoundLooping(soundIndex, false);
+                        auto soundState = findSamplerSoundState(sampler, soundIndex);
+                        soundState.setProperty(juce::Identifier("orbitOriginalSource"), file.getFullPathName(),
+                                               sampler->getUndoManager());
+                        soundState.setProperty(juce::Identifier("orbitReversed"), false,
+                                               sampler->getUndoManager());
+                        if (drumRackWindow != nullptr)
+                            refreshDrumRackPadInfoLater(trackId, pad);
                         isDirty = true;
                         status.setText("Loaded " + file.getFileName() + " into Drum Rack pad "
                                            + juce::String(pad + 1) + ". Save to keep the change.",
@@ -9009,16 +14180,35 @@ private:
             },
             [this, trackId](int pad)
             {
-                drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, selectedPatternIndex(), pad));
+                if (drumRackWindow != nullptr)
+                {
+                    drumRackWindow->setPadInfo(pad, getDrumRackPadInfo(findSamplerPlugin(trackId), pad));
+                    const auto slot = selectedPatternIndex();
+                    drumRackWindow->setStepCount(project.getPatternLengthSteps(trackId, slot));
+                    drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, slot, pad));
+                    drumRackWindow->setVelocities(pad, getDrumRackVelocities(trackId, slot, pad));
+                }
+            },
+            [this, trackId](int pad)
+            {
+                auto* sampler = findSamplerPlugin(trackId);
+                if (sampler == nullptr || !juce::isPositiveAndBelow(pad, 16)) return;
+                juce::BigInteger pressed;
+                pressed.setBit(48 + pad);
+                sampler->playNotes(pressed);
+                juce::Component::SafePointer<ProjectView> safeThis(this);
+                juce::Timer::callAfterDelay(90, [safeThis, trackId]
+                {
+                    if (safeThis == nullptr) return;
+                    if (auto* currentSampler = safeThis->findSamplerPlugin(trackId))
+                        currentSampler->playNotes(juce::BigInteger{});
+                });
             },
             [this, trackId](int pad, int step, bool enabled)
             {
                 const int slot = selectedPatternIndex();
                 if (!project.isPatternCreated(trackId, slot))
-                {
                     project.setPatternCreated(trackId, slot, true);
-                    project.setPatternLengthSteps(trackId, slot, 16);
-                }
                 const int pitch = 48 + pad;
                 project.setPatternNote(trackId, slot, pitch, step, enabled);
                 if (enabled)
@@ -9027,27 +14217,108 @@ private:
                     project.setPatternNoteLength(trackId, slot, pitch, step, 1);
                 }
                 drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, slot, pad));
+                drumRackWindow->setVelocities(pad, getDrumRackVelocities(trackId, slot, pad));
                 rebuildPatternClip();
                 isDirty = true;
                 status.setText("Drum Rack pattern edited. Save to keep the change.", juce::dontSendNotification);
-            });
+            },
+            [this, trackId](int pad, int step, int velocity)
+            {
+                const int slot = selectedPatternIndex();
+                const int pitch = 48 + pad;
+                if (project.getPatternNote(trackId, slot, pitch, step))
+                    project.setPatternNoteVelocity(trackId, slot, pitch, step, velocity);
+                if (drumRackWindow != nullptr)
+                    drumRackWindow->setVelocities(pad, getDrumRackVelocities(trackId, slot, pad));
+                rebuildPatternClip();
+                isDirty = true;
+                status.setText("Drum Rack hit velocity updated. Save to keep the change.", juce::dontSendNotification);
+            },
+            [this, trackId](int pad, DrumRackWindow::PadControl control, double value)
+            {
+                setDrumRackPadControl(trackId, pad, control, value);
+            },
+            [this, trackId](int count)
+            {
+                const auto slot = selectedPatternIndex();
+                rememberUndo("Change Drum Rack pattern length");
+                project.setPatternCreated(trackId, slot, true);
+                project.setPatternLengthSteps(trackId, slot, count);
+                rebuildPatternClip();
+                isDirty = true;
+                status.setText("Drum Rack pattern set to " + juce::String(count)
+                                   + " steps. Save to keep the change.",
+                               juce::dontSendNotification);
+            },
+            getSavedDrumRackBounds(),
+            [this](juce::Rectangle<int> bounds) { saveDrumRackBounds(bounds); });
 
-        const auto* sampler = findSamplerPlugin(trackId);
-        if (sampler != nullptr)
-            for (int pad = 0; pad < 16; ++pad)
-                for (int sound = 0; sound < sampler->getNumSounds(); ++sound)
-                    if (sampler->getKeyNote(sound) == 48 + pad)
-                        drumRackWindow->setPadSampleName(pad, sampler->getSoundName(sound));
+        addAndMakeVisible(*drumRackWindow);
+        resized();
+        drumRackWindow->toFront(false);
+
+        drumRackWindow->undoGestureHandler = [this](const juce::String& label) { rememberUndo(label); };
+        drumRackWindow->onGeneratorMenu = [this, trackId](juce::Component* anchor)
+        {
+            showGeneratorMenuFor(trackId, anchor);
+        };
+        auto* sampler = findSamplerPlugin(trackId);
+        drumRackWindow->setStepCount(project.getPatternLengthSteps(trackId, selectedPatternIndex()));
+        for (int pad = 0; pad < 16; ++pad)
+            drumRackWindow->setPadInfo(pad, getDrumRackPadInfo(sampler, pad));
         for (int pad = 0; pad < 16; ++pad)
             drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, selectedPatternIndex(), pad));
+        for (int pad = 0; pad < 16; ++pad)
+            drumRackWindow->setVelocities(pad, getDrumRackVelocities(trackId, selectedPatternIndex(), pad));
     }
 
-    std::array<bool, 16> getDrumRackSteps(const juce::String& trackId, int slot, int pad) const
+    juce::Rectangle<int> getSavedDrumRackBounds()
     {
-        std::array<bool, 16> steps{};
-        for (int step = 0; step < 16; ++step)
-            steps[static_cast<size_t>(step)] = project.getPatternNote(trackId, slot, 48 + pad, step);
+        auto* settings = applicationProperties.getUserSettings();
+        if (settings == nullptr) return {};
+        const juce::Rectangle<int> bounds(settings->getIntValue("drumRackPanelX", 80),
+                                           settings->getIntValue("drumRackPanelY", 100),
+                                           settings->getIntValue("drumRackPanelWidth", 1320),
+                                           settings->getIntValue("drumRackPanelHeight", 760));
+        return bounds.getWidth() >= 760 && bounds.getHeight() >= 590 ? bounds : juce::Rectangle<int>{};
+    }
+
+    void saveDrumRackBounds(juce::Rectangle<int> bounds)
+    {
+        if (auto* settings = applicationProperties.getUserSettings())
+        {
+            settings->setValue("drumRackPanelX", bounds.getX());
+            settings->setValue("drumRackPanelY", bounds.getY());
+            settings->setValue("drumRackPanelWidth", bounds.getWidth());
+            settings->setValue("drumRackPanelHeight", bounds.getHeight());
+            applicationProperties.saveIfNeeded();
+        }
+    }
+
+    DrumRackStepGrid::StepIndices getDrumRackSteps(const juce::String& trackId, int slot, int pad) const
+    {
+        const auto count = project.getPatternLengthSteps(trackId, slot);
+        DrumRackStepGrid::StepIndices steps;
+        for (const auto& note : project.getPatternNotes(trackId, slot))
+            if (note.pitch == 48 + pad)
+            {
+                const auto step = note.startTick / 64;
+                if (juce::isPositiveAndBelow(step, count)) steps.push_back(step);
+            }
         return steps;
+    }
+
+    DrumRackStepGrid::StepVelocities getDrumRackVelocities(const juce::String& trackId, int slot, int pad) const
+    {
+        const auto count = project.getPatternLengthSteps(trackId, slot);
+        DrumRackStepGrid::StepVelocities values;
+        for (const auto& note : project.getPatternNotes(trackId, slot))
+            if (note.pitch == 48 + pad)
+            {
+                const auto step = note.startTick / 64;
+                if (juce::isPositiveAndBelow(step, count)) values.emplace_back(step, note.velocity);
+            }
+        return values;
     }
 
     void addPattern()
@@ -9058,17 +14329,17 @@ private:
         const auto patternIndex = selectedPatternIndex();
         const auto trackId = selectedProjectTrackId();
         project.setPatternCreated(trackId, patternIndex, true);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-                project.setPatternNote(trackId, patternIndex, pitch, step, false);
-        for (auto& pitchSteps : noteGrid) pitchSteps.fill(false);
+        for (const auto& note : project.getPatternNotes(trackId, patternIndex))
+            project.removePatternNoteTicks(trackId, patternIndex, note.pitch, note.startTick);
+        project.setPatternLengthSteps(trackId, patternIndex, 16);
+        for (auto& pitchSteps : noteGrid) pitchSteps.clear();
         pitchSelector.setSelectedId(pitchToItemId(60), juce::dontSendNotification);
         pitchSelector.setEnabled(true);
         pianoRollButton.setEnabled(true);
         for (int i = 0; i < 16; ++i)
         {
             const bool enabled = i == 0 || i == 4 || i == 8 || i == 12;
-            noteGrid[static_cast<size_t>(60 - minimumPitch)][static_cast<size_t>(i)] = enabled;
+            if (enabled) noteGrid[static_cast<size_t>(60 - minimumPitch)].insert(i);
             project.setPatternNote(trackId, patternIndex, 60, i, enabled);
         }
         project.setPatternCreated(trackId, patternIndex, true);
@@ -9083,7 +14354,8 @@ private:
     void updatePatternStep(int index, bool enabled)
     {
         if (!hasPattern || index < 0 || index >= 16) return;
-        noteGrid[static_cast<size_t>(selectedPitch() - minimumPitch)][static_cast<size_t>(index)] = enabled;
+        auto& row = noteGrid[static_cast<size_t>(selectedPitch() - minimumPitch)];
+        if (enabled) row.insert(index); else row.erase(index);
         project.setPatternNote(selectedProjectTrackId(), selectedPatternIndex(), selectedPitch(), index, enabled);
         rebuildPatternClip();
         isDirty = true;
@@ -9095,9 +14367,131 @@ private:
         refreshEnginePlaylist();
     }
 
+    void refreshSelectedPatternClips()
+    {
+        if (edit == nullptr || instrumentTrack == nullptr || auditionPatternPlayback)
+        {
+            if (edit != nullptr) refreshEnginePlaylist();
+            return;
+        }
+        const auto tracks = getGeneratorTracks();
+        const auto trackIndex = tracks.indexOf(instrumentTrack);
+        if (!juce::isPositiveAndBelow(trackIndex, project.getTrackCount())) return;
+        const auto trackId = project.getTrackId(trackIndex);
+        const auto patternId = project.getPatternId(trackId, selectedPatternIndex());
+        invalidatePlaylistPatternPreview(trackId, selectedPatternIndex());
+        bool refreshedAny = false;
+        for (int bar = 0; bar < PlaylistGrid::barCount; ++bar)
+        {
+            if (project.getPlaylistPatternId(trackId, bar) != patternId
+                || project.getPlaylistClipStartBar(trackId, bar) != bar) continue;
+            refreshEnginePlaylistClip(trackIndex, bar);
+            refreshedAny = true;
+        }
+        if (!refreshedAny && patternClip != nullptr)
+            refreshEnginePlaylist();
+        if (playlistWindow != nullptr) playlistWindow->repaintGrid();
+    }
+
+    void addMidiAutomationToClip(te::MidiClip& clip, const juce::String& trackId,
+                                 int patternIndex, int songBar, int patternLength)
+    {
+        const auto addLane = [this, &clip](const ProjectDocument::AutomationLane& lane,
+                                           int localStep, int laneStep)
+        {
+            if (lane.pluginName != "MIDI") return;
+            int controllerType = 0;
+            if (lane.parameterId == "Pitch") controllerType = te::MidiControllerEvent::pitchWheelType;
+            else if (lane.parameterId == "Aftertouch") controllerType = te::MidiControllerEvent::channelPressureType;
+            else if (lane.parameterId == "Modulation Wheel") controllerType = 1;
+            if (controllerType == 0) return;
+            const auto value = juce::jlimit(0.0f, 1.0f, evaluateAutomationLane(lane, laneStep));
+            const auto rawValue = controllerType == te::MidiControllerEvent::pitchWheelType
+                ? juce::roundToInt(value * 16383.0f)
+                : juce::roundToInt(value * 127.0f) << 7;
+            clip.getSequence().addControllerEvent(tracktion::BeatPosition::fromBeats(localStep * 0.25),
+                                                   controllerType, rawValue, nullptr);
+        };
+
+        for (int laneIndex = 0; laneIndex < project.getPatternAutomationLaneCount(trackId, patternIndex); ++laneIndex)
+        {
+            const auto lane = project.getPatternAutomationLane(trackId, patternIndex, laneIndex);
+            if (lane.pluginName != "MIDI") continue;
+            for (int step = 0; step < patternLength; ++step) addLane(lane, step, step);
+        }
+        for (int laneIndex = 0; laneIndex < project.getSongAutomationLaneCount(trackId); ++laneIndex)
+        {
+            const auto lane = project.getSongAutomationLane(trackId, laneIndex);
+            if (lane.pluginName != "MIDI") continue;
+            for (int step = 0; step < patternLength; ++step)
+                addLane(lane, step, songBar * 16 + step);
+        }
+    }
+
+    void mutePlaylistAudioClipsForPatternPlayback()
+    {
+        const auto engineTracks = getGeneratorTracks();
+        for (int trackIndex = 0; trackIndex < engineTracks.size() && trackIndex < project.getTrackCount(); ++trackIndex)
+        {
+            if (project.getTrackKind(trackIndex) != ProjectDocument::TrackKind::audio)
+                continue;
+            auto* track = engineTracks.getUnchecked(trackIndex);
+            const auto trackId = project.getTrackId(trackIndex);
+            for (int item = 0; item < track->getNumTrackItems(); ++item)
+            {
+                auto* clip = dynamic_cast<te::WaveAudioClip*>(track->getTrackItem(item));
+                if (clip == nullptr) continue;
+                const auto clipId = clip->itemID.toString();
+                const auto saved = std::find_if(patternPlaybackMutedAudioClips.begin(), patternPlaybackMutedAudioClips.end(),
+                    [&trackId, &clipId](const PatternPlaybackMutedAudioClip& entry)
+                    { return entry.trackId == trackId && entry.clipId == clipId; });
+                if (saved == patternPlaybackMutedAudioClips.end())
+                    patternPlaybackMutedAudioClips.push_back({ trackId, clipId, clip->isMuted() });
+                clip->setMuted(true);
+            }
+        }
+    }
+
+    void restorePlaylistAudioClipsAfterPatternPlayback()
+    {
+        if (patternPlaybackMutedAudioClips.empty()) return;
+        const auto engineTracks = getGeneratorTracks();
+        for (const auto& saved : patternPlaybackMutedAudioClips)
+        {
+            for (int trackIndex = 0; trackIndex < engineTracks.size() && trackIndex < project.getTrackCount(); ++trackIndex)
+            {
+                if (project.getTrackId(trackIndex) != saved.trackId
+                    || project.getTrackKind(trackIndex) != ProjectDocument::TrackKind::audio)
+                    continue;
+                auto* track = engineTracks.getUnchecked(trackIndex);
+                for (int item = 0; item < track->getNumTrackItems(); ++item)
+                {
+                    auto* clip = dynamic_cast<te::WaveAudioClip*>(track->getTrackItem(item));
+                    if (clip != nullptr && clip->itemID.toString() == saved.clipId)
+                    {
+                        clip->setMuted(saved.wasMuted);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        patternPlaybackMutedAudioClips.clear();
+    }
+
+    void finishPatternPlayback()
+    {
+        if (!auditionPatternPlayback) return;
+        auditionPatternPlayback = false;
+        restorePlaylistAudioClipsAfterPatternPlayback();
+        refreshEnginePlaylist();
+    }
+
     void refreshEnginePlaylist()
     {
         if (edit == nullptr) return;
+        if (auditionPatternPlayback)
+            mutePlaylistAudioClipsForPatternPlayback();
         playlistPreviewCache.clear();
         patternClip = nullptr;
         const auto engineTracks = getGeneratorTracks();
@@ -9116,34 +14510,41 @@ private:
             for (auto* clip : oldClips)
                 track->deleteRegionOfClip(clip, clip->getEditTimeRange(), nullptr);
 
-            for (int bar = 0; bar < PlaylistGrid::barCount; ++bar)
+            if (!auditionPatternPlayback)
             {
-                const auto patternId = project.getPlaylistPatternId(trackId, bar);
-                const auto patternIndex = project.getPatternIndexForId(trackId, patternId);
-                if (patternIndex < 0 || !project.isPatternCreated(trackId, patternIndex)) continue;
-                const auto name = project.getPatternName(trackId, patternIndex);
-                const auto start = bar * secondsPerBar;
-                const auto patternLength = project.getPatternLengthSteps(trackId, patternIndex);
-                const auto clipSeconds = juce::jmax(secondsPerBar, patternLength * secondsPerStep);
-                auto inserted = track->insertMIDIClip(name, { tracktion::TimePosition::fromSeconds(start),
-                                                              tracktion::TimePosition::fromSeconds(start + clipSeconds) }, nullptr);
-                auto* clip = inserted.get();
-                if (clip == nullptr) continue;
-                clip->setLoopRangeBeats({ tracktion::BeatPosition::fromBeats(0.0), tracktion::BeatPosition::fromBeats(patternLength * 0.25) });
-                for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                    for (int step = 0; step < patternLength; ++step)
-                        if (project.getPatternNote(trackId, patternIndex, pitch, step))
-                            clip->getSequence().addNote(pitch, tracktion::BeatPosition::fromBeats(step * 0.25),
-                                                        tracktion::BeatDuration::fromBeats(project.getPatternNoteLength(trackId, patternIndex, pitch, step) * 0.25),
-                                                        project.getPatternNoteVelocity(trackId, patternIndex, pitch, step), 0, nullptr);
-                if (track == instrumentTrack && patternIndex == selectedPatternIndex())
-                    patternClip = clip;
+                for (const auto& placement : project.getPlaylistClips(trackId))
+                {
+                    const auto bar = placement.startBar;
+                    const auto patternId = placement.patternId;
+                    const auto patternIndex = project.getPatternIndexForId(trackId, patternId);
+                    if (patternIndex < 0 || !project.isPatternCreated(trackId, patternIndex)) continue;
+                    const auto name = project.getPatternName(trackId, patternIndex);
+                    const auto start = bar * secondsPerBar;
+                    const auto patternLength = project.getPatternLengthSteps(trackId, patternIndex);
+                    const auto clipBars = placement.lengthBars;
+                    const auto clipSeconds = clipBars * secondsPerBar;
+                    auto inserted = track->insertMIDIClip(name, { tracktion::TimePosition::fromSeconds(start),
+                                                                  tracktion::TimePosition::fromSeconds(start + clipSeconds) }, nullptr);
+                    auto* clip = inserted.get();
+                    if (clip == nullptr) continue;
+                    clip->setLoopRangeBeats({ tracktion::BeatPosition::fromBeats(0.0), tracktion::BeatPosition::fromBeats(patternLength * 0.25) });
+                    for (const auto& note : project.getPatternNotes(trackId, patternIndex))
+                        clip->getSequence().addNote(note.pitch,
+                            tracktion::BeatPosition::fromBeats((note.startTick / 64.0) * 0.25),
+                            tracktion::BeatDuration::fromBeats((note.lengthTicks / 64.0) * 0.25),
+                            note.velocity, 0, nullptr);
+                    addMidiAutomationToClip(*clip, trackId, patternIndex, bar, patternLength);
+                    if (track == instrumentTrack && patternIndex == selectedPatternIndex())
+                        patternClip = clip;
+                }
             }
         }
         if (auditionPatternPlayback)
         {
             for (int trackIndex = 0; trackIndex < engineTracks.size() && trackIndex < project.getTrackCount(); ++trackIndex)
             {
+                if (project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio)
+                    continue;
                 auto* track = engineTracks.getUnchecked(trackIndex);
                 const auto trackId = project.getTrackId(trackIndex);
                 const auto patternIndex = project.getTrackSelectedPatternIndex(trackId);
@@ -9161,14 +14562,11 @@ private:
                 {
                     clip->setLoopRangeBeats({ tracktion::BeatPosition::fromBeats(0.0),
                                               tracktion::BeatPosition::fromBeats(lengthBeats) });
-                    for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                        for (int step = 0; step < patternLength; ++step)
-                            if (project.getPatternNote(trackId, patternIndex, pitch, step))
-                                clip->getSequence().addNote(pitch,
-                                    tracktion::BeatPosition::fromBeats(step * 0.25),
-                                    tracktion::BeatDuration::fromBeats(
-                                        project.getPatternNoteLength(trackId, patternIndex, pitch, step) * 0.25),
-                                    project.getPatternNoteVelocity(trackId, patternIndex, pitch, step), 0, nullptr);
+                    for (const auto& note : project.getPatternNotes(trackId, patternIndex))
+                        clip->getSequence().addNote(note.pitch,
+                            tracktion::BeatPosition::fromBeats((note.startTick / 64.0) * 0.25),
+                            tracktion::BeatDuration::fromBeats((note.lengthTicks / 64.0) * 0.25),
+                            note.velocity, 0, nullptr);
                     if (track == instrumentTrack)
                         patternClip = clip;
                 }
@@ -9194,6 +14592,8 @@ private:
         const auto trackId = project.getTrackId(trackIndex);
         const auto secondsPerStep = 15.0 / juce::jmax(20.0, project.getInitialTempoBpm());
         const auto secondsPerBar = secondsPerStep * 16.0;
+        const auto actualStartBar = project.getPlaylistClipStartBar(trackId, bar);
+        if (actualStartBar >= 0) bar = actualStartBar;
         const auto targetStart = static_cast<double>(bar) * secondsPerBar;
         std::vector<te::MidiClip*> oldClips;
         for (int item = 0; item < track->getNumTrackItems(); ++item)
@@ -9212,7 +14612,8 @@ private:
         if (patternIndex < 0 || !project.isPatternCreated(trackId, patternIndex)) return;
 
         const auto patternLength = project.getPatternLengthSteps(trackId, patternIndex);
-        const auto clipSeconds = juce::jmax(secondsPerBar, patternLength * secondsPerStep);
+        const auto clipBars = juce::jmax(1, project.getPlaylistClipLengthBars(trackId, bar));
+        const auto clipSeconds = clipBars * secondsPerBar;
         auto inserted = track->insertMIDIClip(project.getPatternName(trackId, patternIndex),
             { tracktion::TimePosition::fromSeconds(targetStart),
               tracktion::TimePosition::fromSeconds(targetStart + clipSeconds) }, nullptr);
@@ -9220,13 +14621,11 @@ private:
         if (clip == nullptr) return;
         clip->setLoopRangeBeats({ tracktion::BeatPosition::fromBeats(0.0),
                                   tracktion::BeatPosition::fromBeats(patternLength * 0.25) });
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < patternLength; ++step)
-                if (project.getPatternNote(trackId, patternIndex, pitch, step))
-                    clip->getSequence().addNote(pitch, tracktion::BeatPosition::fromBeats(step * 0.25),
-                        tracktion::BeatDuration::fromBeats(
-                            project.getPatternNoteLength(trackId, patternIndex, pitch, step) * 0.25),
-                        project.getPatternNoteVelocity(trackId, patternIndex, pitch, step), 0, nullptr);
+        for (const auto& note : project.getPatternNotes(trackId, patternIndex))
+            clip->getSequence().addNote(note.pitch,
+                tracktion::BeatPosition::fromBeats((note.startTick / 64.0) * 0.25),
+                tracktion::BeatDuration::fromBeats((note.lengthTicks / 64.0) * 0.25),
+                note.velocity, 0, nullptr);
         if (track == instrumentTrack && patternIndex == selectedPatternIndex())
             patternClip = clip;
     }
@@ -9330,11 +14729,7 @@ private:
         if (playlistWindow->isMinimized()) playlistWindow->setMinimized(false);
         playlistWindow->refresh();
         playlistWindow->setVisible(true);
-        if (auto* settings = applicationProperties.getUserSettings())
-        {
-            settings->setValue("playlistWindowOpen", true);
-            settings->saveIfNeeded();
-        }
+        savePlaylistPanelState();
         // Keep generator pattern controls behind the Playlist while it is open.
         playlistWindow->toFront(false);
     }
@@ -9344,6 +14739,20 @@ private:
         if (playlistBoundsInitialised) return;
         const auto area = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
         playlistPanelBounds = area.withHeight(juce::jmin(700, area.getHeight()));
+        if (auto* settings = applicationProperties.getUserSettings();
+            settings != nullptr && settings->getBoolValue("playlistPanelBoundsSet", false))
+        {
+            playlistPanelBounds.setPosition(settings->getIntValue("playlistPanelX", playlistPanelBounds.getX()),
+                                             settings->getIntValue("playlistPanelY", playlistPanelBounds.getY()));
+            playlistPanelBounds.setSize(settings->getIntValue("playlistPanelWidth", playlistPanelBounds.getWidth()),
+                                         settings->getIntValue("playlistPanelHeight", playlistPanelBounds.getHeight()));
+            playlistRestoreBounds.setPosition(settings->getIntValue("playlistRestoreX", playlistPanelBounds.getX()),
+                                              settings->getIntValue("playlistRestoreY", playlistPanelBounds.getY()));
+            playlistRestoreBounds.setSize(settings->getIntValue("playlistRestoreWidth", playlistPanelBounds.getWidth()),
+                                          settings->getIntValue("playlistRestoreHeight", playlistPanelBounds.getHeight()));
+            playlistWindow->setMaximized(settings->getBoolValue("playlistMaximized", false));
+            if (settings->getBoolValue("playlistMinimized", false)) playlistWindow->setMinimized(true);
+        }
         playlistBoundsInitialised = true;
         resized();
     }
@@ -9356,6 +14765,7 @@ private:
             juce::jlimit(48 - playlistPanelBounds.getWidth(), getWidth() - 48, position.x),
             juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - 28), position.y));
         playlistWindow->setBounds(playlistPanelBounds);
+        savePlaylistPanelState();
     }
 
     void resizePlaylistPanel(juce::Rectangle<int> bounds)
@@ -9368,6 +14778,7 @@ private:
                            juce::jlimit(area.getY(), juce::jmax(area.getY(), area.getBottom() - 28), bounds.getY()));
         playlistPanelBounds = bounds;
         playlistWindow->setBounds(playlistPanelBounds);
+        savePlaylistPanelState();
     }
 
     void togglePlaylistMaximized()
@@ -9388,6 +14799,7 @@ private:
         }
         playlistWindow->setBounds(playlistPanelBounds);
         playlistWindow->toFront(false);
+        savePlaylistPanelState();
     }
 
     void togglePlaylistView()
@@ -9405,6 +14817,52 @@ private:
             }
         }
         else showPlaylist();
+    }
+
+    void savePlaylistPanelState()
+    {
+        if (playlistWindow == nullptr || !playlistBoundsInitialised) return;
+        if (auto* settings = applicationProperties.getUserSettings())
+        {
+            settings->setValue("playlistPanelBoundsSet", true);
+            settings->setValue("playlistPanelX", playlistPanelBounds.getX());
+            settings->setValue("playlistPanelY", playlistPanelBounds.getY());
+            settings->setValue("playlistPanelWidth", playlistPanelBounds.getWidth());
+            settings->setValue("playlistPanelHeight", playlistPanelBounds.getHeight());
+            settings->setValue("playlistRestoreX", playlistRestoreBounds.getX());
+            settings->setValue("playlistRestoreY", playlistRestoreBounds.getY());
+            settings->setValue("playlistRestoreWidth", playlistRestoreBounds.getWidth());
+            settings->setValue("playlistRestoreHeight", playlistRestoreBounds.getHeight());
+            settings->setValue("playlistMaximized", playlistWindow->isMaximized());
+            settings->setValue("playlistMinimized", playlistWindow->isMinimized());
+            settings->setValue("playlistWindowOpen", playlistWindow->isVisible());
+            settings->saveIfNeeded();
+        }
+    }
+
+    void savePianoRollState()
+    {
+        if (auto* settings = applicationProperties.getUserSettings())
+        {
+            settings->setValue("pianoRollWindowOpen", pianoRollWindow != nullptr && pianoRollWindow->isVisible());
+            settings->setValue("pianoRollMaximized", pianoRollMaximized);
+            settings->setValue("generatorPanelX", generatorPanelBounds.getX());
+            settings->setValue("generatorPanelY", generatorPanelBounds.getY());
+            settings->setValue("generatorPanelWidth", generatorPanelBounds.getWidth());
+            settings->setValue("generatorPanelHeight", generatorPanelBounds.getHeight());
+            settings->setValue("generatorPatternToolbarCollapsed", patternToolbarCollapsed);
+            settings->setValue("pianoRollBoundsSet", !pianoRollBounds.isEmpty());
+            settings->setValue("pianoRollX", pianoRollBounds.getX());
+            settings->setValue("pianoRollY", pianoRollBounds.getY());
+            settings->setValue("pianoRollWidth", pianoRollBounds.getWidth());
+            settings->setValue("pianoRollHeight", pianoRollBounds.getHeight());
+            settings->setValue("pianoRollRestoreBoundsSet", !pianoRollRestoreBounds.isEmpty());
+            settings->setValue("pianoRollRestoreX", pianoRollRestoreBounds.getX());
+            settings->setValue("pianoRollRestoreY", pianoRollRestoreBounds.getY());
+            settings->setValue("pianoRollRestoreWidth", pianoRollRestoreBounds.getWidth());
+            settings->setValue("pianoRollRestoreHeight", pianoRollRestoreBounds.getHeight());
+            settings->saveIfNeeded();
+        }
     }
 
     void cascadeOpenWindows()
@@ -9426,16 +14884,16 @@ private:
 
     void stopPlayback()
     {
+        const bool recorded=midiTake.active || !midiTake.notes.empty();
+        const bool committed=finishMidiRecording();
         if (edit != nullptr && playbackMode == PlaybackMode::song)
             rememberSongPatternsAt(edit->getTransport().getPosition().inSeconds());
         if (edit != nullptr) edit->getTransport().stop(false, false);
         if (auditionPatternPlayback)
-        {
-            auditionPatternPlayback = false;
-            refreshEnginePlaylist();
-        }
+            finishPatternPlayback();
         playButton.setButtonText("Play");
-        status.setText("Stopped.", juce::dontSendNotification);
+        if(!recorded)status.setText("Stopped.", juce::dontSendNotification);
+        else if(committed)status.setText("Stopped. MIDI take committed; Undo restores the previous notes.",juce::dontSendNotification);
     }
 
     void showMixer(bool focusMaster = false)
@@ -9463,6 +14921,7 @@ private:
         if (auto* settings = applicationProperties.getUserSettings())
         {
             settings->setValue("mixerWindowOpen", true);
+            settings->setValue("mixerMasterMode", focusMaster);
             settings->saveIfNeeded();
         }
         resized();
@@ -9835,7 +15294,7 @@ private:
         return juce::isPositiveAndBelow(index, tracks.size()) && tracks.getUnchecked(index)->isSolo(false);
     }
 
-    void syncTrackMixerState(te::AudioTrack* track)
+    void syncTrackMixerState(te::AudioTrack* track, bool includeSends = true)
     {
         if (track == nullptr || edit == nullptr) return;
         const auto generators = getGeneratorTracks();
@@ -9866,11 +15325,12 @@ private:
                                    volume != nullptr ? volume->getVolumeDb() : 0.0,
                                    volume != nullptr ? volume->pan.get() : 0.0,
                                    track->isMuted(false), track->isSolo(false));
-        for (int bus = 0; bus < 8; ++bus)
-        {
-            auto* send = track->getAuxSendPlugin(bus);
-            project.setTrackSendGain(projectIndex, bus, send != nullptr ? send->getGainDb() : -60.0);
-        }
+        if (includeSends)
+            for (int bus = 0; bus < 8; ++bus)
+            {
+                auto* send = track->getAuxSendPlugin(bus);
+                project.setTrackSendGain(projectIndex, bus, send != nullptr ? send->getGainDb() : -60.0);
+            }
     }
 
     void syncMasterMixerState()
@@ -9887,7 +15347,7 @@ private:
         if (auto* plugin = tracks.getUnchecked(index)->getVolumePlugin())
         {
             plugin->setVolumeDb(static_cast<float>(value));
-            syncTrackMixerState(tracks.getUnchecked(index));
+            syncTrackMixerState(tracks.getUnchecked(index), false);
             isDirty = true;
             status.setText("Mixer level changed. Save to keep the change.", juce::dontSendNotification);
         }
@@ -9901,7 +15361,7 @@ private:
         if (auto* plugin = tracks.getUnchecked(index)->getVolumePlugin())
         {
             plugin->setPan(static_cast<float>(value));
-            syncTrackMixerState(tracks.getUnchecked(index));
+            syncTrackMixerState(tracks.getUnchecked(index), false);
             isDirty = true;
             status.setText("Mixer pan changed. Save to keep the change.", juce::dontSendNotification);
         }
@@ -10027,8 +15487,8 @@ private:
         isDirty = true;
         if (mixerWindow != nullptr)
         {
-            mixerWindow->refreshEqControls();
-            mixerWindow->repaintEqGraphs();
+            mixerWindow->refreshEqControls(index);
+            mixerWindow->repaintEqGraphs(index);
         }
         status.setText("Equaliser changed. Save to keep the change.", juce::dontSendNotification);
     }
@@ -10047,8 +15507,8 @@ private:
         isDirty = true;
         if (mixerWindow != nullptr)
         {
-            mixerWindow->refreshEqControls();
-            mixerWindow->repaintEqGraphs();
+            mixerWindow->refreshEqControls(index);
+            mixerWindow->repaintEqGraphs(index);
         }
         if (equaliserWindow != nullptr) equaliserWindow->refreshParameterValues(index);
         status.setText("Equaliser band changed. Save to keep the change.", juce::dontSendNotification);
@@ -10073,6 +15533,7 @@ private:
                 && dynamic_cast<te::LevelMeterPlugin*>(plugin) == nullptr
                 && dynamic_cast<te::EqualiserPlugin*>(plugin) == nullptr
                 && dynamic_cast<te::SamplerPlugin*>(plugin) == nullptr
+                && dynamic_cast<orbit::generator::MidiPlugin*>(plugin) == nullptr
                 && dynamic_cast<te::AuxReturnPlugin*>(plugin) == nullptr
                 && dynamic_cast<te::AuxSendPlugin*>(plugin) == nullptr
                 && (dynamic_cast<te::ExternalPlugin*>(plugin) == nullptr
@@ -10379,7 +15840,27 @@ private:
         return patternIndex >= 0 ? project.getPatternName(trackId, patternIndex) : juce::String{};
     }
 
-    std::vector<juce::Point<int>> getPlaylistPreviewNotes(int trackIndex, int bar) const
+    void invalidatePlaylistPatternPreview(const juce::String& trackId, int patternIndex)
+    {
+        // A track can have several Playlist clips pointing at a pattern while
+        // slots are being switched or reassigned. Drop every cached preview
+        // for that track so the next paint always reads the current note data.
+        // Clearing only one index left stale thumbnails when the selected slot
+        // and a clip's resolved pattern index changed during an edit.
+        if (trackId.isNotEmpty())
+        {
+            const auto prefix = trackId + ":";
+            for (auto it = playlistPreviewCache.begin(); it != playlistPreviewCache.end();)
+                if (it->first.startsWith(prefix)) it = playlistPreviewCache.erase(it); else ++it;
+        }
+        else if (patternIndex < 0)
+        {
+            playlistPreviewCache.clear();
+        }
+        if (playlistWindow != nullptr) playlistWindow->repaintGrid();
+    }
+
+    std::vector<PlaylistPreviewNote> getPlaylistPreviewNotes(int trackIndex, int bar) const
     {
         if (!juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
             || !juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return {};
@@ -10389,12 +15870,16 @@ private:
         const auto cacheKey = trackId + ":" + juce::String(patternIndex);
         if (const auto found = playlistPreviewCache.find(cacheKey); found != playlistPreviewCache.end())
             return found->second;
-        std::vector<juce::Point<int>> notes;
+        std::vector<PlaylistPreviewNote> notes;
         const auto length = project.getPatternLengthSteps(trackId, patternIndex);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < length; ++step)
-                if (project.getPatternNote(trackId, patternIndex, pitch, step))
-                    notes.emplace_back(step * 64 / juce::jmax(1, length), pitch - minimumPitch);
+        // Pattern notes store their time in 1/64-step ticks. Convert those
+        // ticks to a fraction of the full pattern cycle so 16-, 32-, and
+        // 64-step patterns all occupy their actual Playlist duration.
+        const auto normalizedPatternTicks = 64.0 * static_cast<double>(juce::jmax(1, length));
+        for (const auto& note : project.getPatternNotes(trackId, patternIndex))
+            notes.push_back({ static_cast<double>(note.startTick) / normalizedPatternTicks,
+                              note.pitch - 48,
+                              static_cast<double>(note.lengthTicks) / normalizedPatternTicks });
         playlistPreviewCache.emplace(cacheKey, notes);
         return notes;
     }
@@ -10403,24 +15888,22 @@ private:
     {
         const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
         if (edit == nullptr || !juce::isPositiveAndBelow(trackIndex, tracks.size())) return false;
-        for (auto* input : edit->getAllInputDevices())
-            if (input != nullptr && input->isRecordingEnabled(tracks.getUnchecked(trackIndex)->itemID)) return true;
-        return false;
+        return bool(tracks.getUnchecked(trackIndex)->state.getProperty("orbitRecordArmed",false));
     }
 
     void setTrackRecordArm(int trackIndex, bool armed)
     {
         const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
         if (edit == nullptr || !juce::isPositiveAndBelow(trackIndex, tracks.size())) return;
-        const auto devices = edit->getAllInputDevices();
-        if (devices.isEmpty())
+        if(midiTake.active || project.getTrackKind(trackIndex)==ProjectDocument::TrackKind::audio)
         {
-            status.setText("No MIDI input is available to arm for recording.", juce::dontSendNotification);
+            status.setText(midiTake.active?"Finish the current take before changing record arms.":"Audio recording is not yet available. Arm an instrument generator for MIDI.", juce::dontSendNotification);
             if (playlistWindow != nullptr) playlistWindow->refresh();
             return;
         }
-        for (auto* input : devices)
-            if (input != nullptr) input->setRecordingEnabled(tracks.getUnchecked(trackIndex)->itemID, armed);
+        if(getTrackRecordArm(trackIndex)==armed)return;
+        rememberUndo("Change MIDI record arm");
+        tracks.getUnchecked(trackIndex)->state.setProperty("orbitRecordArmed",armed,nullptr);
         isDirty = true;
         status.setText(armed ? "Generator armed for recording." : "Generator disarmed.", juce::dontSendNotification);
         if (playlistWindow != nullptr) playlistWindow->refresh();
@@ -10445,6 +15928,22 @@ private:
         if (!createdPattern && currentPatternId == patternId)
             return;
 
+        const auto patternBars = juce::jmax(1, (project.getPatternLengthSteps(trackId, patternIndex) + 15) / 16);
+        if (bar + patternBars > PlaylistGrid::barCount)
+        {
+            status.setText("This pattern would extend past the end of the Playlist.", juce::dontSendNotification);
+            return;
+        }
+        for (int occupiedBar = bar + 1; occupiedBar < bar + patternBars; ++occupiedBar)
+        {
+            const auto occupyingPattern = project.getPlaylistPatternId(trackId, occupiedBar);
+            if (occupyingPattern.isNotEmpty() && occupyingPattern != currentPatternId)
+            {
+                status.setText("This longer pattern overlaps another Playlist clip.", juce::dontSendNotification);
+                return;
+            }
+        }
+
         if (!playlistPaintGestureActive)
         {
             rememberUndo("Draw playlist pattern");
@@ -10452,7 +15951,9 @@ private:
         }
         if (createdPattern)
             project.setPatternCreated(trackId, patternIndex, true);
-        project.setPlaylistClip(trackId, patternId, bar, 1, true);
+        if (currentPatternId.isNotEmpty())
+            project.setPlaylistClip(trackId, {}, bar, 1, false);
+        project.setPlaylistClip(trackId, patternId, bar, 0, true);
         refreshEnginePlaylistClip(trackIndex, bar);
         isDirty = true;
         if (createdPattern) readPatternSteps();
@@ -10461,12 +15962,78 @@ private:
             + " in Playlist bar " + juce::String(bar + 1) + ".", juce::dontSendNotification);
     }
 
+    void paintPlaylistClipRange(int trackIndex, int firstBar, int lastBar)
+    {
+        if (!hasProject || edit == nullptr || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
+            || !juce::isPositiveAndBelow(firstBar, PlaylistGrid::barCount)
+            || !juce::isPositiveAndBelow(lastBar, PlaylistGrid::barCount)) return;
+        if (project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio)
+        {
+            paintPlaylistClip(trackIndex, juce::jmin(firstBar, lastBar));
+            return;
+        }
+
+        const auto trackId = project.getTrackId(trackIndex);
+        const auto patternIndex = selectedPatternIndex();
+        const auto patternId = project.getPatternId(trackId, patternIndex);
+        const auto patternBars = juce::jmax(1, (project.getPatternLengthSteps(trackId, patternIndex) + 15) / 16);
+        const auto startBar = juce::jmin(firstBar, lastBar);
+        const auto draggedBars = std::abs(lastBar - firstBar) + 1;
+        const auto lengthBars = juce::jmax(patternBars, draggedBars);
+        if (startBar + lengthBars > PlaylistGrid::barCount)
+        {
+            status.setText("This pattern would extend past the end of the Playlist.", juce::dontSendNotification);
+            return;
+        }
+
+        const auto existingId = project.getPlaylistPatternId(trackId, startBar);
+        if (existingId == patternId
+            && project.getPlaylistClipStartBar(trackId, startBar) == startBar
+            && project.getPlaylistClipLengthBars(trackId, startBar) == lengthBars)
+            return;
+
+        if (!playlistPaintGestureActive)
+        {
+            rememberUndo("Draw Playlist pattern range");
+            playlistPaintGestureActive = true;
+        }
+        if (!project.isPatternCreated(trackId, patternIndex))
+            project.setPatternCreated(trackId, patternIndex, true);
+
+        // Remove any existing clips touched by the painted range before
+        // inserting one continuous clip. The project model deletes whole
+        // overlapping clips when any occupied bar is cleared.
+        std::set<int> replacedClipStarts;
+        for (int bar = startBar; bar < startBar + lengthBars; ++bar)
+        {
+            if (project.getPlaylistPatternId(trackId, bar).isEmpty()) continue;
+            const auto existingStart = project.getPlaylistClipStartBar(trackId, bar);
+            if (existingStart >= 0) replacedClipStarts.insert(existingStart);
+        }
+        for (const auto existingStart : replacedClipStarts)
+            project.setPlaylistClip(trackId, {}, existingStart, 1, false);
+
+        const auto lengthArgument = lengthBars == patternBars ? 0 : lengthBars;
+        project.setPlaylistClip(trackId, patternId, startBar, lengthArgument, true);
+        refreshEnginePlaylist();
+        isDirty = true;
+        if (playlistWindow != nullptr) playlistWindow->repaintGrid();
+        status.setText("Drew " + project.getPatternName(trackId, patternIndex) + " across "
+            + juce::String(lengthBars) + (lengthBars == 1 ? " bar." : " bars."), juce::dontSendNotification);
+    }
+
     void togglePlaylistClip(int trackIndex, int bar)
     {
         if (!hasProject || edit == nullptr || trackIndex < 0 || trackIndex >= project.getTrackCount()) return;
         if (!juce::isPositiveAndBelow(bar, PlaylistGrid::barCount)) return;
         if (project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio)
         {
+            if (findAudioClipAtBar(trackIndex, bar, nullptr, nullptr) != nullptr)
+            {
+                status.setText("Audio clip selected. Drag it to move it; right-click for clip actions.",
+                               juce::dontSendNotification);
+                return;
+            }
             importAudioFile(trackIndex, bar);
             return;
         }
@@ -10497,12 +16064,55 @@ private:
         const auto trackId = project.getTrackId(trackIndex);
         const auto patternId = project.getPlaylistPatternId(trackId, bar);
         if (patternId.isEmpty()) return;
+        const auto clipStart = project.getPlaylistClipStartBar(trackId, bar);
         rememberUndo("Delete Playlist clip");
         project.setPlaylistClip(trackId, {}, bar, 1, false);
-        refreshEnginePlaylistClip(trackIndex, bar);
+        refreshEnginePlaylistClip(trackIndex, juce::jmax(0, clipStart));
         isDirty = true;
         if (playlistWindow != nullptr) playlistWindow->repaintGrid();
         status.setText("Deleted the Playlist clip at bar " + juce::String(bar + 1) + ". Save to keep the change.",
+                       juce::dontSendNotification);
+    }
+
+    void resizePlaylistPatternClip(int trackIndex, int startBar, int newLengthBars)
+    {
+        if (!hasProject || edit == nullptr || !juce::isPositiveAndBelow(trackIndex, project.getTrackCount())
+            || !juce::isPositiveAndBelow(startBar, PlaylistGrid::barCount)
+            || project.getTrackKind(trackIndex) == ProjectDocument::TrackKind::audio) return;
+        const auto trackId = project.getTrackId(trackIndex);
+        const auto patternId = project.getPlaylistPatternId(trackId, startBar);
+        const auto patternIndex = project.getPatternIndexForId(trackId, patternId);
+        if (patternIndex < 0 || project.getPlaylistClipStartBar(trackId, startBar) != startBar) return;
+        const auto placements = project.getPlaylistClips(trackId);
+        const bool exactLength = std::any_of(placements.begin(), placements.end(),
+            [startBar](const auto& placement) { return placement.startBar == startBar && placement.exactLength; });
+        const auto minimumLength = exactLength ? 1 : juce::jmax(1, (project.getPatternLengthSteps(trackId, patternIndex) + 15) / 16);
+        const auto availableLength = PlaylistGrid::barCount - startBar;
+        if (minimumLength > availableLength)
+        {
+            status.setText("Resize canceled. The pattern is longer than the remaining Playlist range.",
+                           juce::dontSendNotification);
+            return;
+        }
+        const auto boundedLength = juce::jlimit(minimumLength, availableLength, newLengthBars);
+        const auto oldLength = project.getPlaylistClipLengthBars(trackId, startBar);
+        if (boundedLength == oldLength && !project.playlistClipFollowsPatternLength(trackId, startBar)) return;
+        for (int candidate = startBar + 1; candidate < startBar + boundedLength; ++candidate)
+        {
+            const auto occupied = project.getPlaylistPatternId(trackId, candidate);
+            if (occupied.isNotEmpty() && occupied != patternId)
+            {
+                status.setText("Resize canceled. Another Playlist clip occupies that range.", juce::dontSendNotification);
+                return;
+            }
+        }
+        rememberUndo("Resize Playlist pattern clip");
+        if (exactLength) project.setPlaylistClipExactBars(trackId, patternId, startBar, boundedLength);
+        else project.setPlaylistClip(trackId, patternId, startBar, boundedLength, true);
+        refreshEnginePlaylistClip(trackIndex, startBar);
+        isDirty = true;
+        if (playlistWindow != nullptr) playlistWindow->refresh();
+        status.setText("Pattern clip length set to " + juce::String(boundedLength) + " bars. Save to keep the change.",
                        juce::dontSendNotification);
     }
 
@@ -10517,12 +16127,33 @@ private:
         const auto patternId = project.getPatternId(trackId, patternIndex);
         if (currentId == patternId) return;
 
+        const auto clipStart = project.getPlaylistClipStartBar(trackId, bar);
+        const auto startBar = clipStart >= 0 ? clipStart : bar;
+        const auto newLength = juce::jmax(1, (project.getPatternLengthSteps(trackId, patternIndex) + 15) / 16);
+        if (startBar + newLength > PlaylistGrid::barCount)
+        {
+            status.setText("Pattern change canceled. The pattern would extend past the end of the Playlist.",
+                           juce::dontSendNotification);
+            return;
+        }
+        for (int candidate = startBar + 1; candidate < startBar + newLength; ++candidate)
+        {
+            const auto occupied = project.getPlaylistPatternId(trackId, candidate);
+            if (occupied.isNotEmpty() && occupied != currentId)
+            {
+                status.setText("Pattern change canceled. The longer pattern overlaps another clip.",
+                               juce::dontSendNotification);
+                return;
+            }
+        }
+
         rememberUndo("Choose Playlist pattern");
-        project.setPlaylistClip(trackId, patternId, bar, 1, true);
+        if (currentId.isNotEmpty()) project.setPlaylistClip(trackId, {}, startBar, 1, false);
+        project.setPlaylistClip(trackId, patternId, startBar, 0, true);
         trackSelector.setSelectedId(trackIndex + 1, juce::sendNotificationSync);
         selectPatternBank(patternIndex / ProjectDocument::patternsPerBank);
         selectPatternSlot(patternIndex % ProjectDocument::patternsPerBank);
-        refreshEnginePlaylistClip(trackIndex, bar);
+        refreshEnginePlaylistClip(trackIndex, startBar);
         isDirty = true;
         if (playlistWindow != nullptr) playlistWindow->repaintGrid();
         status.setText("Selected " + project.getPatternName(trackId, patternIndex)
@@ -10583,18 +16214,45 @@ private:
         int clipLengthBars = 1;
         auto* clip = bar >= 0 ? findAudioClipAtBar(trackIndex, bar, &clipStartBar, &clipLengthBars) : nullptr;
         const auto trackId = project.getTrackId(trackIndex);
-        juce::PopupMenu menu;
+        juce::PopupMenu menu, colourMenu;
         menu.addItem(9201, clip != nullptr ? "Replace / Import Audio File…" : "Open / Import Audio File…");
         if (clip != nullptr)
         {
-            menu.addItem(9202, "Rename Audio Clip…");
-            menu.addItem(9203, "Delete Audio Clip");
+            menu.addItem(9202, "Rename…");
+            menu.addItem(9203, "Delete");
+            menu.addItem(9206, "Reverse", true, clip->getIsReversed());
+            menu.addItem(9207, "Normalize");
+            menu.addItem(9208, "Clone");
+            menu.addItem(9209, "Make Unique");
         }
         menu.addSeparator();
-        menu.addItem(9204, "Rename Audio Track…");
-        menu.addItem(9205, "Delete Audio Track…");
+        menu.addItem(9204, "Rename Track…");
+        menu.addItem(9205, "Delete Track…");
+        menu.addItem(9224, "Move Track Up", trackIndex > 0);
+        menu.addItem(9225, "Move Track Down", trackIndex + 1 < project.getTrackCount());
+        menu.addItem(9223, "Gradient Color Wash for This Track", true,
+                     project.getTrackGradientHighlight(trackIndex));
+        const std::array<std::pair<const char*, juce::Colour>, 12> audioPalette {{
+            { "Red", orbit::options::colour(210, 77, 77) },
+            { "Orange", orbit::options::colour(225, 133, 55) },
+            { "Yellow", orbit::options::colour(207, 174, 61) },
+            { "Lime", orbit::options::colour(137, 181, 70) },
+            { "Green", orbit::options::colour(65, 166, 106) },
+            { "Teal", orbit::options::colour(53, 174, 164) },
+            { "Cyan", orbit::options::colour(58, 171, 205) },
+            { "Blue", orbit::options::colour(68, 128, 211) },
+            { "Indigo", orbit::options::colour(103, 104, 197) },
+            { "Violet", orbit::options::colour(158, 91, 198) },
+            { "Magenta", orbit::options::colour(205, 83, 161) },
+            { "Pink", orbit::options::colour(224, 116, 143) }
+        }};
+        colourMenu.addItem(9210, "Default", true, project.getTrackColour(trackIndex).isTransparent());
+        for (int i = 0; i < static_cast<int>(audioPalette.size()); ++i)
+            colourMenu.addItem(9211 + i, audioPalette[static_cast<size_t>(i)].first, true,
+                project.getTrackColour(trackIndex) == audioPalette[static_cast<size_t>(i)].second);
+        menu.addSubMenu("Track Color", colourMenu);
         menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(target != nullptr ? target : playlistWindow.get()),
-            [this, trackId, clipStartBar, bar](int result)
+            [this, trackId, clipStartBar, bar, audioPalette](int result)
             {
                 auto findTrackIndex = [this, trackId]
                 {
@@ -10604,6 +16262,33 @@ private:
                 };
                 const auto row = findTrackIndex();
                 if (!juce::isPositiveAndBelow(row, project.getTrackCount())) return;
+                if (result == 9224 || result == 9225)
+                {
+                    reorderPlaylistTrack(row, row + (result == 9224 ? -1 : 1));
+                    return;
+                }
+                if (result == 9223)
+                {
+                    const auto enabled = !project.getTrackGradientHighlight(row);
+                    project.setTrackGradientHighlight(row, enabled);
+                    isDirty = true;
+                    if (playlistWindow != nullptr) playlistWindow->refresh();
+                    status.setText(enabled ? "Gradient color wash enabled for this track. Save to keep the change."
+                                           : "Gradient color wash disabled for this track. Save to keep the change.",
+                                   juce::dontSendNotification);
+                    return;
+                }
+                if (result >= 9210 && result <= 9222)
+                {
+                    const auto colour = result == 9210 ? juce::Colour{}
+                        : audioPalette[static_cast<size_t>(result - 9211)].second;
+                    project.setTrackColour(row, colour);
+                    isDirty = true;
+                    if (playlistWindow != nullptr) playlistWindow->refresh();
+                    status.setText(colour.isTransparent() ? "Track color reset." : "Track color updated. Save to keep the change.",
+                                   juce::dontSendNotification);
+                    return;
+                }
                 auto findClip = [this, row, clipStartBar, bar]() -> te::WaveAudioClip*
                 {
                     const auto targetBar = clipStartBar >= 0 ? clipStartBar : bar;
@@ -10643,6 +16328,51 @@ private:
                     isDirty = true;
                     if (playlistWindow != nullptr) playlistWindow->refresh();
                     status.setText("Deleted audio clip. Save to keep the change.", juce::dontSendNotification);
+                    return;
+                }
+                if (result == 9206)
+                {
+                    auto* audioClip = findClip();
+                    if (audioClip == nullptr) return;
+                    rememberUndo("Reverse audio clip");
+                    audioClip->setIsReversed(!audioClip->getIsReversed());
+                    const bool reversed = audioClip->getIsReversed();
+                    isDirty = true;
+                    edit->restartPlayback();
+                    if (playlistWindow != nullptr) playlistWindow->refresh();
+                    status.setText(reversed
+                        ? "Reversing audio clip for playback. Rendering may take a moment for long files."
+                        : "Restored audio clip direction.", juce::dontSendNotification);
+                    return;
+                }
+                if (result == 9207)
+                {
+                    auto* audioClip = findClip();
+                    if (audioClip == nullptr) return;
+                    if (auto* effects = audioClip->getClipEffects())
+                        for (auto* effect : *effects)
+                            if (effect->getType() == te::ClipEffect::EffectType::normalise)
+                            {
+                                status.setText("This audio clip is already normalized.", juce::dontSendNotification);
+                                return;
+                            }
+                    rememberUndo("Normalize audio clip");
+                    audioClip->enableEffects(true, false);
+                    if (auto* effects = audioClip->getClipEffects())
+                    {
+                        te::ClipEffect::createEffectAndAddToValueTree(*edit, effects->state,
+                            te::ClipEffect::EffectType::normalise, -1);
+                        isDirty = true;
+                        edit->restartPlayback();
+                        if (playlistWindow != nullptr) playlistWindow->refresh();
+                        status.setText("Added non-destructive normalization to the audio clip.",
+                                       juce::dontSendNotification);
+                    }
+                    return;
+                }
+                if (result == 9208 || result == 9209)
+                {
+                    duplicateAudioClip(trackId, clipStartBar, result == 9209);
                     return;
                 }
                 if (result == 9204)
@@ -10690,6 +16420,81 @@ private:
             });
     }
 
+    void deleteGeneratorAtProjectIndex(int sourceIndex)
+    {
+        if (edit == nullptr || !juce::isPositiveAndBelow(sourceIndex, project.getTrackCount())
+            || project.getTrackKind(sourceIndex) == ProjectDocument::TrackKind::audio)
+            return;
+
+        const auto trackName = project.getTrackName(sourceIndex);
+        juce::AlertWindow dialog("Delete Generator", "Delete " + trackName + " and its patterns and Playlist clips?",
+                                 juce::MessageBoxIconType::NoIcon);
+        dialog.addButton("Delete", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
+        dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
+        if (dialog.runModalLoop() != 1) return;
+
+        const auto tracks = getGeneratorTracks();
+        if (!juce::isPositiveAndBelow(sourceIndex, tracks.size())) return;
+        rememberUndo("Delete generator");
+        auto* removedTrack = tracks.getUnchecked(sourceIndex);
+        if (instrumentTrack == removedTrack)
+        {
+            if (pianoRollWindow != nullptr && pianoRollWindow->isVisible()) closePianoRollView();
+            instrumentTrack = nullptr;
+            patternClip = nullptr;
+            // Tear down the editor while its Tracktion plugin still exists.
+            updateActiveInstrumentEditor();
+        }
+        edit->deleteTrack(removedTrack);
+        project.removeTrack(sourceIndex);
+        findFirstInstrumentTrack();
+        refreshTrackSelector();
+        readPatternSteps();
+        refreshMixerControls();
+        refreshEnginePlaylist();
+        updateActiveInstrumentEditor();
+        isDirty = true;
+        refreshProjectView("Deleted " + trackName + ". Save to keep the change.");
+    }
+
+    void deleteSelectedGenerator()
+    {
+        const auto selectedTrackIndex = getGeneratorTracks().indexOf(instrumentTrack);
+        deleteGeneratorAtProjectIndex(selectedTrackIndex);
+    }
+
+    void reorderPlaylistTrack(int sourceIndex, int destinationIndex)
+    {
+        if (edit == nullptr || !juce::isPositiveAndBelow(sourceIndex, project.getTrackCount())
+            || !juce::isPositiveAndBelow(destinationIndex, project.getTrackCount())
+            || sourceIndex == destinationIndex)
+            return;
+        const auto generatorTracks = getGeneratorTracks();
+        if (!juce::isPositiveAndBelow(sourceIndex, generatorTracks.size())
+            || !juce::isPositiveAndBelow(destinationIndex, generatorTracks.size()))
+            return;
+
+        rememberUndo("Reorder Playlist track");
+        auto* source = generatorTracks.getUnchecked(sourceIndex);
+        auto* destination = generatorTracks.getUnchecked(destinationIndex);
+        te::Track::Ptr sourcePointer(source);
+        edit->moveTrack(sourcePointer, te::TrackInsertPoint(*destination, destinationIndex < sourceIndex));
+        project.moveTrack(sourceIndex, destinationIndex);
+        edit->restartPlayback();
+
+        const auto selectedTrack = instrumentTrack;
+        refreshTrackSelector();
+        const auto reorderedTracks = getGeneratorTracks();
+        const auto selectedIndex = reorderedTracks.indexOf(selectedTrack);
+        if (juce::isPositiveAndBelow(selectedIndex, project.getTrackCount()))
+            trackSelector.setSelectedId(selectedIndex + 1, juce::sendNotificationSync);
+        refreshEnginePlaylist();
+        refreshMixerControls();
+        if (playlistWindow != nullptr) playlistWindow->refresh();
+        isDirty = true;
+        status.setText("Track moved. Save to keep the new Playlist order.", juce::dontSendNotification);
+    }
+
     void showPlaylistTrackContextMenu(int sourceIndex, juce::Component* target)
     {
         if (!hasProject || !juce::isPositiveAndBelow(sourceIndex, project.getTrackCount())) return;
@@ -10710,24 +16515,30 @@ private:
         menu.addItem(9001, "Show Generator");
         menu.addItem(9002, "Rename Generator...");
         menu.addItem(9003, "Delete Generator...");
+        menu.addItem(9007, "Move Track Up", sourceIndex > 0);
+        menu.addItem(9008, "Move Track Down", sourceIndex + 1 < project.getTrackCount());
         menu.addSeparator();
         menu.addSubMenu("Clone Track To", cloneMenu, !destinations.empty());
         menu.addItem(9004, "Edit Song Events");
         menu.addSeparator();
+        menu.addItem(9005, "Show Grid Notes for This Track", !playlistShowPatternGrid,
+                     playlistShowPatternGrid || project.getTrackShowGridNotes(sourceIndex));
+        menu.addItem(9006, "Gradient Color Wash for This Track", true,
+                     project.getTrackGradientHighlight(sourceIndex));
 
         const std::array<std::pair<const char*, juce::Colour>, 12> palette {{
-            { "Red", juce::Colour::fromRGB(210, 77, 77) },
-            { "Orange", juce::Colour::fromRGB(225, 133, 55) },
-            { "Yellow", juce::Colour::fromRGB(207, 174, 61) },
-            { "Lime", juce::Colour::fromRGB(137, 181, 70) },
-            { "Green", juce::Colour::fromRGB(65, 166, 106) },
-            { "Teal", juce::Colour::fromRGB(53, 174, 164) },
-            { "Cyan", juce::Colour::fromRGB(58, 171, 205) },
-            { "Blue", juce::Colour::fromRGB(68, 128, 211) },
-            { "Indigo", juce::Colour::fromRGB(103, 104, 197) },
-            { "Violet", juce::Colour::fromRGB(158, 91, 198) },
-            { "Magenta", juce::Colour::fromRGB(205, 83, 161) },
-            { "Pink", juce::Colour::fromRGB(224, 116, 143) }
+            { "Red", orbit::options::colour(210, 77, 77) },
+            { "Orange", orbit::options::colour(225, 133, 55) },
+            { "Yellow", orbit::options::colour(207, 174, 61) },
+            { "Lime", orbit::options::colour(137, 181, 70) },
+            { "Green", orbit::options::colour(65, 166, 106) },
+            { "Teal", orbit::options::colour(53, 174, 164) },
+            { "Cyan", orbit::options::colour(58, 171, 205) },
+            { "Blue", orbit::options::colour(68, 128, 211) },
+            { "Indigo", orbit::options::colour(103, 104, 197) },
+            { "Violet", orbit::options::colour(158, 91, 198) },
+            { "Magenta", orbit::options::colour(205, 83, 161) },
+            { "Pink", orbit::options::colour(224, 116, 143) }
         }};
         const auto currentColour = project.getTrackColour(sourceIndex);
         colourMenu.addItem(500, "Default", true, currentColour.isTransparent());
@@ -10747,6 +16558,34 @@ private:
                 };
                 auto currentSourceIndex = findSourceIndex();
                 if (currentSourceIndex < 0) return;
+                if (result == 9005)
+                {
+                    if (playlistShowPatternGrid) return;
+                    const auto showGridNotes = !project.getTrackShowGridNotes(currentSourceIndex);
+                    project.setTrackShowGridNotes(currentSourceIndex, showGridNotes);
+                    isDirty = true;
+                    if (playlistWindow != nullptr) playlistWindow->refresh();
+                    status.setText(showGridNotes ? "Grid notes enabled for this track. Save to keep the change."
+                                                 : "Grid notes hidden for this track. Save to keep the change.",
+                                   juce::dontSendNotification);
+                    return;
+                }
+                if (result == 9006)
+                {
+                    const auto enabled = !project.getTrackGradientHighlight(currentSourceIndex);
+                    project.setTrackGradientHighlight(currentSourceIndex, enabled);
+                    isDirty = true;
+                    if (playlistWindow != nullptr) playlistWindow->refresh();
+                    status.setText(enabled ? "Gradient color wash enabled for this track. Save to keep the change."
+                                           : "Gradient color wash disabled for this track. Save to keep the change.",
+                                   juce::dontSendNotification);
+                    return;
+                }
+                if (result == 9007 || result == 9008)
+                {
+                    reorderPlaylistTrack(currentSourceIndex, currentSourceIndex + (result == 9007 ? -1 : 1));
+                    return;
+                }
                 if (result == 9001)
                 {
                     const auto tracks = getGeneratorTracks();
@@ -10784,32 +16623,7 @@ private:
                 }
                 if (result == 9003)
                 {
-                    const auto trackName = project.getTrackName(currentSourceIndex);
-                    juce::AlertWindow dialog("Delete Generator", "Delete " + trackName + " and its patterns and Playlist clips?",
-                                             juce::MessageBoxIconType::NoIcon);
-                    dialog.addButton("Delete", 1, juce::KeyPress(juce::KeyPress::returnKey, 0, 0));
-                    dialog.addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey, 0, 0));
-                    if (dialog.runModalLoop() != 1) return;
-                    const auto tracks = getGeneratorTracks();
-                    if (!juce::isPositiveAndBelow(currentSourceIndex, tracks.size())) return;
-                    rememberUndo("Delete generator");
-                    auto* removedTrack = tracks.getUnchecked(currentSourceIndex);
-                    closePianoRollView();
-                    if (instrumentTrack == removedTrack)
-                    {
-                        instrumentTrack = nullptr;
-                        patternClip = nullptr;
-                    }
-                    edit->deleteTrack(removedTrack);
-                    project.removeTrack(currentSourceIndex);
-                    findFirstInstrumentTrack();
-                    refreshTrackSelector();
-                    readPatternSteps();
-                    refreshMixerControls();
-                    refreshEnginePlaylist();
-                    updateActiveInstrumentEditor();
-                    isDirty = true;
-                    refreshProjectView("Deleted " + trackName + ". Save to keep the change.");
+                    deleteGeneratorAtProjectIndex(currentSourceIndex);
                     return;
                 }
                 if (result == 9004)
@@ -10868,6 +16682,84 @@ private:
                 refreshProjectView("Cloned patterns and Playlist arrangement to "
                     + project.getTrackName(destinationIndex) + ". Save to keep the change.");
             });
+    }
+
+    void duplicateAudioClip(const juce::String& trackId, int sourceStartBar, bool makeUnique)
+    {
+        if (edit == nullptr || sourceStartBar < 0) return;
+        int trackIndex = -1;
+        for (int i = 0; i < project.getTrackCount(); ++i)
+            if (project.getTrackId(i) == trackId) { trackIndex = i; break; }
+        auto* sourceClip = findAudioClipAtBar(trackIndex, sourceStartBar, nullptr, nullptr);
+        if (sourceClip == nullptr) return;
+        const auto tracks = getGeneratorTracks();
+        if (!juce::isPositiveAndBelow(trackIndex, tracks.size())) return;
+        auto* audioTrack = tracks.getUnchecked(trackIndex);
+        const auto secondsPerBar = 60.0 / juce::jmax(20.0, project.getInitialTempoBpm()) * 4.0;
+        const auto clipDuration = sourceClip->getEditTimeRange().getLength().inSeconds();
+        int destinationBar = -1;
+        for (int candidate = sourceStartBar + 1; candidate < PlaylistGrid::barCount; ++candidate)
+        {
+            const auto candidateStart = candidate * secondsPerBar;
+            const auto candidateEnd = candidateStart + clipDuration;
+            bool overlaps = false;
+            for (int i = 0; i < audioTrack->getNumTrackItems(); ++i)
+                if (auto* other = dynamic_cast<te::WaveAudioClip*>(audioTrack->getTrackItem(i));
+                    other != nullptr && other != sourceClip)
+                {
+                    const auto range = other->getEditTimeRange();
+                    if (range.getStart().inSeconds() < candidateEnd && range.getEnd().inSeconds() > candidateStart)
+                    { overlaps = true; break; }
+                }
+            if (!overlaps) { destinationBar = candidate; break; }
+        }
+        if (destinationBar < 0)
+        {
+            status.setText("There is no free Playlist space after this audio clip.", juce::dontSendNotification);
+            return;
+        }
+
+        juce::File uniqueSource;
+        if (makeUnique)
+        {
+            const auto original = sourceClip->getOriginalFile();
+            auto uniqueFolder = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                                   .getChildFile("Orbit").getChildFile("Unique Audio");
+            if (!original.existsAsFile() || !uniqueFolder.createDirectory())
+            {
+                status.setText("Could not create an independent audio file for this clip.", juce::dontSendNotification);
+                return;
+            }
+            uniqueSource = uniqueFolder.getChildFile(original.getFileNameWithoutExtension() + " - Unique "
+                + juce::Uuid().toString().substring(0, 8) + original.getFileExtension());
+            if (!original.copyFileTo(uniqueSource))
+            {
+                status.setText("Could not copy the source audio for this unique clip.", juce::dontSendNotification);
+                return;
+            }
+        }
+
+        rememberUndo(makeUnique ? "Make audio clip unique" : "Clone audio clip");
+        auto duplicate = te::duplicateClip(*sourceClip);
+        auto* newClip = dynamic_cast<te::WaveAudioClip*>(duplicate.get());
+        if (newClip == nullptr)
+        {
+            if (uniqueSource.existsAsFile()) uniqueSource.deleteFile();
+            return;
+        }
+        if (makeUnique)
+        {
+            newClip->addTake(uniqueSource);
+            newClip->setCurrentTake(newClip->getNumTakes(false) - 1);
+            newClip->setName(sourceClip->getName() + " (Unique)");
+        }
+        newClip->setStart(tracktion::TimePosition::fromSeconds(destinationBar * secondsPerBar), true, true);
+        edit->restartPlayback();
+        isDirty = true;
+        if (playlistWindow != nullptr) playlistWindow->refresh();
+        status.setText(makeUnique ? "Created a unique audio clip with its own source copy."
+                                  : "Cloned the audio clip to the next free Playlist position.",
+                       juce::dontSendNotification);
     }
 
     void movePlaylistClip(int trackIndex, int sourceBar, int destinationTrackIndex, int destinationBar)
@@ -10935,20 +16827,42 @@ private:
         const auto patternId = project.getPlaylistPatternId(trackId, sourceBar);
         if (patternId.isEmpty()) return;
 
+        const auto sourceStartBar = project.getPlaylistClipStartBar(trackId, sourceBar);
+        if (sourceStartBar < 0) return;
+        const auto sourceLengthBars = project.getPlaylistClipLengthBars(trackId, sourceBar);
+        const auto followsPatternLength = project.playlistClipFollowsPatternLength(trackId, sourceBar);
+        const auto sourcePlacements = project.getPlaylistClips(trackId);
+        const bool exactLength = std::any_of(sourcePlacements.begin(), sourcePlacements.end(),
+            [sourceStartBar](const auto& placement) { return placement.startBar == sourceStartBar && placement.exactLength; });
+        const auto barOffset = sourceBar - sourceStartBar;
+        const auto destinationStartBar = destinationBar - barOffset;
+        if (destinationStartBar < 0 || destinationStartBar + sourceLengthBars > PlaylistGrid::barCount)
+        {
+            status.setText("Move canceled. The pattern clip would extend outside the Playlist grid.",
+                           juce::dontSendNotification);
+            return;
+        }
+
         auto destinationPatternId = patternId;
         const int sourcePatternIndex = project.getPatternIndexForId(trackId, patternId);
         if (sourcePatternIndex < 0) return;
         const auto destinationTrackId = project.getTrackId(destinationTrackIndex);
         int destinationPatternIndex = sourcePatternIndex;
-        if (destinationTrackIndex != trackIndex)
+        for (int candidateBar = destinationStartBar;
+             candidateBar < destinationStartBar + sourceLengthBars; ++candidateBar)
         {
-            const auto occupied = project.getPlaylistPatternId(destinationTrackId, destinationBar);
-            if (occupied.isNotEmpty())
+            const bool overlapsSource = destinationTrackIndex == trackIndex
+                && candidateBar >= sourceStartBar && candidateBar < sourceStartBar + sourceLengthBars;
+            const auto occupied = project.getPlaylistPatternId(destinationTrackId, candidateBar);
+            if (!overlapsSource && occupied.isNotEmpty())
             {
                 status.setText("Move canceled. The destination Playlist cell already contains a pattern.",
                                juce::dontSendNotification);
                 return;
             }
+        }
+        if (destinationTrackIndex != trackIndex)
+        {
             destinationPatternIndex = -1;
             for (int candidate = 0; candidate < ProjectDocument::patternSlotCount; ++candidate)
                 if (!project.isPatternCreated(destinationTrackId, candidate))
@@ -10963,12 +16877,7 @@ private:
                 return;
             }
         }
-        else if (project.getPlaylistPatternId(destinationTrackId, destinationBar).isNotEmpty())
-        {
-            status.setText("Move canceled. The destination Playlist cell already contains a pattern.",
-                           juce::dontSendNotification);
-            return;
-        }
+        else if (destinationStartBar == sourceStartBar) return;
 
         rememberUndo("Move playlist pattern");
         if (destinationTrackIndex != trackIndex)
@@ -10976,30 +16885,24 @@ private:
             project.setPatternCreated(destinationTrackId, destinationPatternIndex, true);
             project.setPatternLengthSteps(destinationTrackId, destinationPatternIndex,
                 project.getPatternLengthSteps(trackId, sourcePatternIndex));
-            for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                for (int step = 0; step < 64; ++step)
-                {
-                    const bool on = project.getPatternNote(trackId, sourcePatternIndex, pitch, step);
-                    project.setPatternNote(destinationTrackId, destinationPatternIndex, pitch, step, on);
-                    if (on)
-                    {
-                        project.setPatternNoteLength(destinationTrackId, destinationPatternIndex, pitch, step,
-                            project.getPatternNoteLength(trackId, sourcePatternIndex, pitch, step));
-                        project.setPatternNoteVelocity(destinationTrackId, destinationPatternIndex, pitch, step,
-                            project.getPatternNoteVelocity(trackId, sourcePatternIndex, pitch, step));
-                    }
-                }
+            for (const auto& note : project.getPatternNotes(trackId, sourcePatternIndex))
+                project.appendPatternNoteTicks(destinationTrackId, destinationPatternIndex, note.pitch,
+                                            note.startTick, note.lengthTicks, note.velocity);
             destinationPatternId = project.getPatternId(destinationTrackId, destinationPatternIndex);
         }
-        project.setPlaylistClip(trackId, {}, sourceBar, 1, false);
-        project.setPlaylistClip(destinationTrackId, destinationPatternId, destinationBar, 1, true);
-        refreshEnginePlaylistClip(trackIndex, sourceBar);
-        refreshEnginePlaylistClip(destinationTrackIndex, destinationBar);
+        project.setPlaylistClip(trackId, {}, sourceStartBar, 1, false);
+        if (exactLength)
+            project.setPlaylistClipExactBars(destinationTrackId, destinationPatternId, destinationStartBar, sourceLengthBars);
+        else
+            project.setPlaylistClip(destinationTrackId, destinationPatternId, destinationStartBar,
+                                    followsPatternLength ? 0 : sourceLengthBars, true);
+        refreshEnginePlaylistClip(trackIndex, sourceStartBar);
+        refreshEnginePlaylistClip(destinationTrackIndex, destinationStartBar);
         isDirty = true;
         const auto destinationPattern = project.getPatternIndexForId(destinationTrackId, destinationPatternId);
         const juce::String name = destinationPattern >= 0 ? project.getPatternName(destinationTrackId, destinationPattern) : juce::String("pattern");
         refreshProjectView("Moved " + name + " to generator " + juce::String(destinationTrackIndex + 1)
-            + ", Playlist bar " + juce::String(destinationBar + 1) + ".");
+            + ", Playlist bar " + juce::String(destinationStartBar + 1) + ".");
     }
 
     void finishPlaylistPaintGesture()
@@ -11016,6 +16919,7 @@ private:
     void setPlaybackMode(PlaybackMode mode)
     {
         if (playbackMode == mode) return;
+        if(!finishMidiRecording())return;
         if (edit != nullptr && edit->getTransport().isPlaying())
         {
             if (playbackMode == PlaybackMode::song)
@@ -11023,13 +16927,12 @@ private:
             edit->getTransport().stop(false, false);
         }
         if (auditionPatternPlayback)
-        {
-            auditionPatternPlayback = false;
-            refreshEnginePlaylist();
-        }
+            finishPatternPlayback();
         playbackMode = mode;
         updatePlaybackModeButtons();
         updateEngineAutomation();
+        if (mode == PlaybackMode::pattern && playlistWindow != nullptr)
+            playlistWindow->setPlayheadPosition(0.0, project.getInitialTempoBpm(), false);
         playButton.setButtonText("Play");
         status.setText(mode == PlaybackMode::pattern
             ? "Pattern mode: Play loops each generator's remembered pattern."
@@ -11047,11 +16950,7 @@ private:
     bool patternHasNotes(const juce::String& trackId, int patternIndex) const
     {
         if (trackId.isEmpty() || !project.isPatternCreated(trackId, patternIndex)) return false;
-        const auto patternLength = project.getPatternLengthSteps(trackId, patternIndex);
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < patternLength; ++step)
-                if (project.getPatternNote(trackId, patternIndex, pitch, step)) return true;
-        return false;
+        return !project.getPatternNotes(trackId, patternIndex).empty();
     }
 
     void rememberSongPatternsAt(double seconds)
@@ -11097,14 +16996,12 @@ private:
         auto& transport = edit->getTransport();
         if (transport.isPlaying())
         {
+            if(!finishMidiRecording())return;
             if (playbackMode == PlaybackMode::song)
                 rememberSongPatternsAt(transport.getPosition().inSeconds());
             transport.stop(false, false);
             if (auditionPatternPlayback)
-            {
-                auditionPatternPlayback = false;
-                refreshEnginePlaylist();
-            }
+                finishPatternPlayback();
             playButton.setButtonText("Play");
             return;
         }
@@ -11115,10 +17012,12 @@ private:
             const auto trackCount = juce::jmin(project.getTrackCount(), getGeneratorTracks().size());
             for (int index = 0; index < trackCount && !anySelectedPatternHasNotes; ++index)
             {
+                if (project.getTrackKind(index) == ProjectDocument::TrackKind::audio)
+                    continue;
                 const auto trackId = project.getTrackId(index);
                 anySelectedPatternHasNotes = patternHasNotes(trackId, project.getTrackSelectedPatternIndex(trackId));
             }
-            if (!anySelectedPatternHasNotes)
+            if (!anySelectedPatternHasNotes && !midiTake.active)
             {
                 auditionPatternPlayback = false;
                 status.setText("Add notes to a generator's selected pattern before Pattern mode playback.",
@@ -11133,7 +17032,7 @@ private:
             for (int trackIndex = 0; trackIndex < project.getTrackCount() && !hasPlaylistContent; ++trackIndex)
                 for (int bar = 0; bar < PlaylistGrid::barCount; ++bar)
                     hasPlaylistContent |= project.getPlaylistPatternId(project.getTrackId(trackIndex), bar).isNotEmpty();
-            if (!hasPlaylistContent)
+            if (!hasPlaylistContent && !midiTake.active)
                 for (auto* track : getGeneratorTracks())
                     for (int item = 0; item < track->getNumTrackItems() && !hasPlaylistContent; ++item)
                         hasPlaylistContent = dynamic_cast<te::WaveAudioClip*>(track->getTrackItem(item)) != nullptr;
@@ -11150,9 +17049,11 @@ private:
             const auto trackCount = juce::jmin(project.getTrackCount(), getGeneratorTracks().size());
             for (int index = 0; index < trackCount; ++index)
             {
+                if (project.getTrackKind(index) == ProjectDocument::TrackKind::audio)
+                    continue;
                 const auto trackId = project.getTrackId(index);
                 const auto patternIndex = project.getTrackSelectedPatternIndex(trackId);
-                if (patternHasNotes(trackId, patternIndex))
+                if (patternHasNotes(trackId, patternIndex) || midiTake.active)
                     longestPatternBeats = juce::jmax(longestPatternBeats,
                         project.getPatternLengthSteps(trackId, patternIndex) * 0.25);
             }
@@ -11167,7 +17068,8 @@ private:
             updateLoopRange();
             transport.looping = loopButton.getToggleState();
         }
-        transport.playFromStart(false);
+        if(midiTake.active && playbackMode==PlaybackMode::song)transport.play(false);
+        else transport.playFromStart(false);
         playButton.setButtonText("Stop");
         status.setText(auditionPatternPlayback
             ? "Pattern mode: playing each generator's remembered pattern through " + activeDevice->getName() + ". Press Stop to finish."
@@ -11188,11 +17090,8 @@ private:
         const auto tracks = edit != nullptr ? getGeneratorTracks() : juce::Array<te::AudioTrack*>{};
         const auto trackIndex = tracks.indexOf(instrumentTrack);
         const auto trackId = selectedProjectTrackId();
-        int patternNotes = 0;
-        if (trackId.isNotEmpty())
-            for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-                for (int step = 0; step < project.getPatternLengthSteps(trackId, selectedPatternIndex()); ++step)
-                    patternNotes += project.getPatternNote(trackId, selectedPatternIndex(), pitch, step) ? 1 : 0;
+        const auto patternNotes = trackId.isNotEmpty()
+            ? static_cast<juce::int64>(project.getPatternNotes(trackId, selectedPatternIndex()).size()) : 0;
 
         juce::String details;
         details << "Audio device: " << (device != nullptr ? device->getName() : "No active output") << "\n";
@@ -11257,6 +17156,17 @@ private:
         {
             auto* track = tracks.getUnchecked(trackIndex);
             const auto trackId = project.getTrackId(trackIndex);
+            // Native patterns are authoritative. This legacy migration only
+            // reconstructs engine-only tracks; it must not invent placements
+            // or reduce imported stacks through the old boolean step grid.
+            bool hasNativePatterns = false;
+            for (int slot = 0; slot < ProjectDocument::patternSlotCount; ++slot)
+                if (project.isPatternCreated(trackId, slot) || !project.getPatternNotes(trackId, slot).empty())
+                {
+                    hasNativePatterns = true;
+                    break;
+                }
+            if (hasNativePatterns) continue;
             std::vector<te::MidiClip*> clips;
             for (int item = 0; item < track->getNumTrackItems(); ++item)
                 if (auto* clip = dynamic_cast<te::MidiClip*>(track->getTrackItem(item)))
@@ -11304,7 +17214,7 @@ private:
             {
                 const auto bar = juce::roundToInt(clip->getEditTimeRange().getStart().inSeconds() / 2.0);
                 if (juce::isPositiveAndBelow(bar, 16) && project.getPlaylistPatternId(trackId, bar).isEmpty())
-                    project.setPlaylistClip(trackId, patternId, bar, 1, true);
+                    project.setPlaylistClip(trackId, patternId, bar, 0, true);
             }
         }
         refreshEnginePlaylist();
@@ -11332,14 +17242,39 @@ private:
 
     void readPatternSteps()
     {
-        allNotesSelected = false;
-        for (auto& pitchSteps : noteGrid) pitchSteps.fill(false);
+        syncNoteSelection();
         const auto trackId = selectedProjectTrackId();
         hasPattern = project.isPatternCreated(trackId, selectedPatternIndex());
-        for (int pitch = minimumPitch; pitch <= maximumPitch; ++pitch)
-            for (int step = 0; step < 64; ++step)
-                noteGrid[static_cast<size_t>(pitch - minimumPitch)][static_cast<size_t>(step)] =
-                    project.getPatternNote(trackId, selectedPatternIndex(), pitch, step);
+        auto patternLength = project.getPatternLengthSteps(trackId, selectedPatternIndex());
+        const auto patternNotes = project.getPatternNotes(trackId, selectedPatternIndex());
+        for (const auto& note : patternNotes)
+        {
+            const auto noteEnd = static_cast<juce::int64>(note.startTick) + note.lengthTicks;
+            const auto noteEndSteps = static_cast<int>(juce::jmin<juce::int64>(
+                ProjectDocument::maximumPatternLengthSteps, noteEnd / 64 + (noteEnd % 64 != 0 ? 1 : 0)));
+            patternLength = juce::jmax(patternLength, noteEndSteps);
+        }
+        if (drumRackWindow!=nullptr && drumRackTrackId==trackId)
+        {
+            auto* sampler=findSamplerPlugin(trackId);
+            drumRackWindow->setStepCount(patternLength);
+            for(int pad=0;pad<16;++pad)
+            {
+                drumRackWindow->setPadInfo(pad,getDrumRackPadInfo(sampler,pad));
+                drumRackWindow->setSteps(pad,getDrumRackSteps(trackId,selectedPatternIndex(),pad));
+                drumRackWindow->setVelocities(pad,getDrumRackVelocities(trackId,selectedPatternIndex(),pad));
+            }
+        }
+        for (auto& pitchSteps : noteGrid) pitchSteps.clear();
+        for (const auto& note : patternNotes)
+            if (note.pitch >= minimumPitch && note.pitch <= maximumPitch)
+            {
+                const auto step = note.startTick / 64;
+                if (juce::isPositiveAndBelow(step, ProjectDocument::maximumPatternLengthSteps))
+                    noteGrid[static_cast<size_t>(note.pitch - minimumPitch)].insert(step);
+            }
+        if (patternLength > project.getPatternLengthSteps(trackId, selectedPatternIndex()))
+            project.setPatternLengthSteps(trackId, selectedPatternIndex(), patternLength);
         pitchSelector.setEnabled(false);
         pitchSelector.setVisible(false);
         pianoRollButton.setEnabled(instrumentTrack != nullptr);
@@ -11347,6 +17282,10 @@ private:
         generatorDragHandle.setVisible(instrumentTrack != nullptr);
         generatorResizeHandle.setVisible(instrumentTrack != nullptr);
         generatorCollapseButton.setVisible(instrumentTrack != nullptr);
+        const auto selectedTrackIndex = getGeneratorTracks().indexOf(instrumentTrack);
+        generatorDeleteButton.setVisible(instrumentTrack != nullptr
+            && juce::isPositiveAndBelow(selectedTrackIndex, project.getTrackCount())
+            && project.getTrackKind(selectedTrackIndex) != ProjectDocument::TrackKind::audio);
         patternTitle.setVisible(instrumentTrack != nullptr);
         for (auto& step : steps)
         {
@@ -11427,10 +17366,18 @@ private:
         }
         readPatternSteps();
         if (drumRackWindow != nullptr && drumRackTrackId == trackId)
+        {
+            drumRackWindow->setStepCount(project.getPatternLengthSteps(trackId, patternIndex));
             for (int pad = 0; pad < 16; ++pad)
+            {
                 drumRackWindow->setSteps(pad, getDrumRackSteps(trackId, patternIndex, pad));
+                drumRackWindow->setVelocities(pad, getDrumRackVelocities(trackId, patternIndex, pad));
+            }
+        }
         if (auditionPatternPlayback && edit->getTransport().isPlaying())
             refreshEnginePlaylist();
+        if (pianoRollWindow != nullptr && pianoRollWindow->isVisible())
+            pianoRollWindow->toFront(false);
         status.setText(hasPattern ? "Selected pattern. Click Playlist to place it, or edit its notes in Piano Roll."
                                   : "Selected empty pattern slot. Click Playlist to place it or add notes in Piano Roll.",
                        juce::dontSendNotification);
@@ -11438,12 +17385,15 @@ private:
 
     void resetPatternButtons()
     {
+        generatorLearnTarget.clear();
+        releaseLiveMidi();
         hasPattern = false;
         if (activeInstrumentEditor != nullptr)
         {
-            removeChildComponent(activeInstrumentEditor.get());
+            instrumentEditorClip.setViewedComponent(nullptr, false);
             activeInstrumentEditor.reset();
         }
+        instrumentEditorClip.setVisible(false);
         if (mixerWindow != nullptr) mixerWindow->detachMeters();
         detachTrackMeter();
         instrumentTrack = nullptr;
@@ -11454,12 +17404,13 @@ private:
         refreshingTrackSelector = false;
         levelSlider.setEnabled(false);
         panSlider.setEnabled(false);
-        for (auto& pitchSteps : noteGrid) pitchSteps.fill(false);
+        for (auto& pitchSteps : noteGrid) pitchSteps.clear();
         pitchSelector.setEnabled(false);
         pitchSelector.setVisible(false);
         pianoRollButton.setEnabled(false);
         pianoRollButton.setVisible(false);
         generatorCollapseButton.setVisible(false);
+        generatorDeleteButton.setVisible(false);
         generatorCollapsed = false;
         allGeneratorsMinimized = false;
         pianoRollMaximized = false;
@@ -11555,9 +17506,9 @@ private:
         {
             auto button = std::make_unique<juce::TextButton>(tracks.getUnchecked(index)->getName());
             button->setTooltip("Select and restore " + tracks.getUnchecked(index)->getName());
-            button->setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(36, 53, 64));
-            button->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(46, 112, 139));
-            button->setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(206, 226, 236));
+            button->setColour(juce::TextButton::buttonColourId, orbit::options::colour(36, 53, 64));
+            button->setColour(juce::TextButton::buttonOnColourId, orbit::options::colour(46, 112, 139));
+            button->setColour(juce::TextButton::textColourOffId, orbit::options::colour(206, 226, 236));
             button->setClickingTogglesState(false);
             button->setToggleState(index == tracks.indexOf(instrumentTrack), juce::dontSendNotification);
             button->onClick = [this, index]
@@ -11586,18 +17537,20 @@ private:
 
     void bringGeneratorToFront()
     {
-        if (activeInstrumentEditor != nullptr && activeInstrumentEditor->isVisible())
-            activeInstrumentEditor->toFront(false);
+        if (instrumentEditorClip.isVisible())
+            instrumentEditorClip.toFront(false);
         if (pianoRollWindow != nullptr && pianoRollWindow->isVisible())
             pianoRollWindow->toFront(false);
         for (auto& button : patternBankButtons) button->toFront(false);
         for (auto& button : patternSlotButtons) button->toFront(false);
-        for (auto* control : std::array<juce::Component*, 14> {
+        for (auto* control : std::array<juce::Component*, 15> {
                  &pianoRollButton, &generatorMuteButton, &generatorSoloButton, &generatorSettingsButton,
                  &patternPresetSelector, &openPresetButton, &savePresetButton, &patternLengthDownButton,
                  &patternLengthDisplay, &patternLengthUpButton, &trackSelector,
-                 &generatorCollapseButton, &generatorDragHandle, &generatorResizeHandle })
+                 &generatorCollapseButton, &generatorDeleteButton, &generatorDragHandle, &generatorResizeHandle })
             control->toFront(false);
+        generatorToolbarToggleButton.toFront(false);
+        pluginScaleSelector.toFront(false);
     }
 
     void updateGeneratorDockSelection()
@@ -11667,9 +17620,10 @@ private:
     {
         if (activeInstrumentEditor != nullptr)
         {
-            removeChildComponent(activeInstrumentEditor.get());
+            instrumentEditorClip.setViewedComponent(nullptr, false);
             activeInstrumentEditor.reset();
         }
+        instrumentEditorClip.setVisible(false);
         if (instrumentTrack == nullptr) return;
 
         for (auto* plugin : instrumentTrack->pluginList)
@@ -11677,7 +17631,12 @@ private:
             if (auto* external = dynamic_cast<te::ExternalPlugin*>(plugin))
             {
                 activeInstrumentEditor = std::make_unique<OrbitPluginEditorContent>(*external);
-                addAndMakeVisible(*activeInstrumentEditor);
+                const auto scaleChoice = pluginScaleSelector.getSelectedId();
+                const auto requestedScale = scaleChoice == 1 ? 0.0f
+                    : static_cast<float>(pluginScaleSelector.getText().getDoubleValue() / 100.0);
+                if (auto* pluginEditor = dynamic_cast<OrbitPluginEditorContent*>(activeInstrumentEditor.get()))
+                    pluginEditor->setRequestedScale(requestedScale);
+                instrumentEditorClip.setViewedComponent(activeInstrumentEditor.get(), false);
                 activeInstrumentEditor->addMouseListener(this, true);
                 resized();
                 if (pianoRollWindow != nullptr && pianoRollWindow->isVisible())
@@ -11686,6 +17645,39 @@ private:
             }
         }
         resized();
+    }
+
+    void fitGeneratorPanelToPluginEditor()
+    {
+        const auto* pluginEditor = dynamic_cast<const OrbitPluginEditorContent*>(activeInstrumentEditor.get());
+        if (pluginEditor == nullptr) return;
+
+        // The VST editor reports its preferred logical size. Size Orbit's
+        // generator around that editor (plus Orbit's own title and controls),
+        // then let the existing viewport scale only when the display is too
+        // small. This avoids opening every instrument in the same oversized
+        // 1040 x 560 frame and keeps the plugin directly beneath its toolbar.
+        const auto workspace = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(22).reduced(14, 10);
+        if (workspace.isEmpty()) return;
+
+        const auto scaleChoice = pluginScaleSelector.getSelectedId();
+        const auto requestedScale = scaleChoice == 1 ? 1.0f
+            : static_cast<float>(pluginScaleSelector.getText().getDoubleValue() / 100.0);
+        const auto editorWidth = juce::roundToInt(pluginEditor->getPreferredWidth() * requestedScale);
+        const auto editorHeight = juce::roundToInt(pluginEditor->getPreferredHeight() * requestedScale);
+        const auto toolbarHeight = patternToolbarCollapsed ? 0 : 56;
+        const auto desiredWidth = editorWidth + 24;
+        const auto desiredHeight = editorHeight + 30 + toolbarHeight + 18;
+        const auto minWidth = juce::jmin(800, workspace.getWidth());
+        const auto minHeight = juce::jmin(350, workspace.getHeight());
+        generatorPanelBounds.setSize(
+            juce::jlimit(minWidth, workspace.getWidth(), desiredWidth),
+            juce::jlimit(minHeight, workspace.getHeight(), desiredHeight));
+        generatorPanelBounds.setPosition(
+            juce::jlimit(workspace.getX(), juce::jmax(workspace.getX(), workspace.getRight() - generatorPanelBounds.getWidth()), generatorPanelBounds.getX()),
+            juce::jlimit(workspace.getY(), juce::jmax(workspace.getY(), workspace.getBottom() - generatorPanelBounds.getHeight()), generatorPanelBounds.getY()));
+        resized();
+        savePianoRollState();
     }
 
     void detachTrackMeter()
@@ -11744,6 +17736,7 @@ private:
         tempoLabel.setEnabled(ready);
         tempoSlider.setEnabled(ready);
         stopButton.setEnabled(ready);
+        recordButton.setEnabled(ready && (canEditPattern() || midiTake.active || !midiTake.notes.empty()));
         loopButton.setEnabled(ready);
         loopStartSlider.setEnabled(ready);
         loopLengthSlider.setEnabled(ready);
@@ -11793,6 +17786,29 @@ private:
 
     te::Engine engine;
     juce::ApplicationProperties applicationProperties;
+    orbit::options::LookAndFeel optionsLookAndFeel;
+    orbit::options::MidiInbox midiInbox;
+    orbit::recording::MidiTake midiTake;
+    double recordingStartMs=0,recordingBpm=120;
+    std::int64_t recordingInitialTick=0;
+    juce::String recordingProjectId;
+    bool finishingMidiRecording=false;
+    std::unique_ptr<orbit::options::VirtualKeyboard> virtualKeyboard;
+    juce::Image wallpaperImage;
+    juce::String midiDeviceSignature;
+    std::map<std::tuple<juce::String,int,int>, juce::StringArray> liveMidiNotes;
+    juce::StringArray liveMidiRecipients;
+    juce::String lastControllerDevice;
+    int lastControllerNumber = -1, lastControllerChannel = 1;
+    juce::uint32 lastControllerUndoMs = 0;
+    juce::String lastControllerUndoTarget;
+    juce::String generatorLearnTarget;
+    bool optionsReady = false, releasingLiveMidi = false;
+    int lastMeterGridPolicy = -1;
+    juce::Component::SafePointer<OptionsPanel> learnControllerPanel;
+    juce::StringArray learnControllerDevices;
+    std::map<juce::String,bool> controllerButtons;
+
     std::unique_ptr<juce::TooltipWindow> tooltipWindow;
     juce::uint32 lastAutoSaveMs = 0;
     float displayedMeterPeakDb = -100.0f;
@@ -11805,38 +17821,46 @@ private:
     te::LevelMeterPlugin* trackMeter = nullptr;
     te::LevelMeasurer::Client trackMeterClient;
     ProjectDocument project;
-    mutable std::map<juce::String, std::vector<juce::Point<int>>> playlistPreviewCache;
+    mutable std::map<juce::String, std::vector<PlaylistPreviewNote>> playlistPreviewCache;
     bool hasProject = false;
     bool isDirty = false;
+    bool playlistShowPatternGrid = false;
     bool pianoRollGestureActive = false;
     bool pianoRollGestureChanged = false;
+    std::optional<ProjectSnapshot> pianoRollGestureSnapshot;
     bool auditionPatternPlayback = false;
+    std::vector<PatternPlaybackMutedAudioClip> patternPlaybackMutedAudioClips;
     bool hasPattern = false;
     bool refreshingTrackSelector = false;
     bool allNotesSelected = false;
+    std::set<std::pair<int,int>> selectedNoteKeys;
+    juce::String noteSelectionTrackId;
+    int noteSelectionPattern = -1, notePasteTick = 0;
+    std::mt19937 editRandom { std::random_device{}() };
     bool generatorCollapsed = false;
+    bool patternToolbarCollapsed = false;
     bool allGeneratorsMinimized = false;
     bool pianoRollWasVisibleWhenCollapsed = false;
     bool pianoRollMaximized = false;
     juce::Rectangle<int> pianoRollRestoreBounds;
     juce::Rectangle<int> expandedGeneratorBounds;
-    static constexpr int minimumPitch = 48; // C3
-    static constexpr int maximumPitch = 84; // C6
-    std::array<std::array<bool, 64>, maximumPitch - minimumPitch + 1> noteGrid{};
+    static constexpr int minimumPitch = PianoRollGrid::minimumPitch; // MIDI C-1
+    static constexpr int maximumPitch = PianoRollGrid::maximumPitch; // MIDI G9
+    // Cache only note positions. Pattern length can represent millions of steps,
+    // so a dense bool array per pitch would make empty space consume memory.
+    std::array<std::unordered_set<int>, maximumPitch - minimumPitch + 1> noteGrid;
     std::array<std::unique_ptr<juce::TextButton>, 16> steps;
     std::array<std::unique_ptr<juce::TextButton>, 8> patternBankButtons, patternSlotButtons;
     std::vector<UndoEntry> undoHistory, redoHistory;
     PatternClipboard patternClipboard;
-    int randomDensityPercent = 25;
-    int randomPitchLow = 48;
-    int randomPitchHigh = 84;
     int selectedBankIndex = 0;
     int selectedSlotIndex = 0;
     PlaybackMode playbackMode = PlaybackMode::pattern;
     juce::ComboBox pitchSelector;
+    juce::ComboBox pluginScaleSelector;
     PianoRollButton pianoRollButton;
     juce::ComboBox patternPresetSelector;
-    juce::Label patternLengthDisplay;
+    juce::TextEditor patternLengthDisplay;
     juce::TextButton patternLengthDownButton, patternLengthUpButton;
     juce::ComboBox trackSelector;
     juce::Slider levelSlider, panSlider;
@@ -11847,11 +17871,14 @@ private:
     juce::Label title, status, projectDetails, musicalDetails, audioDetails, patternTitle,
                 arrangementTitle, mixerTitle, levelLabel, panLabel, meterStatus, buildLabel, tempoLabel,
                 loopStartLabel, loopLengthLabel, timeSignatureLabel, barLabel, barReadoutLabel;
-    GeneratorDragLabel generatorDragHandle;
+    GeneratorDragLabel generatorDragHandle, generatorToolbarDragHandle;
     GeneratorResizeHandle generatorResizeHandle;
+    juce::Viewport instrumentEditorClip;
     MixerMoveHandle mixerMoveHandle;
     GeneratorResizeHandle mixerResizeHandle { "Resize mixer" };
     PlaylistWindowIconButton generatorCollapseButton { PlaylistWindowIconButton::Kind::minimize };
+    PlaylistWindowIconButton generatorDeleteButton { PlaylistWindowIconButton::Kind::close };
+    juce::TextButton generatorToolbarToggleButton;
     juce::Viewport generatorDockViewport;
     juce::Component generatorDockStrip;
     std::vector<std::unique_ptr<juce::TextButton>> generatorDockButtons;
@@ -11864,10 +17891,11 @@ private:
                   masterButton{ToolbarButton::Symbol::master}, recordButton{ToolbarButton::Symbol::record},
                   rewindButton{ToolbarButton::Symbol::rewind}, previousButton{ToolbarButton::Symbol::previous},
                   nextButton{ToolbarButton::Symbol::next}, generatorMuteButton, generatorSoloButton,
-                  generatorSettingsButton{ToolbarButton::Symbol::settings}, openPresetButton{ToolbarButton::Symbol::open},
+                  generatorSettingsButton{ToolbarButton::Symbol::dropdown}, openPresetButton{ToolbarButton::Symbol::open},
                   savePresetButton{ToolbarButton::Symbol::save};
     OutputMeterDisplay outputMeter;
     std::unique_ptr<juce::FileChooser> fileChooser;
+    std::shared_ptr<te::EditRenderer::Handle> renderHandle;
     std::unique_ptr<AudioSettingsWindow> audioSettingsWindow;
     std::unique_ptr<SearchPathsWindow> samplePathsWindow, vstPathsWindow;
     std::unique_ptr<Vst3InstrumentBrowser> vst3InstrumentBrowser;
@@ -11888,6 +17916,7 @@ private:
     bool draggingGenerator = false, resizingGenerator = false, playlistPaintGestureActive = false;
     bool playlistBoundsInitialised = false, mixerBoundsInitialised = false;
     bool mixerMaximized = false, draggingMixer = false, resizingMixer = false;
+    bool restoringSavedGuiLayout = false;
     bool showHints = true;
 };
 
@@ -11895,7 +17924,7 @@ class MainWindow final : public juce::DocumentWindow
 {
 public:
     explicit MainWindow(juce::JUCEApplication& application)
-        : DocumentWindow("Orbit", juce::Colour::fromRGB(20, 29, 38), juce::DocumentWindow::allButtons), app(application)
+        : DocumentWindow("Orbit", orbit::options::colour(20, 29, 38), juce::DocumentWindow::allButtons), app(application)
     {
         setUsingNativeTitleBar(true);
         setContentOwned(new ProjectView(), true);
@@ -11912,7 +17941,7 @@ class OrbitApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override { return "Orbit"; }
-    const juce::String getApplicationVersion() override { return "0.3.110"; }
+    const juce::String getApplicationVersion() override { return "0.3.215"; }
     void initialise(const juce::String&) override
     {
         installOrbitCrashReportHandler();

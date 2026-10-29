@@ -8,15 +8,10 @@ HISTORY_FILE="$PROJECT_ROOT/BUILD_HISTORY.md"
 CURRENT_APP="$PROJECT_ROOT/Builds/Current/Orbit.app"
 STAGING_APP="$PROJECT_ROOT/Builds/Current/Orbit.next.app"
 BUILD_SUMMARY="${1:-Development rebuild; see ORION_LEARN_TODO.md and the source archive.}"
-METADATA_BACKUP="$(mktemp -d)"
-cp "$COUNTER_FILE" "$METADATA_BACKUP/DEV_BUILD_COUNTER.json"
-cp "$HISTORY_FILE" "$METADATA_BACKUP/BUILD_HISTORY.md"
-cp "$PROJECT_ROOT/CMakeLists.txt" "$METADATA_BACKUP/CMakeLists.txt"
-cp "$PROJECT_ROOT/Source/Main.cpp" "$METADATA_BACKUP/Main.cpp"
-cp "$PROJECT_ROOT/README.md" "$METADATA_BACKUP/README.md"
+BUILD_JOBS="${ORBIT_BUILD_JOBS:-2}"
 
-# Prepare the next product build label for compilation. Only a successful,
-# staged app advances the product build number.
+# Reserve the next product build before compiling. A failed build consumes its
+# number, so retries always receive a fresh product label.
 RESERVED_BUILD="$(python3 - "$PROJECT_ROOT" "$BUILD_SUMMARY" <<'PY'
 import datetime
 import json
@@ -28,15 +23,19 @@ root = pathlib.Path(sys.argv[1])
 summary = sys.argv[2].replace("|", "/").replace("\n", " ").strip()
 counter_path = root / "DEV_BUILD_COUNTER.json"
 counter = json.loads(counter_path.read_text())
-build = int(counter.get("product_checkpoint_build", 0)) + 1
-parts = [int(piece) for piece in str(counter["product_checkpoint_version"]).split(".")]
+build = max(int(counter.get("product_checkpoint_build", 0)),
+            int(counter.get("last_reserved_product_build", 0))) + 1
+cmake_path = root / "CMakeLists.txt"
+cmake = cmake_path.read_text()
+current_version = re.search(r"project\(OrbitDAW VERSION ([0-9.]+) LANGUAGES C CXX\)", cmake)
+if current_version is None:
+    raise SystemExit("Could not read the current Orbit product version")
+parts = [int(piece) for piece in current_version.group(1).split(".")]
 if len(parts) != 3:
-    raise SystemExit("Expected a three-part product version in DEV_BUILD_COUNTER.json")
+    raise SystemExit("Expected a three-part product version in CMakeLists.txt")
 parts[2] += 1
 version = ".".join(map(str, parts))
 
-cmake_path = root / "CMakeLists.txt"
-cmake = cmake_path.read_text()
 cmake, n1 = re.subn(r"project\(OrbitDAW VERSION [0-9.]+ LANGUAGES C CXX\)",
                     f"project(OrbitDAW VERSION {version} LANGUAGES C CXX)", cmake, count=1)
 cmake, n2 = re.subn(r'BUILD_VERSION "[0-9]+"', f'BUILD_VERSION "{build}"', cmake, count=1)
@@ -68,6 +67,8 @@ today = datetime.date.today().isoformat()
 row = f"| {build} | {version} | {today} | {summary} | Build reserved; compilation in progress. |\n"
 history += row
 history_path.write_text(history)
+counter["last_reserved_product_build"] = build
+counter_path.write_text(json.dumps(counter, indent=2) + "\n")
 print(build)
 PY
 )"
@@ -77,13 +78,21 @@ finish_build() {
     local result=$?
     if [[ "$BUILD_RESERVED" == "1" ]]; then
         if [[ "$result" -ne 0 ]]; then
-            cp "$METADATA_BACKUP/DEV_BUILD_COUNTER.json" "$COUNTER_FILE"
-            cp "$METADATA_BACKUP/BUILD_HISTORY.md" "$HISTORY_FILE"
-            cp "$METADATA_BACKUP/CMakeLists.txt" "$PROJECT_ROOT/CMakeLists.txt"
-            cp "$METADATA_BACKUP/Main.cpp" "$PROJECT_ROOT/Source/Main.cpp"
-            cp "$METADATA_BACKUP/README.md" "$PROJECT_ROOT/README.md"
+            python3 - "$HISTORY_FILE" "$RESERVED_BUILD" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+build = int(sys.argv[2])
+lines = path.read_text().splitlines()
+for index, line in enumerate(lines):
+    if line.startswith(f"| {build} |") and "Build reserved; compilation in progress." in line:
+        lines[index] = line.replace("Build reserved; compilation in progress.",
+                                    "Build failed; product build number consumed.")
+        break
+path.write_text("\n".join(lines) + "\n")
+PY
         fi
-        rm -rf "$METADATA_BACKUP"
     fi
     return "$result"
 }
@@ -94,7 +103,7 @@ if [[ ! -f "$BUILD_DIR/Makefile" ]]; then
     exit 2
 fi
 
-cmake --build "$BUILD_DIR" --target Orbit -j 4
+cmake --build "$BUILD_DIR" --target Orbit -j "$BUILD_JOBS"
 
 mkdir -p "$(dirname "$CURRENT_APP")"
 bundle_digest() {
@@ -127,7 +136,7 @@ if [[ -d "$CURRENT_APP" ]] && [[ "$(bundle_digest "$BUILT_APP")" == "$(bundle_di
 fi
 
 rm -rf "$STAGING_APP"
-ditto "$BUILT_APP" "$STAGING_APP"
+mv "$BUILT_APP" "$STAGING_APP"
 touch "$STAGING_APP"
 if [[ -e "$CURRENT_APP" ]]; then
     rm -rf "$CURRENT_APP"
@@ -172,7 +181,6 @@ PY
 
 BUILD_RESERVED=0
 trap - EXIT
-rm -rf "$METADATA_BACKUP"
 python3 - "$PROJECT_ROOT/README.md" "$COUNTER_FILE" <<'PY'
 import json
 import pathlib

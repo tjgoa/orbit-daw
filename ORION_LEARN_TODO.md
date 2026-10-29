@@ -4,7 +4,16 @@
 **Source:** observations from `ORION LEARN.mov`, combined with the user's Orbit requirements already recorded in `ORION_VISUAL_TARGETS.md` and the supplied screenshots.
 **Purpose:** a working product backlog, not a claim that every item is already present or should be delivered in one build.
 
-## Implementation status — product Build 100 / version 0.3.79; development iteration 155
+**Manual reference (2026-10-29):** the connected Orion Help and the supplied generator
+options recording now inform generator-menu implementation. Working host MIDI
+settings, Arpeggiator/Shuffle with Render/Undo, names, pinned CC learning and native
+MIDI receiving are documented in [Source/Generator/README.md](Source/Generator/README.md).
+Keep [ORION_MANUAL_AUDIT.md](ORION_MANUAL_AUDIT.md) as the explicit chapter-review and
+remaining-differences checklist; its unchecked topics are not claimed as complete.
+
+**Legacy import research:** Orionology's observed capabilities, AGPLv3 boundary, pending Synapse licensing proposal, Jouni's supplied reply (raw layouts derive from Orion headers; scaling tables require Richard's permission), and the recommended Transplant Map Compiler/IR stages are recorded in [ORIONOLOGY_ANALYSIS.md](ORIONOLOGY_ANALYSIS.md). Orion SFS import or merge remains a one-way, preview-first feature; supported independent recovery and unresolved coverage are detailed in [Source/Import/README.md](Source/Import/README.md).
+
+## Implementation status — product Build 206 / version 0.3.185; development iteration 244
 
 The current pass has implemented the following pieces while the larger Orion backlog remains active:
 
@@ -19,11 +28,12 @@ The current pass has implemented the following pieces while the larger Orion bac
 - Window menu includes Hide All, Minimize All, and Cascade. Reopening Playlist/Mixer restores minimized windows. View includes full-screen control; Audio Input opens the device selector.
 - Preferences persist update rate, meter decay, auto-save interval, and a default project path; Open and Save use that path. Project Settings stores description and creator URL.
 - The entire generator title strip, including the six-dot grip, label, and blank header space, is now one drag target. The View/Options menus can edit the initial tempo and time signature. The time signature is applied to the Tracktion edit and saved project metadata; the transport and project summary refresh with it.
-- MIDI Input Settings now opens the combined JUCE audio/MIDI device selector, which exposes available MIDI input devices.
+- MIDI Input Settings now has device selection, Easy/Advanced channel routing, message filters and pedal policy; a separate MIDI Controllers panel adds CC assignments and learning.
 - View > Modules lists the active built-in generators and activates the selected generator in the existing project workspace.
 - Playlist Draw now creates the active A1–H8 slot on any clicked generator lane, without requiring that generator to be selected first. Clicking an occupied clip activates its pattern; the mouse wheel cycles the created patterns on that lane, and double-click opens a menu containing only created patterns.
 - Playlist clip moves validate occupied destinations and, when moved across generators, copy notes, note lengths, and velocities into a free destination pattern slot instead of overwriting a same-numbered pattern. A single paint drag records one undo action.
-- Options > Sample Paths now opens a persistent folder-list preference and validates each entered folder before saving. Sample browsing is not yet implemented, so this stores the locations for the sampler/import workflow.
+- Options > Sample Paths now opens a persistent folder-list preference and validates each entered folder before saving. Audio import and Drum Rack sample loading now start in the first existing configured folder.
+- Builds 202–203 removed the earlier short pattern-length bounds, stored pattern notes and Drum Rack hit/velocity data sparsely, and added overflow-safe tick/end calculations. Rack length is set before hit data loads, and cached hit/velocity state follows edits. The current Rack UI still exposes variable lengths; the next Rack pass replaces that with a fixed 16-step bar selector covering four bars (64 steps), while general MIDI/piano-roll patterns remain uncapped by the Rack UI. Build 206 adds MIDI track/song import and pattern/song MIDI export through File.
 
 Build 52 embeds each VST3 editor inside the selected generator, below its persistent pattern controls; the piano roll overlays that same editor area. File > New Project offers Discard or Cancel when the current project has unsaved changes. Build 51 removed the Mixer heading and excess space above and below the strips. Builds 54–55 made the in-app Mixer movable, resizable, compact, expanded, and minimized without popping out of Orbit, and added Playlist pattern cycling/selection. Build 57 makes the piano roll and plugin GUI mutually exclusive in the same generator area, adds a generator minimize dock, raises the selected generator over the Mixer, and adds eight selectable output buses plus Master. Each strip exposes four send knobs in a 2×2 layout. Build 58 shows 48 piano-roll time columns and draws black keyboard keys at a shorter width than white keys. Build 59 clears stale dock/mixer state on new projects, focuses the piano roll above plugin editors, and leaves only dock tabs when generators are minimized. Build 63 adds a narrow draggable Mixing Desk header with minimize/close controls and fits mixer width to its channel strips. Build 64 removes the vertical scrollbar gutter while keeping wheel scrolling and only shows horizontal scrolling when strips exceed the available width. Build 66 keeps the Mixer hidden on instrument insert, makes clicked mixer/generator surfaces raise to the foreground, adds a keyboard icon and expanded Piano Roll settings, and adds Playlist right-click clip deletion, a cell-anchored pattern menu, MIDI note previews, quieter grid lines, and a settings entry. Build 67 makes Piano Roll note hit-testing cover the full drawn note, allowing right-click deletion and drag-length editing anywhere on a long note without mistaking it for an empty cell; new notes continue to use the selected paint length. Build 68 moves velocity-lane, coloured-key, and pitch-name toggles into always-visible icon buttons along the Piano Roll footer; the settings pop-up now contains only grid subdivision and emphasis choices. The Piano Roll retains its lower-edge note-length selector and persistent drag length. Builds 60–62 and 65 were reserved but did not complete; see BUILD_HISTORY.md. Manual runtime interaction and audio-routing verification remain outstanding. The Mixer stays inside Orbit; selecting it or a generator brings that surface forward. The source archives are incremental; see the latest archive's change summary for its baseline. Build 69 moves Playlist Draw/Move, zoom and settings into a persistent lower-right icon strip. Right-clicking an occupied clip deletes it, and dragging with the right button erases occupied cells along the gesture; empty cells remain empty and never invoke paint behavior. Build 70 lets Play audition the selected pattern when the Playlist has no clips, routes that pattern through the selected audio output, and draws the moving transport position in both the Piano Roll and Playlist. When the Playlist contains clips, Play runs the arrangement. Menu ellipses use plain ASCII to avoid the garbled â€¦ text seen in the current UI.
 
@@ -33,11 +43,11 @@ Build 27 / version 0.3.6 added Add Folder / Remove list windows for Sample Paths
 
 | Menu area | Working today | Still remaining |
 | --- | --- | --- |
-| File | New/Open/Save, MIDI export, Project Settings | Project format recovery and media relinking |
+| File | New/Open/Save, native project/template merge, Save As/Template, MIDI track/song import and pattern/song export, Stream To File, Preferences/Project Settings, recent projects | Orion SFS import/merge (one-way, preview-first; contingent on parser coverage and licensing), project recovery/media relinking |
 | Edit | Undo/Redo, note clipboard, Select All, randomize, humanize, quantize, transpose, velocity/length dialogs | Groove/pluck templates |
 | View | Playlist, docked in-app Mixer/Master, Piano Roll, audio output, tempo, time signature, Modules, Full Screen, Status Bar, Show Hints | Time display and persistent multi-surface/window focus behavior |
 | Insert | Orion-style top-level grouping for internal Synths and VST Instruments; automatic standard-location discovery, extra folders, optional startup scanning from VST Paths, per-plugin progress and Desktop logs, VST3 instrument insertion with an embedded generator GUI, supported internal effect choices | Plugin state save/reopen and missing-plugin recovery; usable sampler/DrumRack and templates |
-| Options | Loop/metronome, audio/MIDI device selection, paths, time signature, preferences, project/Playlist settings | MIDI controller mapping, timebase, appearance skins/wallpapers |
+| Options | All reference entries: original skins/wallpapers, audio input/output, MIDI channel/filter policies, CC learning/assignments, MIDI output, virtual keyboard, paths, meter/triplet grid and export/display timebase; existing extra settings retained | Physical-device/native-desktop validation, end-to-end recording, external MIDI clock following, general mixed-meter arrangements |
 | Window | Open surfaces, Hide/Minimize All, Cascade | Stable Orion-like movable/restorable generator and piano-roll focus model |
 | Help | About Orbit | Context help and user documentation |
 
@@ -95,11 +105,11 @@ VST3 instrument scanning and insertion are implemented. Orbit starts with a fres
 
 - [ ] Keep the File, Edit, View, Insert, Options, Window, and Help menus compact and available from every workspace state.
 - [ ] File: New/Open/Save/Export MIDI and Project Settings, including project description and creator URL.
-- [x] Edit: working undo/redo, pattern-note cut/copy/paste, Select All, Randomize and Randomize Options, Humanize, Quantize, Transpose, Scale Velocities, and Length actions.
+- [x] Edit: all 15 commands wired with detailed dialogs, exact/selection-aware clipboard, shortcuts, Randomize targets/algorithms/chord scales, tick-based Humanize/control variation, independent Quantize fields, drum-safe Transpose scopes, Scale Velocities/Lengths, and original Groove/Pluck templates. Host/sanitizer checks pass; see Source/Editing/README.md for desktop and recording limits.
 - [ ] Edit: add groove and pluck template actions.
-- [ ] View: Playlist, Event Editor/Piano Roll, Mixing Console, Master, Tempo, Time, Modules, Full Screen, Status Bar, and Show Hints.
+- [ ] View: separate Event Editor automation from Piano Roll notes. Current item 304 is miswired to showPianoRoll(); review the manual before implementing the correction, as requested on 2026-10-29.
 - [ ] Insert: organized generator, track, template, instrument, and effect categories; activate only actions Orbit can perform and keep third-party hosting excluded.
-- [ ] Options: Preferences, audio output and input, MIDI input/controllers, sample locations, time signature, timebase, skins, and wallpapers; settings that have no Orbit behavior must remain visibly unavailable until implemented. (Audio, MIDI input, and time signature are implemented.)
+- [x] Options: all reference menu entries have working handlers and persisted settings, including original skins/wallpapers, separate audio input/output, MIDI routing/filters/controllers/learn, MIDI out, virtual keyboard, paths, time signature/triplets and non-destructive export/display timebase. Host and panel checks are documented in Source/Options/README.md; hardware/native presentation, recording and mixed-meter arrangement limits remain explicit.
 - [ ] Window: list open child surfaces, show/focus them without replacing the project, and provide Hide/Minimize All and Cascade behavior.
 - [ ] Persist preferences separately from project settings; persist project metadata and musical settings in the `.orbit` file.
 - [ ] Bind shortcuts to the same actions as their menu items, and keep enabled/check states synchronized with the selected project and open views.
@@ -107,6 +117,28 @@ VST3 instrument scanning and insertion are implemented. Orbit starts with a fres
 **Suggested menu passes:** (1) menu shell and window commands; (2) pattern editing actions; (3) project settings and preferences; (4) Playlist/generator settings; (5) audio/MIDI configuration and insert categories; (6) polish and end-to-end verification. VST hosting is excluded from this scope.
 
 **Done when:** each enabled menu item performs its labeled action, project and user settings survive their appropriate reopen cycle, shortcuts match menu actions, and unavailable features are not presented as working controls.
+
+### File workflows — Orion reference analyzed 2026-10-27
+
+The supplied Orion recording shows these File menu entries: New, Open, Merge, Save, Save As, Save As Template, Stream To File, Import, Export, Preferences, Project Settings, Recent files, and Exit. Import and Export are submenus. These notes distinguish the Orion reference workflow from Orbit's supported formats.
+
+- [x] Import MIDI Track… lets the user choose a MIDI track; Import MIDI Song… creates one Orbit instrument/pattern lane for each note-bearing MIDI track. Beat timing and durations become pattern ticks, and song clips span each imported track's full note range rather than a short fixed pattern.
+- [x] Export Pattern as MIDI File… and Export Song as MIDI File…; song export follows placed MIDI pattern clips and includes the project's initial tempo and meter.
+- [x] Merge… has a multi-select track dialog with Select All, Select None, Merge, Cancel, and Remove unused FX sends. Native `.orbit` projects and `.orbittemplate` files preserve track/pattern/arrangement/plugin state. Referenced media remains at its source path.
+- [ ] Merge Orion `.sfs` projects. The dialog recognizes `.sfs` but rejects it clearly because Orbit has no SFS parser; no source data is changed.
+- [x] Save As… and Save As Template… use `.orbit` and `.orbittemplate` formats. Opening a template creates an unsaved project copy so Save cannot overwrite the template.
+- [x] Stream To File… renders asynchronously using writable audio formats registered in the current build, with supported 16/24/32-bit depths, 44100/48000/96000/192000 Hz, mono, and Entire Song / Instrument Tracks / All Track Channels combined-mix scopes. This build does not create individual stems; formats or bit depths unavailable from the active encoder are omitted.
+- [x] Add a persistent recent-project list and retain New/Open/Save/Preferences/Project Settings/Exit actions.
+
+**Scope boundary:** Orion's `.sfs` format is not Orbit's native `.orbit` format. Orbit does not claim to open `.sfs` projects losslessly. Native project merge keeps referenced media at the existing file paths rather than copying it into the destination project.
+
+### File-menu implementation record
+
+- The File menu now follows the Orion hierarchy and every enabled item has a working action: native project merge, MIDI track/song import, pattern/song MIDI export, Save As, Save As Template, recent projects, and asynchronous audio rendering.
+- MIDI import preserves PPQN note timing/lengths and derives pattern duration from note endpoints, bounded only by the signed-tick project representation. Import applies the first tempo and meter events that occur at time zero; later changes and SMPTE-timed MIDI are not represented.
+- Song MIDI export writes placed MIDI pattern clips only; audio clips are not converted into MIDI. It includes the project's initial tempo and meter.
+- Merge is available for Orbit-native projects and templates. Orion `.sfs` parsing remains outstanding, and media/plugin dependencies are not copied or guaranteed to exist on the destination system.
+- Audio render choices are driven by the current engine's writable formats and bit depths. Track scopes are combined mixes, not per-track stems; formats absent from the registered encoders are omitted.
 
 ### 6. Build a useful Insert menu and generator instantiation model
 
@@ -269,3 +301,32 @@ Build 75 adds a visible Pattern/Song selector beside BPM. Pattern mode plays eve
 - Source implementation is in `ProjectDocument` and the Playlist generator-row context menu. Clone copies pattern names/created state, note pitch/step/velocity/length, pattern automation, song automation and playlist arrangement to another instrument generator, remapping each destination pattern ID. It asks before replacing destination patterns and clips.
 - Track colors are saved as a track property and used to tint the Playlist row and clips.
 - The clone/color UI and copied arrangement have not yet been exercised in the running app; treat those boxes above as implemented in source, pending runtime validation.
+
+
+## 2026-10-29 — Build 235: visible generator menu and manual section 2
+
+- Replaced the toolbar-only generator gear with a drawn downward triangle at the
+  left of the generator header. It remains visible with hidden pattern controls
+  and rolled-up generators.
+- Added the same menu to the separate Drum Rack header, pinned to that rack and
+  its remembered pattern even when another generator is selected.
+- Built/installed Build 235 / v0.3.214. Preserved Build 234 in Builds/Previous.
+  ASan/UBSan regression checks passed; the native header appearance was inspected
+  in an isolated GUI harness. Native popup interaction and audible/hardware tests
+  remain unverified. The user's running app/project was not closed.
+- Reviewed all 18 rows in Changes since Orion 7. Recording in both modes,
+  portable controller maps, pan-law choices, sidechains, tuning and window/zoom
+  consistency are recorded ideas in ORION_MANUAL_AUDIT.md, not newly implemented
+  capabilities. Next ordered topic: System Requirements. SFS work remains paused.
+
+
+## 2026-10-29 — implementation and tester distribution
+
+- User authorized starting section 2's missing features. MIDI take recording is
+  the first increment; see Source/Recording/README.md for precise scope and limits.
+- Event Editor is an automation editor, distinct from Piano Roll. The current
+  combined View menu entry is wrong; correction is logged for the View chapter.
+- Explicitly requested binary tester builds: native Mac universal package and
+  Windows/Linux native-runner workflow. See DISTRIBUTION.md. No paid signing
+  identity is available locally; no notarization is claimed. Source-only remains
+  the ordinary backup default. SFS work remains paused.
