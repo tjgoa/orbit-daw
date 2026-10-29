@@ -25,6 +25,7 @@ def eligible_files() -> list[pathlib.Path]:
         "LICENSE",
         "DEPENDENCIES.md",
         ".gitmodules",
+        ".gitattributes",
         "BUILD_HISTORY.md",
         "ORBIT_DAW_FOUNDATION_PLAN_001.md",
         "ORION_LEARN_TODO.md",

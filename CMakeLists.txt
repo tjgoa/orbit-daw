@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OrbitDAW VERSION 0.3.216 LANGUAGES C CXX)
+project(OrbitDAW VERSION 0.3.217 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,7 +26,7 @@ endif()
 juce_add_gui_app(Orbit
     PRODUCT_NAME "Orbit"
     VERSION "${PROJECT_VERSION}"
-    BUILD_VERSION "237"
+    BUILD_VERSION "238"
     COMPANY_NAME "Touch The Universe"
     BUNDLE_ID "${ORBIT_APP_BUNDLE_ID}"
     PLUGINHOST_AU ${ORBIT_HOST_AU})
@@ -44,6 +44,7 @@ target_sources(Orbit PRIVATE
     Source/Options/Appearance.h
     Source/Options/MidiInbox.h
     Source/Options/VirtualKeyboard.h
+    Source/Options/WallpaperLibrary.h
     Source/Main.cpp
     Source/Editing/PatternTools.h
     Source/Editing/EditToolPanel.h
@@ -90,7 +91,7 @@ target_link_libraries(Orbit PRIVATE
 set_target_properties(Orbit PROPERTIES
     MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
-    MACOSX_BUNDLE_BUNDLE_VERSION "237"
+    MACOSX_BUNDLE_BUNDLE_VERSION "238"
     CXX_VISIBILITY_PRESET hidden
     C_VISIBILITY_PRESET hidden)
 

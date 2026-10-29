@@ -49,6 +49,14 @@ public:
     void finish(std::int64_t tick)
     {if(!active)return;active=false;for(const auto& [key,n]:held)emit(key,n,tick);held.clear();pedals.clear();}
     void clear(){*this=MidiTake{};}
+    std::vector<Note> preview(const std::string& id,std::int64_t tick) const
+    {
+        // Render held lengths without committing or mutating the captured take.
+        MidiTake result;result.targets=targets;result.quantizeTicks=quantizeTicks;result.quantizeDurations=quantizeDurations;
+        for(const auto& note:notes)if(note.id==id)result.append(note);
+        if(active)for(const auto& [key,n]:held)if(std::get<0>(key)==id)result.emit(key,n,tick);
+        return result.notes;
+    }
 private:
     using Key=std::tuple<std::string,std::string,int,int>;
     using Pedal=std::tuple<std::string,std::string,int>;

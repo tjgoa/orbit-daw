@@ -1,9 +1,17 @@
 # MIDI take recording
 
-Record captures live MIDI and Virtual MIDI Keyboard notes into Orbit's native
+Record captures live MIDI, the left-side Piano Roll keyboard, the instrument's
+host keyboard and Virtual MIDI Keyboard notes into Orbit's native
 patterns. Playlist R arms instrument generators. With no explicit arms, Record
 uses the selected instrument. During a take, input stays with the armed/pinned
 generators and respects their input channels. Audio-track recording is separate.
+
+To test without hardware: select an instrument, choose Pattern mode, open its
+Piano Roll, press Record, then click/hold or drag across the keyboard at the left.
+Pending notes appear while recording; Stop commits the take. Undo removes that
+whole take. Without Record, the keys audition without adding notes. The separate
+virtual keyboard (F12) also supports mouse/computer-key input. In Song mode,
+first turn Song looping off and move to an empty region on the armed tracks.
 
 - Pattern mode adds the finished performance to each destination's remembered
   pattern. Existing notes remain intact. Crossing its loop boundary splits a
@@ -29,7 +37,8 @@ generators and respects their input channels. Audio-track recording is separate.
 - MIDI is recorded before generator arp/transpose processing. Use the existing
   arpeggiator Render action afterwards to bake its result.
 
-New notes are committed at the end of the take, so an earlier overdub pass is not
+Pending Pattern notes, including held durations, are drawn without changing the
+document. New notes are committed at the end of the take, so an earlier overdub pass is not
 heard on the next loop until committed. This does not implement count-in,
 punch-in/out, replace mode, audio recording, controller/automation performance
 recording, sostenuto/soft-pedal capture, or Song pattern-launch performance capture.

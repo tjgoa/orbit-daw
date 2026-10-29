@@ -24,6 +24,7 @@
 #include "Options/Appearance.h"
 #include "Options/MidiInbox.h"
 #include "Options/VirtualKeyboard.h"
+#include "Options/WallpaperLibrary.h"
 #include "Generator/GeneratorMidiPlugin.h"
 #include "Generator/ArpeggiatorPanel.h"
 #include "Recording/MidiTake.h"
@@ -4909,6 +4910,28 @@ public:
     }
     int pitchAtY(int y) const {return maximumPitch-int(std::floor(firstPitchRow+(y-headerHeight())/double(rowHeight())));}
     int yForPitch(int pitch) const {return headerHeight()+juce::roundToInt((maximumPitch-pitch-firstPitchRow)*rowHeight());}
+    static bool isBlackKey(int pitch)
+    {const int p=pitch%12;return p==1 || p==3 || p==6 || p==8 || p==10;}
+    int blackKeyWidth() const {return labelWidth()*3/5;}
+    int keyboardPitchAt(int x,int y) const
+    {
+        if(x<0 || x>=labelWidth()-2 || y<headerHeight() || y>=headerHeight()+noteAreaHeight())return -1;
+        int pitch=pitchAtY(y);
+        if(pitch<minimumPitch || pitch>maximumPitch)return -1;
+        if(isBlackKey(pitch) && x>=blackKeyWidth())
+            pitch+=(y-yForPitch(pitch)<rowHeight()/2?1:-1);
+        return juce::jlimit(minimumPitch,maximumPitch,pitch);
+    }
+    void updateKeyboardNote(int pitch)
+    {
+        if(pitch==keyboardPitch)return;
+        if(keyboardPitch>=0 && keyboardNoteChanged)keyboardNoteChanged(keyboardPitch,false);
+        keyboardPitch=pitch;
+        if(pitch>=0 && keyboardNoteChanged)keyboardNoteChanged(pitch,true);
+        repaint();
+    }
+    void releaseKeyboardNote() {keyboardGestureActive=false;updateKeyboardNote(-1);}
+    void visibilityChanged() override {if(!isShowing())releaseKeyboardNote();}
     void centrePitch(int pitch) {setPitchScrollPosition(maximumPitch-juce::jlimit(minimumPitch,maximumPitch,pitch)-(visiblePitchRows()-1)*0.5);}
     void resized() override {setPitchScrollPosition(firstPitchRow);}
     void mouseWheelMove(const juce::MouseEvent& event,const juce::MouseWheelDetails& wheel) override
@@ -4925,6 +4948,7 @@ public:
     std::function<bool(int, int)> noteIsOn;
     std::function<bool()> areAllNotesSelected;
     std::function<std::vector<ProjectDocument::PatternNote>()> getNotes;
+    std::function<std::vector<ProjectDocument::PatternNote>()> getRecordingNotes;
     std::function<int(int, int)> getNoteLength;
     std::function<void(int, int, bool)> noteClicked;
     std::function<void(int, int, int)> noteLengthChanged;
@@ -5049,7 +5073,9 @@ public:
             static_cast<int>(std::ceil((clipBounds.getRight() - labelWidthPx) / static_cast<double>(stepWidthPx))));
         const auto firstCurveStep = juce::jmax(0, firstVisibleStep - 1);
         const auto lastActiveVisibleStep = juce::jmin(activeStepCount - 1, lastVisibleStep + 1);
-        const auto patternNotes = getNotes ? getNotes() : std::vector<ProjectDocument::PatternNote>{};
+        auto patternNotes = getNotes ? getNotes() : std::vector<ProjectDocument::PatternNote>{};
+        if(getRecordingNotes)
+        {auto pending=getRecordingNotes();patternNotes.insert(patternNotes.end(),pending.begin(),pending.end());}
         for (int step = firstVisibleStep; step <= lastVisibleStep; ++step)
         {
             g.setColour(lightTheme
@@ -5060,29 +5086,30 @@ public:
         }
 
         g.saveState();g.reduceClipRegion(0,headerHeightPx,getWidth(),noteAreaHeight());
+        // Paint a continuous white key bed before overlaying the shorter black
+        // keys. White-key tails stay white in every theme, zoom and scroll state.
+        const auto white=lightTheme?orbit::options::colour(232,238,244)
+            :(colouredKeys?orbit::options::colour(224,232,237):orbit::options::colour(196,207,215));
+        g.setColour(white);g.fillRect(0,headerHeightPx,labelWidthPx-2,noteAreaHeight());
+        for(int pitch=maximumPitch;pitch>=minimumPitch;--pitch)if(!isBlackKey(pitch))
+        {
+            const int y=yForPitch(pitch),top=y-(isBlackKey(pitch+1)?rowHeightPx/2:0);
+            const int bottom=y+rowHeightPx+(pitch>0 && isBlackKey(pitch-1)?rowHeightPx/2:0);
+            if(keyboardPitch==pitch){g.setColour(orbit::options::colour(105,193,218));g.fillRect(0,top,labelWidthPx-2,bottom-top);}
+            g.setColour(orbit::options::colour(106,126,139));g.drawHorizontalLine(top,0,float(labelWidthPx-2));
+        }
         for (int pitch = maximumPitch; pitch >= minimumPitch; --pitch)
         {
             const auto y = yForPitch(pitch);
             if(y+rowHeightPx<=headerHeightPx || y>=headerHeightPx+noteAreaHeight())continue;
-            const bool blackKey = ((pitch % 12) == 1 || (pitch % 12) == 3 || (pitch % 12) == 6
-                                   || (pitch % 12) == 8 || (pitch % 12) == 10);
-            // Draw a compact piano keyboard at the left edge: white keys span
-            // the strip while black keys sit over the left portion of their row.
-            // This makes the chromatic pattern immediately recognizable.
-            if (!blackKey)
+            const bool blackKey = isBlackKey(pitch);
+            if (blackKey)
             {
-                g.setColour(lightTheme ? orbit::options::colour(232, 238, 244)
-                    : (colouredKeys ? orbit::options::colour(224, 232, 237) : orbit::options::colour(196, 207, 215)));
-                g.fillRect(0, y, labelWidthPx - 2, rowHeightPx);
-                g.setColour(orbit::options::colour(106, 126, 139));
-                g.drawRect(0, y, labelWidthPx - 2, rowHeightPx, 1);
-            }
-            else
-            {
-                const auto keyWidth = (labelWidthPx * 3) / 5;
+                const auto keyWidth = blackKeyWidth();
                 const auto keyHeight = juce::jmax(4, rowHeightPx - 2);
-                g.setColour(lightTheme ? orbit::options::colour(36, 48, 58)
-                    : (colouredKeys ? orbit::options::colour(24, 34, 43) : orbit::options::colour(13, 21, 28)));
+                g.setColour(keyboardPitch==pitch?orbit::options::colour(51,158,191)
+                    :lightTheme?orbit::options::colour(36,48,58)
+                    :(colouredKeys?orbit::options::colour(24,34,43):orbit::options::colour(13,21,28)));
                 g.fillRoundedRectangle(0.0f, static_cast<float>(y), static_cast<float>(keyWidth),
                                        static_cast<float>(keyHeight), 2.0f);
                 g.setColour(orbit::options::colour(13, 21, 28));
@@ -5359,8 +5386,8 @@ public:
         {
             if (!event.mods.isRightButtonDown() && keyboardNoteChanged)
             {
-                keyboardPitch = pitch;
-                keyboardNoteChanged(pitch, true);
+                keyboardGestureActive=true;
+                updateKeyboardNote(keyboardPitchAt(event.x,event.y));
             }
             return;
         }
@@ -5424,6 +5451,7 @@ public:
 
     void mouseDrag(const juce::MouseEvent& event) override
     {
+        if(keyboardGestureActive){updateKeyboardNote(keyboardPitchAt(event.x,event.y));return;}
         if(selectingNotes){selectionRect=juce::Rectangle<int>(selectionStart,event.getPosition());repaint();return;}
         if (resizingLane)
         {
@@ -5541,9 +5569,7 @@ public:
         automationDragActive = false;
         if (velocityGestureActive && velocityGestureEnded) velocityGestureEnded();
         velocityGestureActive = false;
-        if (keyboardPitch >= 0 && keyboardNoteChanged)
-            keyboardNoteChanged(keyboardPitch, false);
-        keyboardPitch = -1;
+        releaseKeyboardNote();
         if (noteGestureActive && noteGestureEnded) noteGestureEnded();
         noteGestureActive = false;
         dragPitch = -1;
@@ -5662,6 +5688,7 @@ private:
     int dragPressTick = -1;
     int dragInitialLengthTicks = 64;
     int keyboardPitch = -1;
+    bool keyboardGestureActive=false;
     bool dragWasExisting = false;
     bool dragResizingFromEdge = false;
     bool dragChanged = false;
@@ -6112,6 +6139,9 @@ public:
     }
 
     ~PianoRollWindow() override {pitchScrollbar.removeListener(this);}
+    void releaseKeyboardNote() {if(grid!=nullptr)grid->releaseKeyboardNote();}
+    void setRecordingNotesProvider(std::function<std::vector<ProjectDocument::PatternNote>()> provider)
+    {if(grid!=nullptr)grid->getRecordingNotes=std::move(provider);}
     void setPatternContext(const juce::String& track,int slot)
     {
         const auto context=track+":"+juce::String(slot);
@@ -6524,12 +6554,14 @@ public:
         }
     }
 
-    void mouseDown(const juce::MouseEvent& event) override { updatePitch(event.position.x, true); }
-    void mouseDrag(const juce::MouseEvent& event) override { updatePitch(event.position.x, true); }
+    void mouseDown(const juce::MouseEvent& event) override {if(!event.mods.isRightButtonDown())updatePitch(event.position);}
+    void mouseDrag(const juce::MouseEvent& event) override {updatePitch(event.position);}
     void mouseUp(const juce::MouseEvent&) override { releasePitch(); }
+    void release() {releasePitch();}
+    void visibilityChanged() override {if(!isShowing())releasePitch();}
 
 private:
-    int pitchAt(float x) const
+    int pitchAt(float x,float y) const
     {
         constexpr int whiteCount = 14;
         const auto whiteWidth = static_cast<float>(getWidth()) / static_cast<float>(whiteCount);
@@ -6540,22 +6572,21 @@ private:
         const auto within = whiteIndex % 7;
         const auto boundaryX = (whiteIndex + 1) * whiteWidth;
         const auto blackWidth = whiteWidth * 0.29f;
-        if (blackSemitones[static_cast<size_t>(within)] >= 0 && x >= boundaryX - blackWidth && x < boundaryX + blackWidth)
+        if (y<getHeight()*0.62f && blackSemitones[static_cast<size_t>(within)] >= 0 && x >= boundaryX - blackWidth && x < boundaryX + blackWidth)
             return 60 + (whiteIndex / 7) * 12 + blackSemitones[static_cast<size_t>(within)];
-        if (whiteIndex > 0 && blackSemitones[static_cast<size_t>((whiteIndex - 1) % 7)] >= 0
+        if (y<getHeight()*0.62f && whiteIndex > 0 && blackSemitones[static_cast<size_t>((whiteIndex - 1) % 7)] >= 0
             && x < whiteIndex * whiteWidth + blackWidth)
             return 60 + ((whiteIndex - 1) / 7) * 12 + blackSemitones[static_cast<size_t>((whiteIndex - 1) % 7)];
         return 60 + (whiteIndex / 7) * 12 + whiteSemitones[static_cast<size_t>(within)];
     }
 
-    void updatePitch(float x, bool down)
+    void updatePitch(juce::Point<float> point)
     {
-        if (!down) return;
-        const auto nextPitch = pitchAt(x);
+        const auto nextPitch = getLocalBounds().toFloat().contains(point)?pitchAt(point.x,point.y):-1;
         if (nextPitch == activePitch) return;
         releasePitch();
         activePitch = nextPitch;
-        if (onNote) onNote(activePitch, true);
+        if (onNote && activePitch>=0) onNote(activePitch, true);
         repaint();
     }
 
@@ -9341,21 +9372,9 @@ public:
             },
             [this](int pitch, bool isDown)
             {
-                if (instrumentTrack == nullptr) return;
-                constexpr int auditionChannel = 1;
-                if (isDown)
-                {
-                    ++midiAuditionNoteOns;
-                    lastMidiActivity = "Piano keyboard pitch " + juce::String(pitch) + " on";
-                    instrumentTrack->playGuideNote(pitch, te::MidiChannel(auditionChannel), 100,
-                                                   true, true, false);
-                }
-                else
-                {
-                    lastMidiActivity = "Piano keyboard pitch " + juce::String(pitch) + " off";
-                    instrumentTrack->turnOffGuideNotes(te::MidiChannel(auditionChannel));
-                }
+                sendOnScreenNote(pitch,isDown,"Orbit Piano Roll Keyboard");
             });
+        pianoRollWindow->setRecordingNotesProvider([this]{return recordingNotesForPianoRoll();});
         pianoRollWindow->setPasteHandler([this] { pastePatternNotes(); });
         pianoRollWindow->setEditHandlers([this](const auto& key){return handleEditShortcut(key,true);},
             [this](int pitch,int tick){return selectedNoteKeys.contains({pitch,tick});},
@@ -9780,7 +9799,7 @@ public:
         meterStatus.setColour(juce::Label::textColourId, orbit::options::colour(170, 204, 222));
         addAndMakeVisible(meterStatus);
 
-        buildLabel.setText("Build 237  -  v0.3.216", juce::dontSendNotification);
+        buildLabel.setText("Build 238  -  v0.3.217", juce::dontSendNotification);
         buildLabel.setJustificationType(juce::Justification::centredRight);
         buildLabel.setColour(juce::Label::textColourId, orbit::options::colour(154, 181, 196));
         addAndMakeVisible(buildLabel);
@@ -10454,6 +10473,13 @@ private:
         wallpapers.addItem(5601,"Slate Gradient",true,optionInt("wallpaper")==1);
         wallpapers.addItem(5602,"Blueprint Grid",true,optionInt("wallpaper")==2);
         wallpapers.addItem(5603,"Choose Image...",true,optionInt("wallpaper")==3);
+        wallpapers.addItem(5604,"Open Wallpaper Folder...");
+        wallpaperMenuFiles=wallpaperLibrary().images();
+        if(!wallpaperMenuFiles.isEmpty())wallpapers.addSeparator();
+        const auto selectedWallpaper=juce::File(optionString("wallpaperFile"));
+        for(int i=0;i<wallpaperMenuFiles.size();++i)
+            wallpapers.addItem(wallpaperMenuBase+i,wallpaperMenuFiles[i].getFileName(),true,
+                optionInt("wallpaper")==3 && wallpaperMenuFiles[i]==selectedWallpaper);
         wallpapers.addSeparator();
         for (int i=0;i<3;++i) wallpapers.addItem(5610+i,juce::StringArray{"Fit","Fill","Tile"}[i],true,optionInt("wallpaperMode",1)==i);
         menu.addSubMenu("Wallpapers", wallpapers); menu.addSeparator();
@@ -10476,8 +10502,14 @@ private:
         orbit::options::currentSkin=juce::jlimit(0,orbit::options::skinNames.size()-1,optionInt("skin"));
         optionsLookAndFeel.refresh(); setLookAndFeel(&optionsLookAndFeel);
         juce::LookAndFeel::setDefaultLookAndFeel(&optionsLookAndFeel);
+        const auto library=wallpaperLibrary();library.folder.createDirectory();
         const auto file=optionString("wallpaperFile");
-        if(file.isNotEmpty()) wallpaperImage=juce::ImageFileFormat::loadFrom(juce::File(file));
+        if(file.isNotEmpty())
+        {
+            // Keep old external selections usable; adopting a wallpaper again
+            // through Choose Image copies it into the managed folder.
+            orbit::options::WallpaperLibrary::load(juce::File(file),wallpaperImage);
+        }
         midiInbox.deliver=[this](const auto& events,bool lost)
         {
             if(lost)releaseLiveMidi();
@@ -10546,6 +10578,30 @@ private:
     }
     void setWallpaper(int kind)
     {saveOption("wallpaper",kind);repaint();}
+    orbit::options::WallpaperLibrary wallpaperLibrary()
+    {
+        auto folder=applicationProperties.getUserSettings()->getFile().getParentDirectory();
+       #if JUCE_MAC
+        folder=folder.getChildFile("Orbit");
+       #endif
+        return orbit::options::WallpaperLibrary(folder.getChildFile("Wallpapers"));
+    }
+    bool useWallpaper(const juce::File& file,bool copyToLibrary)
+    {
+        juce::File stored=file;juce::Image image;
+        const auto result=copyToLibrary?wallpaperLibrary().addImage(file,stored,image)
+            :orbit::options::WallpaperLibrary::load(file,image);
+        if(result.failed()){status.setText(result.getErrorMessage(),juce::dontSendNotification);return false;}
+        wallpaperImage=std::move(image);saveOption("wallpaperFile",stored.getFullPathName());setWallpaper(3);
+        status.setText("Wallpaper: "+stored.getFileName(),juce::dontSendNotification);return true;
+    }
+    void openWallpaperFolder()
+    {
+        const auto folder=wallpaperLibrary().folder;
+        const auto result=folder.createDirectory();
+        if(result.failed()){showError("Wallpaper folder",result.getErrorMessage());return;}
+        folder.revealToUser();
+    }
     void chooseWallpaper()
     {
         fileChooser=std::make_unique<juce::FileChooser>("Choose a workspace wallpaper",juce::File::getSpecialLocation(juce::File::userPicturesDirectory),"*.png;*.jpg;*.jpeg;*.gif");
@@ -10553,11 +10609,7 @@ private:
         fileChooser->launchAsync(juce::FileBrowserComponent::openMode|juce::FileBrowserComponent::canSelectFiles,[owner](const auto& chooser)
         {
             if(owner==nullptr)return;const auto file=chooser.getResult();if(!file.existsAsFile())return;
-            if(file.getSize()>32*1024*1024){owner->showError("Wallpaper","Choose an image smaller than 32 MiB.");return;}
-            auto image=juce::ImageFileFormat::loadFrom(file);
-            if(!image.isValid() || image.getWidth()>8192 || image.getHeight()>8192)
-            {owner->showError("Wallpaper","Choose a supported image no larger than 8192 pixels per side.");return;}
-            owner->wallpaperImage=std::move(image);owner->saveOption("wallpaperFile",file.getFullPathName());owner->setWallpaper(3);
+            if(!owner->useWallpaper(file,true))owner->showError("Wallpaper",owner->status.getText());
         });
     }
     void paintWallpaper(juce::Graphics& g)
@@ -10767,6 +10819,8 @@ private:
         finishMidiRecording();
         const juce::ScopedValueSetter<bool> releasing(releasingLiveMidi,true);
         midiInbox.clear();
+        if(pianoRollWindow!=nullptr)pianoRollWindow->releaseKeyboardNote();
+        auditionKeyboard.release();
         if(virtualKeyboard!=nullptr)virtualKeyboard->release();
         if(edit!=nullptr)
             for(const auto& id:liveMidiRecipients)if(auto* track=engineTrackForProjectId(id))
@@ -10864,6 +10918,18 @@ private:
                 if(auto* out=dynamic_cast<te::MidiOutputDevice*>(engine.getDeviceManager().findOutputDeviceForID(outputId));out!=nullptr && out->isEnabled())out->fireMessage(message);
         }
         lastMidiActivity="MIDI channel "+juce::String(channel)+" / "+juce::String(targets.size())+" generator(s)";
+    }
+    void sendOnScreenNote(int pitch,bool down,const juce::String& source)
+    {
+        if(pitch<0 || pitch>127)return;
+        if(down)
+        {
+            const int assigned=instrumentTrack!=nullptr?int(instrumentTrack->state.getProperty("orbitMidiChannel",0)):1;
+            processLiveMidi(juce::MidiMessage::noteOn(juce::jlimit(1,16,assigned),pitch,juce::uint8(100)),source);
+        }
+        else for(int channel=1;channel<=16;++channel)
+            if(liveMidiNotes.contains(std::make_tuple(source,channel,pitch)))
+                processLiveMidi(juce::MidiMessage::noteOff(channel,pitch),source);
     }
     void toggleVirtualKeyboard()
     {
@@ -11283,6 +11349,8 @@ private:
         if (menuKind == 4 && item >= 5500 && item < 5500 + orbit::options::skinNames.size()) { setSkin(item-5500); return; }
         if (menuKind == 4 && item >= 5600 && item <= 5602) { setWallpaper(item-5600); return; }
         if (menuKind == 4 && item >= 5610 && item <= 5612) { saveOption("wallpaperMode", item-5610); repaint(); return; }
+        if(menuKind==4 && item>=wallpaperMenuBase && item-wallpaperMenuBase<wallpaperMenuFiles.size())
+        {useWallpaper(wallpaperMenuFiles[item-wallpaperMenuBase],false);return;}
         if (menuKind == 1)
             if (auto* text = focusedEditText())
             {
@@ -11372,6 +11440,7 @@ private:
             case 518: showMidiOutputOptions(); break;
             case 519: toggleVirtualKeyboard(); break;
             case 5603: chooseWallpaper(); break;
+            case 5604: openWallpaperFolder(); break;
             case 507: showSamplePathsDialog(); break;
             case 508: showVstPathsDialog(); break;
             case 306:
@@ -12460,25 +12529,7 @@ private:
 
     void auditionSelectedInstrument(int pitch, bool isDown)
     {
-        constexpr int auditionChannel = 1;
-        if (isDown)
-        {
-            auditionTrack = instrumentTrack;
-            if (auditionTrack == nullptr) return;
-            ++midiAuditionNoteOns;
-            lastMidiActivity = "Instrument keyboard pitch " + juce::String(pitch) + " on";
-            // Tracktion Engine suppresses guide-note audition by default for
-            // hosted apps. Force the note so the visible host keyboard works
-            // immediately, without first starting transport or opening Piano Roll.
-            auditionTrack->playGuideNote(pitch, te::MidiChannel(auditionChannel), 100, true, true, false);
-            return;
-        }
-        if (auditionTrack != nullptr)
-        {
-            lastMidiActivity = "Instrument keyboard pitch " + juce::String(pitch) + " off";
-            auditionTrack->turnOffGuideNotes(te::MidiChannel(auditionChannel));
-            auditionTrack = nullptr;
-        }
+        sendOnScreenNote(pitch,isDown,"Orbit Instrument Keyboard");
     }
 
     void setLoopEnabled(bool enabled)
@@ -14886,6 +14937,8 @@ private:
 
     void stopPlayback()
     {
+        if(pianoRollWindow!=nullptr)pianoRollWindow->releaseKeyboardNote();
+        auditionKeyboard.release();
         const bool recorded=midiTake.active || !midiTake.notes.empty();
         const bool committed=finishMidiRecording();
         if (edit != nullptr && playbackMode == PlaybackMode::song)
@@ -17797,6 +17850,8 @@ private:
     bool finishingMidiRecording=false;
     std::unique_ptr<orbit::options::VirtualKeyboard> virtualKeyboard;
     juce::Image wallpaperImage;
+    static constexpr int wallpaperMenuBase=200000;
+    juce::Array<juce::File> wallpaperMenuFiles;
     juce::String midiDeviceSignature;
     std::map<std::tuple<juce::String,int,int>, juce::StringArray> liveMidiNotes;
     juce::StringArray liveMidiRecipients;
@@ -17818,7 +17873,6 @@ private:
     juce::String lastMidiActivity;
     std::unique_ptr<te::Edit> edit;
     te::AudioTrack* instrumentTrack = nullptr;
-    te::AudioTrack* auditionTrack = nullptr;
     te::MidiClip* patternClip = nullptr;
     te::LevelMeterPlugin* trackMeter = nullptr;
     te::LevelMeasurer::Client trackMeterClient;
@@ -17943,7 +17997,7 @@ class OrbitApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override { return "Orbit"; }
-    const juce::String getApplicationVersion() override { return "0.3.216"; }
+    const juce::String getApplicationVersion() override { return "0.3.217"; }
     void initialise(const juce::String&) override
     {
         installOrbitCrashReportHandler();

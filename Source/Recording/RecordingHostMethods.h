@@ -1,5 +1,15 @@
 // Included inside ProjectView. Native document notes remain authoritative;
 // a finished take is staged atomically and adds exactly one undo snapshot.
+std::vector<ProjectDocument::PatternNote> recordingNotesForPianoRoll()
+{
+    std::vector<ProjectDocument::PatternNote> result;
+    const auto id=selectedProjectTrackId();const int slot=selectedPatternIndex();
+    for(const auto& target:midiTake.targets)
+        if(!target.song && target.id==id.toStdString() && target.slot==slot)
+            for(const auto& note:midiTake.preview(target.id,midiTake.active?recordingTick():recordingEndTick))
+            {ProjectDocument::PatternNote n;n.pitch=note.pitch;n.startTick=note.start;n.lengthTicks=note.length;n.velocity=note.velocity;result.push_back(n);}
+    return result;
+}
 std::int64_t recordingTick(double receivedAtMs=0)const
 {
     if(receivedAtMs<=0)receivedAtMs=juce::Time::getMillisecondCounterHiRes();

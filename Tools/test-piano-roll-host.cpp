@@ -38,6 +38,19 @@ int main()
         host.undoProjectAction();pianoCheck(!host.project.getPatternNote(id,0,127,127%7) && host.capturePatternData(id,0).notes.size()==6,"single high-note undo failed");host.redoProjectAction();
         pianoCheck(host.capturePatternData(id,0).notes==authored,"redo did not restore full-range notes");
         host.instrumentTrack->getListeners().add(&listener);
+        // Right-hand white-key tails must remain white beside every black key,
+        // and hit-testing must match the shorter black-key drawing.
+        for(int skin:{5,6})for(float zoom:{0.6f,1.12f,2.2f})
+        {
+            host.setSkin(skin);grid->setZoom(1.12f,zoom);window->resizeGridToViewport();grid->centrePitch(61);
+            auto image=grid->createComponentSnapshot(grid->getLocalBounds());
+            const int y=grid->yForPitch(61),h=grid->rowHeight();
+            pianoCheck(image.getPixelAt(52,y+h/4).getBrightness()>0.65f,"black key lost its white tail");
+            pianoCheck(image.getPixelAt(10,y+h/2).getBrightness()<0.4f,"black key no longer dark");
+            pianoCheck(grid->keyboardPitchAt(10,y+h/4)==61 && grid->keyboardPitchAt(52,y+h/4)==62
+                && grid->keyboardPitchAt(52,y+3*h/4)==60,"key tails play the wrong pitch");
+        }
+        grid->setZoom(1.12f,1.12f);window->resizeGridToViewport();
         // Piano key audition must address both MIDI endpoints without painting notes.
         for(int pitch:{0,127})
         {
@@ -46,6 +59,21 @@ int main()
             pianoCheck(host.capturePatternData(id,0).notes.size()==count,"keyboard audition painted a note");
             pianoCheck(std::any_of(listener.messages.begin(),listener.messages.end(),[&](const auto& m){return m.isNoteOn() && m.getNoteNumber()==pitch;}),"endpoint keyboard audition failed");
         }
+        // The actual keyboard mouse gesture now enters the live MIDI recorder.
+        grid->centrePitch(60);const auto recordingBefore=host.capturePatternData(id,0).notes;
+        const auto recordingUndo=host.undoHistory.size();
+        pianoCheck(host.prepareMidiRecording(0,juce::Time::getMillisecondCounterHiRes()),"mouse recording did not start");
+        auto keyDown=pianoMouse(grid,10,float(grid->yForPitch(60)+grid->rowHeight()/2));grid->mouseDown(keyDown);
+        pianoCheck(!host.recordingNotesForPianoRoll().empty(),"held mouse note not visible during recording");
+        auto keyDrag=pianoMouse(grid,10,float(grid->yForPitch(62)+grid->rowHeight()/2),juce::ModifierKeys::leftButtonModifier,keyDown.position,true);grid->mouseDrag(keyDrag);
+        auto outside=pianoMouse(grid,100,keyDrag.y,juce::ModifierKeys::leftButtonModifier,keyDown.position,true);grid->mouseDrag(outside);
+        pianoCheck(host.liveMidiNotes.empty(),"drag outside keyboard left a stuck note");
+        grid->mouseDrag(keyDrag);grid->mouseUp(keyDrag);
+        pianoCheck(host.capturePatternData(id,0).notes==recordingBefore && !host.recordingNotesForPianoRoll().empty(),"mouse take painted the document before commit");
+        pianoCheck(host.finishMidiRecording() && host.undoHistory.size()==recordingUndo+1,"mouse take did not commit in one undo");
+        pianoCheck(host.capturePatternData(id,0).notes.size()>=recordingBefore.size()+2,"mouse keys were only auditioned, not recorded");
+        host.undoProjectAction();pianoCheck(host.capturePatternData(id,0).notes==recordingBefore,"mouse take undo changed existing notes");
+        host.instrumentTrack->getListeners().add(&listener);
         // Scrollbar, wheel and zoom must reach both boundaries and remain independent of lanes.
         grid->setPitchScrollPosition(0);pianoCheck(grid->pitchAtY(grid->headerHeight()+grid->rowHeight()/2)==127,"top note unreachable");
         juce::MouseWheelDetails wheel{};wheel.deltaY=-0.5f;auto atGrid=pianoMouse(grid,200,120,0);grid->mouseWheelMove(atGrid,wheel);pianoCheck(grid->getPitchScrollPosition()>0,"wheel did not scroll pitches");
@@ -88,7 +116,7 @@ int main()
             host.setSkin(skin);grid->centrePitch(pitch);auto image=window->createComponentSnapshot(window->getLocalBounds());
             juce::FileOutputStream output(juce::File(juce::String("OPTIONS_CHECK_FOLDER/piano-")+juce::String(pitch)+"-skin"+juce::String(skin)+".png"));juce::PNGImageFormat png;pianoCheck(png.writeImageToStream(image,output),"range render failed");
         }
-        std::cout<<"PASS: full MIDI 0-127 drawing, scrolling/scrollbar, zoom, audition, scrolled drag/resize/lasso/selection/erase, full-range velocity and clipboard, fixed lanes, single-gesture undo/redo, exact native reopen, high-pattern focus, six dark/light range renders. Hardware/native display disabled.\n";
+        std::cout<<"PASS: real Piano Roll mouse click/drag recording, pending held preview, release outside keyboard, one take undo, short black keys/white tails and matching hit-testing at three zooms in both skins; full MIDI 0-127 drawing, scrolling, audition, drag/resize/lasso, velocity, fixed lanes and native reopen. Hardware/native display disabled.\n";
     }
     catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<"\n";return 1;}
 }

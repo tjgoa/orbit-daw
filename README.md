@@ -4,7 +4,7 @@ Orbit is a standalone DAW inspired by Orion's generator → pattern → playlist
 
 ## Current state
 
-Orbit is an actively changing DAW foundation rather than a finished Orion-style workflow. The current source checkpoint is Build 236 / v0.3.215, with local development iteration **271**. It includes a Tracktion Engine-backed built-in 4OSC instrument, VST3 instruments, editable Piano Roll, generator-owned A1–H8 pattern banks, a 512-bar Playlist, MIDI export, and `.orbit` project save/reopen. Pattern mode plays each generator's remembered pattern together; Song mode follows Playlist clips and preserves the other generators' remembered positions. Automation has separate pattern-time lanes in the Piano Roll and song-time lanes in the Playlist. Playlist generator context actions include Show, Rename, Delete, Clone Track To, Edit Song Events, and Track Color; patterns/arrangement clone and persistent track colors are implemented. Loop start/length/enabled state persists and is drawn on the Playlist ruler. The Mixer contains generator strips with sends and output-bus assignment; the separate Master Section contains bus/return strips and a Master strip with four inserts and no sends. Routed buses appear there automatically. The Mixer stays in the Orbit workspace and can be moved, minimized, or closed. VST3 scan and crash reports are written to the Desktop. Current follow-up work includes immediate instrument-key audition, Playlist responsiveness and controls, Mixer Settings/Effects cloning, and runtime verification of loop playback, automation, bus routing, and context actions. See `ORION_LEARN_TODO.md` for remaining work, `ORION_NATIVE_EFFECTS_COMPATIBILITY.md` for the observed Orion effect inventory and migration plan, `BUILD_HISTORY.md` for product checkpoints, and `Source/Project/PROJECT_FORMAT.md` for the project format. Orbit is not yet verified as a finished production DAW.
+Orbit is an actively changing DAW foundation rather than a finished Orion-style workflow. The current source checkpoint is Build 238 / v0.3.217, with local development iteration **273**. It includes a Tracktion Engine-backed built-in 4OSC instrument, VST3 instruments, editable Piano Roll, generator-owned A1–H8 pattern banks, a 512-bar Playlist, MIDI export, and `.orbit` project save/reopen. Pattern mode plays each generator's remembered pattern together; Song mode follows Playlist clips and preserves the other generators' remembered positions. Automation has separate pattern-time lanes in the Piano Roll and song-time lanes in the Playlist. Playlist generator context actions include Show, Rename, Delete, Clone Track To, Edit Song Events, and Track Color; patterns/arrangement clone and persistent track colors are implemented. Loop start/length/enabled state persists and is drawn on the Playlist ruler. The Mixer contains generator strips with sends and output-bus assignment; the separate Master Section contains bus/return strips and a Master strip with four inserts and no sends. Routed buses appear there automatically. The Mixer stays in the Orbit workspace and can be moved, minimized, or closed. VST3 scan and crash reports are written to the Desktop. Current follow-up work includes immediate instrument-key audition, Playlist responsiveness and controls, Mixer Settings/Effects cloning, and runtime verification of loop playback, automation, bus routing, and context actions. See `ORION_LEARN_TODO.md` for remaining work, `ORION_NATIVE_EFFECTS_COMPATIBILITY.md` for the observed Orion effect inventory and migration plan, `BUILD_HISTORY.md` for product checkpoints, and `Source/Project/PROJECT_FORMAT.md` for the project format. Orbit is not yet verified as a finished production DAW.
 
 See [`PROGRESS.md`](PROGRESS.md) for a dated development update and current focus.
 
@@ -30,7 +30,10 @@ shortcuts, validation and the recording-workflow limitation.
 
 ### MIDI recording and tester downloads
 
-Record captures MIDI/Virtual MIDI Keyboard performances into native patterns with
+Record captures hardware MIDI and the Piano Roll, host instrument and F12 virtual
+keyboards into native patterns. Click/hold or drag the left-side Piano Roll keys
+while Record runs; pending Pattern notes appear immediately and Stop commits
+the take. This provides a recording test without a MIDI keyboard. Recording has
 one take undo. Playlist R arms generators; otherwise Record uses the selected
 instrument. Pattern takes add notes to the remembered pattern. Song takes use
 fresh slots and empty Playlist regions (initially 4/4, Song looping off).
@@ -43,7 +46,10 @@ combined View entry is incorrect and is logged for the manual's View chapter.
 
 ### Options menu
 
-Options starts with Skins and Wallpapers. Navy Blue and Light Blue are coordinated
+Options starts with Skins and Wallpapers. Open Wallpaper Folder opens a local
+image library; added PNG/JPEG/GIF files appear when Options is reopened.
+Choose Image copies the selected image into this folder without replacing
+same-name images. Navy Blue and Light Blue are coordinated
 presets for Playlist, Piano Roll and Mixer, using the existing dark and light artwork.
 The runnable app in `Builds/Current/Orbit.app` is updated to this checkpoint; restart
 an older running instance to load it. The Options menu also includes separate audio

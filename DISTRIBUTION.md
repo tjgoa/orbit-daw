@@ -8,6 +8,10 @@ compatibility still need testing beyond automated checks.
 
 ## Download and run
 
+Download the platform package from [GitHub Releases](https://github.com/tjgoa/orbit-daw/releases).
+Choose the named Mac ZIP, Windows ZIP or Linux tar.gz under Assets; GitHub's
+automatic "Source code" downloads contain source rather than the runnable app.
+
 - macOS: extract the ZIP and move Orbit.app to Applications. The universal binary
   contains Apple Silicon and Intel code. Its deployment target is macOS 11;
   older-OS compatibility has not been established by the local macOS 26 tests.
@@ -24,6 +28,43 @@ compatibility still need testing beyond automated checks.
   Typical runtime packages include libasound2t64, libjack-jackd2-0, libfreetype6,
   libfontconfig1 and the X11 libraries listed there. A graphical/audio session is
   required; CI compilation does not establish desktop/audio operation.
+
+### First launch on Mac
+
+1. Extract the Mac ZIP, open its extracted folder and drag **Orbit.app** into
+   **Applications**. Save/quit an older running Orbit before opening the new copy.
+2. Try opening `/Applications/Orbit.app`. If macOS blocks this early tester build,
+   use **System Settings > Privacy & Security > Open Anyway**, then confirm.
+   See [Apple's instructions](https://support.apple.com/en-us/102445).
+3. If the downloaded app is still blocked, testers who trust this project's
+   download can paste this app-specific command into Terminal, then open Orbit:
+
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/Orbit.app"
+   ```
+
+   This removes the download-quarantine attribute only from that Orbit app. It
+   does not sign or notarize it. Keep the quoted path; adjust it if you installed
+   somewhere else. There is no need to disable Gatekeeper for your whole Mac.
+
+### Test MIDI recording without a MIDI keyboard
+
+Insert/select an instrument, choose **Pattern** mode, open **Piano Roll**, and
+press **Record**. Click/hold or drag on the piano keys at the left. Pending notes
+appear while you record. Press **Stop** to commit, Play to hear the pattern, and
+Undo to remove the whole take. The host instrument keyboard and F12 virtual
+keyboard also record. Song mode currently needs **4/4**, **Song looping off** and
+an empty region on the armed generators. Audio recording is unfinished.
+
+### Add wallpapers
+
+Choose **Options > Wallpapers > Open Wallpaper Folder...**, place PNG/JPEG/GIF
+images there, then reopen Options to see them in the menu. **Choose Image...**
+also copies an image into this folder and selects the copy. Originals and
+same-name library images are preserved. Fit, Fill and Tile control placement.
+The Mac folder is `~/Library/Application Support/Orbit/Wallpapers`; Windows uses
+`%APPDATA%/Orbit/Wallpapers`, Linux `~/.Orbit/Wallpapers`. Images must be at most
+32 MiB and 8192 pixels per side.
 
 No compiler is needed to run a tester download. The package includes licenses,
 third-party notices and a complete Orbit-owned source ZIP. Fetch the pinned
@@ -51,6 +92,13 @@ revisions, then applies Tools/tracktion-sampler.patch. It needs no signing secre
 and uploads downloadable artifacts, not a published GitHub Release. Workflow
 permissions are read-only. Retrying a failed product build requires a fresh
 number/source commit, not Re-run jobs under the same number.
+
+Release publication is separate: `Tools/publish-tester-release.py` promotes the
+three artifacts from an explicitly pinned successful run, checks their digests,
+build metadata and matching source contents, and publishes a prerelease only
+after uploading every download, source, installation guide and checksums. It
+does not compile a product or consume a new product build number. The publishing
+workflow grants only its job contents-write/actions-read permissions.
 
 Source-only backups remain the default for ordinary development. Binary tester
 packages are produced only by the explicit tester-build command. It includes no

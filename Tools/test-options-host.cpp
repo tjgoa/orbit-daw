@@ -157,6 +157,24 @@ int main(int argc,char** argv)
         host.handleMenuResult(4,5500);requireOption(orbit::options::colour(40,60,80)==base,"default skin did not restore original drawing");
         for(int i=0;i<3;++i){host.handleMenuResult(4,5600+i);requireOption(host.optionInt("wallpaper")==i,"wallpaper command ignored");auto image=host.createComponentSnapshot(host.getLocalBounds());requireOption(image.isValid(),"wallpaper render failed");}
         host.handleMenuResult(4,5612);requireOption(host.optionInt("wallpaperMode")==2,"wallpaper placement ignored");
+        const auto library=host.wallpaperLibrary();
+        requireOption(library.folder.isDirectory() && library.folder.getFullPathName().startsWith("OPTIONS_CHECK_FOLDER"),"wallpaper folder missing or escaped isolated settings");
+        const auto external=juce::File("OPTIONS_CHECK_FOLDER/external/wallpaper.png");external.getParentDirectory().createDirectory();
+        auto writeImage=[&](juce::Colour colour)
+        {juce::Image image(juce::Image::RGB,20,20,true);juce::Graphics g(image);g.fillAll(colour);
+         juce::FileOutputStream out(external);out.setPosition(0);out.truncate();juce::PNGImageFormat png;requireOption(png.writeImageToStream(image,out),"test image write failed");};
+        writeImage(juce::Colours::red);requireOption(host.useWallpaper(external,true),"chosen wallpaper could not be copied");
+        const auto stored=juce::File(host.optionString("wallpaperFile"));
+        requireOption(stored.getParentDirectory()==library.folder && external.existsAsFile() && stored.hasIdenticalContentTo(external),"wallpaper did not retain a private copy");
+        const auto wallpaperCount=library.images().size();requireOption(host.useWallpaper(external,true) && library.images().size()==wallpaperCount,"same wallpaper copied twice");
+        writeImage(juce::Colours::blue);requireOption(host.useWallpaper(external,true),"same-name image import failed");
+        requireOption(juce::File(host.optionString("wallpaperFile"))!=stored && !stored.hasIdenticalContentTo(external),"same-name import overwrote old wallpaper");
+        const auto added=library.folder.getChildFile("Added.png");external.copyFileTo(added);host.makeOptionsMenu();
+        const int addedIndex=host.wallpaperMenuFiles.indexOf(added);requireOption(addedIndex>=0,"folder image not added to menu");
+        host.handleMenuResult(4,ProjectView::wallpaperMenuBase+addedIndex);requireOption(host.optionString("wallpaperFile")==added.getFullPathName(),"folder menu did not select its image");
+        const auto broken=library.folder.getChildFile("Broken.png");broken.replaceWithText("not an image");const auto previous=host.optionString("wallpaperFile");
+        requireOption(!host.useWallpaper(broken,false) && host.optionString("wallpaperFile")==previous,"bad image replaced the selected wallpaper");
+        added.deleteFile();host.makeOptionsMenu();requireOption(!host.wallpaperMenuFiles.contains(added),"removed wallpaper stayed in menu");
         requireOption(host.handleEditShortcut(juce::KeyPress(juce::KeyPress::F12Key)) && checkedKeyboardToggles==1,"F12 did not dispatch keyboard toggle");
         std::vector<juce::MidiMessage> keyboardEvents;
         {orbit::options::VirtualKeyboard::Content keyboard([&](const auto& m){keyboardEvents.push_back(m);});keyboard.state.noteOn(1,60,0.7f);keyboard.state.noteOn(1,64,0.8f);keyboard.state.noteOff(1,60,0);requireOption(keyboardEvents.size()==3 && keyboardEvents[0].isNoteOn() && keyboardEvents[1].getNoteNumber()==64 && keyboardEvents[2].isNoteOff(),"virtual keyboard not polyphonic");keyboard.release();requireOption(keyboardEvents.size()>3,"virtual keyboard panic ignored");}

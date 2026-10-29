@@ -8,7 +8,7 @@ report unavailable targets rather than pretending to apply a setting.
 | Entry | Behavior |
 | --- | --- |
 | Skins | Navy Blue switches Playlist/Piano Roll to the existing dark blue canvases and Mixer to Midnight Navy; Light Blue switches both canvases to their existing cool light blue/gray look and Mixer to Classic Blue. Both presets persist together. Default, Azure, Classic, Grey and Mixer palettes remain available. Hosted instrument artwork remains owned by its plug-in. |
-| Wallpapers | None, original Slate Gradient or Blueprint Grid, or a user-selected PNG/JPEG/GIF. Fit, Fill and Tile placements persist. Custom images are referenced by path and are not embedded in projects or source archives. |
+| Wallpapers | None, original Slate Gradient or Blueprint Grid, or a PNG/JPEG/GIF from the local wallpaper library. Open Wallpaper Folder opens the library; supported filenames are refreshed whenever Options opens. Choose Image copies a validated image into that folder and selects the copy, preserving same-name images. Fit, Fill and Tile persist. Images are not embedded in projects or source archives. |
 | Audio Input Settings | Device/channel selector, actual input-channel enable/disable, mono/stereo engine inputs, monitoring, 16/24/32-bit recording format, sample-based input compensation, and explicit assignment to the selected audio track. Monitoring is off by default. |
 | Audio Output Settings | Device, output channels, supported sample rates and buffer sizes; project CPU-core policy, global CPU protection threshold and output clipping control. |
 | MIDI In Settings | Device enablement, Easy/Advanced routing, generator input channel, pitch-bend/aftertouch/program-change/transport filters, and pedal enablement/polarity. |
@@ -25,6 +25,17 @@ The top menu follows the reference order, starting with Skins and Wallpapers;
 Navy Blue and Light Blue are first in the Skins submenu. Selecting a preset updates
 all existing surfaces immediately and saves the choices for later reopening. Local
 surface overrides remain available and clear the preset checkmark until reapplied.
+
+The wallpaper folder is `~/Library/Application Support/Orbit/Wallpapers` on Mac,
+`%APPDATA%/Orbit/Wallpapers` on Windows and `~/.Orbit/Wallpapers` on Linux.
+Use Open Wallpaper Folder to locate the active path. Add images directly there,
+then reopen Options to see their names. Imported originals remain untouched;
+copies stay available if the original is moved. Re-selecting the same name and
+contents reuses its copy; different contents receive a unique name. Images must
+be at most 32 MiB and 8192 pixels per side. Unsupported/corrupt images fail without
+replacing the current wallpaper. Existing external-path selections continue to
+work; choosing them again copies them into the library. Library images are local
+user data and survive application replacement.
 
 Orbit's additional Loop, Metronome, Diagnostics, Preferences, Project Settings and
 Playlist Settings entries retain their existing working handlers. Preferences
