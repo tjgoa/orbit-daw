@@ -1,0 +1,31 @@
+name: Publish verified Orbit tester release
+on:
+  push:
+    branches: ['codex/publish-tester-*']
+    paths:
+      - '.github/workflows/publish-tester-release.yml'
+      - 'Releases/Build-*.json'
+      - 'Releases/Build-*.md'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: orbit-publish-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'tjgoa/orbit-daw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: false
+          persist-credentials: false
+      - name: Verify existing packages and publish complete prerelease
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 Tools/publish-tester-release.py Releases/Build-238.json
