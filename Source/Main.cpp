@@ -1,6 +1,7 @@
 #include <JuceHeader.h>
 #include <tracktion_engine/tracktion_engine.h>
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -5127,7 +5128,7 @@ public:
             // notes, so finer divisions remain visible without crossing notes.
             const auto subdivisionTicks = juce::jmax(1, 1024 / subdivisionsPerBar);
             const auto lastTick = static_cast<int64_t>(activeStepCount) * 64;
-            const auto firstTick = juce::jmax<int64_t>(0,
+            const auto firstTick = std::max<int64_t>(0,
                 static_cast<int64_t>(std::floor((clipBounds.getX() - labelWidthPx)
                     * 64.0 / stepWidthPx / subdivisionTicks)) * subdivisionTicks);
             for (auto tick = firstTick; tick <= lastTick
@@ -8870,13 +8871,13 @@ public:
             label->setFont(juce::FontOptions(10.0f, juce::Font::bold));
             addAndMakeVisible(*label);
         }
-        loopStartSlider.onValueChange = [this] { updateLoopRange(); };
+        loopStartSlider.onValueChange = [this] { if(finishMidiRecording())updateLoopRange(); };
         loopLengthSlider.setSliderStyle(juce::Slider::IncDecButtons);
         loopLengthSlider.setRange(1, PlaylistGrid::barCount, 1);
         loopLengthSlider.setTextBoxStyle(juce::Slider::TextBoxLeft, false, 38, 22);
         loopLengthSlider.setValue(4, juce::dontSendNotification);
         loopLengthSlider.setTooltip("Loop length in bars.");
-        loopLengthSlider.onValueChange = [this] { updateLoopRange(); };
+        loopLengthSlider.onValueChange = [this] { if(finishMidiRecording())updateLoopRange(); };
         const std::array<juce::Component*, 25> actionButtons {{
             &newProjectButton, &openButton, &saveButton, &midiExportButton, &audioSettingsButton, &addTrackButton,
             &patternButton, &playlistButton, &playButton, &stopButton, &patternModeButton, &songModeButton, &mixerButton, &masterButton,
@@ -9779,7 +9780,7 @@ public:
         meterStatus.setColour(juce::Label::textColourId, orbit::options::colour(170, 204, 222));
         addAndMakeVisible(meterStatus);
 
-        buildLabel.setText("Build 236  -  v0.3.215", juce::dontSendNotification);
+        buildLabel.setText("Build 237  -  v0.3.216", juce::dontSendNotification);
         buildLabel.setJustificationType(juce::Justification::centredRight);
         buildLabel.setColour(juce::Label::textColourId, orbit::options::colour(154, 181, 196));
         addAndMakeVisible(buildLabel);
@@ -10816,7 +10817,7 @@ private:
         {
             if(!optionBool("receiveTransport"))return;
             if(message.isMidiStop()){edit->getTransport().stop(false,false);releaseLiveMidi();}
-            else if(message.isSongPositionPointer())edit->getTransport().setPosition(tracktion::TimePosition::fromSeconds(message.getSongPositionPointerMidiBeat()*0.25*60/project.getInitialTempoBpm()));
+            else if(message.isSongPositionPointer()){if(!finishMidiRecording(receivedAtMs))return;edit->getTransport().setPosition(tracktion::TimePosition::fromSeconds(message.getSongPositionPointerMidiBeat()*0.25*60/project.getInitialTempoBpm()));}
             else if(!edit->getTransport().isPlaying())
             {
                 const auto resume=edit->getTransport().getPosition();togglePlayback();
@@ -11932,7 +11933,7 @@ private:
         project.setPatternCreated(id,slot,true);
         if(patternClipboard.wholePattern)
             project.setPatternLengthSteps(id,slot,juce::jmax(project.getPatternLengthSteps(id,slot),
-                int(juce::jmin<juce::int64>(ProjectDocument::maximumPatternLengthSteps,
+                int(std::min<juce::int64>(ProjectDocument::maximumPatternLengthSteps,
                     (static_cast<juce::int64>(notePasteTick)+static_cast<juce::int64>(patternClipboard.lengthSteps)*64+63)/64))));
         for(const auto& n:pasted){project.appendPatternNoteTicks(id,slot,n.pitch,n.startTick,n.lengthTicks,n.velocity);selectedNoteKeys.emplace(n.pitch,n.startTick);}
         finishPatternEdit("Pasted "+juce::String(pasted.size())+" note(s).");
@@ -11947,7 +11948,7 @@ private:
         for (const auto& note : sourceNotes)
         {
             const auto noteEnd = static_cast<juce::int64>(note.startTick) + note.lengthTicks;
-            const auto noteEndSteps = static_cast<int>(juce::jmin<juce::int64>(
+            const auto noteEndSteps = static_cast<int>(std::min<juce::int64>(
                 ProjectDocument::maximumPatternLengthSteps,
                 noteEnd / 64 + (noteEnd % 64 != 0 ? 1 : 0)));
             data.lengthSteps = juce::jmax(data.lengthSteps, noteEndSteps);
@@ -12482,6 +12483,7 @@ private:
 
     void setLoopEnabled(bool enabled)
     {
+        if(!finishMidiRecording()){loopButton.setToggleState(project.isLoopEnabled(),juce::dontSendNotification);return;}
         if (edit != nullptr)
         {
             updateLoopRange();
@@ -13931,7 +13933,7 @@ private:
         int64_t written = 0;
         while (written < reader->lengthInSamples)
         {
-            const auto frames = static_cast<int>(juce::jmin<int64_t>(blockSize, reader->lengthInSamples - written));
+            const auto frames = static_cast<int>(std::min<int64_t>(blockSize, reader->lengthInSamples - written));
             const auto readStart = reader->lengthInSamples - written - frames;
             block.clear();
             if (!reader->read(&block, 0, frames, readStart, true, true))
@@ -17250,7 +17252,7 @@ private:
         for (const auto& note : patternNotes)
         {
             const auto noteEnd = static_cast<juce::int64>(note.startTick) + note.lengthTicks;
-            const auto noteEndSteps = static_cast<int>(juce::jmin<juce::int64>(
+            const auto noteEndSteps = static_cast<int>(std::min<juce::int64>(
                 ProjectDocument::maximumPatternLengthSteps, noteEnd / 64 + (noteEnd % 64 != 0 ? 1 : 0)));
             patternLength = juce::jmax(patternLength, noteEndSteps);
         }
@@ -17790,7 +17792,7 @@ private:
     orbit::options::MidiInbox midiInbox;
     orbit::recording::MidiTake midiTake;
     double recordingStartMs=0,recordingBpm=120;
-    std::int64_t recordingInitialTick=0;
+    std::int64_t recordingInitialTick=0,recordingEndTick=0;
     juce::String recordingProjectId;
     bool finishingMidiRecording=false;
     std::unique_ptr<orbit::options::VirtualKeyboard> virtualKeyboard;
@@ -17941,7 +17943,7 @@ class OrbitApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override { return "Orbit"; }
-    const juce::String getApplicationVersion() override { return "0.3.215"; }
+    const juce::String getApplicationVersion() override { return "0.3.216"; }
     void initialise(const juce::String&) override
     {
         installOrbitCrashReportHandler();

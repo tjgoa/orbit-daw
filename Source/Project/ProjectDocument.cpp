@@ -142,8 +142,8 @@ int patternLengthInBars(int lengthSteps)
 
 int stepsForTickEnd(juce::int64 endTick)
 {
-    const auto safeEnd = juce::jmax<juce::int64>(0, endTick);
-    return static_cast<int>(juce::jmin<juce::int64>(
+    const auto safeEnd = std::max<juce::int64>(0, endTick);
+    return static_cast<int>(std::min<juce::int64>(
         ProjectDocument::maximumPatternLengthSteps, safeEnd / 64 + (safeEnd % 64 != 0 ? 1 : 0)));
 }
 

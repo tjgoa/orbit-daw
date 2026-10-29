@@ -36,7 +36,7 @@ bool prepareMidiRecording(double positionSeconds,double nowMs)
     }
     if(targets.empty()){status.setText("Select or arm an instrument generator for MIDI recording. Audio recording is not yet available.",juce::dontSendNotification);return false;}
     releaseLiveMidi();
-    recordingBpm=project.getInitialTempoBpm();recordingStartMs=nowMs;
+    recordingBpm=project.getInitialTempoBpm();recordingStartMs=nowMs;recordingEndTick=0;
     recordingInitialTick=std::llround(positionSeconds*recordingBpm*256.0/60.0)-(song?startBar*1024:0);
     recordingProjectId=project.getProjectId();
     const bool quantize=edit->state.getProperty("orbitInputQuantize",false);
@@ -66,7 +66,8 @@ bool finishMidiRecording(double nowMs=0)
 {
     if(finishingMidiRecording)return true;
     const juce::ScopedValueSetter<bool> guard(finishingMidiRecording,true);
-    const auto endTick=recordingTick(nowMs);midiTake.finish(endTick);
+    if(midiTake.active)recordingEndTick=recordingTick(nowMs);
+    const auto endTick=recordingEndTick;midiTake.finish(endTick);
     recordButton.setToggleState(false,juce::dontSendNotification);recordButton.repaint();
     if(midiTake.notes.empty()){midiTake.clear();return true;}
     const auto fail=[this]
@@ -91,7 +92,8 @@ bool finishMidiRecording(double nowMs=0)
         staged.setPatternCreated(id,slot,true);
         if(target.song)
         {
-            const int bars=juce::jmax(1,(lastTick+1023)/1024);
+            const int extent=int(std::max<std::int64_t>(lastTick,std::min<std::int64_t>(endTick,target.lengthTicks)));
+            const int bars=juce::jmax(1,(extent+1023)/1024);
             for(int bar=target.startBar;bar<target.startBar+bars;++bar)
                 if(staged.getPlaylistPatternId(id,bar).isNotEmpty())return fail();
             staged.setPatternLengthSteps(id,slot,bars*16);

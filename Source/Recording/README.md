@@ -10,7 +10,8 @@ generators and respects their input channels. Audio-track recording is separate.
   note into tail/head pieces; a single held note is capped at one pattern cycle.
 - Song mode chooses fresh unused pattern slots and places takes at the current
   cursor's bar. Note offsets retain the cursor's position within that bar.
-  Capture is bounded by the next occupied region/end of the 512-bar Playlist.
+  The clip keeps the recorded silent tail through Stop. Capture is bounded by the
+  next occupied region/end of the 512-bar Playlist.
   This initial Song recorder requires 4/4 and Song looping off.
 - Stop or Record again commits all notes/placements as one undoable transaction.
   A silent take creates no undo. Conflicting edits retain the take in memory and

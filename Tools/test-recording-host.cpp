@@ -43,9 +43,10 @@ int main()
   const auto songUndo=host.undoHistory.size();recordingCheck(host.prepareMidiRecording(8,30000),"song take could not begin at cursor");
   host.processLiveMidi(juce::MidiMessage::noteOn(1,67,juce::uint8(100)),"one",30125);
   host.processLiveMidi(juce::MidiMessage::noteOff(1,67),"one",30500);
-  recordingCheck(host.finishMidiRecording(30600),"song take commit failed");
+  recordingCheck(host.finishMidiRecording(35000),"song take commit failed");
   recordingCheck(host.project.getPlaylistClipStartBar(other,4)==4 && host.project.getPatternNotes(other,0).size()==1,"song take not placed at cursor bar");
   recordingCheck(host.project.getPatternNotes(other,0)[0].startTick==64 && host.project.getPatternNotes(other,0)[0].lengthTicks==192,"song note time wrong");
+  recordingCheck(host.project.getPlaylistClipLengthBars(other,4)==3,"song take lost its recorded silent tail");
   recordingCheck(host.undoHistory.size()==songUndo+1,"song take undo grouping wrong");host.undoProjectAction();
   recordingCheck(host.project.getPlaylistPatternId(other,4).isEmpty() && host.project.getPatternNotes(other,0).empty(),"song take undo left clip or notes");host.redoProjectAction();
   recordingCheck(!host.prepareMidiRecording(8,40000),"song take overwrote an occupied clip");
@@ -56,7 +57,8 @@ int main()
   recordingCheck(host.prepareMidiRecording(0,50000),"conflict take setup failed");host.processLiveMidi(juce::MidiMessage::noteOn(1,55,juce::uint8(80)),"one",50000);host.processLiveMidi(juce::MidiMessage::noteOff(1,55),"one",50125);
   host.project.setPlaylistClip(other,host.project.getPatternId(other,0),0,1,true);
   const auto conflictUndo=host.undoHistory.size();recordingCheck(!host.finishMidiRecording(50200) && !host.midiTake.notes.empty() && host.undoHistory.size()==conflictUndo,"conflicting take was discarded or partially committed");
-  host.project.setPlaylistClip(other,{},0,1,false);recordingCheck(host.finishMidiRecording(50200) && host.midiTake.notes.empty(),"retained take could not be committed after conflict resolution");
+  host.project.setPlaylistClip(other,{},0,1,false);recordingCheck(host.finishMidiRecording(60200) && host.midiTake.notes.empty(),"retained take could not be committed after conflict resolution");
+  recordingCheck(host.project.getPlaylistClipLengthBars(other,0)==1,"retry extended a stopped take into later time");
   std::cout<<"PASS: pattern/song MIDI takes, source timestamps, full range, sustain and overlapping devices, quantization, loop split/bounds, armed routing, unchanged pending notes, atomic commit/conflict retry, one take undo/redo and native save/reopen. Hardware disabled.\n";
  }
  catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}
