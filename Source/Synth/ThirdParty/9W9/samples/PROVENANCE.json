@@ -1,0 +1,30 @@
+{
+  "repository": "athousanddetails/schwung-9W9",
+  "commit": "a9e030d9bad46e3e53aafce92c7104b8e7bba47f",
+  "files": {
+    "hh.wav": {
+      "sha256": "8ae963e80b8604bf23733545117d3b115767aa48ecd3013ad5d91506337d289a",
+      "git_blob": "3cbd3b911490d38850387931c00f835c386a1034",
+      "channels": 1,
+      "width": 3,
+      "rate": 44100,
+      "frames": 20250
+    },
+    "ride.wav": {
+      "sha256": "f1d1cee24a7c91bb2ca9c6eb97badad3841226897ad0daabfc35801371d78182",
+      "git_blob": "985f418679f58eed7a340928e1ad18483331d179",
+      "channels": 1,
+      "width": 2,
+      "rate": 44100,
+      "frames": 46999
+    },
+    "crash.wav": {
+      "sha256": "4a1b8d8828f9e530e9ae7f1a3cdffbcb1466e633a2b0607b3aac914699bc8400",
+      "git_blob": "7451f3330e6ff3a18f65f3b3c6e9be23d93503df",
+      "channels": 1,
+      "width": 2,
+      "rate": 44100,
+      "frames": 43300
+    }
+  }
+}

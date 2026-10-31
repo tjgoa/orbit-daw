@@ -1,0 +1,14 @@
+diff --git a/modules/tracktion_engine/playback/graph/tracktion_NodeRenderContext.cpp b/modules/tracktion_engine/playback/graph/tracktion_NodeRenderContext.cpp
+index 86f4ece..b959be4 100644
+--- a/modules/tracktion_engine/playback/graph/tracktion_NodeRenderContext.cpp
++++ b/modules/tracktion_engine/playback/graph/tracktion_NodeRenderContext.cpp
+@@ -331,7 +331,8 @@ NodeRenderContext::WriteResult NodeRenderContext::writeAudioBlock (choc::buffer:
+     // Prepare buffer to use
+     auto blockSizeSamples = (int) block.getNumFrames();
+ 
+-    juce::AudioBuffer<float> buffer (block.data.channels, numOutputChans, blockSizeSamples);
++    juce::AudioBuffer<float> buffer (block.data.channels, numOutputChans,
++                                   (int) block.data.offset, blockSizeSamples);
+ 
+     // Apply dithering and mag/rms analysis
+     if (r.ditheringEnabled && r.bitDepth < 32)

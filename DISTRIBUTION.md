@@ -9,6 +9,7 @@ compatibility still need testing beyond automated checks.
 ## Download and run
 
 Download the platform package from [GitHub Releases](https://github.com/tjgoa/orbit-daw/releases).
+These are portable app packages, not setup-wizard installers. No compiler is needed.
 Choose the named Mac ZIP, Windows ZIP or Linux tar.gz under Assets; GitHub's
 automatic "Source code" downloads contain source rather than the runnable app.
 
@@ -88,7 +89,7 @@ user instance open; save/quit/reopen to load the new executable.
 The GitHub workflow runs native Windows, Linux and universal Mac jobs from a
 codex/tester-build-* branch. All three formats share that reserved invocation's
 number. It verifies the reserved source metadata and fetches exact dependency
-revisions, then applies Tools/tracktion-sampler.patch. It needs no signing secrets
+revisions, then applies the sampler and export overlays with Tools/prepare-dependencies.py. It needs no signing secrets
 and uploads downloadable artifacts, not a published GitHub Release. Workflow
 permissions are read-only. Retrying a failed product build requires a fresh
 number/source commit, not Re-run jobs under the same number.

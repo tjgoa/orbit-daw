@@ -1,6 +1,8 @@
 #include "ProjectDocument.h"
 
 #include <cmath>
+#include <algorithm>
+#include <map>
 
 namespace
 {
@@ -119,6 +121,33 @@ juce::ValueTree findPatternSlot(juce::ValueTree state, const juce::String& track
     return {};
 }
 
+int patternNoteStartTick(const juce::ValueTree& note)
+{
+    return note.hasProperty("startTick")
+        ? static_cast<int>(note.getProperty("startTick"))
+        : static_cast<int>(note.getProperty("step", 0)) * 64;
+}
+
+int patternNoteLengthTicks(const juce::ValueTree& note)
+{
+    return note.hasProperty("lengthTicks")
+        ? juce::jmax(1, static_cast<int>(note.getProperty("lengthTicks")))
+        : juce::jmax(1, static_cast<int>(note.getProperty("lengthSteps", 1))) * 64;
+}
+
+int patternLengthInBars(int lengthSteps)
+{
+    const auto safeLength = juce::jmax(1, lengthSteps);
+    return safeLength / 16 + (safeLength % 16 != 0 ? 1 : 0);
+}
+
+int stepsForTickEnd(juce::int64 endTick)
+{
+    const auto safeEnd = std::max<juce::int64>(0, endTick);
+    return static_cast<int>(std::min<juce::int64>(
+        ProjectDocument::maximumPatternLengthSteps, safeEnd / 64 + (safeEnd % 64 != 0 ? 1 : 0)));
+}
+
 juce::ValueTree findProjectTrack(juce::ValueTree state, const juce::String& trackId)
 {
     const auto tracks = state.getChildWithName(tracksType);
@@ -195,6 +224,10 @@ bool ensureSchemaShape(juce::ValueTree& state, juce::String& error)
         state.setProperty("projectId", newId(), nullptr);
     if (state.getProperty("name").toString().isEmpty())
         state.setProperty("name", "Untitled Project", nullptr);
+    if (!state.hasProperty("pluginDelayCompensation"))
+        state.setProperty("pluginDelayCompensation", true, nullptr);
+    if (!state.hasProperty("multiCoreAudio"))
+        state.setProperty("multiCoreAudio", true, nullptr);
     const auto storedPpq = static_cast<int>(state.getProperty("ticksPerQuarterNote", 0));
     if (storedPpq == 0)
         state.setProperty("ticksPerQuarterNote", ProjectDocument::ticksPerQuarterNote, nullptr);
@@ -454,6 +487,81 @@ juce::String ProjectDocument::addTrack(TrackKind kind, const juce::String& reque
     return trackId;
 }
 
+juce::String ProjectDocument::importTrackFrom(const ProjectDocument& source, int sourceTrackIndex,
+                                               bool removeUnusedFx)
+{
+    const auto sourceTracks = source.state.getChildWithName(tracksType);
+    if (!juce::isPositiveAndBelow(sourceTrackIndex, sourceTracks.getNumChildren()))
+        return {};
+
+    auto importedTrack = sourceTracks.getChild(sourceTrackIndex).createCopy();
+    const auto sourceChannelId = importedTrack.getProperty("mixerChannelId").toString();
+    const auto sourceMixer = source.state.getChildWithName(mixerType);
+    const auto sourceChannel = findMixerChannel(sourceMixer, sourceChannelId);
+
+    auto tracks = state.getChildWithName(tracksType);
+    auto mixer = state.getChildWithName(mixerType);
+    const auto importedTrackId = newId();
+    const auto importedChannelId = newId();
+    const auto trackName = importedTrack.getProperty("name").toString();
+
+    importedTrack.setProperty("id", importedTrackId, nullptr);
+    importedTrack.setProperty("order", tracks.getNumChildren(), nullptr);
+    importedTrack.setProperty("mixerChannelId", importedChannelId, nullptr);
+
+    juce::ValueTree importedChannel;
+    if (sourceChannel.isValid())
+        importedChannel = sourceChannel.createCopy();
+    else
+        importedChannel = juce::ValueTree(mixerChannelType);
+
+    importedChannel.setProperty("id", importedChannelId, nullptr);
+    importedChannel.setProperty("kind", "track", nullptr);
+    importedChannel.setProperty("trackId", importedTrackId, nullptr);
+    importedChannel.setProperty("name", trackName, nullptr);
+    importedChannel.setProperty("outputId", mixer.getProperty("masterChannelId"), nullptr);
+    if (!importedChannel.hasProperty("gainDb")) importedChannel.setProperty("gainDb", 0.0, nullptr);
+    if (!importedChannel.hasProperty("pan")) importedChannel.setProperty("pan", 0.0, nullptr);
+    if (!importedChannel.hasProperty("muted")) importedChannel.setProperty("muted", false, nullptr);
+    if (!importedChannel.hasProperty("solo")) importedChannel.setProperty("solo", false, nullptr);
+    for (int bus = 0; bus < 8; ++bus)
+    {
+        const auto sendName = "fx" + juce::String(bus + 1) + "SendDb";
+        if (removeUnusedFx || !importedChannel.hasProperty(sendName))
+            importedChannel.setProperty(sendName, -60.0, nullptr);
+    }
+
+    std::vector<std::pair<juce::String, juce::String>> patternIdMap;
+    auto patterns = importedTrack.getChildWithName(patternsType);
+    for (int i = 0; i < patterns.getNumChildren(); ++i)
+    {
+        auto slot = patterns.getChild(i);
+        if (slot.getType() != patternSlotType) continue;
+        const auto previousId = slot.getProperty("id").toString();
+        const auto newPatternId = newId();
+        slot.setProperty("id", newPatternId, nullptr);
+        patternIdMap.emplace_back(previousId, newPatternId);
+    }
+
+    auto clips = importedTrack.getChildWithName(clipsType);
+    for (int i = 0; i < clips.getNumChildren(); ++i)
+    {
+        auto clip = clips.getChild(i);
+        const auto oldPatternId = clip.getProperty("patternId").toString();
+        for (const auto& mapping : patternIdMap)
+            if (mapping.first == oldPatternId)
+            {
+                clip.setProperty("patternId", mapping.second, nullptr);
+                break;
+            }
+    }
+
+    ensureTrackShape(importedTrack, mixer);
+    tracks.addChild(importedTrack, -1, nullptr);
+    mixer.addChild(importedChannel, -1, nullptr);
+    return importedTrackId;
+}
+
 void ProjectDocument::addInstrumentTrack()
 {
     addTrack(TrackKind::instrument);
@@ -506,6 +614,26 @@ juce::String ProjectDocument::getCreatorUrl() const
 void ProjectDocument::setCreatorUrl(const juce::String& url)
 {
     state.setProperty("creatorUrl", url.trim(), nullptr);
+}
+
+bool ProjectDocument::isPluginDelayCompensationEnabled() const
+{
+    return static_cast<bool>(state.getProperty("pluginDelayCompensation", true));
+}
+
+void ProjectDocument::setPluginDelayCompensationEnabled(bool enabled)
+{
+    state.setProperty("pluginDelayCompensation", enabled, nullptr);
+}
+
+bool ProjectDocument::isMultiCoreAudioEnabled() const
+{
+    return static_cast<bool>(state.getProperty("multiCoreAudio", true));
+}
+
+void ProjectDocument::setMultiCoreAudioEnabled(bool enabled)
+{
+    state.setProperty("multiCoreAudio", enabled, nullptr);
 }
 
 int ProjectDocument::getTrackCount() const
@@ -617,6 +745,50 @@ void ProjectDocument::setTrackColour(int index, juce::Colour colour)
     tracks.getChild(index).setProperty("colour", static_cast<juce::int64>(colour.getARGB()), nullptr);
 }
 
+bool ProjectDocument::getTrackGradientHighlight(int index) const
+{
+    const auto tracks = state.getChildWithName(tracksType);
+    return juce::isPositiveAndBelow(index, tracks.getNumChildren())
+        && static_cast<bool>(tracks.getChild(index).getProperty("gradientHighlight", false));
+}
+
+void ProjectDocument::setTrackGradientHighlight(int index, bool enabled)
+{
+    auto tracks = state.getChildWithName(tracksType);
+    if (juce::isPositiveAndBelow(index, tracks.getNumChildren()))
+        tracks.getChild(index).setProperty("gradientHighlight", enabled, nullptr);
+}
+
+bool ProjectDocument::getTrackShowGridNotes(int index) const
+{
+    const auto tracks = state.getChildWithName(tracksType);
+    if (!juce::isPositiveAndBelow(index, tracks.getNumChildren())) return false;
+    return static_cast<bool>(tracks.getChild(index).getProperty("showGridNotes", false));
+}
+
+void ProjectDocument::setTrackShowGridNotes(int index, bool enabled)
+{
+    auto tracks = state.getChildWithName(tracksType);
+    if (!juce::isPositiveAndBelow(index, tracks.getNumChildren())) return;
+    tracks.getChild(index).setProperty("showGridNotes", enabled, nullptr);
+}
+
+bool ProjectDocument::copyPatternFrom(const ProjectDocument& source,const juce::String& sourceTrackId,int sourceSlot,
+                                     const juce::String& destinationTrackId,int destinationSlot)
+{
+    const auto from=findPatternSlot(source.state,sourceTrackId,sourceSlot);
+    auto to=findPatternSlot(state,destinationTrackId,destinationSlot);
+    if(!from.isValid() || !to.isValid())return false;
+    const auto id=to.getProperty("id");const auto bank=to.getProperty("bank"),slot=to.getProperty("slot");
+    auto copy=from.createCopy();copy.setProperty("id",id,nullptr);
+    copy.setProperty("index",destinationSlot,nullptr);
+    if(to.hasProperty("bank"))copy.setProperty("bank",bank,nullptr);
+    if(to.hasProperty("slot"))copy.setProperty("slot",slot,nullptr);
+    const auto slotName=[](int i){return juce::String::charToString(juce::juce_wchar('A'+i/8))+juce::String(i%8+1);};
+    if(from.getProperty("name").toString()==slotName(sourceSlot))copy.setProperty("name",slotName(destinationSlot),nullptr);
+    to.copyPropertiesAndChildrenFrom(copy,nullptr);return true;
+}
+
 bool ProjectDocument::cloneTrackPatternsAndArrangement(const juce::String& sourceTrackId,
                                                         const juce::String& destinationTrackId)
 {
@@ -677,6 +849,10 @@ bool ProjectDocument::cloneTrackPatternsAndArrangement(const juce::String& sourc
             copiedClip.setProperty("patternId", getPatternId(destinationTrackId, patternIndex), nullptr);
             copiedClip.setProperty("startBar", sourceClip.getProperty("startBar", 0), nullptr);
             copiedClip.setProperty("lengthBars", sourceClip.getProperty("lengthBars", 1), nullptr);
+            copiedClip.setProperty("followsPatternLength",
+                sourceClip.getProperty("followsPatternLength", true), nullptr);
+            if (sourceClip.hasProperty("exactLength"))
+                copiedClip.setProperty("exactLength", sourceClip.getProperty("exactLength"), nullptr);
             destinationClips.addChild(copiedClip, -1, nullptr);
         }
     }
@@ -827,6 +1003,12 @@ juce::String ProjectDocument::getPatternName(const juce::String& trackId, int sl
     return findPatternSlot(state, trackId, slotIndex).getProperty("name").toString();
 }
 
+void ProjectDocument::setPatternName(const juce::String& trackId, int slotIndex, const juce::String& name)
+{
+    auto slot = findPatternSlot(state, trackId, slotIndex);
+    if (slot.isValid() && name.isNotEmpty()) slot.setProperty("name", name, nullptr);
+}
+
 bool ProjectDocument::isPatternCreated(const juce::String& trackId, int slotIndex) const
 {
     return static_cast<bool>(findPatternSlot(state, trackId, slotIndex).getProperty("created", false));
@@ -840,7 +1022,7 @@ bool ProjectDocument::getPatternNote(const juce::String& trackId, int slotIndex,
     {
         const auto note = notes.getChild(i);
         if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
+            && patternNoteStartTick(note) / 64 == step)
             return true;
     }
     return false;
@@ -853,7 +1035,7 @@ int ProjectDocument::getPatternNoteVelocity(const juce::String& trackId, int slo
     {
         const auto note = notes.getChild(i);
         if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
+            && patternNoteStartTick(note) / 64 == step)
             return juce::jlimit(1, 127, static_cast<int>(note.getProperty("velocity", 100)));
     }
     return 100;
@@ -867,16 +1049,32 @@ int ProjectDocument::getPatternNoteLength(const juce::String& trackId, int slotI
     {
         const auto note = notes.getChild(i);
         if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
-            return juce::jmax(1, static_cast<int>(note.getProperty("lengthSteps", 1)));
+            && patternNoteStartTick(note) / 64 == step)
+            return stepsForTickEnd(patternNoteLengthTicks(note));
     }
     return 1;
+}
+
+std::vector<ProjectDocument::PatternNote> ProjectDocument::getPatternNotes(
+    const juce::String& trackId, int slotIndex) const
+{
+    std::vector<PatternNote> result;
+    const auto notes = findPatternSlot(state, trackId, slotIndex).getChildWithName(patternNotesType);
+    result.reserve(static_cast<size_t>(notes.getNumChildren()));
+    for (int i = 0; i < notes.getNumChildren(); ++i)
+    {
+        const auto note = notes.getChild(i);
+        result.push_back({ static_cast<int>(note.getProperty("pitch", 60)),
+                           patternNoteStartTick(note), patternNoteLengthTicks(note),
+                           juce::jlimit(1, 127, static_cast<int>(note.getProperty("velocity", 100))) });
+    }
+    return result;
 }
 
 int ProjectDocument::getPatternLengthSteps(const juce::String& trackId, int slotIndex) const
 {
     const auto slot = findPatternSlot(state, trackId, slotIndex);
-    return juce::jlimit(1, 64, static_cast<int>(slot.getProperty("lengthSteps", 16)));
+    return juce::jlimit(1, maximumPatternLengthSteps, static_cast<int>(slot.getProperty("lengthSteps", 16)));
 }
 
 void ProjectDocument::setPatternCreated(const juce::String& trackId, int slotIndex, bool created)
@@ -888,6 +1086,7 @@ void ProjectDocument::setPatternCreated(const juce::String& trackId, int slotInd
 
 void ProjectDocument::setPatternNote(const juce::String& trackId, int slotIndex, int pitch, int step, bool enabled)
 {
+    if (pitch < 0 || !juce::isPositiveAndBelow(step, maximumPatternLengthSteps)) return;
     auto slot = findPatternSlot(state, trackId, slotIndex);
     if (!slot.isValid())
         return;
@@ -897,7 +1096,7 @@ void ProjectDocument::setPatternNote(const juce::String& trackId, int slotIndex,
     {
         auto note = notes.getChild(i);
         if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
+            && patternNoteStartTick(note) / 64 == step)
         {
             if (enabled)
             {
@@ -913,8 +1112,10 @@ void ProjectDocument::setPatternNote(const juce::String& trackId, int slotIndex,
         juce::ValueTree note(patternNoteType);
         note.setProperty("pitch", pitch, nullptr);
         note.setProperty("step", step, nullptr);
+        note.setProperty("startTick", step * 64, nullptr);
         note.setProperty("velocity", 100, nullptr);
         note.setProperty("lengthSteps", 1, nullptr);
+        note.setProperty("lengthTicks", 64, nullptr);
         notes.addChild(note, -1, nullptr);
         slot.setProperty("created", true, nullptr);
     }
@@ -927,9 +1128,16 @@ void ProjectDocument::setPatternNoteVelocity(const juce::String& trackId, int sl
     {
         auto note = notes.getChild(i);
         if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
+            && patternNoteStartTick(note) / 64 == step)
         {
-            note.setProperty("velocity", juce::jlimit(1, 127, velocity), nullptr);
+            const auto onset = patternNoteStartTick(note);
+            for (int member = 0; member < notes.getNumChildren(); ++member)
+            {
+                auto stacked = notes.getChild(member);
+                if (static_cast<int>(stacked.getProperty("pitch", -1)) == pitch
+                    && patternNoteStartTick(stacked) == onset)
+                    stacked.setProperty("velocity", juce::jlimit(1, 127, velocity), nullptr);
+            }
             return;
         }
     }
@@ -937,17 +1145,153 @@ void ProjectDocument::setPatternNoteVelocity(const juce::String& trackId, int sl
 
 void ProjectDocument::setPatternNoteLength(const juce::String& trackId, int slotIndex, int pitch, int step, int lengthSteps)
 {
+    if (!juce::isPositiveAndBelow(step, maximumPatternLengthSteps)) return;
     auto slot = findPatternSlot(state, trackId, slotIndex);
     auto notes = slot.getChildWithName(patternNotesType);
     for (int i = 0; i < notes.getNumChildren(); ++i)
     {
         auto note = notes.getChild(i);
         if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
-            && static_cast<int>(note.getProperty("step", -1)) == step)
+            && patternNoteStartTick(note) == step * 64)
         {
-            note.setProperty("lengthSteps", juce::jlimit(1, 64 - step, lengthSteps), nullptr);
+            const auto length = juce::jlimit(1, maximumPatternLengthSteps - step, lengthSteps);
+            note.setProperty("lengthSteps", length, nullptr);
+            note.setProperty("lengthTicks", length * 64, nullptr);
             return;
         }
+    }
+}
+
+void ProjectDocument::setPatternNoteTicks(const juce::String& trackId, int slotIndex, int pitch,
+                                          int startTick, int lengthTicks, int velocity)
+{
+    auto slot = findPatternSlot(state, trackId, slotIndex);
+    if (!slot.isValid() || pitch < 0 || startTick < 0
+        || static_cast<juce::int64>(startTick) >= static_cast<juce::int64>(maximumPatternLengthSteps) * 64) return;
+    auto notes = slot.getChildWithName(patternNotesType);
+    const auto remainingTicks = static_cast<juce::int64>(maximumPatternLengthSteps) * 64 - startTick;
+    const auto boundedLength = static_cast<int>(juce::jlimit<juce::int64>(1, remainingTicks, lengthTicks));
+    const auto requiredSteps = stepsForTickEnd(static_cast<juce::int64>(startTick) + boundedLength);
+    for (int i = 0; i < notes.getNumChildren(); ++i)
+    {
+        auto note = notes.getChild(i);
+        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
+            && patternNoteStartTick(note) == startTick)
+        {
+            note.setProperty("startTick", startTick, nullptr);
+            note.setProperty("step", startTick / 64, nullptr);
+            note.setProperty("lengthTicks", boundedLength, nullptr);
+            note.setProperty("lengthSteps", (boundedLength + 63) / 64, nullptr);
+            note.setProperty("velocity", juce::jlimit(1, 127, velocity), nullptr);
+            slot.setProperty("lengthSteps", juce::jmax(getPatternLengthSteps(trackId, slotIndex), requiredSteps), nullptr);
+            return;
+        }
+    }
+    juce::ValueTree note(patternNoteType);
+    note.setProperty("pitch", pitch, nullptr);
+    note.setProperty("step", startTick / 64, nullptr);
+    note.setProperty("startTick", startTick, nullptr);
+    note.setProperty("velocity", juce::jlimit(1, 127, velocity), nullptr);
+    note.setProperty("lengthSteps", (boundedLength + 63) / 64, nullptr);
+    note.setProperty("lengthTicks", boundedLength, nullptr);
+    notes.addChild(note, -1, nullptr);
+    slot.setProperty("created", true, nullptr);
+    slot.setProperty("lengthSteps", juce::jmax(getPatternLengthSteps(trackId, slotIndex), requiredSteps), nullptr);
+}
+
+bool ProjectDocument::appendPatternNoteTicks(const juce::String& trackId, int slotIndex, int pitch,
+                                             int startTick, int lengthTicks, int velocity)
+{
+    auto slot = findPatternSlot(state, trackId, slotIndex);
+    auto notes = slot.getChildWithName(patternNotesType);
+    constexpr auto maximumTicks = static_cast<juce::int64>(maximumPatternLengthSteps) * 64;
+    if (!slot.isValid() || !notes.isValid() || pitch < 0 || pitch > 127 || startTick < 0
+        || startTick >= maximumTicks || lengthTicks <= 0 || lengthTicks > maximumTicks - startTick
+        || velocity < 1 || velocity > 127)
+        return false;
+    juce::ValueTree note(patternNoteType);
+    note.setProperty("pitch", pitch, nullptr);
+    note.setProperty("step", startTick / 64, nullptr);
+    note.setProperty("startTick", startTick, nullptr);
+    note.setProperty("velocity", velocity, nullptr);
+    note.setProperty("lengthSteps", (lengthTicks + 63) / 64, nullptr);
+    note.setProperty("lengthTicks", lengthTicks, nullptr);
+    notes.addChild(note, -1, nullptr);
+    slot.setProperty("created", true, nullptr);
+    slot.setProperty("lengthSteps", juce::jmax(getPatternLengthSteps(trackId, slotIndex),
+        stepsForTickEnd(static_cast<juce::int64>(startTick) + lengthTicks)), nullptr);
+    return true;
+}
+
+bool ProjectDocument::movePatternNoteStack(const juce::String& trackId, int slotIndex,
+                                           int fromPitch, int fromTick, int toPitch, int toTick)
+{
+    auto slot = findPatternSlot(state, trackId, slotIndex);
+    const auto notes = slot.getChildWithName(patternNotesType);
+    constexpr auto maximumTicks = static_cast<juce::int64>(maximumPatternLengthSteps) * 64;
+    if (!slot.isValid() || fromPitch < 0 || fromPitch > 127 || fromTick < 0 || fromTick >= maximumTicks
+        || toPitch < 0 || toPitch > 127 || toTick < 0 || toTick >= maximumTicks
+        || (fromPitch == toPitch && fromTick == toTick)) return false;
+    std::vector<juce::ValueTree> stack;
+    for (int index = 0; index < notes.getNumChildren(); ++index)
+    {
+        const auto note = notes.getChild(index);
+        const auto pitch = static_cast<int>(note.getProperty("pitch", -1));
+        const auto start = patternNoteStartTick(note);
+        if (pitch == toPitch && start == toTick) return false;
+        if (pitch == fromPitch && start == fromTick)
+        {
+            if (patternNoteLengthTicks(note) > maximumTicks - toTick) return false;
+            stack.push_back(note);
+        }
+    }
+    if (stack.empty()) return false;
+    for (auto& note : stack)
+    {
+        note.setProperty("pitch", toPitch, nullptr);
+        note.setProperty("startTick", toTick, nullptr);
+        note.setProperty("step", toTick / 64, nullptr);
+        slot.setProperty("lengthSteps", juce::jmax(getPatternLengthSteps(trackId, slotIndex),
+            stepsForTickEnd(static_cast<juce::int64>(toTick) + patternNoteLengthTicks(note))), nullptr);
+    }
+    return true;
+}
+
+bool ProjectDocument::setPatternNoteStackLengthTicks(const juce::String& trackId, int slotIndex,
+                                                     int pitch, int startTick, int lengthTicks)
+{
+    auto slot = findPatternSlot(state, trackId, slotIndex);
+    auto notes = slot.getChildWithName(patternNotesType);
+    constexpr auto maximumTicks = static_cast<juce::int64>(maximumPatternLengthSteps) * 64;
+    if (!slot.isValid() || pitch < 0 || pitch > 127 || startTick < 0 || startTick >= maximumTicks
+        || lengthTicks <= 0 || lengthTicks > maximumTicks - startTick) return false;
+    bool changed = false;
+    for (int index = 0; index < notes.getNumChildren(); ++index)
+    {
+        auto note = notes.getChild(index);
+        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch && patternNoteStartTick(note) == startTick)
+        {
+            note.setProperty("lengthTicks", lengthTicks, nullptr);
+            note.setProperty("lengthSteps", (lengthTicks + 63) / 64, nullptr);
+            changed = true;
+        }
+    }
+    if (changed)
+        slot.setProperty("lengthSteps", juce::jmax(getPatternLengthSteps(trackId, slotIndex),
+            stepsForTickEnd(static_cast<juce::int64>(startTick) + lengthTicks)), nullptr);
+    return changed;
+}
+
+void ProjectDocument::removePatternNoteTicks(const juce::String& trackId, int slotIndex,
+                                             int pitch, int startTick)
+{
+    auto notes = findPatternSlot(state, trackId, slotIndex).getChildWithName(patternNotesType);
+    for (int i = notes.getNumChildren(); --i >= 0;)
+    {
+        const auto note = notes.getChild(i);
+        if (static_cast<int>(note.getProperty("pitch", -1)) == pitch
+            && patternNoteStartTick(note) == startTick)
+            notes.removeChild(i, nullptr);
     }
 }
 
@@ -955,11 +1299,24 @@ void ProjectDocument::setPatternLengthSteps(const juce::String& trackId, int slo
 {
     auto slot = findPatternSlot(state, trackId, slotIndex);
     if (slot.isValid())
-        slot.setProperty("lengthSteps", juce::jlimit(1, 64, lengthSteps), nullptr);
+        slot.setProperty("lengthSteps", juce::jlimit(1, maximumPatternLengthSteps, lengthSteps), nullptr);
 }
 
 namespace
 {
+juce::ValueTree findSongAutomationOwner(juce::ValueTree state, const juce::String& id, bool create = false)
+{
+    if (auto track = findProjectTrack(state, id); track.isValid()) return track;
+    const bool valid = id == "mixer:master" || (id.startsWith("mixer:fx:") || id.startsWith("mixer:bus:"))
+        && id.getLastCharacters(1).containsOnly("01234567") && id.length() == (id.startsWith("mixer:fx:") ? 10 : 11);
+    if (!valid) return {};
+    auto modules = state.getChildWithName("SongAutomationModules");
+    if (!modules.isValid() && create) { modules = juce::ValueTree("SongAutomationModules"); state.addChild(modules, -1, nullptr); }
+    for (auto module : modules) if (module.getProperty("id").toString() == id) return module;
+    if (!create) return {};
+    juce::ValueTree module("Module"); module.setProperty("id", id, nullptr); modules.addChild(module, -1, nullptr); return module;
+}
+
 juce::ValueTree findAutomationLane(juce::ValueTree lanes, const juce::String& pluginName,
                                    const juce::String& parameterId)
 {
@@ -967,6 +1324,7 @@ juce::ValueTree findAutomationLane(juce::ValueTree lanes, const juce::String& pl
     {
         auto lane = lanes.getChild(i);
         if (lane.getType() == automationLaneType
+            && lane.getProperty("pluginId").toString().isEmpty()
             && lane.getProperty("pluginName").toString() == pluginName
             && lane.getProperty("parameterId").toString() == parameterId)
             return lane;
@@ -979,15 +1337,17 @@ ProjectDocument::AutomationLane readAutomationLane(const juce::ValueTree& lane)
     ProjectDocument::AutomationLane result;
     if (!lane.isValid()) return result;
     result.pluginName = lane.getProperty("pluginName").toString();
+    result.pluginId = lane.getProperty("pluginId").toString();
     result.parameterId = lane.getProperty("parameterId").toString();
     result.parameterName = lane.getProperty("parameterName").toString();
     for (int i = 0; i < lane.getNumChildren(); ++i)
     {
         const auto point = lane.getChild(i);
         if (point.getType() != automationPointType) continue;
-        result.points.add({ static_cast<int>(point.getProperty("position", 0)),
+        result.points.add({ static_cast<double>(point.getProperty("position", 0)),
                             static_cast<float>(point.getProperty("value", 0.5)) });
     }
+    std::stable_sort(result.points.begin(), result.points.end(), [](const auto& a, const auto& b) { return a.position < b.position; });
     return result;
 }
 
@@ -1008,11 +1368,16 @@ void setAutomationPoint(juce::ValueTree lanes, const juce::String& pluginName,
     }
     lane.setProperty("parameterName", parameterName, nullptr);
     const auto boundedPosition = juce::jlimit(0, maxPosition, position);
+    for (int i=lane.getNumChildren();--i>=0;)
+    {
+        const auto p=lane.getChild(i);const double at=p.getProperty("position",0);
+        if(at>boundedPosition && at<boundedPosition+1)lane.removeChild(i,nullptr);
+    }
     for (int i = 0; i < lane.getNumChildren(); ++i)
     {
         auto point = lane.getChild(i);
         if (point.getType() == automationPointType
-            && static_cast<int>(point.getProperty("position", -1)) == boundedPosition)
+            && static_cast<double>(point.getProperty("position", -1)) == boundedPosition)
         {
             point.setProperty("value", juce::jlimit(0.0f, 1.0f, value), nullptr);
             return;
@@ -1065,6 +1430,51 @@ void ProjectDocument::setPatternAutomationTarget(const juce::String& trackId, in
     lane.setProperty("parameterName", parameterName, nullptr);
 }
 
+std::vector<ProjectDocument::PatternSwitch> ProjectDocument::getPatternSwitches(const juce::String& trackId,int slotIndex) const
+{
+    std::vector<PatternSwitch> result;
+    const auto slot=findPatternSlot(state,trackId,slotIndex);const auto switches=slot.getChildWithName("Articulations");
+    const int ticks=getPatternLengthSteps(trackId,slotIndex)*64;
+    for(const auto& child:switches)
+    {
+        const int start=child.getProperty("startTick",-1),length=child.getProperty("lengthTicks",0);
+        if(start>=0 && start<ticks && length>0 && length<=ticks-start)
+            result.push_back({start,length,bool(child.getProperty("slide",false))});
+    }
+    return result;
+}
+void ProjectDocument::replacePatternSwitches(const juce::String& trackId,int slotIndex,const std::vector<PatternSwitch>& values)
+{
+    auto slot=findPatternSlot(state,trackId,slotIndex);if(!slot.isValid())return;
+    const int ticks=getPatternLengthSteps(trackId,slotIndex)*64;
+    juce::ValueTree replacement("Articulations");
+    for(const auto& value:values)
+        if(value.startTick>=0 && value.startTick<ticks && value.lengthTicks>0 && value.lengthTicks<=ticks-value.startTick)
+        {
+            juce::ValueTree child("Switch");child.setProperty("startTick",value.startTick,nullptr);
+            child.setProperty("lengthTicks",value.lengthTicks,nullptr);child.setProperty("slide",value.slide,nullptr);
+            replacement.addChild(child,-1,nullptr);
+        }
+    const auto old=slot.getChildWithName("Articulations");if(old.isValid())slot.removeChild(old,nullptr);
+    slot.addChild(replacement,-1,nullptr);
+    if(!values.empty())slot.setProperty("created",true,nullptr);
+}
+void ProjectDocument::setPatternSwitch(const juce::String& trackId,int slotIndex,bool slide,int tick,int lengthTicks,bool enabled)
+{
+    const int ticks=getPatternLengthSteps(trackId,slotIndex)*64;
+    if(tick<0 || tick>=ticks || lengthTicks<=0)return;
+    const int end=tick+juce::jmin(lengthTicks,ticks-tick);std::vector<PatternSwitch> next;
+    for(const auto& item:getPatternSwitches(trackId,slotIndex))
+    {
+        const int itemEnd=item.startTick+item.lengthTicks;
+        if(item.slide!=slide || itemEnd<=tick || item.startTick>=end){next.push_back(item);continue;}
+        if(item.startTick<tick)next.push_back({item.startTick,tick-item.startTick,slide});
+        if(itemEnd>end)next.push_back({end,itemEnd-end,slide});
+    }
+    if(enabled)next.push_back({tick,end-tick,slide});
+    replacePatternSwitches(trackId,slotIndex,next);
+}
+
 void ProjectDocument::setPatternAutomationPoint(const juce::String& trackId, int slotIndex,
                                                 const juce::String& pluginName,
                                                 const juce::String& parameterId,
@@ -1072,14 +1482,43 @@ void ProjectDocument::setPatternAutomationPoint(const juce::String& trackId, int
                                                 int step, float value)
 {
     auto slot = findPatternSlot(state, trackId, slotIndex);
-    if (!slot.isValid()) return;
+    if (!slot.isValid() || pluginName.isEmpty() || parameterId.isEmpty()) return;
+    slot.setProperty("created", true, nullptr);
     auto lanes = slot.getChildWithName(patternAutomationLanesType);
     if (!lanes.isValid())
     {
         lanes = juce::ValueTree(patternAutomationLanesType);
         slot.addChild(lanes, -1, nullptr);
     }
-    setAutomationPoint(lanes, pluginName, parameterId, parameterName, step, value, 4095);
+    setAutomationPoint(lanes, pluginName, parameterId, parameterName, step, value,
+                       juce::jmax(0, getPatternLengthSteps(trackId, slotIndex) - 1));
+}
+
+void ProjectDocument::replacePatternAutomationPoints(const juce::String& trackId,int slotIndex,
+    const juce::String& pluginName,const juce::String& parameterId,const juce::String& parameterName,
+    const juce::Array<AutomationPoint>& points)
+{
+    auto slot=findPatternSlot(state,trackId,slotIndex);
+    if(!slot.isValid() || pluginName.isEmpty() || parameterId.isEmpty())return;
+    auto lanes=slot.getChildWithName(patternAutomationLanesType);
+    auto old=findAutomationLane(lanes,pluginName,parameterId);
+    auto replacement=old.isValid()?old.createCopy():juce::ValueTree(automationLaneType);
+    replacement.removeAllChildren(nullptr);
+    if(!old.isValid())replacement.setProperty("id",juce::Uuid().toString(),nullptr);
+    replacement.setProperty("pluginName",pluginName,nullptr);replacement.setProperty("parameterId",parameterId,nullptr);
+    replacement.setProperty("parameterName",parameterName,nullptr);
+    std::map<double,float> ordered;
+    const double last=std::nextafter(double(getPatternLengthSteps(trackId,slotIndex)),0.0);
+    for(const auto& point:points)if(std::isfinite(point.position) && std::isfinite(point.value))ordered[juce::jlimit(0.0,last,point.position)]=juce::jlimit(0.0f,1.0f,point.value);
+    for(auto [position,value]:ordered)
+    {
+        juce::ValueTree point(automationPointType);point.setProperty("position",position,nullptr);point.setProperty("value",value,nullptr);
+        replacement.addChild(point,-1,nullptr);
+    }
+    if(!lanes.isValid()){lanes=juce::ValueTree(patternAutomationLanesType);slot.addChild(lanes,-1,nullptr);}
+    const int index=old.isValid()?lanes.indexOf(old):-1;
+    lanes.addChild(replacement,index,nullptr);if(old.isValid())lanes.removeChild(old,nullptr);
+    slot.setProperty("created",true,nullptr);
 }
 
 void ProjectDocument::removePatternAutomationPoint(const juce::String& trackId, int slotIndex,
@@ -1090,25 +1529,25 @@ void ProjectDocument::removePatternAutomationPoint(const juce::String& trackId, 
     auto lanes = slot.getChildWithName(patternAutomationLanesType);
     auto lane = findAutomationLane(lanes, pluginName, parameterId);
     if (!lane.isValid()) return;
-    const auto boundedPosition = juce::jlimit(0, 4095, step);
+    const auto boundedPosition = juce::jlimit(0, maximumPatternLengthSteps - 1, step);
     for (int i = lane.getNumChildren(); --i >= 0;)
     {
         const auto point = lane.getChild(i);
         if (point.getType() == automationPointType
-            && static_cast<int>(point.getProperty("position", -1)) == boundedPosition)
+            && std::floor(static_cast<double>(point.getProperty("position", -1))) == boundedPosition)
             lane.removeChild(i, nullptr);
     }
 }
 
 int ProjectDocument::getSongAutomationLaneCount(const juce::String& trackId) const
 {
-    return findProjectTrack(state, trackId).getChildWithName(automationType).getNumChildren();
+    return findSongAutomationOwner(state, trackId).getChildWithName(automationType).getNumChildren();
 }
 
 ProjectDocument::AutomationLane ProjectDocument::getSongAutomationLane(const juce::String& trackId,
                                                                          int laneIndex) const
 {
-    const auto lanes = findProjectTrack(state, trackId).getChildWithName(automationType);
+    const auto lanes = findSongAutomationOwner(state, trackId).getChildWithName(automationType);
     return juce::isPositiveAndBelow(laneIndex, lanes.getNumChildren())
         ? readAutomationLane(lanes.getChild(laneIndex)) : AutomationLane{};
 }
@@ -1119,7 +1558,7 @@ void ProjectDocument::setSongAutomationPoint(const juce::String& trackId,
                                              const juce::String& parameterName,
                                              int songStep, float value)
 {
-    auto track = findProjectTrack(state, trackId);
+    auto track = findSongAutomationOwner(state, trackId, true);
     if (!track.isValid()) return;
     auto lanes = track.getChildWithName(automationType);
     if (!lanes.isValid())
@@ -1128,6 +1567,69 @@ void ProjectDocument::setSongAutomationPoint(const juce::String& trackId,
         track.addChild(lanes, -1, nullptr);
     }
     setAutomationPoint(lanes, pluginName, parameterId, parameterName, songStep, value, 65535);
+}
+
+void ProjectDocument::replaceSongAutomationPoints(const juce::String& trackId,
+    const juce::String& pluginName, const juce::String& parameterId, const juce::String& parameterName,
+    const juce::Array<AutomationPoint>& points, const juce::String& pluginId)
+{
+    auto track = findSongAutomationOwner(state, trackId, true);
+    if (!track.isValid() || pluginName.isEmpty() || parameterId.isEmpty()) return;
+    auto lanes = track.getChildWithName(automationType);
+    if (!lanes.isValid()) { lanes = juce::ValueTree(automationType); track.addChild(lanes, -1, nullptr); }
+    juce::ValueTree lane;
+    for (auto child : lanes)
+        if (child.getProperty("parameterId").toString() == parameterId
+            && (pluginId.isNotEmpty() ? child.getProperty("pluginId").toString() == pluginId
+                : child.getProperty("pluginId").toString().isEmpty()
+                    && child.getProperty("pluginName").toString() == pluginName))
+            { lane = child; break; }
+    if (!lane.isValid())
+    {
+        lane = juce::ValueTree(automationLaneType);
+        lane.setProperty("id", juce::Uuid().toString(), nullptr);
+        lanes.addChild(lane, -1, nullptr);
+    }
+    lane.setProperty("pluginName", pluginName, nullptr);
+    lane.setProperty("pluginId", pluginId, nullptr);
+    lane.setProperty("parameterId", parameterId, nullptr);
+    lane.setProperty("parameterName", parameterName, nullptr);
+    lane.removeAllChildren(nullptr);
+    std::map<double, float> ordered;
+    for (const auto& point : points)
+        if (std::isfinite(point.position) && std::isfinite(point.value)) ordered[juce::jlimit(0.0, std::nextafter(65536.0,0.0), point.position)] = juce::jlimit(0.0f, 1.0f, point.value);
+    for (auto [position, value] : ordered)
+    {
+        juce::ValueTree point(automationPointType);
+        point.setProperty("position", position, nullptr); point.setProperty("value", value, nullptr);
+        lane.addChild(point, -1, nullptr);
+    }
+}
+
+void ProjectDocument::remapSongAutomationPluginIds(const juce::String& trackId,
+    const std::map<juce::String, juce::String>& ids)
+{
+    auto lanes = findSongAutomationOwner(state, trackId).getChildWithName(automationType);
+    for (auto lane : lanes)
+        if (auto i = ids.find(lane.getProperty("pluginId").toString()); i != ids.end())
+            lane.setProperty("pluginId", i->second, nullptr);
+}
+
+void ProjectDocument::remapSongAutomationParameter(const juce::String& owner, const juce::String& pluginName,
+    const juce::String& fromPlugin, const juce::String& fromParameter, const juce::String& toPlugin,
+    const juce::String& toParameter, const juce::String& toName, bool includeLegacy)
+{
+    auto lanes=findSongAutomationOwner(state,owner).getChildWithName(automationType);
+    for(auto lane:lanes)
+    {
+        const auto id=lane.getProperty("pluginId").toString();
+        const bool matches=id==fromPlugin || (includeLegacy && id.isEmpty() && lane.getProperty("pluginName").toString()==pluginName);
+        if(matches && lane.getProperty("parameterId").toString()==fromParameter)
+        {
+            lane.setProperty("pluginId",toPlugin,nullptr);lane.setProperty("parameterId",toParameter,nullptr);
+            lane.setProperty("parameterName",toName,nullptr);
+        }
+    }
 }
 
 void ProjectDocument::moveTrack(int sourceIndex, int destinationIndex)
@@ -1140,26 +1642,132 @@ void ProjectDocument::moveTrack(int sourceIndex, int destinationIndex)
     tracks.moveChild(sourceIndex, destinationIndex, nullptr);
 }
 
+std::vector<ProjectDocument::PlaylistClipRecord> ProjectDocument::getPlaylistClips(const juce::String& trackId) const
+{
+    std::vector<PlaylistClipRecord> result;
+    const auto clips = findProjectTrack(state, trackId).getChildWithName(clipsType);
+    for (int index = 0; index < clips.getNumChildren(); ++index)
+    {
+        const auto clip = clips.getChild(index);
+        if (!clip.hasType(playlistClipType)) continue;
+        PlaylistClipRecord record;
+        record.patternId = clip.getProperty("patternId").toString();
+        record.startBar = static_cast<int>(clip.getProperty("startBar", -1));
+        record.lengthBars = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
+        record.exactLength = static_cast<bool>(clip.getProperty("exactLength", false));
+        const auto pattern = getPatternIndexForId(trackId, record.patternId);
+        if (pattern < 0 || record.startBar < 0) continue;
+        if (!record.exactLength)
+            record.lengthBars = juce::jmax(record.lengthBars,
+                patternLengthInBars(getPatternLengthSteps(trackId, pattern)));
+        result.push_back(record);
+    }
+    std::stable_sort(result.begin(), result.end(), [](const auto& left, const auto& right)
+        { return left.startBar < right.startBar; });
+    return result;
+}
+
+bool ProjectDocument::setPlaylistClipExactBars(const juce::String& trackId, const juce::String& patternId,
+                                               int startBar, int lengthBars)
+{
+    if (startBar < 0 || lengthBars < 1
+        || static_cast<juce::int64>(startBar) + lengthBars > std::numeric_limits<int>::max()
+        || getPatternIndexForId(trackId, patternId) < 0)
+        return false;
+    auto track = findProjectTrack(state, trackId);
+    if (!track.isValid()) return false;
+    setPlaylistClip(trackId, patternId, startBar, lengthBars, true);
+    auto clips = track.getChildWithName(clipsType);
+    for (int index = 0; index < clips.getNumChildren(); ++index)
+    {
+        auto clip = clips.getChild(index);
+        if (static_cast<int>(clip.getProperty("startBar", -1)) == startBar)
+        {
+            clip.setProperty("exactLength", true, nullptr);
+            clip.setProperty("followsPatternLength", false, nullptr);
+            return true;
+        }
+    }
+    return false;
+}
+
 juce::String ProjectDocument::getPlaylistPatternId(const juce::String& trackId, int bar) const
 {
-    if (!juce::isPositiveAndBelow(bar, 4096)) return {};
+    if (bar < 0) return {};
     const auto track = findProjectTrack(state, trackId);
     const auto clips = track.getChildWithName(clipsType);
     for (int i = 0; i < clips.getNumChildren(); ++i)
     {
         const auto clip = clips.getChild(i);
         const auto start = static_cast<int>(clip.getProperty("startBar", -1));
-        const auto length = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
-        if (bar >= start && bar < start + length)
+        auto length = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
+        const auto patternIndex = getPatternIndexForId(trackId, clip.getProperty("patternId").toString());
+        if (patternIndex >= 0 && !static_cast<bool>(clip.getProperty("exactLength", false)))
+            length = juce::jmax(length, patternLengthInBars(getPatternLengthSteps(trackId, patternIndex)));
+        if (start >= 0 && bar >= start && static_cast<juce::int64>(bar) < static_cast<juce::int64>(start) + length)
             return clip.getProperty("patternId").toString();
     }
     return {};
 }
 
+int ProjectDocument::getPlaylistClipStartBar(const juce::String& trackId, int bar) const
+{
+    if (bar < 0) return -1;
+    const auto track = findProjectTrack(state, trackId);
+    const auto clips = track.getChildWithName(clipsType);
+    for (int i = 0; i < clips.getNumChildren(); ++i)
+    {
+        const auto clip = clips.getChild(i);
+        const auto start = static_cast<int>(clip.getProperty("startBar", -1));
+        auto length = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
+        const auto patternIndex = getPatternIndexForId(trackId, clip.getProperty("patternId").toString());
+        if (patternIndex >= 0 && !static_cast<bool>(clip.getProperty("exactLength", false)))
+            length = juce::jmax(length, patternLengthInBars(getPatternLengthSteps(trackId, patternIndex)));
+        if (start >= 0 && bar >= start && static_cast<juce::int64>(bar) < static_cast<juce::int64>(start) + length)
+            return start;
+    }
+    return -1;
+}
+
+bool ProjectDocument::playlistClipFollowsPatternLength(const juce::String& trackId, int bar) const
+{
+    const auto start = getPlaylistClipStartBar(trackId, bar);
+    if (start < 0) return false;
+    const auto track = findProjectTrack(state, trackId);
+    const auto clips = track.getChildWithName(clipsType);
+    for (int i = 0; i < clips.getNumChildren(); ++i)
+    {
+        const auto clip = clips.getChild(i);
+        if (static_cast<int>(clip.getProperty("startBar", -1)) == start)
+            return !clip.hasProperty("followsPatternLength")
+                || static_cast<bool>(clip.getProperty("followsPatternLength", true));
+    }
+    return false;
+}
+
+int ProjectDocument::getPlaylistClipLengthBars(const juce::String& trackId, int bar) const
+{
+    const auto start = getPlaylistClipStartBar(trackId, bar);
+    if (start < 0) return 0;
+    const auto track = findProjectTrack(state, trackId);
+    const auto clips = track.getChildWithName(clipsType);
+    for (int i = 0; i < clips.getNumChildren(); ++i)
+    {
+        const auto clip = clips.getChild(i);
+        if (static_cast<int>(clip.getProperty("startBar", -1)) != start) continue;
+        const auto storedLength = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
+        const auto patternIndex = getPatternIndexForId(trackId, clip.getProperty("patternId").toString());
+        if (patternIndex >= 0 && !static_cast<bool>(clip.getProperty("exactLength", false)))
+            return juce::jmax(storedLength, patternLengthInBars(getPatternLengthSteps(trackId, patternIndex)));
+        return storedLength;
+    }
+    return 0;
+}
+
 void ProjectDocument::setPlaylistClip(const juce::String& trackId, const juce::String& patternId,
                                      int startBar, int lengthBars, bool enabled)
 {
-    if (!juce::isPositiveAndBelow(startBar, 4096)) return;
+    if (startBar < 0) return;
     auto track = findProjectTrack(state, trackId);
     if (!track.isValid()) return;
     auto clips = track.getChildWithName(clipsType);
@@ -1169,13 +1777,22 @@ void ProjectDocument::setPlaylistClip(const juce::String& trackId, const juce::S
         track.addChild(clips, -1, nullptr);
     }
 
-    // The first Playlist pass is a bar grid: one pattern clip occupies one bar.
-    // Replacing the cell removes an older clip at that position before adding the new reference.
+    // A zero length follows the source pattern's step count. Positive values
+    // represent an explicit arrangement length set by the Playlist resize tool.
+    const bool followsPatternLength = lengthBars <= 0;
+    const auto storedLength = juce::jmax(1, lengthBars);
     for (int i = clips.getNumChildren(); --i >= 0;)
     {
         const auto clip = clips.getChild(i);
         const auto start = static_cast<int>(clip.getProperty("startBar", -1));
-        if (clip.getType() == playlistClipType && start == startBar)
+        auto existingLength = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
+        const auto existingPattern = getPatternIndexForId(trackId, clip.getProperty("patternId").toString());
+        if (existingPattern >= 0 && !static_cast<bool>(clip.getProperty("exactLength", false)))
+            existingLength = juce::jmax(existingLength,
+                patternLengthInBars(getPatternLengthSteps(trackId, existingPattern)));
+        const bool containsTarget = start >= 0 && startBar >= start
+            && static_cast<juce::int64>(startBar) < static_cast<juce::int64>(start) + existingLength;
+        if (clip.getType() == playlistClipType && (start == startBar || (!enabled && containsTarget)))
             clips.removeChild(i, nullptr);
     }
 
@@ -1185,7 +1802,8 @@ void ProjectDocument::setPlaylistClip(const juce::String& trackId, const juce::S
         clip.setProperty("id", newId(), nullptr);
         clip.setProperty("patternId", patternId, nullptr);
         clip.setProperty("startBar", startBar, nullptr);
-        clip.setProperty("lengthBars", juce::jmax(1, lengthBars), nullptr);
+        clip.setProperty("lengthBars", storedLength, nullptr);
+        clip.setProperty("followsPatternLength", followsPatternLength, nullptr);
         clips.addChild(clip, -1, nullptr);
     }
 }

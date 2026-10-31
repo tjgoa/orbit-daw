@@ -25,22 +25,46 @@ def eligible_files() -> list[pathlib.Path]:
         "LICENSE",
         "DEPENDENCIES.md",
         ".gitmodules",
+        ".gitattributes",
         "BUILD_HISTORY.md",
         "ORBIT_DAW_FOUNDATION_PLAN_001.md",
         "ORION_LEARN_TODO.md",
+        "ORION_MANUAL_AUDIT.md",
         "ORION_NATIVE_EFFECTS_COMPATIBILITY.md",
         "ORION_VISUAL_TARGETS.md",
+        "DRUM_RACK_SCOPE.md",
         "DEV_BUILD_COUNTER.json",
+        "DISTRIBUTION.md",
     ):
         path = ROOT / name
         if path.is_file():
             files.add(path)
-    for folder in ("Source", "Tools"):
+    for folder in ("Source", "Tools", "Releases"):
         for path in (ROOT / folder).rglob("*"):
             if not path.is_file() or path.name == "__pycache__":
                 continue
-            if path.suffix in {".cpp", ".h", ".hpp", ".mm", ".m", ".py", ".sh", ".md", ".json"}:
+            if path.suffix in {".cpp", ".c", ".h", ".hpp", ".mm", ".m", ".py", ".sh", ".md", ".json", ".patch"}:
                 files.add(path)
+            elif path.parent == ROOT / "Source/Synth/ThirdParty/Open303" and path.name in {"License.txt", "OOURA-LICENSE.txt"}:
+                files.add(path)
+            elif ROOT / "Source/Synth/ThirdParty/Geonkick" in path.parents and path.name == "LICENSE":
+                files.add(path)
+            elif ROOT / "Source/Synth/ThirdParty/9W9" in path.parents and (path.name in {"LICENSE","NOTICE"} or path.suffix==".wav"):
+                files.add(path)
+    for path in (ROOT / ".github" / "workflows").glob("*.yml"):
+        if path.is_file():
+            files.add(path)
+    # Orbit's sampler and export fixes touch three files in the pinned
+    # Tracktion Engine submodule. Include only these project patch overlays;
+    # never duplicate the unchanged JUCE/Tracktion dependency tree in archives.
+    for relative in (
+        "Dependencies/tracktion_engine/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.h",
+        "Dependencies/tracktion_engine/modules/tracktion_engine/plugins/effects/tracktion_SamplerPlugin.cpp",
+        "Dependencies/tracktion_engine/modules/tracktion_engine/playback/graph/tracktion_NodeRenderContext.cpp",
+    ):
+        path = ROOT / relative
+        if path.is_file():
+            files.add(path)
     return sorted(files, key=lambda p: p.relative_to(ROOT).as_posix().lower())
 
 
@@ -75,6 +99,7 @@ def main() -> None:
     group.add_argument("--checkpoint", action="store_true", help="Save a complete source checkpoint and reset the incremental baseline")
     group.add_argument("--dev-iteration", action="store_true", help="Save only changes since the last source checkpoint/iteration")
     parser.add_argument("--label", help="Optional checkpoint label, e.g. Build_025")
+    parser.add_argument("--summary", help="Short description of the features/changes in this source archive")
     args = parser.parse_args()
 
     files = eligible_files()
@@ -89,8 +114,8 @@ def main() -> None:
         summary = (
             f"# Orbit {label} source checkpoint\n\n"
             f"Complete Orbit-owned source/configuration checkpoint for product Build {build}, version {version}. "
-            "This archive contains no compiled app, executable, build output, cache, or vendored JUCE/Tracktion dependency source.\n\n"
-            "The project uses CMake with JUCE and Tracktion Engine as pinned external dependencies; see DEPENDENCIES.md and README.md.\n"
+            "This archive contains no compiled app, executable, build output, or cache. It includes only Orbit's three patched Tracktion sampler/export files; all unchanged JUCE/Tracktion dependency source remains external.\n\n"
+            "The project uses CMake with JUCE and Tracktion Engine as pinned external dependencies; run Tools/prepare-dependencies.py to apply the included sampler/export overlays to the pinned Tracktion revision. See DEPENDENCIES.md and README.md.\n"
         )
         baseline = f"Complete source checkpoint. Product Build {build}, version {version}. Created {datetime.now(timezone.utc).isoformat(timespec='seconds')}."
     else:
@@ -112,6 +137,7 @@ def main() -> None:
             f"Incremental source archive for product Build {build}, version {version}.",
             f"Baseline archive: {state.get('archive', '(no baseline)')}.",
             "",
+            *([args.summary.strip(), ""] if args.summary else []),
             "Changed or added files:",
             *(f"- `{item}`" for item in changed_names),
         ]
