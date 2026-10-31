@@ -1,0 +1,29 @@
+{
+  "repository": "tjgoa/orbit-daw",
+  "build": 276,
+  "version": "0.3.255",
+  "tag": "tester-build-276",
+  "source_commit": "053b68711a289a0f04e15f2b567639bfa3769fe6",
+  "run_id": 41152119079,
+  "notes": "Releases/Build-276.md",
+  "artifacts": [
+    {
+      "id": 13024155703,
+      "platform": "macos-universal",
+      "package": "Orbit-Build-276-macos-universal.zip",
+      "sha256": "1802ef5121174de6c51037de4db41a27307845a6fc7fab31c0358433fc55b462"
+    },
+    {
+      "id": 13022884406,
+      "platform": "windows-x64",
+      "package": "Orbit-Build-276-windows-x64.zip",
+      "sha256": "0b6536f0a03704481bd115d9dc74ca45d16b027a57931cb6508080002e7c72e6"
+    },
+    {
+      "id": 13022884923,
+      "platform": "linux-x64",
+      "package": "Orbit-Build-276-linux-x64.tar.gz",
+      "sha256": "36a0fa50b49e8d687e07b839feefbf93ececc810209c9b4a0976d950f562af54"
+    }
+  ]
+}
