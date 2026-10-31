@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OrbitDAW VERSION 0.3.254 LANGUAGES C CXX)
+project(OrbitDAW VERSION 0.3.255 LANGUAGES C CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -31,7 +31,7 @@ endif()
 juce_add_gui_app(Orbit
     PRODUCT_NAME "Orbit"
     VERSION "${PROJECT_VERSION}"
-    BUILD_VERSION "275"
+    BUILD_VERSION "276"
     COMPANY_NAME "Touch The Universe"
     BUNDLE_ID "${ORBIT_APP_BUNDLE_ID}"
     PLUGINHOST_AU ${ORBIT_HOST_AU})
@@ -185,7 +185,7 @@ target_link_libraries(Orbit PRIVATE
 set_target_properties(Orbit PROPERTIES
     MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
-    MACOSX_BUNDLE_BUNDLE_VERSION "275"
+    MACOSX_BUNDLE_BUNDLE_VERSION "276"
     CXX_VISIBILITY_PRESET hidden
     C_VISIBILITY_PRESET hidden)
 

@@ -28,4 +28,4 @@ jobs:
       - name: Verify existing packages and publish complete prerelease
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 Tools/publish-tester-release.py Releases/Build-275.json
+        run: python3 Tools/publish-tester-release.py Releases/Build-276.json

@@ -19,6 +19,12 @@ Local portability/safety changes, 2026-10-29:
 - Clear prototypeTable only to its declared tableLength. The upstream loop
   cleared four elements beyond the allocation; UBSan exposed this during tests.
 
+Additional Windows portability change, 2026-10-30:
+
+- Rename the global custom log2 helper to rosicLog2 and update its internal
+  callers. Modern MSVC reserves log2 as an intrinsic and rejects a replacement.
+  The original ONE_OVER_LN2 * log(x) equation is unchanged.
+
 Orbit's voice adapter calls the core's trigger/slide routines from fixed-capacity
 note state, bypassing the upstream std::list MIDI allocator and internal
 sequencer. Wave tables and FFT resources are initialized outside note rendering.

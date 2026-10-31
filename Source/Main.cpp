@@ -10754,7 +10754,7 @@ public:
         meterStatus.setColour(juce::Label::textColourId, orbit::options::colour(170, 204, 222));
         addAndMakeVisible(meterStatus);
 
-        buildLabel.setText("Build 275  -  v0.3.254", juce::dontSendNotification);
+        buildLabel.setText("Build 276  -  v0.3.255", juce::dontSendNotification);
         buildLabel.setJustificationType(juce::Justification::centredRight);
         buildLabel.setColour(juce::Label::textColourId, orbit::options::colour(154, 181, 196));
         addAndMakeVisible(buildLabel);
@@ -19098,7 +19098,7 @@ class OrbitApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override { return "Orbit"; }
-    const juce::String getApplicationVersion() override { return "0.3.254"; }
+    const juce::String getApplicationVersion() override { return "0.3.255"; }
     void initialise(const juce::String&) override
     {
         installOrbitCrashReportHandler();
