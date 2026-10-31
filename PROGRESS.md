@@ -1,5 +1,34 @@
 # Orbit development progress
 
+## 2026-10-30 — Public tester refresh, Build 276 / v0.3.255
+
+The public refresh carries the major additions since Build 238: Acid Bass and
+its internal drive/phase controls, 9W9 and Geonkick drum auditions, Song/Pattern
+automation and LFO tools, native dynamics/distortion, expanded editing/recording,
+independent generator/FX windows, mixer routing and SFS recovery/media relinking.
+See Releases/Build-276.md for the user-facing changelog, quick tests and limits.
+
+Build 275's Windows compile exposed the old Open303 global log2 helper conflicting
+with an MSVC intrinsic. The replacement Build 276 renames that helper and its
+internal callers, preserving the original equation; five-rate sanitizer/phase
+checks pass. Build 275 remains consumed and is not published. All three Build 276
+native CI jobs passed at https://github.com/tjgoa/orbit-daw/actions/runs/41152119079.
+
+The publication job verifies the pinned artifact digests, package checksums,
+matching source contents, metadata and source-only archive boundaries before
+publishing the downloads at
+https://github.com/tjgoa/orbit-daw/releases/tag/tester-build-276 . The corresponding
+source is commit 053b68711a289a0f04e15f2b567639bfa3769fe6; the main branch contains
+that updated code with current release notes and both existing README screenshots.
+Mac ZIP, Windows ZIP and Linux tar.gz are portable tester downloads, not setup
+wizard installers; no compiler is needed. Mac first-launch instructions include
+the app-specific quarantine command. Earlier releases/assets remain intact.
+
+This public CI invocation does not replace the locally installed Build 274 app
+or increment the local successful-development counter. Hardware audio/MIDI,
+third-party plugin compatibility, listening and older-OS operation still need
+feedback. No complete Orion parity or production-ready claim is made.
+
 ## 2026-10-30 — Build 274 / v0.3.253 Triangle Foldback
 
 Acid Bass Effects / Drive now has a three-choice shape selector: Soft, Sine Fold

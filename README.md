@@ -4,12 +4,15 @@ Orbit is a standalone DAW inspired by Orion's generator → pattern → playlist
 
 ## Tester downloads
 
-The next tester checkpoint is **Build 276 / v0.3.255**, carrying the features
-through Build 274. Its native Mac/Windows/Linux packages are being verified.
-Until publication, the [current public download remains Build 238](https://github.com/tjgoa/orbit-daw/releases/tag/tester-build-238).
-No compiler is needed for the named platform downloads. See
+[Download Build 276 / v0.3.255 for Mac, Windows or Linux](https://github.com/tjgoa/orbit-daw/releases/tag/tester-build-276).
+These are ready-to-run portable tester packages; no compiler is needed. See
 [installation and Mac first-launch instructions](DISTRIBUTION.md) and the
 [major changelog since Build 238](Releases/Build-276.md).
+
+This branch contains the updated application source. The exact release source
+is pinned by the [tester-build-276 tag](https://github.com/tjgoa/orbit-daw/tree/tester-build-276)
+and [tester branch](https://github.com/tjgoa/orbit-daw/tree/codex/tester-build-276).
+Existing project screenshots below are preserved.
 
 ## Current state
 
@@ -242,4 +245,4 @@ The project records Tracktion Engine as a submodule at v3.2.0; that engine revis
 
 ## Licensing
 
-Orbit application code is released under GNU AGPLv3 (see `LICENSE`). JUCE is used under AGPLv3 and Tracktion Engine under GPLv3, subject to their respective license files and notices. Third-party dependencies inside either repository may have additional licenses; preserve those notices when distributing builds. This repository publishes source code; it does not include a compiled application bundle.
+Orbit application code is released under GNU AGPLv3 (see `LICENSE`). JUCE is used under AGPLv3 and Tracktion Engine under GPLv3, subject to their respective license files and notices. Third-party dependencies inside either repository may have additional licenses; preserve those notices when distributing builds. Source is published here; ready-to-run application packages, corresponding source and notices are attached to GitHub Releases.
