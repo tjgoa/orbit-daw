@@ -27,7 +27,7 @@ int main(int argc,char**)
     if(argc>1)
     {
         acidFxCheck(host.loadProjectFile(file),"fresh Acid FX project reopen failed");auto* p=dynamic_cast<orbit::synth::AcidBassPlugin*>(host.generatorControlPlugin(host.project.getTrackId(0)));host.songModeButton.onClick();host.updateEngineAutomation();
-        acidFxCheck(p!=nullptr && p->parameters.size()==17 && p->parameters[9]->getCurrentValue()==81 && p->parameters[10]->getCurrentValue()==67 && p->parameters[14]->getCurrentValue()==1 && p->parameters[16]->getCurrentValue()==1 && p->parameters[14]->hasAutomationPoints(),"fresh FX/triangle/legacy automation state lost");
+        acidFxCheck(p!=nullptr && p->parameters.size()==orbit::synth::AcidBassPlugin::parameterCount && p->parameters[9]->getCurrentValue()==81 && p->parameters[10]->getCurrentValue()==67 && p->parameters[14]->getCurrentValue()==1 && p->parameters[16]->getCurrentValue()==1 && p->parameters[14]->hasAutomationPoints(),"fresh FX/triangle/legacy automation state lost");
         auto audio=acidFxRender(host,"fresh-fx");acidFxCheck(audio.getMagnitude(0,audio.getNumSamples())>.001,"fresh FX silent");std::cout<<"PASS: fresh-process native FX parameters and actual audio render.\n";return 0;
     }
     // Unchanged default dry samples, fixed latency, block segmentation and aligned blend.
@@ -108,9 +108,10 @@ int main(int argc,char**)
     click(host.playButton);click(host.stopButton);click(host.rewindButton);click(host.previousButton);click(host.nextButton);
     click(host.songModeButton);click(host.playButton);acidFxCheck(host.edit->getTransport().isPlaying(),"Song Play never reached playing branch");click(host.stopButton);
     host.loopButton.setToggleState(true,juce::dontSendNotification);click(host.loopButton);host.loopButton.setToggleState(false,juce::dontSendNotification);click(host.loopButton);
-    host.saveOption("recordContent",1);click(host.recordButton);acidFxCheck(host.automationTakeActive,"Automation Record did not arm");click(host.stopButton);
-    host.saveOption("recordContent",0);click(host.recordButton);acidFxCheck(host.midiTake.active,"MIDI Record did not arm");click(host.stopButton);
+    host.saveOption("recordContent",1);click(host.recordButton);acidFxCheck(host.recordArmed && !host.automationTakeActive,"Automation Record did not arm without playing");click(host.playButton);acidFxCheck(host.automationTakeActive,"armed automation did not begin with Play");click(host.stopButton);
+    host.saveOption("recordContent",0);click(host.patternModeButton);click(host.recordButton);acidFxCheck(host.recordArmed && !host.midiTake.active,"MIDI Record did not arm without playing");click(host.playButton);acidFxCheck(host.midiTake.active,"armed MIDI did not begin with Play");click(host.stopButton);
     std::cout<<"PASS: real Play/Stop/play-toggle, Pattern/Song, Return, previous/next, Loop, MIDI/automation Record preserve open and deliberately minimized windows. Hosted buffers, no hardware.\n";
+    click(host.songModeButton);
     // Isolate synth for actual engine render, PDC and automation checks.
     host.engine.getDeviceManager().deviceManager.closeAudioDevice();host.removeInsert(0,0);host.removeInsert(1,0);host.selectGeneratorControlTrack(id);
     host.setTrackEqEnabled(0,false);host.setMasterGainDb(0);host.setTrackEqEnabled(host.getMixerTracks().size(),false);

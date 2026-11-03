@@ -1,3 +1,4 @@
+#include "../Workspace/OwnedAlert.h"
 #include "OrionSfsImportDialog.h"
 #include "OrionSfsConversion.h"
 #include "OrionSfsReport.h"
@@ -357,6 +358,6 @@ void launchOrionSfsPreview(const juce::File& file, juce::Component* parent,
     options.componentToCentreAround = parent;
     options.resizable = false;
     options.content = juce::OptionalScopedPointer<juce::Component>(createOrionSfsPreview(file, std::move(commit)).release(), true);
-    options.launchAsync();
+    orbit::workspace::ownDialog(options.launchAsync());
 }
 }

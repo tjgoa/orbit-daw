@@ -1,4 +1,4 @@
-# Orbit Project Format — Schema 20
+# Orbit Project Format — Schema 24
 
 Orbit owns the project document format. Tracktion Engine is currently the live
 audio and MIDI engine behind an adapter; stable Orbit IDs identify project
@@ -15,6 +15,44 @@ objects and mixer channels independently of Tracktion's internal IDs.
   the new XML has been written.
 
 ## Current structure
+
+Schema 24 adds `ORBITFREEZE` metadata under a generator's native engine track.
+It contains a version, durable stereo WAV reference/byte count/duration/sample
+rate, Song body/tail seconds, a musical-content signature, mixer-bake and live
+Pattern flags, and original `SOURCE` plugin states/bypass flags. Isolated rack
+state and bound member identities are included when printed. Native derived WAV
+clips are marked `orbitFreezeProjection`; their canonical source remains the
+Orbit pattern/placement document. `orbitRenderedAudio` reapplies the phase-aligned
+reader configuration after restoring native state. These markers are never used
+to remove ordinary imported/recorded audio clips.
+
+Unfreeze restores only printed processing, retaining unprinted live mixer edits.
+Missing cache or incompatible source timing restores the original and marks the
+project dirty. Freeze/Unfreeze snapshots keep media for Redo. Permanent conversion
+stores ordinary audio instead and removes the original source and source-owned
+musical/automation data; it clears Undo histories after a verified render. Older
+readers reject schema 24 rather than replay a cached WAV in Pattern mode or leave
+a source disabled. Full behavior and limits: [Song Freeze](../Freeze/README.md).
+
+Schema 23 appends nine Acid Bass post-FX EQ parameters at indices 47–55:
+`eqEnabled`, `eqLowFrequency`, `eqLowGain`, `eqMidFrequency`, `eqMidGain`,
+`eqMidQ`, `eqHighFrequency`, `eqHighGain`, `eqOutput`. Missing values restore
+EQ Off, 120 Hz / 0 dB low shelf, 1000 Hz / 0 dB / Q .7071 mid peak,
+6000 Hz / 0 dB high shelf, and 0 dB output. The first 47 parameter IDs,
+ranges and defaults remain unchanged. EQ filter/smoothing state is transient;
+values and automation save in ordinary native plugin state and generator presets.
+Supported old projects migrate; older readers reject schema 23 rather than
+silently dropping the EQ. Preset library paths, mixer knob size, and header
+contrast are application appearance/library preferences, not project schema.
+
+
+Schema 21 appends Acid Bass filter-bank parameters `filterSpreadEnabled` (0/1),
+`filterVoices` (0/1/2 selects 2/4/8), `filterSpread` and `stereoWidth` (0–100).
+Missing fields default to zero, preserving the original single-filter sound.
+Existing parameter indices and automation ranges are unchanged. Audio history is
+transient. Old supported projects migrate; readers before schema 21 reject new
+saves. CPU readout visibility is an application preference, not project state.
+See Source/Synth/ACID_FILTER_SPREAD.md.
 
 Schema 20 appends Acid Bass `fxTriangleFold` (0=Off, 1=On, missing=Off). The
 new shape uses the same oversampling latency/dry alignment. Original `fxMode`
@@ -63,7 +101,15 @@ Older Orbit builds reject schema 17 rather than silently dropping this synth.
   length; legacy clips without that flag follow the pattern length, with a
   minimum of one bar. Schema 5 adds an optional `exactLength` boolean: when
   true, `lengthBars` is the exact range, even if shorter than its pattern, and
-  `followsPatternLength` is false. Without it, previous minimum-pattern-length
+  `followsPatternLength` is false. Normal whole-bar Playlist edge resizing now edits
+  the shared pattern step count and links every non-exact occurrence to that
+  length, including previously extended ordinary placements. Starts stay fixed
+  and overlaps are retained. New single/range painting uses the shared length.
+  Fractional trimming stores `exactLength=true`; older explicit fractional
+  extensions are promoted to exact trims when the source pattern changes.
+  Hit-testing resolves the latest-starting covering placement; deleting it
+  leaves earlier overlapping placements intact.
+  Without it, previous minimum-pattern-length
   behavior is preserved. This allows short pattern placements without shortening
   the source pattern. Clone/import retains the flag. New readers migrate the
   root schema version on load; readers predating schema 5 reject these clips
@@ -290,3 +336,31 @@ use the documented defaults; old projects remain dry at Distort 0%. Existing
 parameter IDs and automation targets retain their meaning. Schema 16 prevents
 older builds from accepting a project and silently dropping new FX settings.
 The oversampler, filters, dry delay and smoothed values are transient audio state.
+
+## Build 315: audio input takes
+
+No native schema bump. Per-track `orbitAudioInputId` in the embedded engine state
+stores the explicit hardware mono/stereo source. `orbitRecordArmed` applies to
+audio and instrument tracks; AUDIO exclusively captures audio destinations.
+Committed WAV clips use existing native wave-clip state. Durable WAVs, take
+manifests and before/after native snapshots live outside the project XML. Save As
+retains their paths. See ../Recording/AUDIO_RECORDING.md for recovery limits.
+
+
+## Editable frozen Song arrangement — schema 25 / Build 323
+
+The native audio track child `ORBITFREEZE` retains Build 322's original source
+plugin/rack state, bypass flags, render metadata and musical signature. Its
+`audioReady` flag distinguishes an intentionally edited/empty frozen Wave
+arrangement from an old project that needs an initial Wave projection. The
+native Wave clips, including splits, source offsets, gain and placement, are now
+the saved frozen Song arrangement. Original document pattern placements remain
+preserved for Unfreeze; they are not the displayed frozen audio arrangement.
+
+`showGhostNotes` is an optional presentation flag. Native clip
+`orbitFreezeProjection` marks audio removed when restoring that lane's original
+source. `orbitFrozenWasMuted` remembers each Wave clip's original mute while
+Pattern audition temporarily mutes it; Song mode restores/removes that property.
+The transient value may occur in saves made from Pattern mode and is recovered
+on load. Earlier supported schemas migrate. Older Orbit builds reject schema 25
+rather than recreating the original print and losing the user's audio edits.

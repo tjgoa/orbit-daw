@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 #include "../Project/ProjectDocument.h"
 #include "../Editing/EditShortcuts.h"
 #include "../Workspace/WorkspaceWindow.h"
@@ -16,15 +17,30 @@ inline bool samePoints(const Points& a, const Points& b)
 struct SongTarget
 {
     juce::String trackId, pluginId, pluginName, parameterId, parameterName, label;
+    bool hasEvents=false;
 };
 inline bool sameTarget(const SongTarget& a, const SongTarget& b)
 {
     return a.trackId == b.trackId && a.pluginId == b.pluginId && a.parameterId == b.parameterId;
 }
 
-class SongEventPanel final : public juce::Component
+class SongEventPanel final : public juce::Component, private juce::ScrollBar::Listener
 {
 public:
+    class ParameterMenuTheme:public juce::LookAndFeel_V4
+    {
+    public:
+        std::set<juce::String> populated;
+        void drawPopupMenuItem(juce::Graphics& g,const juce::Rectangle<int>& area,bool separator,bool active,bool highlighted,bool ticked,bool submenu,
+            const juce::String& text,const juce::String& shortcut,const juce::Drawable* icon,const juce::Colour* colour)override
+        {
+            const bool used=populated.contains(text);
+            if(used && !highlighted){g.setColour(juce::Colour(0xff183745));g.fillRect(area);}
+            const auto ink=used?juce::Colour(0xff9ce5f3):juce::Colour(0xffe5edf1);
+            LookAndFeel_V4::drawPopupMenuItem(g,area,separator,active,highlighted,ticked,submenu,text,shortcut,icon,used?&ink:colour);
+            if(used){g.setColour(juce::Colour(0xff6ccee4));g.fillRect(area.getX()+1,area.getY()+3,3,juce::jmax(1,area.getHeight()-6));}
+        }
+    };
     enum class Tool { pencil, line, erase, move };
     class ToolButton:public juce::TextButton
     {
@@ -46,8 +62,8 @@ public:
         explicit Graph(SongEventPanel& p) : panel(p) { setWantsKeyboardFocus(true); }
         juce::Rectangle<float> plot() const { return getLocalBounds().toFloat().withTrimmedTop(24).withTrimmedBottom(5); }
         int stepAt(float x) const { return juce::jlimit(0, panel.lastStep, int(std::floor(x / panel.pixelsPerStep))); }
-        float valueAt(float y) const { auto r = plot(); return juce::jlimit(0.0f, 1.0f, (r.getBottom() - y) / juce::jmax(1.0f, r.getHeight())); }
-        float yAt(float v) const { auto r = plot(); return r.getBottom() - v * r.getHeight(); }
+        float valueAt(float y) const { auto r = plot(); return juce::jlimit(0.0f, 1.0f, panel.verticalLow + (r.getBottom() - y) / juce::jmax(1.0f, r.getHeight()) * panel.verticalSpan()); }
+        float yAt(float v) const { auto r = plot(); return r.getBottom() - (v-panel.verticalLow) / panel.verticalSpan() * r.getHeight(); }
         void paint(juce::Graphics& g) override
         {
             g.fillAll(juce::Colour(0xff16232d));
@@ -63,7 +79,7 @@ public:
                 g.drawVerticalLine(int(loop.getEnd()), 0, float(getHeight()));
             }
             g.setColour(juce::Colour(0xff304955));
-            for (int i = 0; i <= 4; ++i) g.drawHorizontalLine(juce::roundToInt(yAt(i / 4.0f)), float(visible.getX()), float(visible.getRight()));
+            for (int i = 0; i <= 4; ++i) g.drawHorizontalLine(juce::roundToInt(yAt(panel.verticalLow + i / 4.0f * panel.verticalSpan())), float(visible.getX()), float(visible.getRight()));
             const int stride = panel.pixelsPerStep >= 8 ? 1 : 4;
             for (int step = juce::jmax(0, stepAt(float(visible.getX())) / stride * stride); step <= stepAt(float(visible.getRight())) + stride; step += stride)
             {
@@ -91,6 +107,7 @@ public:
             }
             else
             {
+            juce::Graphics::ScopedSaveState curveClip(g);g.reduceClipRegion(plot().toNearestInt());
             juce::Path path;
             path.startNewSubPath(0, yAt(displayed.getFirst().value));
             for (const auto& point : displayed) path.lineTo(point.position * panel.pixelsPerStep, yAt(point.value));
@@ -145,18 +162,16 @@ public:
 
     SongEventPanel() : graph(*this)
     {
-        for (auto* c : std::initializer_list<juce::Component*>{&trackSelector, &parameterSelector, &zoomSelector, &readout, &transportLabel, &hint, &viewport, &settingsButton}) addAndMakeVisible(c);
+        for (auto* c : std::initializer_list<juce::Component*>{&parameterSelector, &readout, &transportLabel, &hint, &viewport, &settingsButton, &horizontalOut, &horizontalIn, &verticalOut, &verticalIn, &valueScroll}) addAndMakeVisible(c);
         viewport.setViewedComponent(&graph, false); viewport.setScrollBarsShown(false, true);
-        trackSelector.onChange = [this] { cancelGesture(); if (onTrack) onTrack(trackSelector.getSelectedId() - 1); };
         parameterSelector.onChange = [this] { cancelGesture(); if (onTarget) onTarget(parameterSelector.getSelectedId() - 1); };
-        zoomSelector.addItem("Zoom 50%", 1); zoomSelector.addItem("Zoom 100%", 2); zoomSelector.addItem("Zoom 200%", 3);
-        zoomSelector.setSelectedId(2, juce::dontSendNotification);
-        zoomSelector.onChange = [this]
-        {
-            const auto start = viewport.getViewPositionX() / pixelsPerStep;
-            pixelsPerStep = zoomSelector.getSelectedId() == 1 ? 4.0f : zoomSelector.getSelectedId() == 3 ? 16.0f : 8.0f;
-            resized(); viewport.setViewPosition(juce::roundToInt(start * pixelsPerStep), 0);
-        };
+        auto zoomButton=[this](juce::TextButton& button,const char* text,const char* tip,std::function<void()> action)
+        {button.setButtonText(text);button.setTooltip(tip);button.setWantsKeyboardFocus(false);button.onClick=std::move(action);};
+        zoomButton(horizontalOut,"-","Zoom out horizontally",[this]{setHorizontalZoom(pixelsPerStep/1.25f);});
+        zoomButton(horizontalIn,"+","Zoom in horizontally",[this]{setHorizontalZoom(pixelsPerStep*1.25f);});
+        zoomButton(verticalOut,"-","Zoom out vertically",[this]{setVerticalZoom(verticalZoom/1.25f);});
+        zoomButton(verticalIn,"+","Zoom in vertically",[this]{setVerticalZoom(verticalZoom*1.25f);});
+        valueScroll.setRangeLimits(0.,1.);valueScroll.addListener(this);
         const char* names[] = {"/", "\\", "X", "<>"};
         const char* tips[]={"Draw","Line","Erase","Move Graph"};
         for (int i = 0; i < 4; ++i)
@@ -184,7 +199,7 @@ public:
         settingsButton.setButtonText("...");settingsButton.setTooltip("Event Editor settings, colors and LFO tool");settingsButton.onClick=[this]{showSettings();};
         setSize(960, 460);
     }
-    ~SongEventPanel() override { viewport.setViewedComponent(nullptr, false); }
+    ~SongEventPanel() override {parameterSelector.setLookAndFeel(nullptr); valueScroll.removeListener(this);viewport.setViewedComponent(nullptr, false); }
     std::function<void(int)> onTrack, onTarget;
     std::function<void(const Points&, const Points&)> onCommit;
     std::function<void(bool)> onUndo;
@@ -231,17 +246,30 @@ public:
     Graph graph;
 
     void setTracks(const juce::StringArray& labels, int selected)
+    {cancelGesture();moduleLabels=labels;selectedModule=selected;}
+    float verticalSpan()const{return 1.0f/verticalZoom;}
+    float horizontalZoomLevel()const{return pixelsPerStep;}
+    float verticalZoomLevel()const{return verticalZoom;}
+    juce::Range<float> visibleValues()const{return {verticalLow,verticalLow+verticalSpan()};}
+    void setHorizontalZoom(float value)
     {
-        cancelGesture(); trackSelector.clear(juce::dontSendNotification);
-        for (int i = 0; i < labels.size(); ++i) trackSelector.addItem(labels[i], i + 1);
-        trackSelector.setSelectedId(selected + 1, juce::dontSendNotification);
+        cancelGesture();const auto first=viewport.getViewPositionX()/pixelsPerStep;
+        pixelsPerStep=juce::jlimit(.5f,64.f,value);resized();viewport.setViewPosition(juce::roundToInt(first*pixelsPerStep),0);
     }
+    void setVerticalZoom(float value)
+    {
+        cancelGesture();const float centre=verticalLow+verticalSpan()*.5f;
+        verticalZoom=juce::jlimit(1.f,16.f,value);verticalLow=juce::jlimit(0.f,1.f-verticalSpan(),centre-verticalSpan()*.5f);
+        resized();graph.repaint();repaint();
+    }
+    bool parameterHasEvents(const juce::String& label)const{return parameterMenuTheme.populated.contains(label);}
     void setTargets(std::vector<SongTarget> next, int selected, Points data, double barSteps)
     {
         cancelGesture();setPreview({},false); targets = std::move(next); selectedTarget = selected;
+        parameterMenuTheme.populated.clear();parameterSelector.setLookAndFeel(&parameterMenuTheme);
         parameterSelector.clear(juce::dontSendNotification);
-        for (int i = 0; i < int(targets.size()); ++i) parameterSelector.addItem(targets[size_t(i)].label, i + 1);
-        parameterSelector.setSelectedId(selected + 1, juce::dontSendNotification);
+        for (int i = 0; i < int(targets.size()); ++i){parameterSelector.addItem(targets[size_t(i)].label, i + 1);if(targets[size_t(i)].hasEvents)parameterMenuTheme.populated.insert(targets[size_t(i)].label);}
+        parameterSelector.setSelectedId(selected + 1, juce::dontSendNotification);parameterSelector.setTooltip(parameterSelector.getText());
         points = std::move(data); stepsPerBar = barSteps;
         lastStep = juce::jlimit(0, 65535, int(std::ceil(512 * stepsPerBar)) - 1);
         for (const auto& point : points) lastStep = juce::jmax(lastStep, int(std::floor(point.position)));
@@ -251,24 +279,28 @@ public:
     {
         g.fillAll(juce::Colour(0xff203340));
         g.setColour(juce::Colours::lightgrey);
-        const auto area = viewport.getBounds();
+        const auto area = viewport.getBounds();g.setFont(12);
         for (int i = 0; i <= 4; ++i)
         {
-            const float v = i / 4.0f;
+            const float v = verticalLow + i / 4.0f * verticalSpan();
             const int y = area.getY() + juce::roundToInt(graph.yAt(v));
-            g.drawText(formatValue ? formatValue(v) : juce::String(v, 2), 2, y - 9, 76, 18, juce::Justification::centredRight);
+            g.drawText(formatValue ? formatValue(v) : juce::String(v, 2), 2, y - 9, 94, 18, juce::Justification::centredRight);
         }
     }
     void resized() override
     {
-        auto r = getLocalBounds().reduced(3);
-        auto row = r.removeFromTop(28);
-        for(auto& button:tools)button.setBounds(row.removeFromLeft(25).reduced(1));
-        trackSelector.setBounds(row.removeFromLeft(juce::jmin(200,row.getWidth()/3)).reduced(1));parameterSelector.setBounds(row.reduced(1));
-        auto bottom=r.removeFromBottom(27);settingsButton.setBounds(bottom.removeFromRight(28));zoomSelector.setBounds(bottom.removeFromRight(115));
-        transportLabel.setBounds(bottom.removeFromRight(300));readout.setBounds(bottom);hint.setBounds({});
-        viewport.setBounds(r.withTrimmedLeft(74));
-        graph.setSize(juce::jmax(viewport.getWidth(), juce::roundToInt((lastStep + 1) * pixelsPerStep)), juce::jmax(80, viewport.getHeight() - viewport.getScrollBarThickness()));
+        auto r=getLocalBounds().reduced(3);auto bottom=r.removeFromBottom(27);
+        for(int i=0;i<4;++i)tools[size_t(i)].setBounds(3+i*24,3,23,23);
+        settingsButton.setBounds(bottom.removeFromRight(27));bottom.removeFromRight(2);
+        horizontalIn.setBounds(bottom.removeFromRight(25));bottom.removeFromRight(2);horizontalOut.setBounds(bottom.removeFromRight(25));
+        const int wanted=juce::jlimit(220,500,juce::Font(14).getStringWidth(parameterSelector.getText())+42);
+        parameterSelector.setBounds(bottom.removeFromLeft(juce::jmin(wanted,juce::jmax(120,bottom.getWidth()-25))).reduced(1));
+        readout.setBounds({});transportLabel.setBounds(bottom.getWidth()>300?bottom:juce::Rectangle<int>{});hint.setBounds({});
+        viewport.setBounds(r.withTrimmedLeft(100).withTrimmedRight(28));
+        graph.setSize(juce::jmax(viewport.getWidth(),juce::roundToInt((lastStep+1)*pixelsPerStep)),juce::jmax(80,viewport.getHeight()-viewport.getScrollBarThickness()));
+        verticalOut.setBounds(getWidth()-27,r.getBottom()-49,23,22);verticalIn.setBounds(getWidth()-27,r.getBottom()-25,23,22);
+        valueScroll.setBounds(getWidth()-18,r.getY()+24,14,juce::jmax(0,r.getHeight()-78));
+        valueScroll.setCurrentRange(1.0-verticalLow-verticalSpan(),verticalSpan(),juce::dontSendNotification);valueScroll.setVisible(verticalZoom>1.001f);
     }
     bool keyPressed(const juce::KeyPress& key) override { return handleKey(key); }
     bool handleKey(const juce::KeyPress& key)
@@ -303,6 +335,8 @@ public:
         const auto next = points; points = before; gesturing = false; commit(next);
     }
 private:
+    void scrollBarMoved(juce::ScrollBar*,double start)override
+    {cancelGesture();verticalLow=juce::jlimit(0.f,1.f-verticalSpan(),float(1.0-start-verticalSpan()));graph.repaint();repaint();}
     bool rulerDragging=false;float rulerX=0;int rulerMode=0,rulerFirst=0,rulerLast=1;
     void beginRuler(const juce::MouseEvent& e)
     {
@@ -323,8 +357,10 @@ private:
         juce::PopupMenu menu;menu.addItem(1,"Gradient fill",true,isGradientFillEnabled());menu.addItem(2,"Follow play cursor",true,isFollowing());menu.addSeparator();
         const char* colors[]={"Cyan / teal","Red / blue","Violet / gold","Green / teal"};for(int i=0;i<4;++i)menu.addItem(10+i,colors[i],true,gradientStyle==i);
         menu.addSeparator();menu.addItem(20,"LFO Tool...");
+        juce::PopupMenu modules;for(int i=0;i<moduleLabels.size();++i)modules.addItem(1000+i,moduleLabels[i],true,i==selectedModule);
+        menu.addSubMenu("Edit module",modules);
         menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&settingsButton),[safe=juce::Component::SafePointer<SongEventPanel>(this)](int choice)
-        {if(safe==nullptr)return;if(choice==1)safe->fillToggle.setToggleState(!safe->isGradientFillEnabled(),juce::dontSendNotification);if(choice==2)safe->followToggle.setToggleState(!safe->isFollowing(),juce::dontSendNotification);if(choice>=10 && choice<=13)safe->setGradientStyle(choice-10);if(choice==20 && safe->onLfo)safe->onLfo();safe->graph.repaint();if(choice!=0 && safe->onViewOptionsChanged)safe->onViewOptionsChanged();});
+        {if(safe==nullptr)return;if(choice==1)safe->fillToggle.setToggleState(!safe->isGradientFillEnabled(),juce::dontSendNotification);if(choice==2)safe->followToggle.setToggleState(!safe->isFollowing(),juce::dontSendNotification);if(choice>=10 && choice<=13)safe->setGradientStyle(choice-10);if(choice==20 && safe->onLfo)safe->onLfo();if(choice>=1000 && choice<1000+safe->moduleLabels.size() && safe->onTrack){safe->cancelGesture();safe->onTrack(choice-1000);}safe->graph.repaint();if(choice!=0 && safe->onViewOptionsChanged)safe->onViewOptionsChanged();});
     }
     void followPlayhead()
     {
@@ -390,7 +426,11 @@ private:
         });
     }
     juce::TextButton settingsButton;
-    juce::ComboBox trackSelector, parameterSelector, zoomSelector;
+    ParameterMenuTheme parameterMenuTheme;
+    juce::ComboBox parameterSelector;
+    juce::StringArray moduleLabels;int selectedModule=-1;
+    juce::TextButton horizontalOut,horizontalIn,verticalOut,verticalIn;
+    juce::ScrollBar valueScroll{true};float verticalZoom=1,verticalLow=0;
     juce::Label readout, transportLabel, hint;
     juce::ToggleButton followToggle, fillToggle, recordToggle;
     double playheadStep = 0, loopStartStep = 0, loopEndStep = 0;

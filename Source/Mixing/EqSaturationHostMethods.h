@@ -21,6 +21,7 @@ void syncTrackEqSaturation(int index)
 }
 void setTrackEqSaturation(int index,bool enabled,bool undo=true)
 {
+    if(!requireLiveMixer(mixerOwnerId(index)))return;
     auto* list=mixerPluginList(index);if(list==nullptr || enabled==getTrackEqSaturation(index))return;
     if(undo)rememberUndo("Change EQ soft saturation");
     auto* eq=enabled?ensureTrackEqualiser(index):getTrackEqualiser(index);if(eq==nullptr)return;

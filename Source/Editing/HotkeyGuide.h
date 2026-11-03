@@ -9,6 +9,7 @@ public:
     static juce::String reference()
     {
         return "GENERAL (when a text field is not being edited)\n"
+            "Space: Play / Stop (also over generator and effect GUIs)\n"
             "Ctrl/Cmd-Z: Undo   |   Ctrl/Cmd-Shift-Z or Ctrl/Cmd-Y: Redo\n"
             "Ctrl/Cmd-X / C / V: Cut / Copy / Paste pattern notes\n"
             "Ctrl/Cmd-A: Select all notes\n"
@@ -43,10 +44,12 @@ public:
             "Right-click graph: Curve clipboard, Clear, Smooth and Scale\n\n"
             "PLAYLIST MOUSE GESTURES\n"
             "Draw mode: click block, then wheel or hold-drag vertically: Change pattern\n"
-            "Draw mode, horizontal drag: Stamp pattern-sized copies\n"
+            "Draw on empty space: Stamp pattern-sized copies; drag an existing block: Move\n"
             "Drag block's right edge: Resize placement\n"
             "Select mode: Drag empty space for a rectangle; Shift-click adds/removes\n"
             "Drag selected clips: Move group   |   Ctrl/Cmd-drag: Copy group\n"
+            "Shift while dragging: Toggle grid snapping; Option/Alt: Snap to nearest bar\n"
+            "Playlist settings: Snap every 1, 2, 4, 8, 16, 32 or 64 steps; Snap off: Free placement\n"
             "Playlist focused: Ctrl/Cmd-A selects all clips; Delete removes placements\n"
             "Escape clears clip selection   |   Shift-S toggles Follow Play Cursor\n"
             "Playlist focused, hover a pattern/audio clip and press N: Rename\n"

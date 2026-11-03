@@ -110,7 +110,7 @@ void promptRenameMixerChannel(const juce::String& owner,const juce::String& proj
 {
     const auto index=mixerIndexForOwner(owner);const auto tracks=getMixerTracks();
     if(!juce::isPositiveAndBelow(index,tracks.size()))return;
-    juce::AlertWindow dialog("Rename Channel","Enter the channel name.",juce::MessageBoxIconType::NoIcon);
+    orbit::workspace::OwnedAlert dialog("Rename Channel","Enter the channel name.",juce::MessageBoxIconType::NoIcon);
     dialog.addTextEditor("name",tracks[index]->getName());dialog.addButton("Rename",1,juce::KeyPress(juce::KeyPress::returnKey));dialog.addButton("Cancel",0,juce::KeyPress(juce::KeyPress::escapeKey));
     if(dialog.runModalLoop()==1 && project.getProjectId()==projectId)renameMixerChannel(mixerIndexForOwner(owner),dialog.getTextEditorContents("name"));
 }
@@ -174,10 +174,10 @@ void handleMixerSendChoice(const juce::String& owner,const juce::String& project
     if(choice==1)setTrackSendLinked(index,bus,!getTrackSendLinked(index,bus));
     if(choice==2 || choice==3)if(auto* send=getGeneratorTracks()[index]->getAuxSendPlugin(bus))openParameterEvents(targetForParameter(*send->gain),choice==3);
     if(choice==4){if(auto* track=getFxReturnTrack(bus)){const int row=getMixerTracks().indexOf(track);const auto plugins=getInsertPlugins(row);for(int slot=0;slot<plugins.size();++slot)openInsertEditor(row,slot);}return;}
-    if((choice>=101 && choice<=110) || choice==99 || juce::isPositiveAndBelow(choice-1000,external.size()))
+    if((choice>=101 && choice<=111) || choice==99 || juce::isPositiveAndBelow(choice-1000,external.size()))
     {
         auto* track=ensureFxReturnTrack(bus);if(track==nullptr)return;const int row=getMixerTracks().indexOf(track);
-        if(choice>=101 && choice<=110)addInsert(row,choice-100);
+        if(choice>=101 && choice<=111)addInsert(row,choice-100);
         else if(choice==99)showVst3EffectBrowser(mixerOwnerId(row));
         else addVst3Effect(row,external[choice-1000]);
     }

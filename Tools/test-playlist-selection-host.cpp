@@ -96,7 +96,7 @@ static void checkPlaylistSelection(ProjectView& host)
     {auto wave=audio->insertWaveClip("Missing sample",juce::File{},
         {{tracktion::TimePosition::fromSeconds(2.25),tracktion::TimePosition::fromSeconds(3.75)},tracktion::TimeDuration::fromSeconds(0.5)},false);
     playlistCheck(wave!=nullptr,"audio fixture creation failed");wave->setIsReversed(true);
-    audioKey.insert({3,1,wave->itemID.toString()});}
+    audioKey.insert({3,2.25/host.playlistSecondsPerBar(),wave->itemID.toString()});}
     const auto movedAudio=host.transformPlaylistSelection(audioKey,1,2,false);playlistCheck(movedAudio.has_value(),"audio group transfer failed");
     auto* movedWave=dynamic_cast<te::WaveAudioClip*>(host.getGeneratorTracks()[4]->getClips()[0]);
     playlistCheck(movedWave!=nullptr && std::abs(movedWave->getPosition().getStart().inSeconds()-6.25)<1e-8
@@ -127,7 +127,7 @@ static void checkPlaylistSelection(ProjectView& host)
     grid->mouseMove(selectionMouse(grid,float(grid->labelWidth()+3.5f*grid->barWidth()),float(grid->headerHeight()+4.5f*grid->rowHeight())));
     playlistCheck(grid->keyPressed(juce::KeyPress('n',0,'n')),"stale audio rename fixture failed");
     const auto clipId=host.getGeneratorTracks()[4]->getClips()[0]->itemID.toString();
-    playlistCheck(host.deletePlaylistSelection(Selection{{4,3,clipId}}),"stale rename delete failed");
+    playlistCheck(host.deletePlaylistSelection(Selection{{4,host.getGeneratorTracks()[4]->getClips()[0]->getPosition().getStart().inSeconds()/host.playlistSecondsPerBar(),clipId}}),"stale rename delete failed");
     const auto deletedUndo=host.undoHistory.size();
     playlistCheck(!checkedApply(*checkedOptions) && host.undoHistory.size()==deletedUndo,"stale audio rename edited another clip");
     checkedApply={};checkedOptions.reset();host.undoProjectAction();
@@ -146,7 +146,10 @@ static void checkPlaylistSelection(ProjectView& host)
     const juce::Rectangle<int> area(grid->labelWidth()+4*grid->barWidth(),grid->headerHeight(),grid->barWidth(),grid->rowHeight());
     prefs=grid->viewPreferences();prefs.setProperty("velocities",false,nullptr);grid->setViewPreferences(prefs);auto plain=grid->createComponentSnapshot(area);
     prefs.setProperty("velocities",true,nullptr);prefs.setProperty("follow",true,nullptr);grid->setViewPreferences(prefs);auto velocities=grid->createComponentSnapshot(area);
-    playlistCheck(plain.getPixelAt(15,15)!=velocities.getPixelAt(15,15) || plain.getPixelAt(9,20)!=velocities.getPixelAt(9,20),"velocity preview preference does not affect rendering");
+    int changedVelocityPixels=0;
+    for(int y=0;y<plain.getHeight();++y)for(int x=0;x<plain.getWidth();++x)
+        if(plain.getPixelAt(x,y)!=velocities.getPixelAt(x,y))++changedVelocityPixels;
+    playlistCheck(changedVelocityPixels>3,"velocity preview preference does not affect rendering");
     for(int skin:{5,6})
     {
         host.setSkin(skin);grid->selectedClips=Selection{{0,4,ap},{1,5,bp}};auto image=grid->createComponentSnapshot({0,0,1300,300});

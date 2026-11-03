@@ -11,7 +11,7 @@
 class ProjectDocument
 {
 public:
-    static constexpr int currentSchemaVersion = 20;
+    static constexpr int currentSchemaVersion = 25;
     static constexpr int ticksPerQuarterNote = 960;
     // Pattern positions and durations are stored as signed integer ticks with
     // 64 ticks per step. This is the representational boundary, not a UI cap.
@@ -102,6 +102,7 @@ public:
     juce::String getTrackName(int index) const;
     void setTrackName(int index, const juce::String& name);
     bool removeTrack(int index);
+    bool convertTrackToRenderedAudio(int index,const juce::StringArray& printedPluginIds,const juce::StringArray& printedPluginNames);
     int getLoopStartBar() const;
     int getLoopLengthBars() const;
     bool isLoopEnabled() const;
@@ -186,21 +187,22 @@ public:
     struct PlaylistClipRecord
     {
         juce::String patternId;
-        int startBar = 0;
-        int lengthBars = 1;
+        double startBar = 0;
+        double lengthBars = 1;
         bool exactLength = false;
     };
     std::vector<PlaylistClipRecord> getPlaylistClips(const juce::String& trackId) const;
     // Exact ranges may be shorter than their pattern. This is a generic native
     // clip capability, not a source-format concept. No Playlist UI limit applies.
     bool setPlaylistClipExactBars(const juce::String& trackId, const juce::String& patternId,
-                                  int startBar, int lengthBars);
-    juce::String getPlaylistPatternId(const juce::String& trackId, int bar) const;
-    int getPlaylistClipStartBar(const juce::String& trackId, int bar) const;
-    int getPlaylistClipLengthBars(const juce::String& trackId, int bar) const;
-    bool playlistClipFollowsPatternLength(const juce::String& trackId, int bar) const;
+                                  double startBar, double lengthBars);
+    double normalisePlaylistBar(double bar) const;
+    juce::String getPlaylistPatternId(const juce::String& trackId, double bar) const;
+    double getPlaylistClipStartBar(const juce::String& trackId, double bar) const;
+    double getPlaylistClipLengthBars(const juce::String& trackId, double bar) const;
+    bool playlistClipFollowsPatternLength(const juce::String& trackId, double bar) const;
     void setPlaylistClip(const juce::String& trackId, const juce::String& patternId,
-                         int startBar, int lengthBars, bool enabled);
+                         double startBar, double lengthBars, bool enabled);
     int getTicksPerQuarterNote() const;
     double getInitialTempoBpm() const;
     void setInitialTempoBpm(double bpm);

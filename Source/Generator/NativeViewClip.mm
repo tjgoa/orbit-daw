@@ -138,3 +138,41 @@ void NativeViewClip::update(juce::Component& editor,juce::Component& body,const 
     [CATransaction commit];
 }
 }
+
+#include "../Workspace/TransportKeys.h"
+namespace orbit::workspace
+{
+struct TransportKeys::Impl
+{
+    id monitor=nil;
+    juce::Component::SafePointer<juce::Component> root;
+    std::function<void()> toggle;
+    ~Impl(){clear();}
+    void clear(){if(monitor!=nil){[NSEvent removeMonitor:monitor];monitor=nil;}root=nullptr;toggle={};}
+    NSEvent* handle(NSEvent* event)
+    {
+        if(root==nullptr || !root->isShowing() || !toggle || [event keyCode]!=49)return event;
+        if(([event modifierFlags] & (NSEventModifierFlagCommand|NSEventModifierFlagControl|NSEventModifierFlagOption|NSEventModifierFlagShift))!=0)return event;
+        auto* peer=root->getPeer();if(peer==nullptr || [(NSView*)peer->getNativeHandle() window]!=[event window])return event;
+        if(juce::Component::getCurrentlyModalComponent()!=nullptr)return event;
+        auto* focused=juce::Component::getCurrentlyFocusedComponent();
+        if(focused!=nullptr && (dynamic_cast<juce::TextEditor*>(focused)!=nullptr || focused->findParentComponentOfClass<juce::TextEditor>()!=nullptr))return event;
+        id responder=[[event window] firstResponder];
+        if([responder isKindOfClass:[NSTextView class]] || [responder isKindOfClass:[NSTextField class]])return event;
+        // Custom plugin views (including JUCE plugins) expose their text target
+        // through NSTextInputClient rather than an NSTextView subclass.
+        if([responder conformsToProtocol:@protocol(NSTextInputClient)] && [responder respondsToSelector:@selector(selectedRange)]
+            && [(id<NSTextInputClient>)responder selectedRange].location!=NSNotFound)return event;
+        if(![event isARepeat])toggle();
+        return nil;
+    }
+};
+TransportKeys::TransportKeys():impl(std::make_unique<Impl>()){}
+TransportKeys::~TransportKeys()=default;
+void TransportKeys::set(juce::Component* root,std::function<void()> toggle)
+{
+    impl->clear();if(root==nullptr)return;
+    impl->root=root;impl->toggle=std::move(toggle);auto* state=impl.get();
+    impl->monitor=[NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent*(NSEvent* event){return state->handle(event);}];
+}
+}

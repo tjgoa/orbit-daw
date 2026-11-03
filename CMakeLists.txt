@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(OrbitDAW VERSION 0.3.255 LANGUAGES C CXX)
+project(OrbitDAW VERSION 0.3.303 LANGUAGES C CXX)
 
 if(APPLE)
     enable_language(OBJCXX)
@@ -31,10 +31,31 @@ endif()
 juce_add_gui_app(Orbit
     PRODUCT_NAME "Orbit"
     VERSION "${PROJECT_VERSION}"
-    BUILD_VERSION "276"
+    BUILD_VERSION "324"
     COMPANY_NAME "Touch The Universe"
     BUNDLE_ID "${ORBIT_APP_BUNDLE_ID}"
-    PLUGINHOST_AU ${ORBIT_HOST_AU})
+    PLUGINHOST_AU ${ORBIT_HOST_AU}
+    MICROPHONE_PERMISSION_ENABLED TRUE
+    MICROPHONE_PERMISSION_TEXT "Orbit records audio from the input channels you choose for armed audio tracks.")
+
+# Original image-based toolbar artwork, shipped as editable source assets.
+set(ORBIT_HEADER_ARTWORK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Source/Options/Artwork")
+set(ORBIT_HEADER_ARTWORK
+    "${ORBIT_HEADER_ARTWORK_DIR}/silver-flow.png"
+    "${ORBIT_HEADER_ARTWORK_DIR}/ambient-glow.png"
+    "${ORBIT_HEADER_ARTWORK_DIR}/champagne-wave.png"
+    "${ORBIT_HEADER_ARTWORK_DIR}/reference-ribbon.png"
+    "${ORBIT_HEADER_ARTWORK_DIR}/compact-silver.png")
+if(APPLE)
+    set(ORBIT_HEADER_ARTWORK_OUTPUT "$<TARGET_BUNDLE_CONTENT_DIR:Orbit>/Resources/Header Artwork")
+else()
+    set(ORBIT_HEADER_ARTWORK_OUTPUT "$<TARGET_FILE_DIR:Orbit>/Header Artwork")
+endif()
+set_property(TARGET Orbit APPEND PROPERTY LINK_DEPENDS ${ORBIT_HEADER_ARTWORK})
+add_custom_command(TARGET Orbit POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${ORBIT_HEADER_ARTWORK_OUTPUT}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ORBIT_HEADER_ARTWORK} "${ORBIT_HEADER_ARTWORK_OUTPUT}"
+    VERBATIM)
 
 # Pinned MIT Open303 DSP only; no VST2 SDK or upstream plugin shell.
 file(GLOB ORBIT_ACID_DSP CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Source/Synth/ThirdParty/Open303/*.cpp")
@@ -107,6 +128,11 @@ target_sources(Orbit PRIVATE
     Source/Generator/GeneratorProcessor.h
     Source/Workspace/WorkspaceWindow.h
     Source/Automation/LfoTool.h
+    Source/Workspace/OwnedAlert.h
+    Source/Workspace/TransportKeys.h
+    Source/Generator/GeneratorPianoRollHostMethods.h
+    Source/Generator/PatternToolbarLayout.h
+    Source/Workspace/WindowMenuHostMethods.h
     Source/Generator/GeneratorControlWindow.h
     Source/Mixing/LookaheadLimiter.h
     Source/Mixing/LookaheadLimiterPlugin.h
@@ -118,6 +144,8 @@ target_sources(Orbit PRIVATE
     Source/Generator/GeneratorMidiPlugin.h
     Source/Generator/ArpeggiatorPanel.h
     Source/Generator/GeneratorHostMethods.h
+    Source/Recording/PatternClipTake.h
+    Source/Recording/PatternClipHostMethods.h
     Source/Recording/MidiTake.h
     Source/Recording/RecordingHostMethods.h
     Source/Options/OptionsPanel.h
@@ -128,6 +156,9 @@ target_sources(Orbit PRIVATE
     Source/Main.cpp
     Source/Automation/AutomationTouchListener.h
     Source/Automation/ParameterEventSlider.h
+    Source/Playlist/SongEventBlocks.h
+    Source/Playlist/SongEventBlockHostMethods.h
+    Source/Automation/RecordedSongCurve.h
     Source/Automation/AutomationProjection.h
     Source/Automation/SongEventEditor.h
     Source/Mixing/EqSaturationPlugin.h
@@ -185,7 +216,7 @@ target_link_libraries(Orbit PRIVATE
 set_target_properties(Orbit PROPERTIES
     MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
-    MACOSX_BUNDLE_BUNDLE_VERSION "276"
+    MACOSX_BUNDLE_BUNDLE_VERSION "324"
     CXX_VISIBILITY_PRESET hidden
     C_VISIBILITY_PRESET hidden)
 

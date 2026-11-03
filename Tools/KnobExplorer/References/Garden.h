@@ -1,0 +1,9 @@
+#pragma once
+#include "MonozoticStudio.h"
+namespace garden {
+class GardenStyle:public hf2::StudioStyle {
+public:
+ GardenStyle(){setColour(juce::Slider::rotarySliderFillColourId,juce::Colour(0xff91d9c2));setColour(juce::Slider::thumbColourId,juce::Colour(0xff91d9c2));setColour(juce::Slider::trackColourId,juce::Colour(0xff32494f));setColour(juce::TextButton::buttonOnColourId,juce::Colour(0xff91d9c2));setColour(juce::TextButton::textColourOnId,juce::Colour(0xff102b26));}
+ void drawRotarySlider(juce::Graphics&g,int x,int y,int w,int h,float value,float start,float end,juce::Slider&s)override{float size=std::min(65.f,float(std::min(w,h)-8));auto box=juce::Rectangle<float>(size,size).withCentre(juce::Point<float>(float(x)+w*.5f,float(y)+h*.5f));auto c=box.getCentre();float radius=size*.46f,angle=start+(end-start)*value;juce::Path track;track.addCentredArc(c.x,c.y,radius,radius,0,start,end,true);g.setColour(juce::Colour(0xff344d53));g.strokePath(track,juce::PathStrokeType(3.2f,juce::PathStrokeType::curved,juce::PathStrokeType::rounded));juce::Path arc;arc.addCentredArc(c.x,c.y,radius,radius,0,start,angle,true);g.setColour(s.findColour(juce::Slider::rotarySliderFillColourId));g.strokePath(arc,juce::PathStrokeType(3.2f,juce::PathStrokeType::curved,juce::PathStrokeType::rounded));auto face=box.reduced(6);g.setColour(juce::Colours::black.withAlpha(.4f));g.fillEllipse(face.translated(0,2));g.setGradientFill(juce::ColourGradient(juce::Colour(0xff465f65),face.getTopLeft(),juce::Colour(0xff13252b),face.getBottomRight(),false));g.fillEllipse(face);g.setColour(juce::Colour(0xff688087).withAlpha(.65f));g.drawEllipse(face,.8f);auto a=c+juce::Point<float>(std::sin(angle),-std::cos(angle))*size*.22f,b=c+juce::Point<float>(std::sin(angle),-std::cos(angle))*size*.34f;g.setColour(juce::Colour(0xffe2f1e9));g.drawLine(a.x,a.y,b.x,b.y,2.f);}
+};
+}

@@ -15,10 +15,12 @@ inline float valueAt(const ProjectDocument::AutomationLane& lane, double step)
     }
     if (step <= lane.points.getFirst().position) return lane.points.getFirst().value;
     if (step >= lane.points.getLast().position) return lane.points.getLast().value;
+    if (before->position == after->position) return before->value;
     return before->value + float((step - before->position) / (after->position - before->position)) * (after->value - before->value);
 }
 // Every repeated cycle resets at its boundary. A tiny pre-boundary sample keeps
 // linear engine curves from introducing a long ramp across loops or silent gaps.
+// Silent gaps and the final tail hold the last value until a later lane begins.
 inline std::map<double, float> arrangedPatternCurve(const ProjectDocument& project, const juce::String& owner,
     const juce::String& plugin, const juce::String& parameter, float baseline)
 {
@@ -26,6 +28,7 @@ inline std::map<double, float> arrangedPatternCurve(const ProjectDocument& proje
     const auto meter = project.getInitialTimeSignature();
     const double barSteps = meter.numerator * 16.0 / juce::jmax(1, meter.denominator);
     constexpr double edge = 0.001;
+    float held=baseline;
     auto clips = project.getPlaylistClips(owner);
     std::sort(clips.begin(), clips.end(), [](const auto& a, const auto& b) { return a.startBar < b.startBar; });
     for (const auto& clip : clips)
@@ -42,16 +45,17 @@ inline std::map<double, float> arrangedPatternCurve(const ProjectDocument& proje
         const double start = clip.startBar * barSteps, end = (clip.startBar + clip.lengthBars) * barSteps;
         const int length = juce::jmax(1, project.getPatternLengthSteps(owner, slot));
         if (result.empty()) result[0] = baseline;
-        if (start > 0 && (result.empty() || result.rbegin()->first < start)) result[juce::jmax(0.0, start - edge)] = baseline;
+        if (start > 0 && (result.empty() || result.rbegin()->first < start)) result[juce::jmax(0.0, start - edge)] = held;
         for (double cycle = start; cycle < end; cycle += length)
         {
             const auto stop = juce::jmin(end, cycle + length);
             result[cycle] = valueAt(lane, 0);
             for (const auto& point : lane.points)
                 if (point.position < stop - cycle) result[cycle + point.position] = point.value;
-            if (stop - cycle > edge) result[stop - edge] = valueAt(lane, stop - cycle - edge);
+            held=valueAt(lane,juce::jmax(0.,stop-cycle-edge));
+            if (stop - cycle > edge) result[stop - edge] = held;
         }
-        result[end] = baseline;
+        result[end] = held;
     }
     return result;
 }

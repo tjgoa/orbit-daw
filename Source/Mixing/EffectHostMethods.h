@@ -4,6 +4,7 @@ struct EffectClipboard
     juce::String projectId;
     std::vector<juce::ValueTree> states;
     std::vector<juce::String> sidechainSources;
+    std::vector<juce::ValueTree> racks;
 };
 std::optional<EffectClipboard> effectClipboard;
 juce::Array<juce::PluginDescription> vst3EffectMenuDescriptions;
@@ -24,14 +25,15 @@ int selectedEffectTarget()
 {
     const auto tracks=getMixerTracks();const int selected=tracks.indexOf(instrumentTrack);return selected>=0?selected:tracks.size();
 }
-bool attachInsertEffect(int index,te::Plugin::Ptr plugin,const juce::String& action,const juce::String& replaceId={})
+bool attachInsertEffect(int index,te::Plugin::Ptr plugin,const juce::String& action,const juce::String& replaceId={},bool undoAlready=false)
 {
+    if(!requireLiveMixer(mixerOwnerId(index)))return false;
     if(plugin==nullptr || mixerOwnerId(index).isEmpty())return false;
     te::Plugin::Ptr replaced;
     for(auto* candidate:getInsertPlugins(index))if(candidate->itemID.toString()==replaceId)replaced=candidate;
     if(replaceId.isNotEmpty() && replaced==nullptr)return false;
     if(replaced==nullptr && getInsertPlugins(index).size()>=maxInsertSlots(index))return false;
-    const auto owner=mixerOwnerId(index),projectId=project.getProjectId();rememberUndo(action);
+    const auto owner=mixerOwnerId(index),projectId=project.getProjectId();if(!undoAlready)rememberUndo(action);
     if(project.getProjectId()!=projectId)return false;index=mixerIndexForOwner(owner);auto* list=mixerPluginList(index);if(list==nullptr)return false;
     int at=list->size();if(index==getMixerTracks().size())at=masterInsertEnd();
     else if(auto* volume=getMixerTracks()[index]->getVolumePlugin())at=list->indexOf(volume);
@@ -89,15 +91,15 @@ void addKnownVst3EffectsToMenu(juce::PopupMenu& menu)
 void showEffectChooser(int index,juce::Component* anchor)
 {
     const auto owner=mixerOwnerId(index),projectId=project.getProjectId();if(owner.isEmpty())return;
-    juce::PopupMenu menu;juce::PopupMenu native;const std::array<const char*,10> names{"Compressor","Reverb","Delay","Chorus","Phaser","Low-pass Filter","Look-ahead Brickwall Limiter","Peak Compressor","Tube Distortion","Two-Band Distortion"};
-    for(int i=0;i<10;++i)native.addItem(i+1,names[size_t(i)]);menu.addSubMenu("Built-in Effects",native);
+    juce::PopupMenu menu;juce::PopupMenu native;const std::array<const char*,11> names{"Compressor","Reverb","Delay","Chorus","Phaser","Low-pass Filter","Look-ahead Brickwall Limiter","Peak Compressor","Tube Distortion","Two-Band Distortion","Multi FX Rack"};
+    for(int i=0;i<11;++i)native.addItem(i+1,names[size_t(i)]);menu.addSubMenu("Built-in Effects",native);
     const auto external=knownVst3Effects();juce::PopupMenu vst;for(int i=0;i<external.size();++i)vst.addItem(1000+i,external[i].name);
     if(external.isEmpty())vst.addItem(900,"No scanned effects",false);menu.addSubMenu("VST3 Effects",vst);
     menu.addSeparator();menu.addItem(99,"Scan / Manage VST3 Effects...");
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(anchor),[safe=juce::Component::SafePointer<ProjectView>(this),owner,projectId,external](int choice)
     {
         if(safe==nullptr || safe->project.getProjectId()!=projectId)return;const auto index=safe->mixerIndexForOwner(owner);if(index<0)return;
-        if(choice>=1 && choice<=10)safe->addInsert(index,choice);
+        if(choice>=1 && choice<=11)safe->addInsert(index,choice);
         else if(choice==99)safe->showVst3EffectBrowser(owner);
         else if(juce::isPositiveAndBelow(choice-1000,external.size()))safe->addVst3Effect(index,external[choice-1000]);
     });
@@ -113,8 +115,11 @@ void copyInsertEffects(int index,int onlySlot=-1)
     for(int i=0;i<plugins.size();++i)if(onlySlot<0 || i==onlySlot)
     {
         auto* plugin=plugins[i];
-        if(dynamic_cast<te::RackInstance*>(plugin)!=nullptr)
-        {status.setText("Rack-linked effects need a rack-aware copy and remain unchanged.",juce::dontSendNotification);return;}
+        auto* rack=dynamic_cast<te::RackInstance*>(plugin);
+        if(rack!=nullptr && !orbit::mixing::isMultiFx(rack))
+        {status.setText("Only Orbit Multi FX racks support independent chain copying.",juce::dontSendNotification);return;}
+        if(rack!=nullptr)rack->type->flushStateToValueTree();
+        clipboard.racks.push_back(rack!=nullptr?rack->type->createStateCopy(false):juce::ValueTree{});
         plugin->flushPluginStateToValueTree();auto state=plugin->state.createCopy();te::AutomationCurve::removeAllAutomationCurvesRecursively(state);
         auto bases=state.getChildWithName("ORBITAUTOMATIONBASES");if(bases.isValid())state.removeChild(bases,nullptr);
         clipboard.states.push_back(state);clipboard.sidechainSources.push_back(plugin->getSidechainSourceID().toString());
@@ -123,17 +128,26 @@ void copyInsertEffects(int index,int onlySlot=-1)
 }
 bool pasteInsertEffects(int index,bool replace)
 {
+    if(!requireLiveMixer(mixerOwnerId(index)))return false;
     if(!effectClipboard || mixerOwnerId(index).isEmpty())return false;
     const auto clipboard=*effectClipboard;const auto old=getInsertPlugins(index);
     if(int(clipboard.states.size())+(replace?0:old.size())>maxInsertSlots(index))
     {status.setText("The copied effects exceed this channel's insert capacity.",juce::dontSendNotification);return false;}
     auto* list=mixerPluginList(index);if(list==nullptr)return false;const auto owner=mixerOwnerId(index),projectId=project.getProjectId();
-    te::Plugin::Array staged;
+    const bool hasRacks=std::any_of(clipboard.racks.begin(),clipboard.racks.end(),[](const auto& tree){return tree.isValid();});
+    if(hasRacks)rememberUndo(replace?"Paste Multi FX chain (replace)":"Paste Multi FX chain (append)");
+    te::Plugin::Array staged;std::vector<te::RackType::Ptr> newRacks;
     for(size_t i=0;i<clipboard.states.size();++i)
     {
         auto state=clipboard.states[i].createCopy();state.removeProperty(te::IDs::masterPluginID,nullptr);state.removeProperty(te::IDs::sidechainSourceID,nullptr);te::EditItemID::remapIDs(state,nullptr,*edit);
+        if(i<clipboard.racks.size() && clipboard.racks[i].isValid())
+        {
+            auto rackState=clipboard.racks[i].createCopy();orbit::mixing::cleanRackClipboard(rackState);te::EditItemID::remapIDs(rackState,nullptr,*edit);
+            auto rack=edit->getRackList().addRackTypeFrom(rackState);
+            if(rack==nullptr)return false;newRacks.push_back(rack);state.setProperty(te::IDs::rackType,rack->itemID,nullptr);
+        }
         auto plugin=edit->getPluginCache().createNewPlugin(state);
-        if(plugin==nullptr){status.setText("An effect could not be restored. No inserts were changed.",juce::dontSendNotification);return false;}
+        if(plugin==nullptr){for(auto rack:newRacks)edit->getRackList().removeRackType(rack);status.setText("An effect could not be restored. No inserts were changed.",juce::dontSendNotification);return false;}
         te::AudioTrack* source=nullptr;
         if(clipboard.projectId==projectId && clipboard.sidechainSources[i].isNotEmpty())
             for(auto* track:te::getAudioTracks(*edit))if(track->itemID.toString()==clipboard.sidechainSources[i])source=track;
@@ -143,7 +157,7 @@ bool pasteInsertEffects(int index,bool replace)
         if(auto* compressor=dynamic_cast<te::CompressorPlugin*>(plugin.get()))compressor->useSidechainTrigger=source!=nullptr;
         if(plugin->isMissing())plugin->setEnabled(false);staged.add(plugin);
     }
-    if(project.getProjectId()!=projectId)return false;rememberUndo(replace?"Paste insert effects (replace)":"Paste insert effects (append)");
+    if(project.getProjectId()!=projectId)return false;if(!hasRacks)rememberUndo(replace?"Paste insert effects (replace)":"Paste insert effects (append)");
     index=mixerIndexForOwner(owner);list=mixerPluginList(index);if(list==nullptr)return false;
     if(replace)for(auto* plugin:old){closeEffectEditor(*plugin);auto state=plugin->state;state.getParent().removeChild(state,&edit->getUndoManager());}
     int at=list->size();if(index==getMixerTracks().size())at=masterInsertEnd();else if(auto* volume=getMixerTracks()[index]->getVolumePlugin())at=list->indexOf(volume);
@@ -153,6 +167,7 @@ bool pasteInsertEffects(int index,bool replace)
 }
 void moveInsertEffect(int index,int slot,int direction)
 {
+    if(!requireLiveMixer(mixerOwnerId(index)))return;
     const auto plugins=getInsertPlugins(index);const auto other=slot+direction;
     if(!juce::isPositiveAndBelow(slot,plugins.size()) || !juce::isPositiveAndBelow(other,plugins.size()))return;
     auto state=plugins[slot]->state,neighbor=plugins[other]->state,parent=state.getParent();if(parent!=neighbor.getParent())return;
@@ -162,8 +177,8 @@ void moveInsertEffect(int index,int slot,int direction)
 void addDirectEffectChoices(juce::PopupMenu& menu,const juce::Array<juce::PluginDescription>& external,bool available=true)
 {
     juce::PopupMenu native,vst;
-    const std::array<const char*,10> names{"Compressor","Reverb","Delay","Chorus","Phaser","Low-pass Filter","Look-ahead Brickwall Limiter","Peak Compressor","Tube Distortion","Two-Band Distortion"};
-    for(int i=0;i<10;++i)native.addItem(101+i,names[size_t(i)],available);
+    const std::array<const char*,11> names{"Compressor","Reverb","Delay","Chorus","Phaser","Low-pass Filter","Look-ahead Brickwall Limiter","Peak Compressor","Tube Distortion","Two-Band Distortion","Multi FX Rack"};
+    for(int i=0;i<11;++i)native.addItem(101+i,names[size_t(i)],available);
     menu.addSubMenu("Built-in Effects",native,available);
     for(int i=0;i<external.size();++i)vst.addItem(1000+i,external[i].name,available);
     if(external.isEmpty())vst.addItem(900,"No scanned effects",false);
@@ -191,7 +206,7 @@ void handleInsertContextChoice(const juce::String& owner,const juce::String& pro
     const auto plugins=getInsertPlugins(index);int slot=-1;for(int i=0;i<plugins.size();++i)if(plugins[i]->itemID.toString()==pluginId)slot=i;
     if(choice==99){showVst3EffectBrowser(owner);return;}
     if(pluginId.isNotEmpty() && slot<0)return;
-    if(choice>=101 && choice<=110){addInsert(index,choice-100,pluginId);return;}
+    if(choice>=101 && choice<=111){addInsert(index,choice-100,pluginId);return;}
     if(juce::isPositiveAndBelow(choice-1000,external.size())){addVst3Effect(index,external[choice-1000],pluginId);return;}
     if(choice==6 || choice==7){pasteInsertEffects(index,choice==7);return;}
     if(choice==11){copyInsertEffects(index);return;}

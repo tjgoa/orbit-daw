@@ -19,11 +19,11 @@ int patternPlaybackCycleTicks() const
 void showRecordingOptions()
 {
     const int numerator=project.getInitialTimeSignature().numerator;
-    auto panel=std::make_unique<OptionsPanel>("MIDI count-in sounds before a stopped transport records notes. Automation records touched parameter movements from the playback cursor and uses the engine clock. Stop commits one take. The metronome switch controls clicking after the MIDI count-in.");
-    panel->choice("content","Record",{"MIDI notes","Automation (knobs / MIDI controls)"},optionInt("recordContent"));
+    auto panel=std::make_unique<OptionsPanel>("Record arms; Play starts capture. Choose AUTO to record knobs without Event Editor, or MIDI for notes. CLIPS: in Song mode with Loop off, arm generators and press Play. Pattern changes launch at the next bar. Record uses the selected generator when none are armed. Stop commits one take. AUDIO records assigned mono/stereo inputs into Song audio tracks; choose each track's Recording Input menu first.");
+    panel->choice("content","Record",{"MIDI notes","Automation (knobs / MIDI controls)","Pattern Clips (Song arrangement)","Audio input (Song audio tracks)"},recordContentMode());
     panel->choice("countIn","Count-in (quarter notes)",{"0 (off)","1","2",juce::String(numerator),juce::String(numerator*2)},optionInt("recordCountIn"));
     openOptionsTool("Recording Settings",std::move(panel),[this](const auto& p)
-    {saveOption("recordCountIn",juce::jlimit(0,4,p.index("countIn")));saveOption("recordContent",p.index("content"));recordModeButton.setButtonText(p.index("content")==1?"AUTO":"MIDI");return true;});
+    {recordArmed=false;if(!finishMidiRecording())return false;saveOption("recordCountIn",juce::jlimit(0,4,p.index("countIn")));saveOption("recordContent",p.index("content"));recordModeButton.setButtonText(recordContentLabel());return true;});
 }
 void clearRecordingOverdub()
 {
@@ -43,7 +43,7 @@ void publishRecordingOverdub(double reference,bool newTake=false)
 std::vector<ProjectDocument::PatternNote> recordingNotesForPianoRoll()
 {
     std::vector<ProjectDocument::PatternNote> result;
-    const auto id=selectedProjectTrackId();const int slot=selectedPatternIndex();
+    const auto id=pianoEditingTrackId();const int slot=pianoEditingPatternIndex();
     for(const auto& target:midiTake.targets)
         if(!target.song && target.id==id.toStdString() && target.slot==slot)
             for(const auto& note:midiTake.preview(target.id,midiTake.active?recordingTick():recordingEndTick))
@@ -57,7 +57,7 @@ std::int64_t recordingTick(double receivedAtMs=0)const
 }
 bool prepareMidiRecording(double positionSeconds,double nowMs)
 {
-    if(edit==nullptr || midiTake.active || !midiTake.notes.empty())return false;
+    if(edit==nullptr || midiTake.active || !midiTake.notes.empty() || patternClipSnapshot)return false;
     const bool song=playbackMode==PlaybackMode::song;
     const auto meter=project.getInitialTimeSignature();
     if(song && (meter.numerator!=4 || meter.denominator!=4 || loopButton.getToggleState()))
@@ -68,7 +68,7 @@ bool prepareMidiRecording(double positionSeconds,double nowMs)
     const int startBar=juce::jlimit(0,PlaylistGrid::barCount-1,int(std::floor(positionSeconds*project.getInitialTempoBpm()/240.0)));
     for(int i=0;i<project.getTrackCount();++i)
     {
-        if(project.getTrackKind(i)==ProjectDocument::TrackKind::audio || !(getTrackRecordArm(i) || (!anyArmed && i==selected)))continue;
+        if(isGeneratorFrozen(project.getTrackId(i)) || project.getTrackKind(i)==ProjectDocument::TrackKind::audio || !(getTrackRecordArm(i) || (!anyArmed && i==selected)))continue;
         const auto id=project.getTrackId(i);int slot=project.getTrackSelectedPatternIndex(id);
         int length=project.getPatternLengthSteps(id,slot)*64;
         if(song)
@@ -79,12 +79,13 @@ bool prepareMidiRecording(double positionSeconds,double nowMs)
                 if(!project.isPatternCreated(id,s) && project.getPatternNotes(id,s).empty()){slot=s;break;}
             if(slot<0){status.setText("An armed generator needs a free pattern slot for its song take.",juce::dontSendNotification);return false;}
             int endBar=PlaylistGrid::barCount;
-            for(const auto& clip:project.getPlaylistClips(id))if(clip.startBar>startBar)endBar=juce::jmin(endBar,clip.startBar);
+            for(const auto& clip:project.getPlaylistClips(id))if(clip.startBar>startBar)endBar=juce::jmin(endBar,int(std::floor(clip.startBar)));
+            if(endBar<=startBar){status.setText("Song MIDI recording needs an empty whole bar before the next clip.",juce::dontSendNotification);return false;}
             length=(endBar-startBar)*1024;
         }
         targets.push_back({id.toStdString(),slot,length,startBar,song});
     }
-    if(targets.empty()){status.setText("Select or arm an instrument generator for MIDI recording. Audio recording is not yet available.",juce::dontSendNotification);return false;}
+    if(targets.empty()){status.setText("Select or arm an instrument generator for MIDI recording. Choose AUDIO to record audio tracks.",juce::dontSendNotification);return false;}
     releaseLiveMidi();
     recordingBpm=project.getInitialTempoBpm();recordingStartMs=nowMs;recordingEndTick=0;
     recordingInitialTick=std::llround(positionSeconds*recordingBpm*256.0/60.0)-(song?startBar*1024:0);
@@ -121,6 +122,8 @@ void captureRecordingEvent(const juce::MidiMessage& message,const juce::String& 
 }
 bool finishMidiRecording(double nowMs=0)
 {
+    if(!finishAudioRecording())return false;
+    if(!finishPatternClipRecording())return false;
     finishAutomationRecording();
     if(finishingMidiRecording)return true;
     const juce::ScopedValueSetter<bool> guard(finishingMidiRecording,true);
@@ -136,7 +139,7 @@ bool finishMidiRecording(double nowMs=0)
     }
     if(midiTake.active)recordingEndTick=recordingTick(nowMs);
     const auto endTick=recordingEndTick;midiTake.finish(endTick);
-    recordButton.setToggleState(false,juce::dontSendNotification);recordButton.repaint();
+    recordButton.setToggleState(recordArmed,juce::dontSendNotification);recordButton.repaint();
     if(midiTake.notes.empty()){midiTake.clear();return true;}
     const auto fail=[this]
     {status.setText("Recorded take retained in memory. Free a pattern slot/region, then press Record or Save to retry committing it.",juce::dontSendNotification);return false;};
@@ -162,8 +165,8 @@ bool finishMidiRecording(double nowMs=0)
         {
             const int extent=int(std::max<std::int64_t>(lastTick,std::min<std::int64_t>(endTick,target.lengthTicks)));
             const int bars=juce::jmax(1,(extent+1023)/1024);
-            for(int bar=target.startBar;bar<target.startBar+bars;++bar)
-                if(staged.getPlaylistPatternId(id,bar).isNotEmpty())return fail();
+            for(const auto& clip:staged.getPlaylistClips(id))
+                if(clip.startBar<target.startBar+bars && clip.startBar+clip.lengthBars>target.startBar)return fail();
             staged.setPatternLengthSteps(id,slot,bars*16);
             staged.setPatternName(id,slot,"Recorded take");
             staged.setPlaylistClip(id,staged.getPatternId(id,slot),target.startBar,bars,true);
@@ -176,9 +179,25 @@ bool finishMidiRecording(double nowMs=0)
     readPatternSteps();refreshEnginePlaylist();if(playlistWindow!=nullptr)playlistWindow->refresh();
     refreshProjectView("Recorded "+juce::String(count)+" MIDI notes. Undo restores the previous patterns and arrangement.");return true;
 }
+// Stopped Record only arms. Resolve targets and create the take at Play, so
+// stopped knob/note audition cannot enter a take or require an editor window.
 void toggleMidiRecording()
 {
-    if(automationTakeActive || optionInt("recordContent")==1){toggleAutomationRecording();return;}
+    if(edit==nullptr || !hasProject)return;
+    const bool pending=audioRecordingActive || patternClipSnapshot || automationTakeActive || midiTake.active || !midiTake.notes.empty();
+    if(!edit->getTransport().isPlaying() && !pending)
+    {
+        recordArmed=!recordArmed;recordButton.setToggleState(recordArmed,juce::dontSendNotification);recordButton.repaint();
+        status.setText(recordArmed?"Recording armed ("+recordContentLabel()+"). Press Play to start; Record again or Stop cancels.":"Recording disarmed.",juce::dontSendNotification);
+        return;
+    }
+    recordArmed=false;startOrFinishRecording();
+}
+void startOrFinishRecording()
+{
+    if(audioRecordingActive || recordContentMode()==3){toggleAudioRecording();return;}
+    if(patternClipSnapshot || recordContentMode()==2){togglePatternClipRecording();return;}
+    if(automationTakeActive || recordContentMode()==1){toggleAutomationRecording();return;}
     if(midiTake.active || !midiTake.notes.empty()){finishMidiRecording();return;}
     if(edit==nullptr)return;
     if(engine.getDeviceManager().deviceManager.getCurrentAudioDevice()==nullptr)
@@ -216,10 +235,10 @@ void alignRecordingClockToTransport(double punchSeconds,double nowMs)
 
 void updateRecordingCountInStatus(double nowMs)
 {
-    if(!midiTake.active || !recordingUsesEnginePreroll)return;
+    if((!midiTake.active && !patternClipTake.active) || !recordingUsesEnginePreroll)return;
     const int left=juce::jlimit(0,edit!=nullptr?edit->getNumCountInBeats():8,int(std::ceil((recordingStartMs-nowMs)*recordingBpm/60000.0)));
     if(left==recordingCountInDisplay)return;
     recordingCountInDisplay=left;
     status.setText(left>0?"Count-in: "+juce::String(left)+" quarter note(s).":
-        "Recording MIDI. Completed notes repeat on later Pattern passes; Stop finishes the take.",juce::dontSendNotification);
+        (patternClipTake.active?"Recording Pattern Clips. Changes launch at the next bar; Stop commits the take.":"Recording MIDI. Completed notes repeat on later Pattern passes; Stop finishes the take."),juce::dontSendNotification);
 }

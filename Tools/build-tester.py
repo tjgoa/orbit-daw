@@ -73,6 +73,8 @@ def main():
             shutil.copy2(output/'Orbit',stage/'Orbit')
             dependencies=subprocess.check_output(['ldd',stage/'Orbit'],text=True);assert 'not found' not in dependencies
             (stage/'RUNTIME_LIBRARIES.txt').write_text(dependencies)
+        if expected!='Darwin':
+            shutil.copytree(output/'Header Artwork',stage/'Header Artwork')
         if not args.reserved:
             data=json.loads(COUNTER.read_text());data.update(product_checkpoint_build=build,product_checkpoint_version=version,successful_dev_iterations=data.get('successful_dev_iterations',0)+1,last_successful_build_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'))
             COUNTER.write_text(json.dumps(data,indent=2)+'\n')

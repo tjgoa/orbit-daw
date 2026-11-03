@@ -1,4 +1,5 @@
 #pragma once
+#include "../UI/KnobStyle.h"
 // Original vector controls for Orbit's dynamics panels. No external artwork.
 namespace orbit::mixing
 {
@@ -8,6 +9,7 @@ public:
     void drawRotarySlider(juce::Graphics& g,int x,int y,int width,int height,float position,
                           float start,float end,juce::Slider& slider) override
     {
+        if(ui::drawSelectedKnob(g,x,y,width,height,position,start,end,slider))return;
         const float side=float(juce::jmin(width,height))-14.0f;
         if(side<=0)return;
         const auto b=juce::Rectangle<float>(0,0,side,side).withCentre({float(x)+width*.5f,float(y)+height*.5f});

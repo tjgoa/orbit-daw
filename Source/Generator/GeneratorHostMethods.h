@@ -20,6 +20,7 @@ void refreshGeneratorSettings(const juce::String& id)
 }
 bool applyGeneratorArpeggio(const juce::String& id,int slot,orbit::generator::Settings settings,bool render)
 {
+    if(!requireUnfrozenGenerator(id))return false;
     auto* track=engineTrackForProjectId(id);if(track==nullptr || edit==nullptr)return false;
     std::vector<orbit::generator::Note> rendered;
     if(render)
@@ -63,7 +64,7 @@ void presentGeneratorArpeggiator(std::unique_ptr<orbit::generator::ArpeggiatorPa
     auto* form=panel.get();juce::DialogWindow::LaunchOptions options;
     options.dialogTitle="Arpeggiator and Shuffle";options.dialogBackgroundColour=orbit::options::colour(27,43,55);
     options.componentToCentreAround=this;options.useNativeTitleBar=true;options.resizable=false;options.content.setOwned(panel.release());
-    auto* window=options.launchAsync();const juce::Component::SafePointer<juce::DialogWindow> safeWindow(window);
+    auto* window=orbit::workspace::ownDialog(options.launchAsync(),this);const juce::Component::SafePointer<juce::DialogWindow> safeWindow(window);
     const juce::Component::SafePointer<orbit::generator::ArpeggiatorPanel> safePanel(form);
     const juce::Component::SafePointer<ProjectView> owner(this);
     form->apply.onClick=[owner,safeWindow,safePanel,commit]
@@ -86,14 +87,24 @@ void presentGeneratorArpeggiator(std::unique_ptr<orbit::generator::ArpeggiatorPa
 }
 void showGeneratorArpeggiator(const juce::String& id,int slot)
 {
+    if(!requireUnfrozenGenerator(id))return;
     if(engineTrackForProjectId(id)==nullptr)return;
     const auto projectId=project.getProjectId();
     const juce::Component::SafePointer<ProjectView> owner(this);
     presentGeneratorArpeggiator(std::make_unique<orbit::generator::ArpeggiatorPanel>(generatorSettings(id)),[owner,id,slot,projectId](auto settings,bool render)
     {if(owner==nullptr)return false;if(owner->project.getProjectId()!=projectId){owner->status.setText("The project changed. Close this panel and reopen it.",juce::dontSendNotification);return false;}return owner->applyGeneratorArpeggio(id,slot,settings,render);});
 }
+void refreshGeneratorKnobStyle(const juce::String& id)
+{
+    auto* plugin=generatorControlPlugin(id);if(plugin==nullptr)return;
+    const int style=juce::jlimit(-1,2,int(plugin->state.getProperty("orbitKnobOverride",-1)));
+    const auto apply=[style](juce::Component* editor){if(editor==nullptr)return;editor->getProperties().set("orbitKnobOverride",style);if(auto* acid=dynamic_cast<orbit::synth::AcidBassEditor*>(editor))acid->refreshAppearance();orbit::ui::repaintKnobTree(*editor);};
+    if(auto found=generatorControlWindows.find(id);found!=generatorControlWindows.end())apply(found->second.window->instrument.get());
+    if(id==selectedProjectTrackId())apply(activeInstrumentEditor.get());
+}
 void showGeneratorProperties(const juce::String& id)
 {
+    if(!requireUnfrozenGenerator(id))return;
     auto* track=engineTrackForProjectId(id);if(track==nullptr)return;
     const auto settings=generatorSettings(id);
     auto panel=std::make_unique<OptionsPanel>("Playback settings for this generator. Transpose and velocity affect playback and live input without changing pattern notes. Input channel follows Options > MIDI In Settings > Advanced routing.");
@@ -102,9 +113,13 @@ void showGeneratorProperties(const juce::String& id)
     panel->choice("output","MIDI output channel",outputs,settings.outputChannel);
     panel->number("transpose","Transpose (semitones)",settings.transpose,-48,48);
     panel->number("velocity","Velocity scale (%)",settings.velocity,1,200);
+    if(auto* plugin=generatorControlPlugin(id))panel->choice("knobStyle","Knob style",orbit::ui::generatorKnobStyleNames,juce::jlimit(-1,2,int(plugin->state.getProperty("orbitKnobOverride",-1)))+1).setTooltip("Orbit controls for this generator. Follow global uses Options > Knob Style; plug-ins keep their own graphics.");
     if(auto* acid=dynamic_cast<orbit::synth::AcidBassPlugin*>(generatorControlPlugin(id)))
+    {
+        panel->choice("acidSkin","Acid Bass skin",{"Silver / White","Dark / Original","Dark / White"},juce::jlimit(0,2,int(acid->state.getProperty("orbitAcidSkin",0))));
         panel->check("phaseRetrigger","Retrigger oscillator phase (slides stay continuous)",acid->parameters[orbit::synth::AcidBassPlugin::phaseRetriggerIndex]->getCurrentValue()>=.5f)
             .setTooltip("Restart the oscillator at phase zero for each fresh note. Slides and live legato keep their phase. Off retains the original idle-note reset behavior.");
+    }
     const auto projectId=project.getProjectId();
     openOptionsTool("Generator Settings",std::move(panel),[this,id,projectId](const auto& p)
     {
@@ -114,7 +129,11 @@ void showGeneratorProperties(const juce::String& id)
         const bool midiChanged=!(settings==generatorSettings(id)) || int(target->state.getProperty("orbitMidiChannel",0))!=p.index("input");
         auto* acid=dynamic_cast<orbit::synth::AcidBassPlugin*>(generatorControlPlugin(id));
         const bool phaseChanged=acid && (acid->parameters[orbit::synth::AcidBassPlugin::phaseRetriggerIndex]->getCurrentValue()>=.5f)!=p.checked("phaseRetrigger");
-        if(!midiChanged && !phaseChanged)return true;
+        auto* instrument=generatorControlPlugin(id);
+        const int knobChoice=p.choices.count("knobStyle")?p.index("knobStyle")-1:-1;
+        const bool knobsChanged=instrument && int(instrument->state.getProperty("orbitKnobOverride",-1))!=knobChoice;
+        const bool skinChanged=acid && int(acid->state.getProperty("orbitAcidSkin",0))!=p.index("acidSkin");
+        if(!midiChanged && !phaseChanged && !knobsChanged && !skinChanged)return true;
         rememberUndo("Change generator settings");
         if(midiChanged)
         {
@@ -122,6 +141,9 @@ void showGeneratorProperties(const juce::String& id)
             target->state.setProperty("orbitMidiChannel",p.index("input"),nullptr);plugin->setSettings(settings);refreshGeneratorSettings(id);
         }
         if(phaseChanged)acid->parameters[orbit::synth::AcidBassPlugin::phaseRetriggerIndex]->setParameter(p.checked("phaseRetrigger")?1.f:0.f,juce::sendNotificationSync);
+        if(knobsChanged)instrument->state.setProperty("orbitKnobOverride",knobChoice,nullptr);
+        if(skinChanged)acid->state.setProperty("orbitAcidSkin",p.index("acidSkin"),nullptr);
+        if(knobsChanged || skinChanged)refreshGeneratorKnobStyle(id);
         isDirty=true;status.setText("Generator settings applied. Save to keep the settings.",juce::dontSendNotification);return true;
     },true);
 }
@@ -157,6 +179,7 @@ std::vector<std::pair<juce::String,juce::String>> generatorControllerTargets(con
 void applyGeneratorController(const juce::String& target,float value)
 {
     const auto parts=juce::StringArray::fromLines(target);if(parts.size()<3)return;
+    if(parts[2]=="parameter" && !requireUnfrozenGenerator(parts[1]))return;
     auto* track=engineTrackForProjectId(parts[1]);if(track==nullptr)return;
     auto* plugin=generatorInstrument(track);te::AutomatableParameter* parameter=nullptr;
     if(parts[2]=="parameter" && parts.size()==4 && plugin!=nullptr)for(auto* p:plugin->getAutomatableParameters())if(p->paramID==parts[3])parameter=p;
@@ -170,6 +193,7 @@ void applyGeneratorController(const juce::String& target,float value)
 }
 bool setGeneratorMidiSource(const juce::String& destination,const juce::String& source)
 {
+    if(!requireUnfrozenGenerator(destination))return false;
     auto* target=engineTrackForProjectId(destination);auto* origin=engineTrackForProjectId(source);
     if(target==nullptr || (source.isNotEmpty() && origin==nullptr) || destination==source)return false;
     std::set<juce::String> visited{destination};auto next=source;
@@ -210,6 +234,8 @@ juce::PopupMenu makeGeneratorMenu(const juce::String& id)
 {
     juce::PopupMenu menu,controllers,sources;const bool valid=engineTrackForProjectId(id)!=nullptr;
     menu.addItem(5,"Open Separate Generator Controls",valid && canOpenGeneratorControls(id));menu.addSeparator();
+    menu.addItem(8,isGeneratorFrozen(id)?"Unfreeze Generator":"Freeze Song...",valid && !freezeJob);menu.addSeparator();
+    menu.addItem(6,"Open Preset Folder",valid);menu.addItem(7,"Refresh Presets",valid);menu.addSeparator();
     menu.addItem(1,"Rename Generator...",valid);menu.addItem(2,"Generator Settings...",valid);menu.addSeparator();
     menu.addItem(3,"Rename Current Pattern...",valid);menu.addItem(4,"Arpeggiator/Shuffle...",valid);menu.addSeparator();
     const auto targets=generatorControllerTargets(id);for(size_t i=0;i<targets.size();++i)controllers.addItem(1000+int(i),targets[i].first,true,generatorLearnTarget==targets[i].second);
@@ -226,6 +252,9 @@ void handleGeneratorMenuResult(const juce::String& id,int slot,int result,const 
     if(engineTrackForProjectId(id)==nullptr || result==0)return;
     if(result==5)openGeneratorControls(id);else if(result==1)renameGeneratorOrPattern(id,slot,false);else if(result==2)showGeneratorProperties(id);
     else if(result==3)renameGeneratorOrPattern(id,slot,true);else if(result==4)showGeneratorArpeggiator(id,slot);
+    else if(result==6){const auto folder=generatorPresetFolder(id,true);if(folder.isDirectory())folder.startAsProcess();else status.setText("Could not create the preset folder.",juce::dontSendNotification);}
+    else if(result==7)refreshGeneratorPresetLists();
+    else if(result==8){if(isGeneratorFrozen(id))unfreezeGenerator(id);else showFreezeOptions(id);}
     else if(result==1999)generatorLearnTarget.clear();
     else if(result>=1000 && result<1000+int(targets.size()))
     {generatorLearnTarget=targets[size_t(result-1000)].second;learnControllerPanel=nullptr;status.setText("Move a controller on an enabled MIDI input to link "+targets[size_t(result-1000)].first+" on this generator.",juce::dontSendNotification);}

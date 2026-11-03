@@ -15,7 +15,7 @@ import plistlib
 import shutil
 from check_build_support import compile_current_models,acid_library,geonkick_library,nine_library,checked_environment,native_clip_object
 
-parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--test-file',type=Path);parser.add_argument('--compile-only',action='store_true');parser.add_argument('--sanitize',action='store_true');parser.add_argument('--generator-controls',action='store_true');parser.add_argument('--distortion',action='store_true');parser.add_argument('--peak-compressor',action='store_true');parser.add_argument('--limiter',action='store_true');parser.add_argument('--effects',action='store_true');parser.add_argument('--effect-plugin',type=Path);parser.add_argument('--instrument-plugin',type=Path);parser.add_argument('--sidechain',action='store_true');parser.add_argument('--mixer',action='store_true');parser.add_argument('--automation',action='store_true');parser.add_argument('--piano-roll',action='store_true');parser.add_argument('--generator',action='store_true');parser.add_argument('--recording',action='store_true');parser.add_argument('--playlist',action='store_true');parser.add_argument('--patterns',action='store_true');parser.add_argument('--acid',action='store_true');parser.add_argument('--sfs-file',type=Path);parser.add_argument('--native-plugins',nargs='+',type=Path);options=parser.parse_args()
+parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--test-file',type=Path);parser.add_argument('--compile-only',action='store_true');parser.add_argument('--sanitize',action='store_true');parser.add_argument('--generator-controls',action='store_true');parser.add_argument('--live-insertion',action='store_true');parser.add_argument('--distortion',action='store_true');parser.add_argument('--peak-compressor',action='store_true');parser.add_argument('--limiter',action='store_true');parser.add_argument('--effects',action='store_true');parser.add_argument('--effect-plugin',type=Path);parser.add_argument('--instrument-plugin',type=Path);parser.add_argument('--sidechain',action='store_true');parser.add_argument('--mixer',action='store_true');parser.add_argument('--automation',action='store_true');parser.add_argument('--piano-roll',action='store_true');parser.add_argument('--generator',action='store_true');parser.add_argument('--recording',action='store_true');parser.add_argument('--playlist',action='store_true');parser.add_argument('--patterns',action='store_true');parser.add_argument('--acid',action='store_true');parser.add_argument('--sfs-file',type=Path);parser.add_argument('--native-plugins',nargs='+',type=Path);options=parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 work = Path(tempfile.mkdtemp(prefix='orbit-options-check-'))
 source = (root/'Source/Main.cpp').read_text()
@@ -85,7 +85,7 @@ b = source.index('void showGeneratorMenuFor(', a)
 source = source[:a]+'''void presentGeneratorMenu(juce::PopupMenu,juce::Component* anchor,std::function<void(int)> result)
 {checkedGeneratorMenuAnchor=anchor;checkedGeneratorMenuResult=std::move(result);}
 '''+source[b:]
-source += options.test_file.read_text() if options.test_file else (root/'Tools'/('test-distortion-host.cpp' if options.distortion else 'test-peak-compressor-host.cpp' if options.peak_compressor else 'test-limiter-host.cpp' if options.limiter else 'test-generator-controls-host.cpp' if options.generator_controls else 'test-effects-host.cpp' if options.effects else 'test-sidechain-host.cpp' if options.sidechain else 'test-mixer-host.cpp' if options.mixer else 'test-automation-host.cpp' if options.automation else 'test-native-generator-host.cpp' if options.native_plugins else 'test-acid-host.cpp' if options.acid else 'test-pattern-editor-host.cpp' if options.patterns else 'test-playlist-host.cpp' if options.playlist else 'test-recording-host.cpp' if options.recording else 'test-generator-host.cpp' if options.generator else 'test-piano-roll-host.cpp' if options.piano_roll else 'test-options-host.cpp')).read_text()
+source += options.test_file.read_text() if options.test_file else (root/'Tools'/('test-live-insertion-host.cpp' if options.live_insertion else 'test-distortion-host.cpp' if options.distortion else 'test-peak-compressor-host.cpp' if options.peak_compressor else 'test-limiter-host.cpp' if options.limiter else 'test-generator-controls-host.cpp' if options.generator_controls else 'test-effects-host.cpp' if options.effects else 'test-sidechain-host.cpp' if options.sidechain else 'test-mixer-host.cpp' if options.mixer else 'test-automation-host.cpp' if options.automation else 'test-native-generator-host.cpp' if options.native_plugins else 'test-acid-host.cpp' if options.acid else 'test-pattern-editor-host.cpp' if options.patterns else 'test-playlist-host.cpp' if options.playlist else 'test-recording-host.cpp' if options.recording else 'test-generator-host.cpp' if options.generator else 'test-piano-roll-host.cpp' if options.piano_roll else 'test-options-host.cpp')).read_text()
 source = source.replace('#include "test-event-workspace-host.cpp"', (root/'Tools/test-event-workspace-host.cpp').read_text())
 source = source.replace('#include "test-effect-workspaces-host.cpp"', (root/'Tools/test-effect-workspaces-host.cpp').read_text())
 source = source.replace('#include "test-mixer-saturation-host.cpp"', (root/'Tools/test-mixer-saturation-host.cpp').read_text())
@@ -93,6 +93,8 @@ source = source.replace('#include "test-mixer-routing-host.cpp"', (root/'Tools/t
 source = source.replace('#include "test-playlist-selection-host.cpp"', (root/'Tools/test-playlist-selection-host.cpp').read_text())
 source = source.replace('#include "test-recording-loop-host.cpp"', (root/'Tools/test-recording-loop-host.cpp').read_text())
 source = source.replace('#include "test-pattern-clipboard-host.cpp"', (root/'Tools/test-pattern-clipboard-host.cpp').read_text())
+source = source.replace('#include "test-acid-free-lfo-host.cpp"', (root/'Tools/test-acid-free-lfo-host.cpp').read_text())
+source = source.replace('#include "test-acid-rack-host.cpp"', (root/'Tools/test-acid-rack-host.cpp').read_text())
 source = source.replace('OPTIONS_CHECK_FOLDER', str(work))
 source = source.replace('GENERATOR_VST_PATH_LITERAL',json.dumps(str(options.instrument_plugin.resolve()) if options.instrument_plugin else ''))
 source = source.replace('VST_EFFECT_PATH_LITERAL',json.dumps(str(options.effect_plugin.resolve()) if options.effect_plugin else ''))
@@ -141,8 +143,14 @@ if options.native_plugins:
 if options.compile_only:
     print('Compiled verification executable:',exe,flush=True)
     raise SystemExit(0)
+if options.live_insertion:
+    # Configure the isolated hosted device before a fresh Engine constructs its
+    # Edit. Product startup already configures its real device in this order.
+    with (work/'device-bootstrap.log').open('w') as log:
+        result=subprocess.run([str(exe),'--bootstrap-device'],stdout=log,stderr=subprocess.STDOUT,timeout=30,env=checked_environment())
+    if result.returncode:print((work/'device-bootstrap.log').read_text()[-3000:]);raise SystemExit(result.returncode)
 with (work/'result.log').open('w') as log:
-    result = subprocess.run([str(exe)],stdout=log,stderr=subprocess.STDOUT,timeout=300 if options.native_plugins else 180 if options.distortion else 180 if options.patterns or options.acid else 60,env=checked_environment())
+    result = subprocess.run([str(exe)],stdout=log,stderr=subprocess.STDOUT,timeout=300 if options.native_plugins else 180 if options.distortion else 180 if options.patterns or options.acid or options.test_file else 60,env=checked_environment())
 print((work/'result.log').read_text()[-6500:])
 if result.returncode: raise SystemExit(result.returncode)
 if options.distortion:
@@ -182,7 +190,7 @@ if options.patterns:
 if options.piano_roll:
     result=subprocess.run([str(exe),'--verify-scale-policy'],timeout=60)
     if result.returncode:raise SystemExit(result.returncode)
-for expected,next_skin in ([] if options.distortion or options.peak_compressor or options.limiter or options.generator_controls or options.effects or options.sidechain or options.test_file or options.mixer or options.automation or options.native_plugins or options.acid or options.patterns or options.playlist or options.piano_roll or options.generator or options.recording else [(5,6),(6,None)]):
+for expected,next_skin in ([] if options.live_insertion or options.distortion or options.peak_compressor or options.limiter or options.generator_controls or options.effects or options.sidechain or options.test_file or options.mixer or options.automation or options.native_plugins or options.acid or options.patterns or options.playlist or options.piano_roll or options.generator or options.recording else [(5,6),(6,None)]):
     command=[str(exe),'--verify-skin',str(expected)]+([str(next_skin)] if next_skin is not None else [])
     with (work/('restore-'+str(expected)+'.log')).open('w') as log:
         result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT,timeout=60)

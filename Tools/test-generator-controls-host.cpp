@@ -19,10 +19,10 @@ int main()
         std::cout << " desktop " << display->userArea.toString();
     std::cout << "\n";
     controlCheck(host.generatorControlWindows.size()==2 && host.generatorControlWindows.at(acidId).window->isVisible() && host.generatorControlWindows.at(drumId).window->isVisible(),"Acid Bass and Drum Rack did not stay open together");
-    a.closeButtonPressed();
+    a.hideControls();
     auto playlistEvent=juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(),juce::Point<float>(25,float(host.playlistWindow->grid->headerHeight()+10)),juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),1,0,0,0,0,host.playlistWindow->grid,host.playlistWindow->grid,juce::Time::getCurrentTime(),{},juce::Time::getCurrentTime(),2,false);
     host.playlistWindow->grid->mouseDoubleClick(playlistEvent);controlCheck(a.isVisible() && d.isVisible(),"Playlist name double click failed");
-    a.closeButtonPressed();host.showMixer(false);auto* footer=&host.mixerWindow->channelStrips[0]->footer;
+    a.hideControls();host.showMixer(false);auto* footer=&host.mixerWindow->channelStrips[0]->footer;
     auto mixerEvent=juce::MouseEvent(juce::Desktop::getInstance().getMainMouseSource(),juce::Point<float>(5,5),juce::ModifierKeys(juce::ModifierKeys::leftButtonModifier),1,0,0,0,0,footer,footer,juce::Time::getCurrentTime(),{},juce::Time::getCurrentTime(),2,false);
     host.mixerWindow->channelStrips[0]->mouseDoubleClick(mixerEvent);controlCheck(a.isVisible() && d.isVisible(),"Mixer name double click failed");
     host.selectGeneratorControlPattern(drumId,5);host.selectGeneratorControlTrack(acidId);
@@ -43,8 +43,8 @@ int main()
     host.addInstrumentTrack();const auto fourId=host.selectedProjectTrackId();
     host.handleGeneratorMenuResult(fourId,0,5,{});
     controlCheck(host.generatorControlWindows.size()==3 && dynamic_cast<OrbitNativeInstrumentEditor*>(host.generatorControlWindows.at(fourId).window->instrument.get())!=nullptr,"generator menu did not open a real independent 4OSC editor");
-    host.generatorControlWindows.at(fourId).window->closeButtonPressed();
-    auto& acidWindow=*host.generatorControlWindows.at(acidId).window;acidWindow.setBounds(180,220,910,330);acidWindow.closeButtonPressed();
+    host.generatorControlWindows.at(fourId).window->hideControls();
+    auto& acidWindow=*host.generatorControlWindows.at(acidId).window;acidWindow.setBounds(180,220,910,330);acidWindow.hideControls();
     controlCheck(!acidWindow.isVisible() && host.generatorControlWindows.at(drumId).window->isVisible(),"closing one control window hid the other");host.openGeneratorControls(acidId,false);controlCheck(acidWindow.isVisible(),"closed controls did not reopen");
     const auto bounds=acidWindow.getBounds();host.generatorControlWindows.clear();host.openGeneratorControls(acidId,false);controlCheck(host.generatorControlWindows.at(acidId).window->getBounds()==bounds,"per-generator window placement did not persist");host.openGeneratorControls(drumId,false);
     auto& window=*host.generatorControlWindows.at(drumId).window;

@@ -91,7 +91,7 @@ int main(int argc,char** argv)
         const auto original=host.capturePatternData(a,0).notes;
         auto menu=host.makeOptionsMenu();std::set<int> ids;
         for(juce::PopupMenu::MenuItemIterator it(menu,true);it.next();){const auto& item=it.getItem();if(item.itemID>0){ids.insert(item.itemID);requireOption(!item.text.containsIgnoreCase("not available") && !item.text.containsIgnoreCase("coming"),"Options placeholder remains");}}
-        for(int id:{501,502,503,504,505,506,507,508,509,510,511,512,513,516,517,518,519,5500,5501,5502,5503,5504,5505,5506,5600,5601,5602,5603,5610,5611,5612})requireOption(ids.contains(id),"Options command missing");
+        for(int id:{501,502,503,504,505,506,507,508,509,510,511,512,513,516,517,518,519,5500,5501,5502,5505,5506,5600,5601,5602,5603,5610,5611,5612})requireOption(ids.contains(id),"Options command missing");
         juce::StringArray topEntries;
         for(juce::PopupMenu::MenuItemIterator it(menu);it.next();)if(!it.getItem().isSeparator)topEntries.add(it.getItem().text);
         const juce::StringArray orionOrder{"Skins","Wallpapers","Audio Input Settings...","Audio Output Settings...","MIDI In Settings...","MIDI In Controllers...","Enable MIDI Out","Virtual MIDI Keyboard","Sample Paths...","VST Paths...","Time Signature...","Timebase..."};
@@ -153,7 +153,8 @@ int main(int argc,char** argv)
         const auto folder=juce::File("OPTIONS_CHECK_FOLDER");auto sampleFolder=folder.getChildFile("Sample Folder");sampleFolder.createDirectory();host.applicationProperties.getUserSettings()->setValue("samplePaths",sampleFolder.getFullPathName());requireOption(host.firstSampleFolder()==sampleFolder,"configured sample path ignored");
         host.saveToFile(folder.getChildFile("Options Check.orbit"));requireOption(host.loadProjectFile(folder.getChildFile("Options Check.orbit")),"native reopen failed");select(a);requireOption(host.midiExportPpq()==96 && bool(host.edit->state.getProperty("orbitTripletGrid",false)) && int(host.instrumentTrack->state.getProperty("orbitMidiChannel",0))==3 && host.capturePatternData(a,0).notes==original,"native options roundtrip failed");
         const auto base=orbit::options::colour(40,60,80);
-        for(int i=1;i<5;++i){host.handleMenuResult(4,5500+i);requireOption(host.optionInt("skin")==i && orbit::options::colour(40,60,80)!=base,"skin had no effect");}
+        for(int i:{1,2}){host.handleMenuResult(4,5500+i);requireOption(host.optionInt("skin")==i && orbit::options::colour(40,60,80)!=base,"skin had no effect");}
+        for(int retired:{5503,5504})requireOption(!ids.contains(retired),"retired skin still in Options menu");
         host.handleMenuResult(4,5500);requireOption(orbit::options::colour(40,60,80)==base,"default skin did not restore original drawing");
         for(int i=0;i<3;++i){host.handleMenuResult(4,5600+i);requireOption(host.optionInt("wallpaper")==i,"wallpaper command ignored");auto image=host.createComponentSnapshot(host.getLocalBounds());requireOption(image.isValid(),"wallpaper render failed");}
         host.handleMenuResult(4,5612);requireOption(host.optionInt("wallpaperMode")==2,"wallpaper placement ignored");

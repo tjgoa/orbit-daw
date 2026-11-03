@@ -12,50 +12,57 @@ std::vector<orbit::playlist::SelectionItem> selectablePlaylistItems() const
     const auto tracks=getGeneratorTracks();const double barSeconds=playlistSecondsPerBar();
     for(int row=0;row<project.getTrackCount();++row)
     {
-        if(project.getTrackKind(row)!=ProjectDocument::TrackKind::audio)
+        if(!isPlaylistAudioTrack(row))
         {
-            for(const auto& clip:project.getPlaylistClips(project.getTrackId(row)))
-                items.push_back({{row,clip.startBar,clip.patternId},clip.lengthBars});
+            const auto id=project.getTrackId(row);
+            for(const auto& clip:project.getPlaylistClips(id))items.push_back({{row,clip.startBar,clip.patternId},clip.lengthBars});
+            for(const auto& clip:patternClipVisible)if(clip.id==id.toStdString())items.push_back({{row,double(clip.startBar),project.getPatternId(id,clip.slot)},double(clip.lengthBars)});
         }
         else if(row<tracks.size())
             for(auto* clip:tracks[row]->getClips())if(auto* wave=dynamic_cast<te::WaveAudioClip*>(clip))
             {
-                const auto range=wave->getEditTimeRange();const int start=int(std::floor(range.getStart().inSeconds()/barSeconds+1.0e-8));
-                const int end=int(std::ceil(range.getEnd().inSeconds()/barSeconds-1.0e-8));
-                items.push_back({{row,start,wave->itemID.toString()},juce::jmax(1,end-start)});
+                const auto range=wave->getEditTimeRange();const double start=range.getStart().inSeconds()/barSeconds;
+                const double end=range.getEnd().inSeconds()/barSeconds;
+                items.push_back({{row,start,wave->itemID.toString()},end-start});
             }
     }
     return items;
 }
 
-std::optional<orbit::playlist::Selection> transformPlaylistSelection(const orbit::playlist::Selection& selected,int rows,int bars,bool copy,bool erase=false)
+std::optional<orbit::playlist::Selection> transformPlaylistSelection(const orbit::playlist::Selection& selected,int rows,double bars,bool copy,bool erase=false)
 {
     using Selection=orbit::playlist::Selection;using Key=orbit::playlist::ClipKey;
     auto fail=[this](const juce::String& why)->std::optional<Selection>{status.setText("Playlist edit canceled. "+why,juce::dontSendNotification);return {};};
-    if(edit==nullptr || !hasProject || selected.empty())return {};
-    if(midiTake.active || !midiTake.notes.empty())return fail("Finish recording before editing the arrangement.");
+    if(edit==nullptr || !hasProject || selected.empty() || !std::isfinite(bars))return {};
+    const bool includesPatterns=std::any_of(selected.begin(),selected.end(),[this](const auto& key){return juce::isPositiveAndBelow(key.row,project.getTrackCount()) && !isPlaylistAudioTrack(key.row);});
+    if(includesPatterns)bars=project.normalisePlaylistBar(bars);
+    if(audioRecordingActive || midiTake.active || !midiTake.notes.empty() || automationTakeActive || !patternClipTake.launches.empty())return fail("Finish recording before editing the arrangement.");
     if(!erase && rows==0 && bars==0)return selected;
     struct Item
     {
-        Key source;int row=0,start=0,length=1,slot=-1;bool audio=false,exact=false,follows=false;
-        te::WaveAudioClip* wave=nullptr;double audioStart=0,audioEnd=0;
+        Key source;int row=0,slot=-1;double start=0,length=1;bool audio=false,exact=false,follows=false;
+        te::WaveAudioClip* wave=nullptr;double audioStart=0,audioEnd=0,cutStart=0,cutEnd=0;bool sliced=false;
     };
     const auto tracks=getGeneratorTracks();const auto seconds=playlistSecondsPerBar();std::vector<Item> items;
     for(const auto& key:selected)
     {
-        if(!juce::isPositiveAndBelow(key.row,project.getTrackCount()))return fail("A selected track no longer exists.");
+        if(!std::isfinite(key.startBar) || !juce::isPositiveAndBelow(key.row,project.getTrackCount()))return fail("A selected track no longer exists.");
         if(key.row>=tracks.size() || tracks[key.row]->isFrozen(te::Track::anyFreeze))return fail("Unfreeze the selected track before editing its clips.");
-        const auto row64=juce::int64(key.row)+rows,start64=juce::int64(key.startBar)+bars;
+        const auto row64=juce::int64(key.row)+rows;const double start64=project.normalisePlaylistBar((key.rangeStart>=0?key.rangeStart:key.startBar)+bars);
         if(!erase && (row64<0 || row64>=project.getTrackCount() || start64<0 || start64>=PlaylistGrid::barCount))return fail("The group would leave the Playlist.");
-        Item item;item.source=key;item.row=erase?key.row:int(row64);item.start=erase?key.startBar:int(start64);
-        item.audio=project.getTrackKind(key.row)==ProjectDocument::TrackKind::audio;
+        Item item;item.source=key;item.row=erase?key.row:int(row64);item.start=erase?key.startBar:start64;
+        item.audio=isPlaylistAudioTrack(key.row);
         if(item.audio)
         {
+            item.start=erase?key.startBar:key.startBar+bars;
             if(key.row>=tracks.size())return fail("A selected audio track is unavailable.");
             for(auto* clip:tracks[key.row]->getClips())if(auto* wave=dynamic_cast<te::WaveAudioClip*>(clip);wave!=nullptr && wave->itemID.toString()==key.id)item.wave=wave;
             if(item.wave==nullptr)return fail("A selected audio clip changed.");
-            const auto range=item.wave->getEditTimeRange();item.audioStart=range.getStart().inSeconds()+bars*seconds;item.audioEnd=range.getEnd().inSeconds()+bars*seconds;
-            if(int(std::floor(range.getStart().inSeconds()/seconds+1.0e-8))!=key.startBar)return fail("A selected audio clip moved before the edit completed.");
+            const auto range=item.wave->getEditTimeRange();const auto [a,b]=selectedAudioTimeRange(*item.wave,key);
+            if(b-a<.001)return fail("The audio selection is empty.");
+            item.cutStart=a;item.cutEnd=b;item.sliced=a>range.getStart().inSeconds()+1.e-8 || b<range.getEnd().inSeconds()-1.e-8;
+            item.audioStart=a+bars*seconds;item.audioEnd=b+bars*seconds;item.start=erase?a/seconds:a/seconds+bars;
+            if(std::abs(range.getStart().inSeconds()/seconds-key.startBar)>1.0e-8)return fail("A selected audio clip moved before the edit completed.");
         }
         else
         {
@@ -69,7 +76,7 @@ std::optional<orbit::playlist::Selection> transformPlaylistSelection(const orbit
         {
             if(!juce::isPositiveAndBelow(item.row,project.getTrackCount()) || item.row>=tracks.size())return fail("The group would leave the available tracks.");
             if(tracks[item.row]->isFrozen(te::Track::anyFreeze))return fail("Unfreeze the destination track before editing its clips.");
-            if(item.audio!=(project.getTrackKind(item.row)==ProjectDocument::TrackKind::audio))return fail("Audio and pattern clips require matching destination track types.");
+            if(item.audio!=isPlaylistAudioTrack(item.row))return fail("Audio and pattern clips require matching destination track types.");
             if(item.start<0 || (item.audio?item.audioStart<0 || item.audioEnd>PlaylistGrid::barCount*seconds:item.start+item.length>PlaylistGrid::barCount))
                 return fail("The group would extend outside the Playlist.");
         }
@@ -86,7 +93,15 @@ std::optional<orbit::playlist::Selection> transformPlaylistSelection(const orbit
             {
                 const bool removed=!copy && std::any_of(items.begin(),items.end(),[&](const auto& i){return i.wave==wave;});
                 const auto range=wave->getEditTimeRange();
-                if(!removed && range.getStart().inSeconds()<item.audioEnd-1.0e-8 && range.getEnd().inSeconds()>item.audioStart+1.0e-8)
+                if(removed)
+                {
+                    for(const auto& source:items)if(source.wave==wave && source.sliced)
+                    {
+                        const auto overlaps=[&](double a,double b){return b>a+1.e-8 && a<item.audioEnd-1.e-8 && b>item.audioStart+1.e-8;};
+                        if(overlaps(range.getStart().inSeconds(),source.cutStart) || overlaps(source.cutEnd,range.getEnd().inSeconds()))return fail("The destination overlaps an unselected part of the audio.");
+                    }
+                }
+                else if(range.getStart().inSeconds()<item.audioEnd-1.0e-8 && range.getEnd().inSeconds()>item.audioStart+1.0e-8)
                     return fail("An audio destination is occupied.");
             }
             for(const auto& other:items)
@@ -96,7 +111,7 @@ std::optional<orbit::playlist::Selection> transformPlaylistSelection(const orbit
         }
         const auto dest=project.getTrackId(item.row);
         for(const auto& occupied:staged.getPlaylistClips(dest))
-            if(occupied.startBar<item.start+item.length && occupied.startBar+occupied.lengthBars>item.start)return fail("A pattern destination is occupied.");
+            if(occupied.startBar<item.start+item.length-1.e-9 && occupied.startBar+occupied.lengthBars>item.start+1.e-9)return fail("A pattern destination is occupied.");
         auto patternId=item.source.id;
         if(item.row!=item.source.row)
         {
@@ -116,16 +131,42 @@ std::optional<orbit::playlist::Selection> transformPlaylistSelection(const orbit
         else staged.setPlaylistClip(dest,patternId,item.start,item.follows?0:item.length,true);
         result.insert({item.row,item.start,patternId});
     }
+    if(!erase && playlistWindow!=nullptr)
+    {
+        const auto prefs=playlistWindow->playlistViewPreferences();
+        const bool generators=bool(prefs.getProperty("generatorEvents",true)),mixer=bool(prefs.getProperty("mixerEvents",true));
+        if(generators || mixer)
+        {
+            std::map<int,std::vector<orbit::playlist::EventRange>> ranges;
+            const auto meter=project.getInitialTimeSignature();const double stepsPerBar=meter.numerator*16.0/juce::jmax(1,meter.denominator);
+            // Native pattern placement still assumes 16 steps per bar. Do not
+            // move its Song curve by a different duration in another meter.
+            if((meter.numerator!=4 || meter.denominator!=4) && std::any_of(items.begin(),items.end(),[](const auto& item){return !item.audio;}))
+                return fail("Moving/copying pattern Song events currently requires 4/4. Disable the event options to edit clips alone.");
+            for(const auto& item:items)
+            {
+                const double start=item.audio?(item.audioStart-bars*seconds)/seconds*stepsPerBar:item.source.startBar*stepsPerBar;
+                const double end=item.audio?(item.audioEnd-bars*seconds)/seconds*stepsPerBar:(item.source.startBar+item.length)*stepsPerBar;
+                ranges[item.source.row].push_back({start,end});
+            }
+            juce::String error;
+            if(!stagePlaylistSongEvents(staged,ranges,rows,bars,copy,generators,mixer,error))return fail(error);
+        }
+    }
     auto before=captureProjectSnapshot();
     for(const auto& item:items)if(item.audio)
     {
-        if(erase){item.wave->removeFromParent();continue;}
-        te::Clip::Ptr duplicate;if(copy)duplicate=te::duplicateClip(*item.wave);
-        auto* wave=copy?dynamic_cast<te::WaveAudioClip*>(duplicate.get()):item.wave;
+        if(erase){if(!retainAudioOutsideSelection(*item.wave,item.cutStart,item.cutEnd)){restoreProjectSnapshot(before,"Audio slicing failed; original clips restored.");return {};}continue;}
+        te::Clip::Ptr duplicate;if(copy || item.sliced)duplicate=te::duplicateClip(*item.wave);
+        auto* wave=(copy || item.sliced)?dynamic_cast<te::WaveAudioClip*>(duplicate.get()):item.wave;
+        if(wave && item.sliced)
+        {
+            const auto old=item.wave->getPosition();wave->setPosition({{tracktion::TimePosition::fromSeconds(item.cutStart),tracktion::TimePosition::fromSeconds(item.cutEnd)},old.getOffset()+tracktion::TimeDuration::fromSeconds(item.cutStart-old.time.getStart().inSeconds())});
+            if(item.cutStart>old.time.getStart().inSeconds()+1.e-8)wave->setFadeIn({});if(item.cutEnd<old.time.getEnd().inSeconds()-1.e-8)wave->setFadeOut({});
+            if(!copy && !retainAudioOutsideSelection(*item.wave,item.cutStart,item.cutEnd)){duplicate=nullptr;restoreProjectSnapshot(before,"Audio slicing failed; original clips restored.");return {};}
+        }
         if(wave==nullptr || (item.row!=item.source.row && !wave->moveTo(*tracks[item.row])))
         {duplicate=nullptr;restoreProjectSnapshot(before,"Playlist edit rolled back because an audio clip could not be transferred.");return {};}
-        // A placement move keeps the same source excerpt. preserveSync=true
-        // would slip the source offset by the timeline movement instead.
         wave->setStart(tracktion::TimePosition::fromSeconds(item.audioStart),false,true);
         result.insert({item.row,item.start,wave->itemID.toString()});
     }
@@ -142,7 +183,7 @@ void renamePlaylistClip(const orbit::playlist::ClipKey& key)
 {
     if(edit==nullptr || !juce::isPositiveAndBelow(key.row,project.getTrackCount()))return;
     const auto trackId=project.getTrackId(key.row);
-    if(project.getTrackKind(key.row)!=ProjectDocument::TrackKind::audio)
+    if(!isPlaylistAudioTrack(key.row))
     {
         const auto slot=project.getPatternIndexForId(trackId,key.id);
         if(slot>=0)renameGeneratorOrPattern(trackId,slot,true);

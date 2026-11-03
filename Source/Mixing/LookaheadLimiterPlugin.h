@@ -26,7 +26,7 @@ public:
     juce::String getSelectableDescription() override {return "Orbit sample-peak look-ahead limiter";}
     bool takesAudioInput() override {return true;}
     bool canBeAddedToClip() override {return false;}
-    bool canBeAddedToRack() override {return false;}
+    bool canBeAddedToRack() override {return true;}
     int getNumOutputChannelsGivenInputs(int channels) override {return juce::jmin(2,channels);}
     double getLatencySeconds() override {return processor.latencySamples()/processor.sampleRate();}
     double getTailLength() const override {return processor.latencySamples()/processor.sampleRate();}

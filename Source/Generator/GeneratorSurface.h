@@ -17,7 +17,7 @@ public:
     void paint(juce::Graphics& g) override
     {
         g.fillAll(options::colour(45,65,77));
-        g.setColour(expandedRoll?options::colour(22,32,42):options::colour(45,65,77));
+        g.setColour(options::colour(22,32,42));
         g.fillRect(getLocalBounds().removeFromTop(titleHeight+toolbarHeight));
         g.setColour(options::colour(106,137,151));g.drawRect(getLocalBounds());
         if(!expandedRoll)

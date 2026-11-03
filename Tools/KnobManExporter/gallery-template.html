@@ -1,0 +1,25 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orbit · KnobMan sprites</title>
+<style>
+:root{font:14px system-ui;color:#e8edf3;background:#171e27}body{margin:24px}h1{font-size:24px;margin-bottom:8px}header{margin-bottom:22px}button,input,select{font:inherit}button,select{padding:7px 12px;border:1px solid #607185;border-radius:6px;background:#263546;color:inherit}button{cursor:pointer}#filter{padding:8px;min-width:250px}#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:18px}.card{padding:16px;background:#26313f;border-radius:10px;border:1px solid #435268;min-width:0}.title{display:block;overflow-wrap:anywhere;margin-bottom:10px}.stage{min-height:170px;display:grid;place-items:center;background:var(--surface,#d4d9df);border-radius:6px;overflow:auto}.stage canvas{max-width:100%;height:auto}.card input{width:100%;margin-top:12px}small{display:block;color:#b7c8da;overflow-wrap:anywhere;margin-top:8px}.error{color:#ffc1b7;white-space:pre-wrap}.warn{color:#f5d8a6}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:16px}a{color:#9bd4ff}label{display:inline-flex;align-items:center;gap:8px}
+</style><header><h1>Orbit · KnobMan sprites</h1><p>These previews use the exported PNG frames. No HTML knob drawing or approximation.</p><div class="bar"><input id="filter" placeholder="Filter names"><button id="play">Animate</button><label>Surface <select id="surface"><option value="#d4d9df">Silver</option><option value="#ffffff">White</option><option value="#1e2c36">Navy</option><option value="checker">Transparency</option></select></label><label>Display size <select id="scale"><option value="1">Actual pixels</option><option value="2">2× pixels</option><option value="0.5">Half size</option></select></label><span id="count"></span></div></header><main id="grid"></main>
+<script>
+const records=/*ORBIT_DATA*/[];const cards=[];let playing=false,tick=0;
+const grid=document.getElementById('grid');
+for(const k of records){
+ const card=document.createElement('section');card.className='card';const title=document.createElement('b');title.className='title';title.textContent=k.source.split(/[\\/]/).pop();title.title=k.source;card.append(title);
+ if(k.status!=='ok'){const e=document.createElement('p');e.className='error';e.textContent=k.error||'Export not validated';card.append(e);grid.append(card);cards.push({card,k});continue}
+ const stage=document.createElement('div');stage.className='stage';const canvas=document.createElement('canvas');canvas.width=k.frame_width;canvas.height=k.frame_height;stage.append(canvas);
+ const slider=document.createElement('input');slider.type='range';slider.min=0;slider.max=k.frames-1;slider.value=Math.floor((k.frames-1)/2);slider.setAttribute('aria-label',title.textContent+' frame');
+ const info=document.createElement('small');const path=document.createElement('small');path.textContent=k.sprite;
+ const image=new Image();function draw(){if(!image.naturalWidth)return;const f=+slider.value,x=k.orientation==='horizontal'?f*k.frame_width:0,y=k.orientation==='vertical'?f*k.frame_height:0;const c=canvas.getContext('2d');c.clearRect(0,0,canvas.width,canvas.height);c.drawImage(image,x,y,k.frame_width,k.frame_height,0,0,k.frame_width,k.frame_height);info.textContent=`${k.frame_width}×${k.frame_height} · frame ${f+1}/${k.frames} · ${k.orientation}`}
+ image.onload=draw;image.onerror=()=>{info.textContent='PNG could not be decoded'};const observer=new IntersectionObserver(entries=>{if(entries.some(e=>e.isIntersecting)){image.src=k.image;observer.disconnect()}},{rootMargin:'200px'});observer.observe(card);slider.oninput=draw;
+ card.append(stage,slider,info,path);for(const warning of k.warnings||[]){const w=document.createElement('small');w.className='warn';w.textContent=warning;card.append(w)}
+ grid.append(card);cards.push({card,k,slider,draw,stage,canvas});
+}
+const count=document.getElementById('count');count.textContent=`${records.filter(k=>k.status==='ok').length} exported · ${records.filter(k=>k.status!=='ok').length} failed`;
+document.getElementById('filter').oninput=e=>{const s=e.target.value.toLowerCase();for(const {card,k}of cards)card.hidden=!k.source.toLowerCase().includes(s)};
+document.getElementById('play').onclick=e=>{playing=!playing;e.target.textContent=playing?'Pause':'Animate'};
+document.getElementById('surface').onchange=e=>{for(const {stage}of cards)if(stage){stage.style.background=e.target.value==='checker'?'repeating-conic-gradient(#adb5be 0% 25%,#e6e9ed 0% 50%) 0 0/20px 20px':e.target.value}};
+document.getElementById('scale').onchange=e=>{for(const {canvas,k}of cards)if(canvas)canvas.style.width=(k.frame_width*+e.target.value)+'px'};
+setInterval(()=>{if(!playing)return;tick++;for(const c of cards)if(c.slider&&!c.card.hidden){c.slider.value=tick%c.k.frames;c.draw()}},45);
+</script></html>

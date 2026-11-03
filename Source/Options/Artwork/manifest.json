@@ -1,0 +1,49 @@
+{
+  "generation_tool": "built-in image_gen for first three only; native crop/clone for two supplied panels",
+  "date": "2026-11-02",
+  "assets": [
+    {
+      "file": "ambient-glow.png",
+      "sha256": "6410574602468327853696ae03e1cd11913f47719b9f028a4ea4f10527322d75",
+      "bytes": 1924400,
+      "width": 2172,
+      "height": 724,
+      "origin": "built-in image_gen"
+    },
+    {
+      "file": "champagne-wave.png",
+      "sha256": "062fe9f4e31e4b13d6a2687935e3fff7042d8e6b6103897e7cbb9717f6cac6a0",
+      "bytes": 1593793,
+      "width": 2172,
+      "height": 724,
+      "origin": "built-in image_gen"
+    },
+    {
+      "file": "compact-silver.png",
+      "sha256": "0dc2877c228ffd11b6b64326b1a273c701a33c90969a3f682057813a85da770e",
+      "bytes": 3446,
+      "width": 1080,
+      "height": 56,
+      "origin": "supplied-image crop"
+    },
+    {
+      "file": "reference-ribbon.png",
+      "sha256": "369d33205a4262d892045ea248407aa0c3e4f3a1f236d7b65531d1432389a800",
+      "bytes": 112983,
+      "width": 1672,
+      "height": 64,
+      "origin": "supplied-image crop"
+    },
+    {
+      "file": "silver-flow.png",
+      "sha256": "1ed2a6974d813d1a38c9702c9672a417226d7409c73e9c3487124a63f2fb0221",
+      "bytes": 1763982,
+      "width": 2172,
+      "height": 724,
+      "origin": "built-in image_gen"
+    }
+  ],
+  "prompts": "README.md",
+  "runtime": "background art only; controls are live code",
+  "crop_tool": "Tools/extract-reference-header-artwork.swift"
+}

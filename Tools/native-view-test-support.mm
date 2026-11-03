@@ -48,3 +48,38 @@ bool nativeMaskStable(juce::Component& editor,const std::function<void()>& actio
     const bool same=[layer mask]==mask && [(CAShapeLayer*)mask path]==path;
     CGPathRelease(path);[mask release];return same;
 }
+
+void postNativeSpace(juce::Component& component,bool repeat=false,NSUInteger modifiers=0)
+{
+    auto* peer=component.getPeer();if(peer==nullptr)return;
+    NSWindow* window=[(NSView*)peer->getNativeHandle() window];
+    for(const auto type:{NSEventTypeKeyDown,NSEventTypeKeyUp})
+    {
+        NSEvent* event=[NSEvent keyEventWithType:type location:NSZeroPoint modifierFlags:modifiers timestamp:[NSProcessInfo processInfo].systemUptime windowNumber:[window windowNumber] context:nil characters:@" " charactersIgnoringModifiers:@" " isARepeat:repeat keyCode:49];
+        [NSApp postEvent:event atStart:NO];
+    }
+}
+bool focusNativeEditor(juce::Component& editor)
+{
+    auto* native=findNative(editor);if(native==nullptr || native->getView()==nullptr)return false;
+    auto* view=(NSView*)native->getView();return [[view window] makeFirstResponder:view];
+}
+void activateNativeWindow(juce::Component& component)
+{
+    if(auto* peer=component.getPeer())
+    {
+        [NSApp activateIgnoringOtherApps:YES];NSWindow* window=[(NSView*)peer->getNativeHandle() window];[window makeKeyAndOrderFront:nil];[window makeMainWindow];
+    }
+}
+static NSTextView* transportTextFixture=nil;
+void installNativeTextInput(juce::Component& component)
+{
+    auto* peer=component.getPeer();if(peer==nullptr)return;NSView* root=(NSView*)peer->getNativeHandle();
+    transportTextFixture=[[NSTextView alloc] initWithFrame:NSMakeRect(30,400,300,40)];[transportTextFixture setString:@"Text"];[root addSubview:transportTextFixture];[[root window] makeFirstResponder:transportTextFixture];[transportTextFixture setSelectedRange:NSMakeRange(4,0)];
+}
+juce::String nativeTextInputValue(){return transportTextFixture!=nil?juce::String([[transportTextFixture string] UTF8String]):juce::String{};}
+void removeNativeTextInput(juce::Component& component)
+{
+    if(auto* peer=component.getPeer())[[((NSView*)peer->getNativeHandle()) window] makeFirstResponder:(NSView*)peer->getNativeHandle()];
+    [transportTextFixture removeFromSuperview];[transportTextFixture release];transportTextFixture=nil;
+}

@@ -1,7 +1,7 @@
 // Included inside ProjectView. Callbacks resolve IDs afresh after Undo/load.
 using SongTarget = orbit::automation::SongTarget;
 using SongPoints = orbit::automation::Points;
-struct AutomationTakeLane { SongTarget target; int slot=-1; SongPoints points; float baseline=0.5f; };
+struct AutomationTakeLane { SongTarget target; int slot=-1; SongPoints points; float baseline=0.5f; std::optional<float> finishValue; };
 
 struct SongModule
 {
@@ -28,7 +28,7 @@ std::vector<SongModule> songEventModules()
 juce::Array<te::Plugin*> songModulePlugins(const SongModule& module)
 {
     juce::Array<te::Plugin*> result;
-    if (module.plugins != nullptr) for (auto* plugin : *module.plugins) if (plugin != nullptr && !bool(plugin->state.getProperty("orbitOutputRouteSend",false)) && !bool(plugin->state.getProperty("orbitRouteDryMute",false))) result.add(plugin);
+    if (module.plugins != nullptr) for (auto* plugin : orbit::mixing::flattenedPlugins(*module.plugins)) if (plugin != nullptr && !bool(plugin->state.getProperty("orbitOutputRouteSend",false)) && !bool(plugin->state.getProperty("orbitRouteDryMute",false))) result.add(plugin);
     // Tracktion's final Master volume is separate from its insert list.
     if (module.id == "mixer:master" && edit != nullptr)
         if (auto* volume = masterVolumePlugin()) result.addIfNotAlreadyThere(volume);
@@ -81,6 +81,7 @@ SongPoints songEventPoints(const SongTarget& target)
 void commitSongEvents(const juce::String& projectId, const SongTarget& target,
                       const SongPoints& before, const SongPoints& next)
 {
+    if(isFrozenSourceParameter(target.trackId,target.pluginId,target.pluginName)){requireUnfrozenGenerator(target.trackId);return;}
     if (automationTakeActive) finishAutomationRecording();
     if (!hasProject || project.getProjectId() != projectId || songEventParameter(target) == nullptr
         || !orbit::automation::samePoints(songEventPoints(target), before))
@@ -127,6 +128,7 @@ void refreshSongEventEditor()
             {
                 SongTarget target{panel.trackId, plugin->itemID.toString(), plugin->getName(), p->paramID, p->getParameterName(), {}};
                 target.label = juce::String(slot) + ": " + target.pluginName + " / " + target.parameterName;
+                target.hasEvents=!songEventPoints(target).isEmpty();
                 targets.push_back(std::move(target));
             }
         }
@@ -167,13 +169,14 @@ void showSongEventEditor(juce::String id = {})
     {
         songEventWindow = std::make_unique<orbit::automation::SongEventWindow>();
         addChildComponent(*songEventWindow);songEventWindow->constrainToWorkspace();
+        songEventWindow->onMinimizeStateChanged=[this]{scheduleGeneratorDockRefresh();};
         songEventWindow->onWorkspaceChanged=[this]{syncGeneratorNativeViews();};
         auto& panel = songEventWindow->panel;
         panel.setViewOptions(optionBool("songEventFollow", true), optionBool("songEventGradient", false));
         panel.setGradientStyle(optionInt("songEventGradientStyle"));
         panel.onLfo=[this]{showAutomationLfo(false);};
-        panel.onSeek=[this](double step){if(edit!=nullptr){edit->getTransport().setPosition(edit->tempoSequence.toTime(tracktion::BeatPosition::fromBeats(step*.25)));syncSongEventTransport();}};
-        panel.onLoop=[this](int start,int length){loopStartSlider.setValue(start,juce::dontSendNotification);loopLengthSlider.setValue(length,juce::dontSendNotification);loopButton.setToggleState(true,juce::dontSendNotification);updateLoopRange();};
+        panel.onSeek=[this](double step){if(patternClipSnapshot && !finishPatternClipRecording())return;if(edit!=nullptr){edit->getTransport().setPosition(edit->tempoSequence.toTime(tracktion::BeatPosition::fromBeats(step*.25)));syncSongEventTransport();}};
+        panel.onLoop=[this](int start,int length){if(patternClipSnapshot && !finishPatternClipRecording())return;loopStartSlider.setValue(start,juce::dontSendNotification);loopLengthSlider.setValue(length,juce::dontSendNotification);loopButton.setToggleState(true,juce::dontSendNotification);updateLoopRange();};
         panel.onViewOptionsChanged = [this]
         {
             saveOption("songEventFollow", songEventWindow->panel.isFollowing());
@@ -191,12 +194,11 @@ void showSongEventEditor(juce::String id = {})
             auto targets = songEventWindow->panel.targets;
             setSongEventTarget(std::move(targets), index);
         };
-        panel.onRecord = [this]{if(!automationTakeActive)setPlaybackMode(PlaybackMode::song);toggleAutomationRecording();};
+        panel.onRecord = [this]{if(!automationTakeActive){setPlaybackMode(PlaybackMode::song);saveOption("recordContent",1);recordModeButton.setButtonText("AUTO");}toggleMidiRecording();};
         panel.onUndo = [this](bool redo) { if (redo) redoProjectAction(); else undoProjectAction(); };
     }
     if (id.isEmpty()) id = selectedProjectTrackId();
     if (id.isEmpty()) id = "mixer:master";
-    saveOption("recordContent",1);recordModeButton.setButtonText("AUTO");
     songEventWindow->panel.trackId = id;
     refreshSongEventEditor();
     syncSongEventTransport();
@@ -262,12 +264,26 @@ void discoverAutomationRecordingTargets()
     for(const auto& module:songEventModules())for(auto* plugin:songModulePlugins(module))
         for(auto* p:plugin->getAutomatableParameters())if(p!=nullptr && !known.contains({module.id,plugin->itemID.toString(),p->paramID}))
         {
+            if(isFrozenSourceParameter(module.id,plugin->itemID.toString(),plugin->getName()))continue;
             SongTarget target{module.id,plugin->itemID.toString(),plugin->getName(),p->paramID,p->getParameterName(),{}};
             const auto slot=automationTakePatternSlots.find(module.id);
             const int pattern=slot!=automationTakePatternSlots.end() && songLegacyTargetIsUnique(target)?slot->second:-1;
             automationTakeTargets.push_back({target,pattern,{},p->getCurrentNormalisedValue()});
             automationTouchListeners.push_back(std::make_unique<orbit::automation::AutomationTouchListener>(p,[this,target]
-                {if(automationTakeActive)automationTouched.emplace(target.trackId,target.pluginId,target.parameterId);}));
+                (float value)
+                {
+                    if(!automationTakeActive || finishingAutomationTake)return;
+                    const auto key=std::make_tuple(target.trackId,target.pluginId,target.parameterId);automationTouched.insert(key);
+                    if(playbackMode!=PlaybackMode::song || edit==nullptr || !edit->getTransport().isPlaying() || !edit->getAutomationRecordManager().isWritingAutomation())return;
+                    if(auto* context=edit->getCurrentPlaybackContext())
+                    {
+                        const double at=edit->tempoSequence.toBeats(context->getUnloopedPosition()).inBeats()*4;
+                        if(!std::isfinite(at) || at<0)return;
+                        auto& samples=automationSongSamples[key];
+                        if(!samples.isEmpty() && at==samples.getLast().position)samples.getReference(samples.size()-1).value=value;
+                        else if(samples.isEmpty() || at>samples.getLast().position)samples.add({at,value});
+                    }
+                }));
         }
 }
 bool beginAutomationRecording()
@@ -275,7 +291,12 @@ bool beginAutomationRecording()
     if(edit==nullptr || !hasProject || automationTakeActive)return false;
     if(!finishMidiRecording())return false;
     automationTakeSnapshot=captureProjectSnapshot();automationTakeProjectId=project.getProjectId();automationTakeTargets.clear();automationTouchListeners.clear();automationTouched.clear();
-    automationTakePatternSlots.clear();
+    automationTakePatternSlots.clear();automationSongSamples.clear();automationTakeLoop.reset();
+    if(playbackMode==PlaybackMode::song && loopButton.getToggleState())
+    {
+        const auto meter=project.getInitialTimeSignature();const double bar=meter.numerator*16.0/juce::jmax(1,meter.denominator);
+        automationTakeLoop=orbit::automation::RecordLoop{(project.getLoopStartBar()-1)*bar,(project.getLoopStartBar()-1+project.getLoopLengthBars())*bar};
+    }
     if(playbackMode==PlaybackMode::pattern)for(int row=0;row<project.getTrackCount();++row)
         automationTakePatternSlots[project.getTrackId(row)]=project.getTrackSelectedPatternIndex(project.getTrackId(row));
     automationTakeActive=true;discoverAutomationRecordingTargets();edit->getAutomationRecordManager().setWritingAutomation(true);
@@ -288,7 +309,7 @@ void cancelAutomationRecording()
     automationTakeActive=false;
     if(edit!=nullptr)edit->getAutomationRecordManager().setWritingAutomation(false);
     automationTouchListeners.clear();automationTouched.clear();
-    automationTakeTargets.clear();automationTakeSnapshot.reset();
+    automationTakeTargets.clear();automationTakeSnapshot.reset();automationSongSamples.clear();automationTakeLoop.reset();
     if(songEventWindow!=nullptr)songEventWindow->panel.setRecording(false);
 }
 void applyAutomationTake(std::vector<AutomationTakeLane> lanes)
@@ -301,6 +322,7 @@ void applyAutomationTake(std::vector<AutomationTakeLane> lanes)
     auto staged=project;int count=0;
     for(const auto& lane:lanes)
     {
+        if(isFrozenSourceParameter(lane.target.trackId,lane.target.pluginId,lane.target.pluginName))continue;
         if(songEventParameter(lane.target)==nullptr || lane.points.isEmpty())continue;
         if(lane.slot<0)staged.replaceSongAutomationPoints(lane.target.trackId,lane.target.pluginName,lane.target.parameterId,
             lane.target.parameterName,lane.points,lane.target.pluginId);
@@ -323,20 +345,42 @@ void applyAutomationTake(std::vector<AutomationTakeLane> lanes)
         rememberUndoSnapshot(std::move(*automationTakeSnapshot),"Record automation take");project=std::move(staged);isDirty=true;
     }
     automationTouchListeners.clear();automationTouched.clear();
-    automationTakeSnapshot.reset();automationTakeTargets.clear();
+    automationTakeSnapshot.reset();automationTakeTargets.clear();automationSongSamples.clear();automationTakeLoop.reset();
     readPatternSteps();refreshEnginePlaylist();refreshSongEventEditor();
+    for(const auto& lane:lanes)if(lane.finishValue)if(auto* p=songEventParameter(lane.target))p->setNormalisedParameter(*lane.finishValue,juce::sendNotificationSync);
     status.setText(count>0?"Automation take recorded. Undo restores the whole take.":"Automation recording ended without parameter changes.",juce::dontSendNotification);
 }
 void finishAutomationRecording()
 {
     if(!automationTakeActive || edit==nullptr)return;
     discoverAutomationRecordingTargets();
+    const juce::ScopedValueSetter<bool> finishing(finishingAutomationTake,true);
+    auto* context=edit->getCurrentPlaybackContext();
+    const double endUnlooped=edit->tempoSequence.toBeats(context?context->getUnloopedPosition():edit->getTransport().getPosition()).inBeats()*4;
+    const double endSong=edit->tempoSequence.toBeats(context?context->getPosition():edit->getTransport().getPosition()).inBeats()*4;
     auto& recorder=edit->getAutomationRecordManager();std::vector<AutomationTakeLane> touched;
     for(const auto& target:automationTakeTargets)
         if(auto* p=songEventParameter(target.target);p!=nullptr && (recorder.isParameterRecording(p) || automationTouched.contains({target.target.trackId,target.target.pluginId,target.target.parameterId})))touched.push_back(target);
     recorder.punchOut(false);recorder.setWritingAutomation(false);
     for(auto& lane:touched)if(auto* p=songEventParameter(lane.target))
     {
+        const auto found=automationSongSamples.find({lane.target.trackId,lane.target.pluginId,lane.target.parameterId});
+        if(lane.slot<0 && found!=automationSongSamples.end() && !found->second.isEmpty() && automationTakeSnapshot)
+        {
+            ProjectDocument::AutomationLane original;original.points.add({0,lane.baseline});
+            const auto& doc=automationTakeSnapshot->document;
+            for(int i=0;i<doc.getSongAutomationLaneCount(lane.target.trackId);++i)
+            {
+                const auto candidate=doc.getSongAutomationLane(lane.target.trackId,i);
+                if(candidate.parameterId!=lane.target.parameterId)continue;
+                if(candidate.pluginId==lane.target.pluginId){original=candidate;break;}
+                if(candidate.pluginId.isEmpty() && candidate.pluginName==lane.target.pluginName && songLegacyTargetIsUnique(lane.target))original=candidate;
+            }
+            if(original.points.isEmpty())original.points.add({0,lane.baseline});
+            lane.points=orbit::automation::recordedSongCurve(original,found->second,endUnlooped,automationTakeLoop);
+            auto finished=original;finished.points=lane.points;lane.finishValue=orbit::automation::valueAt(finished,endSong);
+            continue;
+        }
         std::map<double,float> ordered;
         for(int i=0;i<p->getCurve().getNumPoints();++i)
         {
@@ -396,5 +440,5 @@ void showAutomationLfo(bool pattern)
         {auto points=orbit::automation::lfoCurve(start,steps,bpm,settings);if(pattern){std::vector<std::pair<int,float>> p;for(const auto& point:points)p.emplace_back(int(point.position),point.value);pianoRollWindow->applyPatternLfo(p);}else commitSongEvents(projectId,target,before,combine(std::move(points)));}
         if(lfoWindow!=nullptr && lfoWindow->panel.onCancel)lfoWindow->panel.onCancel();
     };
-    lfoWindow->onWorkspaceChanged=[this]{syncGeneratorNativeViews();};lfoWindow->setVisible(true);lfoWindow->toFront(true);lfoWindow->panel.changed();
+    lfoWindow->onMinimizeStateChanged=[this]{scheduleGeneratorDockRefresh();};lfoWindow->onWorkspaceChanged=[this]{syncGeneratorNativeViews();};lfoWindow->setVisible(true);lfoWindow->toFront(true);lfoWindow->panel.changed();
 }

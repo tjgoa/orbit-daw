@@ -121,8 +121,8 @@ int main(int argc,char** argv)
          playlistCheck(menus==1 && host.undoHistory.size()==before,"selector painted/cycled instead of opening menu");
          playlistCheck(!tab.isPatternSelector({tab.getWidth()-1,tab.getHeight()-5}),"selector stole right-edge resize");tab.onPatternMenu=callback;
          auto menu=host.makePlaylistPatternMenu(0,0);int slots=0;bool empty=false;
-         for(juce::PopupMenu::MenuItemIterator bank(menu);bank.next();)if(bank.getItem().subMenu!=nullptr)
-           for(juce::PopupMenu::MenuItemIterator item(*bank.getItem().subMenu);item.next();){++slots;empty|=item.getItem().text.contains("empty");}
+         for(juce::PopupMenu::MenuItemIterator item(menu);item.next();)
+           if(item.getItem().itemID>=1 && item.getItem().itemID<=64){++slots;empty|=item.getItem().text.contains("empty");}
          playlistCheck(slots==64 && empty,"pattern chooser omits empty slots");}
 
         // Up/down travel while holding an existing block is distinct from a
@@ -166,18 +166,18 @@ int main(int argc,char** argv)
         const auto beforeEnd=host.undoHistory.size();host.paintPlaylistClipRange(0,510,511);host.finishPlaylistPaintGesture();
         playlistCheck(host.project.getPlaylistPatternId(id,510).isEmpty() && host.undoHistory.size()==beforeEnd,"end-of-song paint truncated a pattern");
 
-        // Only a deliberate right-edge gesture extends a placement.
+        // A whole-bar right-edge gesture changes the shared source pattern.
         grid->setHorizontalZoom(0.25f);window->refresh();grid->setViewportArea({0,0,1600,400});
         auto& edge=*grid->cellButtons.at(27);auto edgeDown=playlistMouse(&edge,float(edge.getWidth()-2),12);
         edge.mouseDown(edgeDown);playlistCheck(edge.resizeGesture,"right-edge handle was not recognized");
         auto edgeDrag=playlistMouse(&edge,edgeDown.x+2*grid->barWidth(),12,edgeDown.position,true);
         edge.mouseDrag(edgeDrag);edge.mouseUp(edgeDrag);
-        playlistCheck(host.project.getPlaylistClipLengthBars(id,20)==10 && host.project.getPatternLengthSteps(id,4)==128,"edge extension changed the source pattern");
+        playlistCheck(host.project.getPlaylistClipLengthBars(id,20)==10 && host.project.getPatternLengthSteps(id,4)==160,"edge extension did not change the shared source pattern");
         host.paintPlaylistClip(0,100);host.finishPlaylistPaintGesture();
-        playlistCheck(host.project.getPlaylistClipLengthBars(id,100)==8,"new paint inherited an instance extension");
+        playlistCheck(host.project.getPlaylistClipLengthBars(id,100)==10,"new paint lost the shared source length");
         host.paintPlaylistClip(0,30);host.finishPlaylistPaintGesture();const auto collisionUndo=host.undoHistory.size();
         host.resizePlaylistPatternClip(0,20,11);
-        playlistCheck(host.project.getPlaylistClipLengthBars(id,20)==10 && host.undoHistory.size()==collisionUndo,"resize overlapped another copy of the same pattern");
+        playlistCheck(host.project.getPlaylistClipLengthBars(id,20)==11 && host.undoHistory.size()==collisionUndo+1,"shared resize rejected an intentional overlap");
         host.project.setPatternLengthSteps(id,5,256);host.setPlaylistPattern(0,20,5);
         playlistCheck(host.project.getPlaylistPatternId(id,20)==host.project.getPatternId(id,4) && !host.project.isPatternCreated(id,5),"wheel pattern change overwrote adjacent clips");
 
@@ -192,7 +192,7 @@ int main(int argc,char** argv)
             juce::PNGImageFormat png;playlistCheck(png.writeImageToStream(image,out),"clip render failed");
         }
         const auto file=juce::File("OPTIONS_CHECK_FOLDER/playlist.orbit");host.saveToFile(file);playlistCheck(host.loadProjectFile(file),"playlist reopen failed");
-        playlistCheck(host.project.getPlaylistClipLengthBars(id,20)==10 && host.project.getPlaylistClipLengthBars(id,100)==8,"reopen lost explicit/default clip lengths");
+        playlistCheck(host.project.getPlaylistClipLengthBars(id,20)==11 && host.project.getPlaylistClipLengthBars(id,100)==11,"reopen lost the shared pattern length");
         host.showPlaylist();const auto restore=host.playlistPanelBounds;host.togglePlaylistMaximized();
         playlistCheck(window->getBounds()==juce::Rectangle<int>(0,82,1440,796),"maximized Playlist retained wallpaper padding");
         host.setSize(1800,1100);playlistCheck(window->getBounds()==juce::Rectangle<int>(0,82,1800,996),"resized maximized Playlist lost edge coverage");
@@ -207,6 +207,7 @@ int main(int argc,char** argv)
         grid->setViewportArea({0,0,1600,400});resizeColumn(60,310);
         checkPlaylistSelection(host);
         std::cout<<"PASS: held vertical pattern travel and wheel share blank/existing policy with one gesture Undo; column grip resizes empty/populated Playlist, clamps, aligns and saves on release; continuous header drag; click-versus-loop ruler; horizontal paint/edge-resize, Undo/collisions, themes, native reopen, maximize/restore and wallpaper coverage. Hardware disabled.\n";
+        return 0;
     }
     catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}
 }

@@ -14,7 +14,7 @@ public:
         for(size_t i=0;i<6;++i)
         {
             values[i].referTo(state,juce::Identifier(ids()[i]),getUndoManager(),defaults()[i]);
-            if(tube && i==3)parameters[i]=new tracktion::engine::DiscreteLabelledParameter(ids()[i],names()[i],*this,{0,2},3,{"Symmetric","Tube A","Tube B"});
+            if(tube && i==3)parameters[i]=new tracktion::engine::SuffixedParameter(ids()[i],names()[i],*this,{0.f,2.f});
             else
             {
                 juce::NormalisableRange<float> range(minima()[i],maxima()[i]);
@@ -31,7 +31,7 @@ public:
     juce::String getSelectableDescription()override{return "Orbit original "+getName();}
     bool takesAudioInput()override{return true;}
     bool canBeAddedToClip()override{return false;}
-    bool canBeAddedToRack()override{return false;}
+    bool canBeAddedToRack()override{return true;}
     int getNumOutputChannelsGivenInputs(int)override{return 2;}
     void getChannelNames(juce::StringArray* in,juce::StringArray* out)override
     {if(in!=nullptr)in->addArray({"Left","Right"});if(out!=nullptr)out->addArray({"Left","Right"});}

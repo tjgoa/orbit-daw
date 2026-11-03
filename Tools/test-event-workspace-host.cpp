@@ -9,6 +9,23 @@ static void testEventWorkspace(ProjectView& host)
     eventCheck(!host.playButton.getWantsKeyboardFocus() && !host.stopButton.getWantsKeyboardFocus() && !host.recordButton.getWantsKeyboardFocus() && !host.recordModeButton.getWantsKeyboardFocus(),"transport steals the active event editor keyboard focus");
     host.stopPlayback();eventCheck(window.isVisible(),"Stop closed Event Editor");
     for(auto* c:p.getChildren())if(auto* b=dynamic_cast<juce::Button*>(c))eventCheck(!juce::StringArray{"Copy","Paste","Clear","Smooth","Undo","Redo","Follow","Record"}.contains(b->getButtonText()),"extra automation toolbar control remains visible");
+    // Orion-like footer: one compact parameter chooser, four fixed zoom
+    // buttons, no module/preset-looking selector across the top.
+    int visibleCombos=0;juce::ComboBox* parameter=nullptr;std::map<juce::String,juce::TextButton*> zooms;
+    for(auto* child:p.getChildren())
+    {
+        if(auto* combo=dynamic_cast<juce::ComboBox*>(child);combo!=nullptr && combo->isVisible()){++visibleCombos;parameter=combo;}
+        if(auto* button=dynamic_cast<juce::TextButton*>(child);button!=nullptr && button->getTooltip().startsWith("Zoom "))zooms[button->getTooltip()]=button;
+    }
+    eventCheck(visibleCombos==1 && parameter!=nullptr && parameter->getY()>p.getHeight()-35 && parameter->getX()<10 && parameter->getWidth()<=500,"Event parameter chooser is not compact at bottom left");
+    eventCheck(zooms.size()==4,"Event Editor lacks horizontal/vertical zoom buttons");
+    const auto viewUndo=host.undoHistory.size();const auto h=p.horizontalZoomLevel();zooms.at("Zoom in horizontally")->onClick();eventCheck(p.horizontalZoomLevel()>h,"horizontal zoom button inactive");p.setHorizontalZoom(h);
+    zooms.at("Zoom in vertically")->onClick();eventCheck(p.verticalZoomLevel()>1,"vertical zoom button inactive");
+    p.setVerticalZoom(2);eventCheck(std::abs(p.visibleValues().getLength()-.5f)<.0001 && std::abs(p.graph.valueAt(p.graph.yAt(.5f))-.5f)<.0001,"vertical view/value transform wrong");
+    for(auto* child:p.getChildren())if(auto* scroll=dynamic_cast<juce::ScrollBar*>(child))scroll->setCurrentRangeStart(0,juce::sendNotificationSync);
+    eventCheck(p.visibleValues().getStart()>.49f,"vertical value scrollbar cannot reach high values");p.setVerticalZoom(1);
+    eventCheck(p.visibleValues().getStart()==0 && p.visibleValues().getEnd()==1 && host.undoHistory.size()==viewUndo,"view zoom/pan changed document or did not restore range");
+    eventCheck(zooms.at("Zoom in horizontally")->getY()>p.getHeight()-35 && zooms.at("Zoom in vertically")->getX()>p.getWidth()-35,"Event zoom positions do not match reference");
     host.loopStartSlider.setValue(1,juce::dontSendNotification);host.loopLengthSlider.setValue(8,juce::dontSendNotification);host.loopButton.setToggleState(false,juce::dontSendNotification);host.updateLoopRange();
     const float bar=128;
     p.graph.mouseDown(eventMouse(&p.graph,bar*2+10,10));p.graph.mouseUp(eventMouse(&p.graph,bar*2+10,10));

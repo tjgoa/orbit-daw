@@ -41,9 +41,16 @@ def eligible_files() -> list[pathlib.Path]:
             files.add(path)
     for folder in ("Source", "Tools", "Releases"):
         for path in (ROOT / folder).rglob("*"):
-            if not path.is_file() or path.name == "__pycache__":
+            if not path.is_file() or "__pycache__" in path.parts or ".runtime" in path.parts:
                 continue
-            if path.suffix in {".cpp", ".c", ".h", ".hpp", ".mm", ".m", ".py", ".sh", ".md", ".json", ".patch"}:
+            if path.suffix in {".cpp", ".c", ".h", ".hpp", ".mm", ".m", ".py", ".sh", ".md", ".json", ".patch", ".swift"}:
+                files.add(path)
+            elif path.parent == ROOT / "Source/Options/Artwork" and path.suffix == ".png":
+                files.add(path)
+            elif path.parent == ROOT / "Tools/KnobManExporter" and path.suffix in {".html", ".txt", ".command"}:
+                files.add(path)
+            elif ROOT / "Tools/KnobExplorer" in path.parents and path.suffix == ".html":
+                # Requested standalone explorer/template; native renders are embedded.
                 files.add(path)
             elif path.parent == ROOT / "Source/Synth/ThirdParty/Open303" and path.name in {"License.txt", "OOURA-LICENSE.txt"}:
                 files.add(path)

@@ -1,6 +1,7 @@
 // Modified Orbit port. GPL-3.0 + additional terms in ThirdParty/9W9/NOTICE.
 // 9W9 by A Thousand Details - https://github.com/athousanddetails/schwung-9W9
 #pragma once
+#include "../Workspace/OwnedAlert.h"
 #include "NineKitPlugin.h"
 #include "../Options/Appearance.h"
 #include "../Automation/ParameterEventSlider.h"
@@ -52,7 +53,7 @@ public:
         for(int n:{16,32,64,128,256})length.addItem(juce::String(n)+" steps",n);length.onChange=[this]{if(act.length)act.length(length.getSelectedId());refresh();};addAndMakeVisible(length);
         previous.setButtonText("<");next.setButtonText(">");previous.onClick=[this]{page=juce::jmax(0,page-1);refresh();};next.onClick=[this]{++page;refresh();};addAndMakeVisible(previous);addAndMakeVisible(next);
         demo.setButtonText("Demo beat");demo.onClick=act.demo;addAndMakeVisible(demo);hit.setButtonText("Hear hit");hit.onClick=[this]{if(act.preview)act.preview(drum);};addAndMakeVisible(hit);
-        credit.setButtonText("Credits");credit.onClick=[] {juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::NoIcon,"9W9 credits","9W9 by A Thousand Details - https://github.com/athousanddetails/schwung-9W9\n\nModified for Orbit: native host/UI, sequencer integration, compiled sample resources and sample-rate correction. This version is not the original and is not made or endorsed by A Thousand Details. GPL-3.0 and additional terms: see included NOTICE.");};addAndMakeVisible(credit);
+        credit.setButtonText("Credits");credit.onClick=[] {orbit::workspace::OwnedAlert::showAsync(juce::MessageBoxIconType::NoIcon,"9W9 credits","9W9 by A Thousand Details - https://github.com/athousanddetails/schwung-9W9\n\nModified for Orbit: native host/UI, sequencer integration, compiled sample resources and sample-rate correction. This version is not the original and is not made or endorsed by A Thousand Details. GPL-3.0 and additional terms: see included NOTICE.");};addAndMakeVisible(credit);
         setSize(900,430);setPage(0);startTimerHz(15);
     }
     bool allowWindowResizing()override{return true;}

@@ -38,7 +38,7 @@ public:
     juce::String getSelectableDescription() override {return "Orbit clean digital peak compressor";}
     bool takesAudioInput() override {return true;}
     bool canBeAddedToClip() override {return false;}
-    bool canBeAddedToRack() override {return false;}
+    bool canBeAddedToRack() override {return true;}
     int getNumOutputChannelsGivenInputs(int channels) override {return juce::jmin(2,channels);}
     void getChannelNames(juce::StringArray* inputs,juce::StringArray* outputs) override
     {

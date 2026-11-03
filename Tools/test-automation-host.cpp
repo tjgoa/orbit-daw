@@ -147,7 +147,7 @@ int main(int argc, char**)
         projection.replacePatternAutomationPoints(projectionId,0,"Filter","cutoff","Cutoff",ramp);
         projection.setPlaylistClip(projectionId,projection.getPatternId(projectionId,0),2,2,true);
         const auto arranged=orbit::automation::arrangedPatternCurve(projection,projectionId,"Filter","cutoff",0.5f);
-        eventCheck(arranged.at(32)==0.1f && arranged.at(48)==0.1f && arranged.at(64)==0.5f && arranged.at(47)>0.8f,"Pattern repetition/reset or gap baseline incorrect");
+        eventCheck(arranged.at(32)==0.1f && arranged.at(48)==0.1f && arranged.at(64)>0.89f && arranged.at(47)>0.8f,"Pattern repetition/reset or held final value incorrect");
         // Automation takes preserve source precision and commit multiple lanes with one Undo.
         host.setPlaybackMode(ProjectView::PlaybackMode::song);host.showSongEventEditor(id);
         const auto liveTarget=panel.targets[0];host.showSongEventEditor("mixer:master");const auto masterTarget=panel.targets[0];

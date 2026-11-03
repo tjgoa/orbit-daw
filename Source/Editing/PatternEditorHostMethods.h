@@ -2,17 +2,17 @@
 // and coincident records; selection keys address a pitch/onset stack.
 void saveSelectedPianoPreferences()
 {
-    if(instrumentTrack==nullptr || pianoRollWindow==nullptr)return;
+    auto* owner=engineTrackForProjectId(pianoEditingTrackId());if(owner==nullptr || pianoRollWindow==nullptr)return;
     const auto prefs=pianoRollWindow->getPreferences();
-    auto old=instrumentTrack->state.getChildWithName("PIANOROLL");
+    auto old=owner->state.getChildWithName("PIANOROLL");
     if(old.isValid() && old.isEquivalentTo(prefs))return;
-    if(old.isValid())instrumentTrack->state.removeChild(old,nullptr);
-    instrumentTrack->state.addChild(prefs.createCopy(),-1,nullptr);isDirty=true;
+    if(old.isValid())owner->state.removeChild(old,nullptr);
+    owner->state.addChild(prefs.createCopy(),-1,nullptr);isDirty=true;
 }
 void loadSelectedPianoPreferences()
 {
-    if(instrumentTrack==nullptr || pianoRollWindow==nullptr)return;
-    const auto prefs=instrumentTrack->state.getChildWithName("PIANOROLL");
+    auto* owner=engineTrackForProjectId(pianoEditingTrackId());if(owner==nullptr || pianoRollWindow==nullptr)return;
+    const auto prefs=owner->state.getChildWithName("PIANOROLL");
     pianoRollWindow->setPreferences(prefs.isValid()?prefs:defaultPianoRollPreferences);
 }
 void auditionPianoEdit(int pitch,bool down)
@@ -35,7 +35,7 @@ void renamePianoPattern()
 {
     if(!canEditPattern())return;
     const auto id=selectedProjectTrackId();const int slot=selectedPatternIndex();
-    juce::AlertWindow dialog("Rename Pattern","Name this generator pattern.",juce::AlertWindow::NoIcon);
+    orbit::workspace::OwnedAlert dialog("Rename Pattern","Name this generator pattern.",juce::AlertWindow::NoIcon);
     dialog.addTextEditor("name",project.getPatternName(id,slot));dialog.addButton("Rename",1);dialog.addButton("Cancel",0);
     if(dialog.runModalLoop()!=1)return;
     const auto name=dialog.getTextEditorContents("name").trim();if(name.isEmpty() || name==project.getPatternName(id,slot))return;

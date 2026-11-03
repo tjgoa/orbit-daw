@@ -688,6 +688,20 @@ void ProjectDocument::setTrackName(int index, const juce::String& requestedName)
         channel.setProperty("name", name, nullptr);
 }
 
+bool ProjectDocument::convertTrackToRenderedAudio(int index,const juce::StringArray& ids,const juce::StringArray& names)
+{
+    auto tracks=state.getChildWithName(tracksType);if(!juce::isPositiveAndBelow(index,tracks.getNumChildren()))return false;
+    auto track=tracks.getChild(index);track.setProperty("kind","audio",nullptr);track.setProperty("selectedPatternIndex",0,nullptr);
+    for(auto type:{patternsType,clipsType,pluginsType})if(auto child=track.getChildWithName(type);child.isValid())child.removeAllChildren(nullptr);
+    auto lanes=track.getChildWithName(automationType);
+    for(int i=lanes.getNumChildren();--i>=0;)
+    {
+        const auto lane=lanes.getChild(i);const auto id=lane.getProperty("pluginId").toString(),name=lane.getProperty("pluginName").toString();
+        if(name=="MIDI" || (id.isNotEmpty()?ids.contains(id):names.contains(name)))lanes.removeChild(i,nullptr);
+    }
+    return true;
+}
+
 bool ProjectDocument::removeTrack(int index)
 {
     auto tracks = state.getChildWithName(tracksType);
@@ -1298,8 +1312,26 @@ void ProjectDocument::removePatternNoteTicks(const juce::String& trackId, int sl
 void ProjectDocument::setPatternLengthSteps(const juce::String& trackId, int slotIndex, int lengthSteps)
 {
     auto slot = findPatternSlot(state, trackId, slotIndex);
-    if (slot.isValid())
-        slot.setProperty("lengthSteps", juce::jlimit(1, maximumPatternLengthSteps, lengthSteps), nullptr);
+    if (!slot.isValid()) return;
+    slot.setProperty("lengthSteps", juce::jlimit(1, maximumPatternLengthSteps, lengthSteps), nullptr);
+    // Ordinary placements are references to this pattern, not independent loops.
+    // Normalize older per-placement extensions when its shared length changes.
+    // Exact performance segments/fine trims retain their explicit boundaries.
+    const auto patternId = getPatternId(trackId, slotIndex);
+    for (auto clip : findProjectTrack(state, trackId).getChildWithName(clipsType))
+        if (clip.hasType(playlistClipType) && clip.getProperty("patternId").toString() == patternId
+            && !static_cast<bool>(clip.getProperty("exactLength", false)))
+        {
+            const double oldBars = static_cast<double>(clip.getProperty("lengthBars", 1));
+            if (std::abs(oldBars - std::round(oldBars)) > 1.e-7
+                && !static_cast<bool>(clip.getProperty("followsPatternLength", true)))
+            {
+                clip.setProperty("exactLength", true, nullptr);
+                continue;
+            }
+            clip.setProperty("lengthBars", 1, nullptr);
+            clip.setProperty("followsPatternLength", true, nullptr);
+        }
 }
 
 namespace
@@ -1642,6 +1674,15 @@ void ProjectDocument::moveTrack(int sourceIndex, int destinationIndex)
     tracks.moveChild(sourceIndex, destinationIndex, nullptr);
 }
 
+// A stable native tick lattice prevents repeated fractional moves drifting.
+// Legacy integer-bar projects read without conversion; schema 22 stores doubles.
+double ProjectDocument::normalisePlaylistBar(double bar) const
+{
+    const auto meter=getInitialTimeSignature();
+    const double ticks=ticksPerQuarterNote*meter.numerator*4.0/juce::jmax(1,meter.denominator);
+    return std::isfinite(bar)?std::round(bar*ticks)/ticks:bar;
+}
+
 std::vector<ProjectDocument::PlaylistClipRecord> ProjectDocument::getPlaylistClips(const juce::String& trackId) const
 {
     std::vector<PlaylistClipRecord> result;
@@ -1652,14 +1693,14 @@ std::vector<ProjectDocument::PlaylistClipRecord> ProjectDocument::getPlaylistCli
         if (!clip.hasType(playlistClipType)) continue;
         PlaylistClipRecord record;
         record.patternId = clip.getProperty("patternId").toString();
-        record.startBar = static_cast<int>(clip.getProperty("startBar", -1));
-        record.lengthBars = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
+        record.startBar = normalisePlaylistBar(static_cast<double>(clip.getProperty("startBar", -1)));
+        record.lengthBars = juce::jmax(1.0 / (ticksPerQuarterNote * 4), normalisePlaylistBar(static_cast<double>(clip.getProperty("lengthBars", 1))));
         record.exactLength = static_cast<bool>(clip.getProperty("exactLength", false));
         const auto pattern = getPatternIndexForId(trackId, record.patternId);
-        if (pattern < 0 || record.startBar < 0) continue;
+        if (pattern < 0 || !std::isfinite(record.startBar) || !std::isfinite(record.lengthBars) || record.startBar < 0 || record.startBar+record.lengthBars>std::numeric_limits<int>::max()) continue;
         if (!record.exactLength)
             record.lengthBars = juce::jmax(record.lengthBars,
-                patternLengthInBars(getPatternLengthSteps(trackId, pattern)));
+                double(patternLengthInBars(getPatternLengthSteps(trackId, pattern))));
         result.push_back(record);
     }
     std::stable_sort(result.begin(), result.end(), [](const auto& left, const auto& right)
@@ -1668,12 +1709,13 @@ std::vector<ProjectDocument::PlaylistClipRecord> ProjectDocument::getPlaylistCli
 }
 
 bool ProjectDocument::setPlaylistClipExactBars(const juce::String& trackId, const juce::String& patternId,
-                                               int startBar, int lengthBars)
+                                               double startBar, double lengthBars)
 {
-    if (startBar < 0 || lengthBars < 1
-        || static_cast<juce::int64>(startBar) + lengthBars > std::numeric_limits<int>::max()
+    if (!std::isfinite(startBar) || !std::isfinite(lengthBars) || startBar < 0 || lengthBars <= 0
+        || startBar + lengthBars > std::numeric_limits<int>::max()
         || getPatternIndexForId(trackId, patternId) < 0)
         return false;
+    startBar=normalisePlaylistBar(startBar);lengthBars=juce::jmax(1.0/(ticksPerQuarterNote*4),normalisePlaylistBar(lengthBars));
     auto track = findProjectTrack(state, trackId);
     if (!track.isValid()) return false;
     setPlaylistClip(trackId, patternId, startBar, lengthBars, true);
@@ -1681,8 +1723,9 @@ bool ProjectDocument::setPlaylistClipExactBars(const juce::String& trackId, cons
     for (int index = 0; index < clips.getNumChildren(); ++index)
     {
         auto clip = clips.getChild(index);
-        if (static_cast<int>(clip.getProperty("startBar", -1)) == startBar)
+        if (normalisePlaylistBar(static_cast<double>(clip.getProperty("startBar", -1))) == startBar)
         {
+            clip.setProperty("lengthBars", lengthBars, nullptr);
             clip.setProperty("exactLength", true, nullptr);
             clip.setProperty("followsPatternLength", false, nullptr);
             return true;
@@ -1691,45 +1734,37 @@ bool ProjectDocument::setPlaylistClipExactBars(const juce::String& trackId, cons
     return false;
 }
 
-juce::String ProjectDocument::getPlaylistPatternId(const juce::String& trackId, int bar) const
+juce::String ProjectDocument::getPlaylistPatternId(const juce::String& trackId, double bar) const
 {
-    if (bar < 0) return {};
-    const auto track = findProjectTrack(state, trackId);
-    const auto clips = track.getChildWithName(clipsType);
-    for (int i = 0; i < clips.getNumChildren(); ++i)
-    {
-        const auto clip = clips.getChild(i);
-        const auto start = static_cast<int>(clip.getProperty("startBar", -1));
-        auto length = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
-        const auto patternIndex = getPatternIndexForId(trackId, clip.getProperty("patternId").toString());
-        if (patternIndex >= 0 && !static_cast<bool>(clip.getProperty("exactLength", false)))
-            length = juce::jmax(length, patternLengthInBars(getPatternLengthSteps(trackId, patternIndex)));
-        if (start >= 0 && bar >= start && static_cast<juce::int64>(bar) < static_cast<juce::int64>(start) + length)
+    const auto start = getPlaylistClipStartBar(trackId, bar);
+    if (start < 0) return {};
+    for (auto clip : findProjectTrack(state, trackId).getChildWithName(clipsType))
+        if (normalisePlaylistBar(static_cast<double>(clip.getProperty("startBar", -1))) == start)
             return clip.getProperty("patternId").toString();
-    }
     return {};
 }
 
-int ProjectDocument::getPlaylistClipStartBar(const juce::String& trackId, int bar) const
+double ProjectDocument::getPlaylistClipStartBar(const juce::String& trackId, double bar) const
 {
     if (bar < 0) return -1;
     const auto track = findProjectTrack(state, trackId);
     const auto clips = track.getChildWithName(clipsType);
+    double latestStart = -1;
     for (int i = 0; i < clips.getNumChildren(); ++i)
     {
         const auto clip = clips.getChild(i);
-        const auto start = static_cast<int>(clip.getProperty("startBar", -1));
-        auto length = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
+        const auto start = normalisePlaylistBar(static_cast<double>(clip.getProperty("startBar", -1)));
+        auto length = juce::jmax(1.0 / (ticksPerQuarterNote * 4), normalisePlaylistBar(static_cast<double>(clip.getProperty("lengthBars", 1))));
         const auto patternIndex = getPatternIndexForId(trackId, clip.getProperty("patternId").toString());
         if (patternIndex >= 0 && !static_cast<bool>(clip.getProperty("exactLength", false)))
-            length = juce::jmax(length, patternLengthInBars(getPatternLengthSteps(trackId, patternIndex)));
-        if (start >= 0 && bar >= start && static_cast<juce::int64>(bar) < static_cast<juce::int64>(start) + length)
-            return start;
+            length = juce::jmax(length, double(patternLengthInBars(getPatternLengthSteps(trackId, patternIndex))));
+        if (start >= 0 && bar >= start && bar < start + length)
+            latestStart = juce::jmax(latestStart, start);
     }
-    return -1;
+    return latestStart;
 }
 
-bool ProjectDocument::playlistClipFollowsPatternLength(const juce::String& trackId, int bar) const
+bool ProjectDocument::playlistClipFollowsPatternLength(const juce::String& trackId, double bar) const
 {
     const auto start = getPlaylistClipStartBar(trackId, bar);
     if (start < 0) return false;
@@ -1738,14 +1773,14 @@ bool ProjectDocument::playlistClipFollowsPatternLength(const juce::String& track
     for (int i = 0; i < clips.getNumChildren(); ++i)
     {
         const auto clip = clips.getChild(i);
-        if (static_cast<int>(clip.getProperty("startBar", -1)) == start)
+        if (normalisePlaylistBar(static_cast<double>(clip.getProperty("startBar", -1))) == start)
             return !clip.hasProperty("followsPatternLength")
                 || static_cast<bool>(clip.getProperty("followsPatternLength", true));
     }
     return false;
 }
 
-int ProjectDocument::getPlaylistClipLengthBars(const juce::String& trackId, int bar) const
+double ProjectDocument::getPlaylistClipLengthBars(const juce::String& trackId, double bar) const
 {
     const auto start = getPlaylistClipStartBar(trackId, bar);
     if (start < 0) return 0;
@@ -1754,20 +1789,21 @@ int ProjectDocument::getPlaylistClipLengthBars(const juce::String& trackId, int 
     for (int i = 0; i < clips.getNumChildren(); ++i)
     {
         const auto clip = clips.getChild(i);
-        if (static_cast<int>(clip.getProperty("startBar", -1)) != start) continue;
-        const auto storedLength = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
+        if (normalisePlaylistBar(static_cast<double>(clip.getProperty("startBar", -1))) != start) continue;
+        const auto storedLength = juce::jmax(1.0 / (ticksPerQuarterNote * 4), normalisePlaylistBar(static_cast<double>(clip.getProperty("lengthBars", 1))));
         const auto patternIndex = getPatternIndexForId(trackId, clip.getProperty("patternId").toString());
         if (patternIndex >= 0 && !static_cast<bool>(clip.getProperty("exactLength", false)))
-            return juce::jmax(storedLength, patternLengthInBars(getPatternLengthSteps(trackId, patternIndex)));
+            return juce::jmax(storedLength, double(patternLengthInBars(getPatternLengthSteps(trackId, patternIndex))));
         return storedLength;
     }
     return 0;
 }
 
 void ProjectDocument::setPlaylistClip(const juce::String& trackId, const juce::String& patternId,
-                                     int startBar, int lengthBars, bool enabled)
+                                     double startBar, double lengthBars, bool enabled)
 {
-    if (startBar < 0) return;
+    if (!std::isfinite(startBar) || !std::isfinite(lengthBars) || startBar < 0 || startBar + juce::jmax(0.,lengthBars) > std::numeric_limits<int>::max()) return;
+    startBar=normalisePlaylistBar(startBar);lengthBars=normalisePlaylistBar(lengthBars);
     auto track = findProjectTrack(state, trackId);
     if (!track.isValid()) return;
     auto clips = track.getChildWithName(clipsType);
@@ -1780,19 +1816,13 @@ void ProjectDocument::setPlaylistClip(const juce::String& trackId, const juce::S
     // A zero length follows the source pattern's step count. Positive values
     // represent an explicit arrangement length set by the Playlist resize tool.
     const bool followsPatternLength = lengthBars <= 0;
-    const auto storedLength = juce::jmax(1, lengthBars);
+    const auto storedLength = juce::jmax(1.0, lengthBars);
+    const auto targetStart = enabled ? startBar : getPlaylistClipStartBar(trackId, startBar);
     for (int i = clips.getNumChildren(); --i >= 0;)
     {
         const auto clip = clips.getChild(i);
-        const auto start = static_cast<int>(clip.getProperty("startBar", -1));
-        auto existingLength = juce::jmax(1, static_cast<int>(clip.getProperty("lengthBars", 1)));
-        const auto existingPattern = getPatternIndexForId(trackId, clip.getProperty("patternId").toString());
-        if (existingPattern >= 0 && !static_cast<bool>(clip.getProperty("exactLength", false)))
-            existingLength = juce::jmax(existingLength,
-                patternLengthInBars(getPatternLengthSteps(trackId, existingPattern)));
-        const bool containsTarget = start >= 0 && startBar >= start
-            && static_cast<juce::int64>(startBar) < static_cast<juce::int64>(start) + existingLength;
-        if (clip.getType() == playlistClipType && (start == startBar || (!enabled && containsTarget)))
+        const auto start = normalisePlaylistBar(static_cast<double>(clip.getProperty("startBar", -1)));
+        if (clip.getType() == playlistClipType && start == targetStart)
             clips.removeChild(i, nullptr);
     }
 

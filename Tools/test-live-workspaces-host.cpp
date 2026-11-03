@@ -2,6 +2,7 @@
 // explicitly supplied installed plugins, isolated prefs, no audio devices.
 bool saveNativePeer(juce::Component&,const juce::File&);
 bool nativeGeometryMatchesPeer(juce::Component&);
+bool nativeHitIsJuce(juce::Component&,juce::Point<int>);
 class LiveWorkspaceProbe final:public juce::JUCEApplication,private juce::Timer
 {
     std::unique_ptr<ProjectView> host;
@@ -11,6 +12,7 @@ class LiveWorkspaceProbe final:public juce::JUCEApplication,private juce::Timer
     std::vector<juce::String> paths{NATIVE_PLUGIN_PATHS};
     juce::String firstGenerator,secondGenerator,firstFx,secondFx;int phase=0;
     juce::Rectangle<int> firstBounds,secondBounds;
+    std::unique_ptr<orbit::workspace::OwnedAlert> modal;int modalResult=-1;juce::Component::SafePointer<juce::DialogWindow> childDialog;juce::Component::SafePointer<juce::TextButton> dialogDone;
     static void check(bool ok,const char* why){if(!ok)throw std::runtime_error(why);}
     juce::PluginDescription description(const juce::String& path,bool instrument)
     {
@@ -64,6 +66,19 @@ class LiveWorkspaceProbe final:public juce::JUCEApplication,private juce::Timer
                 verifyNative();auto a=host->mixerWindow->openEffectWindows().at(firstFx),b=host->mixerWindow->openEffectWindows().at(secondFx);
                 check(a->getBounds()==firstBounds && b->getBounds()==secondBounds,"Opening unrelated panels moved FX windows");
                 check(saveNativePeer(*host,juce::File("OPTIONS_CHECK_FOLDER/live-workspaces.png")),"Workspace capture failed");
+                // Native Cocoa editors must remain aligned and clipped while their
+                // complete owning frame extends beyond the parent on any edge.
+                auto& w=*host->generatorControlWindows.at(firstGenerator).window;
+                const auto original=w.getBounds();
+                for(const juce::Point<int> position:std::array<juce::Point<int>,3>{{{-200,120},{1300,160},{100,w.workspaceArea().getBottom()-30}}})
+                {
+                    w.setTopLeftPosition(position);host->resized();verifyNative();
+                    check(w.getPosition()==position && w.getWidth()==original.getWidth() && w.getHeight()==original.getHeight(),"Native generator was boxed in or shrunk");
+                    check(nativeHitIsJuce(*host,{100,40}),"Off-edge native editor intercepts transport clicks");
+                    w.minimiseButtonPressed();check(!w.instrument->isShowing(),"Off-edge native editor leaked while minimized");
+                    w.showControls(false);verifyNative();check(w.getPosition()==position,"Native restore lost off-edge bounds");
+                }
+                w.setBounds(original);verifyNative();
                 b->minimiseButtonPressed();check(!b->isVisible() && a->isVisible(),"Native minimize affected another FX");
                 check(host->generatorDockViewport.isVisible(),"Native FX dock missing");phase=2;startTimer(500);return;
             }
@@ -72,8 +87,51 @@ class LiveWorkspaceProbe final:public juce::JUCEApplication,private juce::Timer
                 auto b=host->mixerWindow->openEffectWindows().at(secondFx);b->restoreEditor(false);
                 host->openGeneratorForRow(0);host->openGeneratorForRow(1);host->stopPlayback();phase=3;startTimer(700);return;
             }
-            verifyNative();check(host->mixerWindow->openEffectWindows().at(firstFx)->getBounds()==firstBounds,"Selection/Stop moved native FX");
-            std::cout<<"PASS: two real instrument GUIs and two real FX GUIs coexist in Orbit's native peer, have valid Cocoa frames, retain placement across Playlist/Event/selection/Stop, and minimize/restore independently. No audio devices used.\n";
+            if(phase==3)
+            {
+                verifyNative();check(host->mixerWindow->openEffectWindows().at(firstFx)->getBounds()==firstBounds,"Selection/Stop moved native FX");
+                host->openGeneratorPianoRoll(firstGenerator);host->resized();phase=4;startTimer(500);return;
+            }
+            auto& frame=*host->generatorControlWindows.at(firstGenerator).window;
+            if(phase==4)
+            {
+                host->syncGeneratorNativeViews();check(frame.isPatternView() && host->pianoRollWindow->isShowing() && !frame.instrument->isShowing(),"Native synth remains visible over Piano Roll");
+                check(nativeHitIsJuce(*host,host->getLocalPoint(host->pianoRollWindow.get(),juce::Point<int>{200,180})),"Hidden native synth intercepts Piano Roll clicks");
+                check(saveNativePeer(*host,juce::File("OPTIONS_CHECK_FOLDER/hosted-native-piano.png")),"Piano Roll capture failed");
+                frame.minimiseButtonPressed();phase=5;startTimer(500);return;
+            }
+            if(phase==5)
+            {
+                host->syncGeneratorNativeViews();check(frame.isMinimised() && !host->pianoRollWindow->isShowing() && !frame.instrument->isShowing(),"Native minimized frame leaked one of its bodies");
+                frame.showControls();check(frame.isPatternView() && host->pianoRollWindow->isShowing(),"Native restore lost Piano Roll");frame.closeButtonPressed();phase=6;startTimer(500);return;
+            }
+            if(phase==6)
+            {
+                verifyNative();check(!frame.isPatternView() && frame.instrument->isShowing(),"Piano Roll X failed to restore native instrument");
+                modal=std::make_unique<orbit::workspace::OwnedAlert>("Clone Options","Native peer modal ownership fixture",juce::MessageBoxIconType::NoIcon);modal->addButton("Clone",1);modal->addButton("Cancel",0);modal->setSize(480,180);
+                modal->enterModalState(true,juce::ModalCallbackFunction::create([this](int result){modalResult=result;}),false);phase=7;startTimer(500);return;
+            }
+            if(phase==7)
+            {
+                host->syncGeneratorNativeViews();check(modal->getParentComponent()==host.get() && modal->isShowing() && modal->isCurrentlyModal(),"Native modal escaped Orbit");
+                check(nativeHitIsJuce(*host,modal->getBounds().getCentre()),"Native plugin intercepts modal clicks");
+                check(saveNativePeer(*host,juce::File("OPTIONS_CHECK_FOLDER/hosted-native-modal.png")),"Modal capture failed");modal->getButton(0)->triggerClick();phase=8;startTimer(500);return;
+            }
+            if(phase==8)
+            {
+                check(modalResult==1 && !modal->isCurrentlyModal(),"Native modal button did not complete");modal.reset();
+                juce::DialogWindow::LaunchOptions options;options.dialogTitle="Owned settings fixture";options.componentToCentreAround=host.get();
+                auto* done=new juce::TextButton("Done");done->setSize(400,150);dialogDone=done;options.content.setOwned(done);
+                childDialog=orbit::workspace::ownDialog(options.launchAsync(),host.get());done->onClick=[this]{if(childDialog!=nullptr)childDialog->exitModalState(1);};phase=9;startTimer(500);return;
+            }
+            if(phase==9)
+            {
+                check(childDialog!=nullptr && childDialog->getParentComponent()==host.get() && !childDialog->isOnDesktop() && childDialog->isCurrentlyModal(),"Settings form escaped Orbit");
+                check(nativeHitIsJuce(*host,childDialog->getBounds().getCentre()),"Native editor intercepts settings form");dialogDone->triggerClick();phase=10;startTimer(500);return;
+            }
+            check(childDialog==nullptr,"Settings form did not close cleanly");
+            host->createProjectDiscardingCurrent();check(host->generatorControlWindows.empty() && host->mixerWindow->openEffectWindows().empty() && !host->playlistWindow->isVisible() && !host->mixerWindow->isVisible(),"New Project left native document windows");
+            std::cout<<"PASS: native generator left/right/bottom overflow with geometry/clipping/minimize recovery; two real instrument and two FX GUIs coexist; native geometry, foreground clipping, transport, one-frame Piano Roll, minimize/restore/X, owned modal hit testing/button completion and blank New Project. No audio devices.\n";
             quit();
         }
         catch(const std::exception& e){std::cerr<<"FAIL: "<<e.what()<<"\n";setApplicationReturnValue(1);quit();}
