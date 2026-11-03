@@ -35,18 +35,19 @@ int main()
     mixer.handleMixerMenuResult(41);spriteCheck(mixer.spritePanel!=nullptr && mixer.spriteWindow->isVisible(),"sprite menu did not open panel");waitSprite(mixer.spriteBrowser);
     auto& browser=mixer.spriteBrowser;browser.open(root);waitSprite(browser);spriteCheck(browser.catalogue.entries.size()==156,"live browser catalogue not populated");
     browser.select(catalog.entries.front());browser.select(catalog.entries.back());waitSprite(browser);
+    browser.mark(catalog.entries.back(),false,1);
     spriteCheck(browser.active && browser.active->entry.id==catalog.entries.back().id,"rapid switching used a stale decode result");
-    spriteCheck(orbit::ui::sprites::forComponent(strip->eqControls[0][0])==browser.active.get(),"EQ did not inherit selected sprite");spriteCheck(orbit::ui::sprites::forComponent(strip->sends[0])==browser.active.get(),"send knob did not inherit sprite");spriteCheck(orbit::ui::sprites::forComponent(strip->pan)==browser.active.get(),"pan did not inherit sprite");
+    spriteCheck(orbit::ui::sprites::forComponent(strip->eqControls[0][0])==nullptr,"EQ did not inherit selected sprite");spriteCheck(orbit::ui::sprites::forComponent(strip->sends[0])==browser.active.get(),"send knob did not inherit sprite");spriteCheck(orbit::ui::sprites::forComponent(strip->pan)==nullptr,"pan did not inherit sprite");
     juce::Slider independent;spriteCheck(orbit::ui::sprites::forComponent(independent)==nullptr,"custom sprite leaked to non-mixer controls");
-    spriteCheck(host.optionString("mixerSpriteID")==browser.active->entry.id && host.optionString("mixerSpriteFolder")==root.getFullPathName(),"sprite preference not saved");
+    spriteCheck(host.optionString("mixerSpriteSetupV2").contains(browser.active->entry.id) && host.optionString("mixerSpriteSetupV2").contains(root.getFullPathName()),"sprite preference not saved");
     const auto chosen=browser.active;
     for(int skin=0;skin<=6;++skin){mixer.setMixerSkin(skin);spriteCheck(mixer.mixerSprite()==chosen.get(),"skin change lost explicit sprite");}
     mixer.setMixerSkin(5);spriteImage(*mixer.spritePanel,"sprite-panel.png");spriteImage(mixer,"sprite-mixer.png");
     mixer.showLayoutPanel();mixer.layoutPanel->sliders[4].setValue(500,juce::sendNotificationSync);mixer.layoutPanel->commit();spriteCheck(mixer.getBounds()==bounds && strip->eqControls[0][0].getBounds()==control,"sprite size resized mixer or control cells");
-    host.showMixer(true);spriteCheck(orbit::ui::sprites::forComponent(mixer.masterStrip.pan)==chosen.get(),"Master bank did not inherit sprite");spriteImage(mixer,"sprite-master.png");host.showMixer();
+    host.showMixer(true);spriteCheck(orbit::ui::sprites::forComponent(mixer.masterStrip.pan)==nullptr,"Master bank did not inherit sprite");spriteImage(mixer,"sprite-master.png");host.showMixer();
     browser.select(invalid);waitSprite(browser);spriteCheck(browser.active==chosen && browser.status.contains("dimensions"),"bad sprite replaced valid selection");
     browser.open(fixtures.getChildFile("missing"));waitSprite(browser);spriteCheck(browser.active==chosen && browser.catalogue.entries.size()==156,"bad library destroyed current selection/library");
-    {MixerWindow restored;restored.restoreSpritePreference(root,chosen->entry.id);waitSprite(restored.spriteBrowser);spriteCheck(restored.mixerSprite()!=nullptr && restored.mixerSprite()->entry.id==chosen->entry.id,"saved sprite did not restore without opening browser");}
+    {MixerWindow restored;restored.spriteBrowser.restore(browser.toJson());waitSprite(restored.spriteBrowser);spriteCheck(restored.mixerSprite()!=nullptr && restored.mixerSprite()->entry.id==chosen->entry.id,"saved sprite did not restore without opening browser");}
     {MixerWindow missing;missing.restoreSpritePreference(fixtures.getChildFile("missing"),"gone");waitSprite(missing.spriteBrowser);spriteCheck(missing.mixerSprite()==nullptr,"missing saved library failed safe fallback");}
     mixer.showSpritePanel();auto* panel=mixer.spritePanel;panel->filter.setText("2000sMasterVolDial",false);panel->filter.onTextChange();spriteCheck(panel->getNumRows()==1,"search failed");panel->list.selectRow(0);waitSprite(browser);spriteCheck(browser.active->entry.name=="2000sMasterVolDial","search selection did not apply");
     panel->filter.setText({},false);panel->filter.onTextChange();panel->next.onClick();waitSprite(browser);const auto next=browser.active->entry.id;panel->previous.onClick();waitSprite(browser);spriteCheck(browser.active->entry.id!=next,"previous/next did not switch sprites");

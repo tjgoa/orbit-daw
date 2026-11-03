@@ -3866,7 +3866,9 @@ public:
     orbit::mixing::KnobSpritePanel* spritePanel=nullptr;
     juce::File spriteInitialFolder;
     std::function<void(juce::File,juce::String)> onSpriteSaved;
-    const orbit::ui::sprites::Sprite* mixerSprite()const override{return spriteBrowser.active.get();}
+    const orbit::ui::sprites::Sprite* mixerSprite()const override{return spriteBrowser.forRole(0);}
+    const orbit::ui::sprites::Sprite* mixerSpriteForRole(int role)const override{return spriteBrowser.forRole(role);}
+    std::function<void(juce::String)> onSpriteSetupSaved;
     void restoreSpritePreference(juce::File folder,const juce::String& id)
     {spriteInitialFolder=folder;if(id.isNotEmpty())spriteBrowser.open(folder,id);}
     void showSpritePanel()
@@ -3879,9 +3881,11 @@ public:
             const juce::Component::SafePointer<MixerWindow> owner(this);
             panel->onClose=[owner]{if(owner!=nullptr && owner->spriteWindow!=nullptr)owner->spriteWindow->closeButtonPressed();};
             panel->onLayout=[owner]{if(owner!=nullptr)owner->showLayoutPanel();};
+            panel->size.setValue(knobSizePercent,juce::dontSendNotification);
+            panel->onSize=[owner](int value){if(owner!=nullptr){owner->setKnobSize(value);if(owner->onLayoutSaved)owner->onLayoutSaved(owner->layoutSettings);}};
             spriteWindow->setContentOwned(panel.release(),true);
             if(auto* parent=getParentComponent())parent->addChildComponent(*spriteWindow);
-            spriteWindow->centreAroundComponent(getParentComponent(),720,555);
+            spriteWindow->centreAroundComponent(getParentComponent(),800,665);
         }
         spriteWindow->setVisible(true);spriteWindow->toFront(true);
         if(spriteBrowser.catalogue.entries.empty() && !spriteBrowser.loading)
@@ -3924,14 +3928,16 @@ public:
         if(!layoutWindow->isVisible())layoutPanel->beginSession(layoutSettings);
         layoutWindow->setVisible(true);layoutWindow->toFront(true);
     }
-    void setKnobSize(int percent){knobSizePercent=juce::jlimit(100,500,percent);layoutSettings.knobPercent=knobSizePercent;getProperties().set("orbitMixerKnobScale",knobSizePercent/100.);orbit::ui::repaintKnobTree(*this);if(layoutPanel!=nullptr)layoutPanel->setSettings(layoutSettings);}
+    void setKnobSize(int percent){knobSizePercent=juce::jlimit(100,500,percent);layoutSettings.knobPercent=knobSizePercent;getProperties().set("orbitMixerKnobScale",knobSizePercent/100.);orbit::ui::repaintKnobTree(*this);if(layoutPanel!=nullptr)layoutPanel->setSettings(layoutSettings);if(spritePanel!=nullptr)spritePanel->size.setValue(knobSizePercent,juce::dontSendNotification);}
     MixerWindow()
     {
         spriteBrowser.onChanged=[this]{if(spritePanel!=nullptr)spritePanel->refresh();};
+        spriteBrowser.onPreferencesChanged=[this]{orbit::ui::repaintKnobTree(*this);if(onSpriteSetupSaved)onSpriteSetupSaved(spriteBrowser.toJson());};
         spriteBrowser.onApplied=[this](auto sprite)
         {
             orbit::ui::repaintKnobTree(*this);
-            if(onSpriteSaved)onSpriteSaved(sprite?sprite->entry.library:spriteBrowser.catalogue.folder,sprite?sprite->entry.id:juce::String{});
+            if(onSpriteSetupSaved)onSpriteSetupSaved(spriteBrowser.toJson());
+            if(onSpriteSaved){const auto original=spriteBrowser.choices[0];onSpriteSaved(original?original->entry.library:spriteBrowser.catalogue.folder,original?original->entry.id:juce::String{});}juce::ignoreUnused(sprite);
         };
         // The frame paints every pixel: avoid repainting the wallpaper beneath it.
         setOpaque(true);
@@ -4009,13 +4015,14 @@ public:
     }
     void setMixerSkin(int skin)
     {
-        mixerSkin = juce::jlimit(0, 6, skin);
-        getProperties().set("orbitMixerLightSurface",mixerSkin>=3);
-        getProperties().set("orbitMixerUseWhite",mixerSkin>=5);getProperties().set("orbitMixerDefaultFinish",mixerSkin==5?2:mixerSkin==6?3:1);
+        mixerSkin = juce::jlimit(0, 7, skin);
+        getProperties().set("orbitMixerConsole",mixerSkin==7);
+        getProperties().set("orbitMixerLightSurface",(mixerSkin>=3 && mixerSkin<=6));
+        getProperties().set("orbitMixerUseWhite",(mixerSkin>=5 && mixerSkin<=6));getProperties().set("orbitMixerDefaultFinish",mixerSkin==5?2:mixerSkin==6?3:1);
         orbit::options::compact::applyVariant(*this,orbit::mixing::compactVariant(mixerSkin));
         content.setSkin(mixerSkin);
         for (auto* strip : channelStrips) strip->setSkin(mixerSkin);
-        masterStrip.setSkin(mixerSkin);masterStrip.setInsertCapacity(4);
+        masterStrip.setSkin(mixerSkin);masterStrip.setInsertCapacity(4);layoutStrips();
         repaint();
     }
     int getVisibleTrackCount() const { return visibleTrackIndices.size(); }
@@ -4271,12 +4278,12 @@ public:
         const auto edge = mixerSkin == 1 ? orbit::options::compact::colour(*this,74, 111, 145)
             : mixerSkin == 2 ? orbit::options::compact::colour(*this,107, 122, 138)
             : orbit::options::compact::colour(*this,151, 194, 216);
-        g.setColour(mixerSkin>=3 ? orbit::options::compact::surface(orbit::mixing::compactVariant(mixerSkin)) : frame);
+        g.setColour((mixerSkin>=3 && mixerSkin<=6) ? orbit::options::compact::surface(orbit::mixing::compactVariant(mixerSkin)) : frame);
         g.fillRect(getLocalBounds());
         g.setColour(header);
         g.fillRect(0, 0, getWidth(), titleBarHeight);
-        if(mixerSkin>=3)orbit::options::compact::panel(g,{0,0,float(getWidth()),float(titleBarHeight)},orbit::options::compact::variant(*this));
-        g.setColour(mixerSkin>=3?orbit::options::compact::ink():orbit::options::compact::colour(*this,222, 235, 242));
+        if((mixerSkin>=3 && mixerSkin<=6))orbit::options::compact::panel(g,{0,0,float(getWidth()),float(titleBarHeight)},orbit::options::compact::variant(*this));
+        g.setColour((mixerSkin>=3 && mixerSkin<=6)?orbit::options::compact::ink():orbit::options::compact::colour(*this,222, 235, 242));
         g.setFont(juce::Font(13.0f, juce::Font::bold));
         g.drawText(masterSectionMode ? "Master Section" : "Mixing Desk", 9, 0, juce::jmax(0, getWidth() - 98), titleBarHeight,
                    juce::Justification::centred);
@@ -4296,7 +4303,8 @@ public:
         skinMenu.addItem(13, "Compact Silver", true, mixerSkin == 3);
         skinMenu.addItem(14, "Compact Silver 2", true, mixerSkin == 4);
         skinMenu.addItem(15,"Warm White",true,mixerSkin==5);skinMenu.addItem(16,"Silver / Silver Knobs",true,mixerSkin==6);
-        menu.addSubMenu("Mixer colors", skinMenu);
+        skinMenu.addItem(17,"Orion Console / Blue",true,mixerSkin==7);
+        menu.addSubMenu("Mixer colors / designs", skinMenu);
         juce::PopupMenu knobs;for(int i=0;i<orbit::ui::knobStyleNames.size();++i)knobs.addItem(30+i,orbit::ui::knobStyleNames[i],true,orbit::ui::currentKnobStyle==i);
         menu.addSubMenu("Knob style (global)",knobs);
         juce::PopupMenu sizes;for(int percent:{100,125,150,175,200,250,300,400,500})sizes.addItem(1000+percent,juce::String(percent)+"%",true,knobSizePercent==percent);
@@ -4311,7 +4319,7 @@ public:
         if(result>=1100 && result<=1500){if(onKnobSizeChanged)onKnobSizeChanged(result-1000);return;}
         if(result>=30 && result<=32){if(onKnobStyleChanged)onKnobStyleChanged(result-30);return;}
         if (result == 1) setEqSectionVisible(!eqSectionVisible);
-        else if (result >= 10 && result <= 16) setMixerSkin(result - 10);
+        else if (result >= 10 && result <= 17) setMixerSkin(result - 10);
         else return;
         if (onAppearanceChanged) onAppearanceChanged(eqSectionVisible, mixerSkin);
     }
@@ -4600,6 +4608,7 @@ private:
                     const auto y = rail.getBottom() - p * rail.getHeight();
                     g.setColour(orbit::options::compact::colour(*this,167, 199, 211).withAlpha(0.65f));
                     g.drawHorizontalLine(juce::roundToInt(y), centreX - 9.0f, centreX + 9.0f);
+                    for(auto* parent=getParentComponent();parent;parent=parent->getParentComponent())if(bool(parent->getProperties().getWithDefault("orbitMixerConsole",false))){g.setFont(7.f);g.drawText(juce::String(int(db)),juce::roundToInt(centreX+11),juce::roundToInt(y)-4,19,9,juce::Justification::centredLeft);break;}
                 }
 
                 const auto p = static_cast<float>(valueToProportionOfLength(getValue()));
@@ -4779,6 +4788,7 @@ private:
         int layoutBaseHeight=0;
         int minimumLayoutHeight(int baseHeight,const orbit::mixing::Layout& l)const
         {
+            if(mixerSkin==7)return juce::jmax(baseHeight,780+3*juce::jmax(0,l.vertical));
             if(l.vertical<=0 && l.labelOffset<=0)return baseHeight;
             const int sendsHeight=sends[0].isVisible()?66+juce::jmax(0,l.vertical):0;
             const int insertsHeight=insertsTitle.isVisible()?18+24*insertCapacity:0;
@@ -4838,6 +4848,7 @@ private:
                 {
                     auto& control = eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)];
                     addAndMakeVisible(control);
+                    control.getProperties().set("orbitMixerKnobRole",parameter==0?2:3);
                     control.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
                     control.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
                     control.setPopupDisplayEnabled(true, true, this);
@@ -4868,6 +4879,8 @@ private:
                     {if(onEqEvents)onEqEvents((3-band)*3+(parameter==0?1:parameter==1?0:2),c);};
                     control.onValueChange = [this, band, parameter]
                     {
+                        if(configuringConsole)return;
+                        const float editedValue=float(eqControls[size_t(band)][size_t(parameter)].getValue());
                         if (!eqEnabled && onToggleEq)
                         {
                             eqEnabled = true;
@@ -4878,9 +4891,10 @@ private:
                             // The compact strip shows Gain, Frequency, Q while
                             // Tracktion stores each band's values as Frequency,
                             // Gain, Q. Translate the UI order to the engine order.
+                            if(mixerSkin==7 && parameter==0 && (band==0||band==3))onEqParameter((3-band)*3,band==0?12000.f:80.f);
                             const auto engineKind = parameter == 0 ? 1 : parameter == 1 ? 0 : 2;
                             onEqParameter((3 - band) * 3 + engineKind,
-                                static_cast<float>(eqControls[static_cast<size_t>(band)][static_cast<size_t>(parameter)].getValue()));
+                                editedValue);
                         }
                     };
 
@@ -4959,6 +4973,7 @@ private:
             panLeft.setText("L", juce::dontSendNotification);
             panTitle.setText("Pan", juce::dontSendNotification);
             panRight.setText("R", juce::dontSendNotification);
+            pan.getProperties().set("orbitMixerKnobRole",4);
             pan.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
             pan.setRange(-1.0, 1.0, 0.01);
             pan.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
@@ -4987,6 +5002,7 @@ private:
                 send.setColour(juce::Slider::thumbColourId, orbit::options::compact::colour(*this,186, 225, 242));
                 send.setColour(juce::Slider::rotarySliderFillColourId, orbit::options::compact::colour(*this,62, 169, 205));
                 send.setColour(juce::Slider::rotarySliderOutlineColourId, orbit::options::compact::colour(*this,34, 58, 74));
+                send.getProperties().set("orbitMixerKnobRole",1);
                 send.setColour(juce::Slider::textBoxTextColourId, orbit::options::compact::colour(*this,242, 249, 252));
                 send.setColour(juce::Slider::textBoxBackgroundColourId, orbit::options::compact::colour(*this,43, 73, 94));
                 send.setColour(juce::Slider::textBoxOutlineColourId, orbit::options::compact::colour(*this,125, 169, 193));
@@ -5182,9 +5198,9 @@ private:
         }
         void setSkin(int skin)
         {
-            mixerSkin = juce::jlimit(0, 6, skin);
+            mixerSkin = juce::jlimit(0, 7, skin);
             orbit::options::compact::applyVariant(*this,orbit::mixing::compactVariant(mixerSkin));
-            repaint();
+            resized();repaint();
         }
         void setSendsVisible(bool shouldShow)
         {
@@ -5266,7 +5282,7 @@ private:
             insert.setButtonText(populated ? "    " + insertName : juce::String{});
             insert.setInsertActive(populated && enabled);
             insert.setColour(juce::TextButton::buttonColourId,
-                             mixerSkin>=3 ? orbit::options::compact::display() : !populated ? orbit::options::compact::colour(*this,48, 78, 95)
+                             (mixerSkin>=3 && mixerSkin<=6) ? orbit::options::compact::display() : !populated ? orbit::options::compact::colour(*this,48, 78, 95)
                                 : enabled ? orbit::options::compact::colour(*this,47, 91, 117) : orbit::options::compact::colour(*this,55, 69, 78));
             insert.setTooltip(populated ? "Click the name to open " + insertName + "; left light enables/bypasses; right-click for effects and settings" : "Right-click to choose an effect");
             bypass.setButtonText("");
@@ -5302,16 +5318,16 @@ private:
         void paint(juce::Graphics& g) override
         {
             auto box = getLocalBounds().toFloat().reduced(1.0f);
-            const auto base = mixerSkin >= 3 ? orbit::options::compact::surface(orbit::mixing::compactVariant(mixerSkin)) : mixerSkin == 1
+            const auto base = mixerSkin==7?juce::Colour(isSelected?0xff326887:0xff284e69):(mixerSkin >= 3 && mixerSkin<=6) ? orbit::options::compact::surface(orbit::mixing::compactVariant(mixerSkin)) : mixerSkin == 1
                 ? (isSelected ? orbit::options::compact::colour(*this,45, 83, 113) : orbit::options::compact::colour(*this,25, 43, 63))
                 : mixerSkin == 2
                     ? (isSelected ? orbit::options::compact::colour(*this,83, 98, 113) : orbit::options::compact::colour(*this,48, 57, 69))
                     : (isSelected ? orbit::options::compact::colour(*this,91, 143, 171) : orbit::options::compact::colour(*this,71, 117, 146));
-            if(mixerSkin>=3) g.setColour(base);
+            if((mixerSkin>=3 && mixerSkin<=6)) g.setColour(base);
             else g.setGradientFill(juce::ColourGradient(base.brighter(0.12f), 0.0f, 0.0f,
                                                         base.darker(0.16f), 0.0f, getHeight(), false));
             g.fillRoundedRectangle(box, 5.0f);
-            g.setColour(mixerSkin>=3 ? (isSelected ? juce::Colour(84,130,154) : juce::Colour(162,171,184)) : orbit::options::compact::colour(*this,161, 197, 216));
+            g.setColour((mixerSkin>=3 && mixerSkin<=6) ? (isSelected ? juce::Colour(84,130,154) : juce::Colour(162,171,184)) : orbit::options::compact::colour(*this,161, 197, 216));
             g.drawRoundedRectangle(box, 5.0f, 1.0f);
             if (!masterEqView)
             {
@@ -5319,7 +5335,7 @@ private:
                 {
                     const auto panel = eqBandBounds[band].toFloat().reduced(1.0f, 0.5f);
                     if (panel.isEmpty()) continue;
-                    const auto panelBase = mixerSkin >= 3 ? base : mixerSkin == 1
+                    const auto panelBase = (mixerSkin >= 3 && mixerSkin<=6) ? base : mixerSkin == 1
                         ? (band % 2 == 0 ? orbit::options::compact::colour(*this,29, 51, 72) : orbit::options::compact::colour(*this,25, 45, 64))
                         : mixerSkin == 2
                             ? (band % 2 == 0 ? orbit::options::compact::colour(*this,43, 51, 62) : orbit::options::compact::colour(*this,38, 46, 56))
@@ -5333,7 +5349,7 @@ private:
                                            juce::jmax(2.0f, panel.getHeight() - 4.0f), 1.0f);
                 }
             }
-            if(mixerSkin>=3)
+            if((mixerSkin>=3 && mixerSkin<=6))
             {
                 for(auto& knob:sends)if(knob.isVisible())orbit::ui::drawMixerParentShadow(g,knob);
                 for(auto& band:eqControls)for(auto& knob:band)if(knob.isVisible())orbit::ui::drawMixerParentShadow(g,knob);
@@ -5347,12 +5363,49 @@ private:
                 g.setColour(orbit::options::compact::colour(*this,255, 183, 166).withAlpha(0.75f));
                 g.drawEllipse(static_cast<float>(insertsTitle.getX() - 12), centreY - 3.0f, 6.0f, 6.0f, 0.8f);
             }
+            if(mixerSkin==7 && !panArchBounds.isEmpty()){auto b=panArchBounds.toFloat().reduced(1,1);juce::Path dome;dome.startNewSubPath(b.getX(),b.getBottom());dome.cubicTo(b.getX()+8,b.getY()-5,b.getRight()-8,b.getY()-5,b.getRight(),b.getBottom());dome.closeSubPath();g.setGradientFill(juce::ColourGradient(juce::Colour(0xff4b8caf),b.getCentreX(),b.getY(),juce::Colour(0xff17354c),b.getCentreX(),b.getBottom(),false));g.fillPath(dome);g.setColour(juce::Colour(0xff90c4dd));g.strokePath(dome,juce::PathStrokeType(.8f));}
             paintMeter(g);
         }
 
+        bool configuringConsole=false;
+        juce::Rectangle<int> panArchBounds;
+        void layoutConsoleEq(juce::Rectangle<int>& area)
+        {
+            const juce::ScopedValueSetter<bool> guard(configuringConsole,true);
+            eqGraph.setBounds(area.removeFromTop(64));area.removeFromTop(4);
+            for(int band=0;band<4;++band)
+            {
+                const bool shelf=band==0||band==3;const int count=band==1?3:band==2?2:1;
+                const int height=(shelf?46:count*32)+juce::jmax(0,layout.vertical);
+                auto panel=area.removeFromTop(height);eqBandBounds[size_t(band)]=panel;
+                const bool left=band==0||band==2;
+                auto knobs=left?panel.removeFromLeft(panel.getWidth()/2):panel.removeFromRight(panel.getWidth()/2);
+                auto caption=panel.reduced(2,0);eqBandTitles[size_t(band)].setText(band==0?"Hi Shelf\n12 kHz":band==1?"High Mid":band==2?"Low Mid":"Lo Shelf\n80 Hz",juce::dontSendNotification);
+                eqBandTitles[size_t(band)].setBounds(caption.withHeight(shelf?36:18));
+                for(int parameter=0;parameter<3;++parameter)
+                {
+                    auto& k=eqControls[size_t(band)][size_t(parameter)];auto& label=eqControlLabels[size_t(band)][size_t(parameter)];
+                    k.setVisible(parameter<count);label.setVisible(parameter<count && !shelf);
+                    if(parameter>=count){k.setBounds({});label.setBounds({});continue;}
+                    auto cell=knobs.removeFromTop(shelf?44:32);k.getProperties().set("orbitMixerBaseKnobSize",shelf?30:24);k.setBounds(cell);
+                    label.setBounds(caption.withY(cell.getY()).withHeight(cell.getHeight()).withTrimmedTop(parameter==0?12:0));
+                    if(parameter==1){const double low=band==1?500:45,high=band==1?10043:2457;if(k.getMinimum()!=low||k.getMaximum()!=high){k.setRange(low,high,1);k.setSkewFactorFromMidPoint(band==1?2200:400);}}
+                }
+            }
+            eqButton.setBounds(eqGraph.getRight()-22,eqGraph.getY()+2,20,14);eqButton.setVisible(true);
+        }
+        void paintConsoleMeter(juce::Graphics& g)
+        {
+            const auto draw=[&](juce::Rectangle<int> b,float peak,float hold){g.setColour(juce::Colour(0xff10212e));g.fillRoundedRectangle(b.toFloat(),2);
+                for(int i=0;i<30;++i){const float db=-60.f+(i+1)*2.f;auto led=juce::Rectangle<float>(b.getX()+2.f,b.getBottom()-2.f-(i+1)*(b.getHeight()-4.f)/30.f,b.getWidth()-4.f,juce::jmax(1.f,(b.getHeight()-4.f)/30.f-1.f));g.setColour(db<=peak?(db>=-6?juce::Colour(0xfff3986b):juce::Colour(0xff63d5f3)):juce::Colour(0xff233e50));g.fillRect(led);}
+                if(hold>-60){g.setColour(juce::Colours::white);g.fillRect(float(b.getX()+2),b.getBottom()-2.f-juce::jlimit(0.f,1.f,(hold+60)/60.f)*(b.getHeight()-4),float(b.getWidth()-4),1.f);}
+                if(clipHeld){g.setColour(juce::Colour(0xffed5847));g.fillRect(b.withHeight(3));}};
+            draw(meterBounds.withWidth(12),leftPeakDb,leftPeakHoldDb);draw(meterBounds.withX(meterBounds.getRight()-12).withWidth(12),rightPeakDb,rightPeakHoldDb);
+        }
         void resized() override
         {
             auto area = getLocalBounds().reduced(6, 6);
+            if(mixerSkin!=7){const juce::ScopedValueSetter<bool> guard(configuringConsole,true);for(int band=0;band<4;++band){eqBandTitles[size_t(band)].setText(band==0?"HI":band==1?"HM":band==2?"LMid":"Low",juce::dontSendNotification);for(int parameter=0;parameter<3;++parameter){const bool visible=!masterEqView&&mixControlsShown&&eqSectionVisible&&(parameter<2||band==1);eqControls[size_t(band)][size_t(parameter)].setVisible(visible);eqControlLabels[size_t(band)][size_t(parameter)].setVisible(visible);if(parameter==1){auto& k=eqControls[size_t(band)][1];if(k.getMinimum()!=20||k.getMaximum()!=20000){k.setRange(20,20000,1);k.setSkewFactorFromMidPoint(1000);}}}}panArchBounds={};}
             footer.setBounds(area.removeFromBottom(20));
             area.removeFromBottom(4);
             if (sends[0].isVisible())
@@ -5399,7 +5452,8 @@ private:
             }
             if (eqGraph.isVisible())
             {
-                if (masterEqView)
+                if(mixerSkin==7 && !masterEqView)layoutConsoleEq(area);
+                else if (masterEqView)
                 {
                     // The reference Master strip gives its EQ response graph
                     // a dedicated display area instead of repeating the four
@@ -5469,6 +5523,9 @@ private:
             }
             if (mute.isVisible())
             {
+                if(mixerSkin==7){auto buttons=area.removeFromTop(20);mute.setBounds(buttons.removeFromLeft(buttons.getWidth()/2).reduced(1,0));solo.setBounds(buttons.reduced(1,0));
+                    panArchBounds=area.removeFromTop(53);panTitle.setBounds(panArchBounds.withTrimmedTop(40));panLeft.setBounds(panArchBounds.getX()+4,panArchBounds.getBottom()-16,14,12);panRight.setBounds(panArchBounds.getRight()-18,panArchBounds.getBottom()-16,14,12);pan.getProperties().set("orbitMixerBaseKnobSize",28);pan.setBounds(panArchBounds.withSizeKeepingCentre(46,40).translated(0,-3));}
+                else {
                 auto modePanRow = area.removeFromTop(38);
                 auto modeButtons = modePanRow.removeFromLeft(48);
                 mute.setBounds(modeButtons.removeFromTop(18).reduced(1, 0));
@@ -5480,7 +5537,7 @@ private:
                 panRight.setBounds(panLabelRow.removeFromRight(14));
                 panTitle.setBounds(panLabelRow);
                 pan.getProperties().set("orbitMixerBaseKnobSize",38);
-                pan.setBounds(panArea.reduced(1,0));
+                pan.setBounds(panArea.reduced(1,0));}
                 area.removeFromTop(3);
             }
             if (!masterEqView)
@@ -5501,6 +5558,7 @@ private:
                     }
                 }
             }
+            if(mixerSkin==7){meterBounds=area;gain.setBounds(area.withTrimmedLeft(16).withTrimmedRight(16));return;}
             auto meterArea = area.removeFromRight(38);
             area.removeFromRight(1);
             gain.setBounds(area);
@@ -5559,6 +5617,7 @@ private:
         void paintMeter(juce::Graphics& g)
         {
             if (!meterVisible || meterBounds.isEmpty()) return;
+            if(mixerSkin==7){paintConsoleMeter(g);return;}
             g.setColour(orbit::options::compact::colour(*this,19, 33, 43));
             g.fillRoundedRectangle(meterBounds.toFloat(), 2.0f);
             const int gap = 2;
@@ -5662,10 +5721,10 @@ private:
     class MixerPanel final : public juce::Component
     {
     public:
-        void setSkin(int value) { skin = juce::jlimit(0, 6, value); repaint(); }
+        void setSkin(int value) { skin = juce::jlimit(0, 7, value); repaint(); }
         void paint(juce::Graphics& g) override
         {
-            const auto colour = skin >= 3 ? orbit::options::compact::surface(orbit::mixing::compactVariant(skin)) : skin == 1 ? orbit::options::compact::colour(*this,18, 30, 47)
+            const auto colour = skin >= 3 && skin<=6 ? orbit::options::compact::surface(orbit::mixing::compactVariant(skin)) : skin == 1 ? orbit::options::compact::colour(*this,18, 30, 47)
                 : skin == 2 ? orbit::options::compact::colour(*this,42, 47, 56)
                 : orbit::options::compact::colour(*this,68, 112, 139);
             g.fillAll(colour);
@@ -10845,7 +10904,9 @@ public:
 
         mixerWindow = std::make_unique<MixerWindow>();
         mixerWindow->onSpriteSaved=[this](const auto& folder,const auto& id){saveOption("mixerSpriteFolder",folder.getFullPathName());saveOption("mixerSpriteID",id);};
-        mixerWindow->restoreSpritePreference(juce::File(optionString("mixerSpriteFolder")),optionString("mixerSpriteID"));
+        mixerWindow->onSpriteSetupSaved=[this](const auto& value){saveOption("mixerSpriteSetupV2",value);};
+        if(optionString("mixerSpriteSetupV2").isNotEmpty())mixerWindow->spriteBrowser.restore(optionString("mixerSpriteSetupV2"));
+        else mixerWindow->restoreSpritePreference(juce::File(optionString("mixerSpriteFolder")),optionString("mixerSpriteID"));
         mixerWindow->onKnobStyleChanged=[this](int style){setKnobStyle(style);};
         mixerWindow->setLayout(orbit::mixing::Layout::fromJson(optionString("mixerLayoutV1"),optionInt("mixerKnobSize",200)));
         mixerWindow->onLayoutSaved=[this](auto value){saveOption("mixerLayoutV1",value.toJson());saveOption("mixerKnobSize",value.knobPercent);};
@@ -11141,7 +11202,7 @@ public:
         meterStatus.setColour(juce::Label::textColourId, orbit::options::colour(170, 204, 222));
         addAndMakeVisible(meterStatus);
 
-        buildLabel.setText("Build 324  -  v0.3.303", juce::dontSendNotification);
+        buildLabel.setText("Build 326  -  v0.3.305", juce::dontSendNotification);
         buildLabel.setJustificationType(juce::Justification::centredRight);
         buildLabel.setColour(juce::Label::textColourId, orbit::options::colour(154, 181, 196));
         addAndMakeVisible(buildLabel);
@@ -19828,7 +19889,7 @@ class OrbitApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override { return "Orbit"; }
-    const juce::String getApplicationVersion() override { return "0.3.303"; }
+    const juce::String getApplicationVersion() override { return "0.3.305"; }
     void initialise(const juce::String&) override
     {
         installOrbitCrashReportHandler();

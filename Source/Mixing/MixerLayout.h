@@ -70,5 +70,5 @@ private:
     void timerCallback()override{commit();}
     Layout opening;bool pending=false;juce::Label description;std::array<juce::Label,8> labels;
 };
-inline int compactVariant(int skin){return skin==5?3:skin==6?2:skin>=3?skin-2:0;}
+inline int compactVariant(int skin){return skin==7?0:skin==5?3:skin==6?2:skin>=3?skin-2:0;}
 }

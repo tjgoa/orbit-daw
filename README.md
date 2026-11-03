@@ -16,12 +16,13 @@ Existing project screenshots below are preserved.
 
 ## Development changes since the last tester
 
-The source is updated through **Build 324 / v0.3.303**. Read the
-[Builds 277–324 changelog](Releases/Build-324.md) for audio recording/editing,
+The source is updated through **Build 326 / v0.3.305**. See the
+[Build 326 mixer/sprite update](Releases/Build-326.md) and the earlier [Builds 277–324 changelog](Releases/Build-324.md) for audio recording/editing,
 Song Freeze/Unfreeze, repeatable Pattern captures, Acid Bass additions,
 Multi FX racks, KnobMan mixer tools, skins and workspace fixes.
 
-Build 324 has been compiled/tested locally as a universal Mac app. The published
+Build 324 was compiled/tested locally as a universal Mac app. The latest mixer
+changes also have native validation; see their changelog for coverage. The published
 cross-platform download above remains Build 276; newer source does not imply that
 those older packages contain these additions. Build from the pinned source using
 the instructions below. Current recording and Freeze limits are in the changelog.
@@ -32,7 +33,7 @@ the instructions below. Current recording and Freeze limits are in the changelog
 
 <img width="1680" height="967" alt="1" src="https://github.com/user-attachments/assets/4776994d-c6af-47f6-abd9-23b55acf3dc6" />
 
-Orbit is an actively changing DAW foundation rather than a finished Orion-style workflow. The current source checkpoint is Build 324 / v0.3.303, with local development iteration **339**. It includes a Tracktion Engine-backed built-in 4OSC instrument, VST3 instruments, editable Piano Roll, generator-owned A1–H8 pattern banks, a 512-bar Playlist, MIDI export, and `.orbit` project save/reopen. Pattern mode plays each generator's remembered pattern together; Song mode follows Playlist clips and preserves the other generators' remembered positions. Automation has separate pattern-time lanes in the Piano Roll and song-time lanes in a dedicated Song Event Editor. Playlist generator context actions include Show, Rename, Delete, Clone Track To, Edit Song Events, and Track Color; patterns/arrangement clone and persistent track colors are implemented. Loop start/length/enabled state persists and is drawn on the Playlist ruler. The Mixer contains generator strips with sends and output-bus assignment; the separate Master Section contains bus/return strips and a Master strip with four inserts and no sends. Routed buses appear there automatically. The Mixer stays in the Orbit workspace and can be moved, minimized, or closed. Generator headers, pattern controls and editor bodies now move and stack as one panel; macOS native VST views are clipped below the toolbar and behind foreground workspace panels. VST3 scan and crash reports are written to the Desktop. Current follow-up work includes immediate instrument-key audition, Playlist responsiveness and controls, Mixer Settings/Effects cloning, and runtime verification of loop playback, automation, bus routing, and context actions. See `ORION_LEARN_TODO.md` for remaining work, `ORION_NATIVE_EFFECTS_COMPATIBILITY.md` for the observed Orion effect inventory and migration plan, `BUILD_HISTORY.md` for product checkpoints, and `Source/Project/PROJECT_FORMAT.md` for the project format. Orbit is not yet verified as a finished production DAW.
+Orbit is an actively changing DAW foundation rather than a finished Orion-style workflow. The current source checkpoint is Build 326 / v0.3.305, with local development iteration **340**. It includes a Tracktion Engine-backed built-in 4OSC instrument, VST3 instruments, editable Piano Roll, generator-owned A1–H8 pattern banks, a 512-bar Playlist, MIDI export, and `.orbit` project save/reopen. Pattern mode plays each generator's remembered pattern together; Song mode follows Playlist clips and preserves the other generators' remembered positions. Automation has separate pattern-time lanes in the Piano Roll and song-time lanes in a dedicated Song Event Editor. Playlist generator context actions include Show, Rename, Delete, Clone Track To, Edit Song Events, and Track Color; patterns/arrangement clone and persistent track colors are implemented. Loop start/length/enabled state persists and is drawn on the Playlist ruler. The Mixer contains generator strips with sends and output-bus assignment; the separate Master Section contains bus/return strips and a Master strip with four inserts and no sends. Routed buses appear there automatically. The Mixer stays in the Orbit workspace and can be moved, minimized, or closed. Generator headers, pattern controls and editor bodies now move and stack as one panel; macOS native VST views are clipped below the toolbar and behind foreground workspace panels. VST3 scan and crash reports are written to the Desktop. Current follow-up work includes immediate instrument-key audition, Playlist responsiveness and controls, Mixer Settings/Effects cloning, and runtime verification of loop playback, automation, bus routing, and context actions. See `ORION_LEARN_TODO.md` for remaining work, `ORION_NATIVE_EFFECTS_COMPATIBILITY.md` for the observed Orion effect inventory and migration plan, `BUILD_HISTORY.md` for product checkpoints, and `Source/Project/PROJECT_FORMAT.md` for the project format. Orbit is not yet verified as a finished production DAW.
 
 **Build 324 follow-up:** audio edge trims and Select-based excerpt slicing retain
 unselected audio and Undo. Repeated Pattern captures/Paste advance insertion;
@@ -48,7 +49,7 @@ numbers and quiet guides. See [Playlist audio editing](Source/Playlist/AUDIO_EDI
 
 See [`PROGRESS.md`](PROGRESS.md) for a dated development update and current focus.
 
-A local [KnobMan batch exporter](Tools/KnobManExporter/README.md) now converts editable projects to validated sprite strips and an offline gallery. Native mixer sprite audition is the next milestone. The [Mixer Layout panel](Source/Mixing/MIXER_LAYOUT.md) adds live spacing, size and finish controls with separate Warm White and silver-knob mixer palettes.
+A local [KnobMan batch exporter](Tools/KnobManExporter/README.md) now converts editable projects to validated sprite strips and an offline gallery. Native mixer sprite audition now includes polarity groups, temporary all-controls testing, favorites, list pruning and live size controls. The [Mixer Layout panel](Source/Mixing/MIXER_LAYOUT.md) adds live spacing, size and finish controls with separate Warm White and silver-knob mixer palettes.
 
 Experimental Orion SFS recovery is available through **File > Merge Project...**.
 It recovers selected generators, tentative whole-bar placements and accepted dry

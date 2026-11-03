@@ -93,7 +93,11 @@ inline bool drawSelectedKnob(juce::Graphics& g,int x,int y,int width,int height,
 {
     if(isMixerKnob(slider))if(const auto* sprite=sprites::forComponent(slider))
     {
-        sprite->draw(g,mixerKnobBounds(slider,{float(x),float(y),float(width),float(height)}),position);return true;
+        // Imported artwork uses the complete fixed cell at 500%. Unlike the
+        // old clamp, 100..500 remains visibly adjustable even in short rows.
+        const auto canvas=juce::Rectangle<float>(float(x),float(y),float(width),float(height));
+        const float size=juce::jmax(1.f,juce::jmin(float(width),float(height))-2.f)*float(mixerKnobScale(slider))/5.f;
+        sprite->draw(g,canvas.withSizeKeepingCentre(size,size),position);return true;
     }
     const int style=effectiveKnobStyle(slider,isMixerKnob(slider)?mixerKnobDefault(slider):skinDefault);if(style==0)return false;
     if(isMixerKnob(slider))

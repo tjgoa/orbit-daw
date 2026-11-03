@@ -48,4 +48,4 @@ The host test also checks silver-only mixer shadow restoration and fixed mixer
 geometry. Source-only archives include the HTML preview and C++ sources, with no
 verification executable or compiled plugin.
 
-The generated all-sprites HTML gallery is omitted from the public source checkout. Recreate it locally with `build-explorer.py` using your own exported sprite library.
+The generated all-sprites HTML gallery is omitted from the public source checkout. Recreate it locally with `python3 build-explorer.py /path/to/native-atlas-output`, using the `knobs.json` and PNG atlases produced by `native-preview.cpp`.

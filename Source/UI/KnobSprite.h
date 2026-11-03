@@ -16,20 +16,23 @@ struct Entry
     juce::File file,library;
     int width=0,height=0,frames=0;
     bool horizontal=false;
+    int polarity=0; // 0 unknown, 1 unipolar, 2 bipolar; explicit metadata only.
 };
 struct Sprite
 {
     Entry entry;
     juce::Image image;
+    juce::Rectangle<int> artworkBounds;
     int frameIndex(float value)const
     {return juce::roundToInt(juce::jlimit(0.f,1.f,std::isfinite(value)?value:0.f)*float(entry.frames-1));}
     juce::Rectangle<int> frameBounds(float value)const
     {const int f=frameIndex(value);return {entry.horizontal?f*entry.width:0,entry.horizontal?0:f*entry.height,entry.width,entry.height};}
     void draw(juce::Graphics& g,juce::Rectangle<float> target,float value)const
     {
-        const auto source=frameBounds(value);
-        const float scale=juce::jmin(target.getWidth()/float(entry.width),target.getHeight()/float(entry.height));
-        const auto dest=target.withSizeKeepingCentre(entry.width*scale,entry.height*scale).toNearestInt();
+        const auto frame=frameBounds(value);
+        const auto source=artworkBounds.isEmpty()?frame:artworkBounds.translated(frame.getX(),frame.getY());
+        const float scale=juce::jmin(target.getWidth()/float(source.getWidth()),target.getHeight()/float(source.getHeight()));
+        const auto dest=target.withSizeKeepingCentre(source.getWidth()*scale,source.getHeight()*scale).toNearestInt();
         g.setImageResamplingQuality(juce::Graphics::highResamplingQuality);
         g.drawImage(image,dest.getX(),dest.getY(),dest.getWidth(),dest.getHeight(),source.getX(),source.getY(),source.getWidth(),source.getHeight(),false);
     }
@@ -39,9 +42,10 @@ struct Provider
 {
     virtual ~Provider()=default;
     virtual const Sprite* mixerSprite()const=0;
+    virtual const Sprite* mixerSpriteForRole(int)const{return mixerSprite();}
 };
 inline const Sprite* forComponent(const juce::Component& c)
-{for(auto* p=&c;p!=nullptr;p=p->getParentComponent())if(auto* provider=dynamic_cast<const Provider*>(p))return provider->mixerSprite();return nullptr;}
+{for(auto* p=&c;p!=nullptr;p=p->getParentComponent())if(auto* provider=dynamic_cast<const Provider*>(p))return provider->mixerSpriteForRole(int(c.getProperties().getWithDefault("orbitMixerKnobRole",0)));return nullptr;}
 
 struct Catalogue
 {
@@ -67,6 +71,7 @@ inline Catalogue scan(juce::File folder)
     {
         auto integer=[&](const char* key){const auto n=item[key];if(!(n.isInt()||n.isInt64()||n.isDouble()))return 0;const double d=double(n);return std::isfinite(d)&&d>=1&&d<=32767&&std::floor(d)==d?int(d):0;};
         Entry e;e.library=folder;e.id=item["id"].toString();const auto source=item["source"].toString().replaceCharacter('\\','/');e.name=source.fromLastOccurrenceOf("/",false,false).upToLastOccurrenceOf(".",false,false);
+        const auto polarity=item["polarity"].toString().toLowerCase();e.polarity=polarity=="bipolar"?2:polarity=="unipolar"?1:0;
         e.width=integer("frame_width");e.height=integer("frame_height");e.frames=integer("frames");
         const auto orientation=item["orientation"].toString();e.horizontal=orientation=="horizontal";
         const auto relative=item["sprite"].toString().replaceCharacter('\\','/');
@@ -99,6 +104,15 @@ inline Ptr load(const Entry& e,juce::String& error)
     {error="PNG dimensions do not match the exported frame metadata.";return {};}
     auto image=juce::ImageFileFormat::loadFrom(e.file);
     if(!image.isValid() || image.getWidth()!=w || image.getHeight()!=h){error="The sprite PNG could not be decoded.";return {};}
-    auto sprite=std::make_shared<Sprite>();sprite->entry=e;sprite->image=std::move(image);return sprite;
+    auto sprite=std::make_shared<Sprite>();sprite->entry=e;sprite->image=std::move(image);
+    // Crop common transparent padding across all frames, never per-frame: the
+    // knob must not wobble as it rotates. Keep soft shadows above 1/255 alpha.
+    int left=e.width,top=e.height,right=0,bottom=0;
+    juce::Image::BitmapData pixels(sprite->image,juce::Image::BitmapData::readOnly);
+    for(int f=0;f<e.frames;++f)for(int y=0;y<e.height;++y)for(int x=0;x<e.width;++x)
+        if(pixels.getPixelColour(x+(e.horizontal?f*e.width:0),y+(e.horizontal?0:f*e.height)).getAlpha()>1)
+        {left=juce::jmin(left,x);top=juce::jmin(top,y);right=juce::jmax(right,x+1);bottom=juce::jmax(bottom,y+1);}
+    if(right>left && bottom>top)sprite->artworkBounds={left,top,right-left,bottom-top};
+    return sprite;
 }
 }
