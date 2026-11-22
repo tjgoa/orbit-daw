@@ -2,9 +2,9 @@
 
 Orbit is a standalone DAW inspired by Orion's generator → pattern → playlist → mixer workflow.
 
-**Latest tester: [Build 612 / v0.3.591 — Mac, Windows and Linux](https://github.com/tjgoa/orbit-daw/releases/tag/tester-build-612).** These new binary-only feedback packages use proprietary evaluation terms and expire on **13 December 2026 at 03:40 UTC**. No compiler is needed. User SoundFonts and Orion factory samples are not bundled. Read the release's INSTALL.md and each package's TESTER-LICENSE.txt and BUILD.json. Desktop/audio-device compatibility still needs tester feedback; legacy .sfs recovery remains partial.
+**Latest tester: [Build 749 / v0.3.728 — Mac, Windows and Linux](https://github.com/tjgoa/orbit-daw/releases/tag/tester-build-749).** These new binary-only feedback packages use proprietary evaluation terms and expire on **22 December 2026 at 02:15:18 UTC (21 December, 9:15:18 PM US Eastern)**. No compiler is needed. Sampler libraries, SoundFonts, and Drum Rack factory kit/sample content are not bundled. The [update log](Releases/Build-749.md) summarizes changes since Build 612. Read the release's INSTALL.md and each package's TESTER-LICENSE.txt and BUILD.json. Desktop/audio-device compatibility still needs tester feedback; legacy .sfs recovery remains partial.
 
-**This public repository is the historical source checkpoint, not the source for Build 612.** Its existing code and old releases retain their original licences. The development/build source for the new preview is private. The older documentation below describes that historical source and may differ from the new tester.
+**This public repository is the historical source checkpoint, not the source for Build 749.** Its existing code and old releases retain their original licences. The development/build source for the new preview is private. The older documentation below describes that historical source and may differ from the new tester.
 
 ## Historical tester downloads
 
@@ -316,6 +316,6 @@ The project records Tracktion Engine as a submodule at v3.2.0; that engine revis
 
 ## Historical source licensing
 
-This section applies to the source checkpoint in this public repository, not the new Build 612 preview, which has its own included evaluation terms. No previously granted source licences are revoked.
+This section applies to the source checkpoint in this public repository, not the new Build 749 preview, which has its own included evaluation terms. No previously granted source licences are revoked.
 
 Orbit application code in this historical checkpoint is released under GNU AGPLv3 (see `LICENSE`). JUCE is used under AGPLv3 and Tracktion Engine under GPLv3, subject to their respective license files and notices. Third-party dependencies inside either repository may have additional licenses; preserve those notices when distributing builds. Source is published here; ready-to-run application packages, corresponding source and notices are attached to GitHub Releases.
